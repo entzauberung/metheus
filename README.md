@@ -221,4 +221,4 @@ ANTHROPIC_API_KEY=你的Anthropic密钥
 
 ---
 
-**Metheus — 带来你的灵感，输出你的创意。**
+**Metheus — 带来你的灵感，输出你的创意。**# metheus
