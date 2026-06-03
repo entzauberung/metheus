@@ -363,40 +363,107 @@ async fn generate_mid_stages(
     Ok(mid_stages)
 }
 
-///根据传入的提示词，在项目文件夹创建一个“执行标记”文件，证明这个子任务被调用过
+/// 调用本地的 claude 命令行工具，让它根据提示词（prompt）在项目目录里执行一些操作（比如写代码、改文件）
+/// 然后判断是否成功，并返回执行结果（成功/失败、输出日志、改动文件列表）。
 #[tauri::command]
 async fn execute_subtask(
     project_path: String,
     prompt: String,
     subtask_id: String,
     _milestone_id: String,
-    _mid_stage_id: String,
+    mid_stage_id: String,
 ) -> Result<project::ExecutionResult, String> {
-    // Mock (假装执行) 版本：在 project_path 下创建一个文件证明执行过
-    // 构造文件路径
-    let mock_path = std::path::Path::new(&project_path).join("metheus_executed.txt");
-    // 准备文件内容format!,并写入文件（std::fs）
-    std::fs::write(
-        &mock_path,
+    // 1. 在执行前记录文件列表
+    let before_files = get_tracked_files(&project_path);
+    // 2. 在prompt 末尾加约束，避免 Claude Code 交互式确认
+    let full_prompt = format!(
+    "{}\n\n=== 重要约束 ===\n请直接执行，不要询问确认。所有决策由你自行判断。完成后不要输出总结，直接结束",
+    prompt
+    );
+    // 3. 调用 claude code
+    let output = std::process::Command::new("claude")
+        .args(["--execute", &full_prompt])
+        .current_dir(&project_path)
+        .output()
+        .map_err(|e| {
+            format!(
+                "无法启动 Claude Code CLI: {}\n请确认 cladue 已安装并在 PATH 中",
+                e
+            )
+        })?;
+    // 4. 捕获输出
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    // 5. 判断成功/失败（exit code 0 为成功）
+    let success = output.status.success();
+    // 6. 获取改动文件列表
+    let after_files = get_tracked_files(&project_path);
+    let file_changes = if success {
+        detect_changes(&before_files, &after_files, &project_path)
+    } else {
+        vec![]
+    };
+    // 7. 构建错误日志
+    let error_log = if success {
+        String::new()
+    } else {
         format!(
-            "Prompt: {}\nSubtask: {}\nTime: {}",
-            prompt,
-            subtask_id,
-            //计算时间戳
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_secs()
-        ),
-    )
-    .map_err(|e| format!("写入失败：{}", e))?;
-    // 返回成功结果
+            "Claude Code 执行失败 (exit code: {:?})\nstderr:\n{}",
+            output.status.code(),
+            stderr
+        )
+    };
+    // 8. 构建输出日志
+    let combined_output = format!(
+        "=== 执行日志 ===\n小阶段 ID：{}\n中阶段 ID：{}\n\n=== 提示词 ===\n{}\n\n=== stdout ===\n{}\n=== stderr ===\n{}",
+        subtask_id, mid_stage_id, full_prompt, stdout, stderr
+    );
     Ok(project::ExecutionResult {
-        success: true,
-        output: "Mock: 文件已创建".to_string(),
-        error_log: String::new(),
-        file_changes: vec!["metheus_executed.txt".to_string()],
+        success,
+        output: combined_output,
+        error_log,
+        file_changes,
     })
+}
+
+/// excute_subtask辅助函数
+/// 扫描项目目录，返回所有文件路径列表（跳过 .git / node_modules / target）
+fn get_tracked_files(project_path: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    // 尝试读取目录
+    if let Ok(entries) = std::fs::read_dir(&project_path) {
+        // 遍历每个目录项，flatten跳过错误项
+        for entry in entries.flatten() {
+            let file_name = entry.file_name().to_string_lossy.to_string();
+            // 跳过非源码目录
+            if file_name == ".git" || file_name == "node_modules" || file_name == "target" {
+                continue;
+            }
+            let path = entry.path().to_string_lossy().to_string();
+            files.push(path);
+        }
+    }
+    // 排序
+    files.sort();
+    files
+}
+/// 对比执行前后的文件列表，返回新增文件（相对路径）
+fn detect_changes(before: &[String], after: &[String], project_path: &str) -> Vec<String> {
+    let mut changes = Vec::new();
+
+    // 检测新增文件（after 中有，before 中没有）
+    for file in after {
+        if !before.contains(file) {
+            // 转换为相对路径
+            if let Ok(relative) = std::path::Path::new(file).strip_prefix(project_path) {
+                changes.push(relative.to_string_lossy().to_string());
+            } else {
+                changes.push(file.clone());
+            }
+        }
+    }
+
+    changes
 }
 
 /// 模拟一个“测试工程师”角色：
