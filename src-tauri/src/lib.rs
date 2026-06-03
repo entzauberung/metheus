@@ -434,7 +434,7 @@ fn get_tracked_files(project_path: &str) -> Vec<String> {
     if let Ok(entries) = std::fs::read_dir(&project_path) {
         // 遍历每个目录项，flatten跳过错误项
         for entry in entries.flatten() {
-            let file_name = entry.file_name().to_string_lossy.to_string();
+            let file_name = entry.file_name().to_string_lossy().to_string();
             // 跳过非源码目录
             if file_name == ".git" || file_name == "node_modules" || file_name == "target" {
                 continue;
