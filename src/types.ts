@@ -33,17 +33,23 @@ export interface Subtask {
   retry_count: number;
 }
 
-export type MidStageStatus = "Pending" | "Ready" | "InProgress" | "Completed" | "Rejected" | "Approved";
+export type MidStageStatus = "Pending" | "Ready" | "InProgress" | "Completed" | "Rejected" | "Approved" | "RolledBack";
 
 export interface MidStage {
   id: string;
-  version: string;
   title: string;
-  description: string;
-  tech_focus: string;
+  version: string;
   status: MidStageStatus;
   subtasks: Subtask[];
-  test_report: string;
+  domain?: string;
+  test_log?: string;
+  created_at: string;
+  completed_at?: string;
+  approved_at?: string;
+  description: string;
+  tech_focus: string;
+  test_report?: string;
+  git_tag?: string;  // ← 4.1.1b
 }
 
 export type StageMode = "Quick" | "Professional";

@@ -75,6 +75,8 @@ pub enum MidStageStatus {
     ///已驳回
     Rejected,
     Approved,
+    // 4.1.1a 该中阶段已被回退（代码和执行树都回到了更早的版本）
+    RolledBack,
 }
 ///小阶段（claude code可执行的最小单元）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,22 +97,21 @@ pub struct Subtask {
 ///中阶段（域负责人拆解的技术实现模块）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MidStage {
-    ///唯一标识
     pub id: String,
-    ///版本号（eg: v0.1.1, v1.1.2)
-    pub version: String,
-    ///中阶段标题
     pub title: String,
-    ///描述
-    pub description: String,
-    ///技术重点
-    pub tech_focus: String,
-    ///当前状态
+    pub version: String, // 如 "v0.1.1"
     pub status: MidStageStatus,
-    ///包含的小阶段列表
     pub subtasks: Vec<Subtask>,
-    ///测试报告
+    pub domain: Option<String>, // 专业模式：域负责人
+    pub test_log: Option<String>,
+    pub created_at: String,
+    pub description: String,
+    pub tech_focus: String,
     pub test_report: String,
+    pub completed_at: Option<String>,
+    pub approved_at: Option<String>,
+    #[serde(default)]
+    pub git_tag: String, // ← 新增：Git tag 名，如 "metheus/v0.1.1"
 }
 ///执行结果（claude code执行后的输出)
 #[derive(Debug, Clone, Serialize, Deserialize)]

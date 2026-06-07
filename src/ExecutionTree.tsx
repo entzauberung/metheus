@@ -7,6 +7,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Milestone, Subtask, PipelineState, GeneratedSubtask } from "./types";
+import { Modal } from './components/Modal';
 
 interface Props {
   milestones: Milestone[];
@@ -26,6 +27,12 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
   const [isExecuting, setIsExecuting] = useState(false);
   const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
   const [executionStatus, setExecutionStatus] = useState<PipelineState | null>(null);
+
+  // 新增：回退相关状态
+  const [rollbackTarget, setRollbackTarget] = useState<{
+    tagName: string;
+    version: string;
+  } | null>(null);
 
   // === Phase 3 轮询执行状态 ===
   useEffect(() => {
@@ -178,6 +185,26 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
       alert(`❌ 驳回失败：${e}`);
     }
   };
+  // 回退处理函数
+  // 把项目回退到之前保存的某个中阶段（mid_stage）状态。
+  const handleRollback = async () => {
+    if (!rollbackTarget || !projectId) return;
+    try {
+      const result = await invoke('git_rollback_to_mid_stage', {
+        projectPath: projectPath || '',
+        tagName: rollbackTarget.tagName,
+        projectId: projectId,
+      });
+      console.log('回退成功:', result);
+      setRollbackTarget(null);
+      // TODO: 触发父组件刷新（需新增 onRollback prop 或引入 useProject）
+    } catch (err) {
+      console.error('回退失败:', err);
+      alert('回退失败: ' + err);
+      setRollbackTarget(null);
+    }
+  };
+
   const getSubtaskStatusIcon = (status: string) => {
     switch (status) {
       case "waiting":
@@ -214,6 +241,8 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
   *                        ├── 已生成计划（子任务列表 + 开始执行）
   *                        ├── 执行状态面板（进度点 + 当前日志）
   *                        └── 完成后显示测试日志 + 审批按钮
+  *  回退按钮 midStage.status === 'Completed' || midStage.status 
+  *  回退弹窗 Model 末尾添加
   */
   return (
     <div className="execution-tree">
@@ -290,6 +319,11 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
                       <span className="mid-stage-icon">├─</span>
                       <span className="mid-stage-version">{mid.version}</span>
                       <span className="mid-stage-title">{mid.title}</span>
+                      {mid.git_tag && (
+                        <span className="mid-stage-tag" style={{ color: "#888", fontSize: "0.75rem", marginLeft: 8 }}>
+                          {mid.git_tag}
+                        </span>
+                      )}
                       <span className="mid-stage-focus">{mid.tech_focus}</span>
                       <span className="mid-stage-status">
                         {mid.status === "Pending" && "○ 待开始"}
@@ -297,8 +331,37 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
                         {mid.status === "InProgress" && "● 进行中"}
                         {mid.status === "Completed" && "✅ 已完成"}
                         {mid.status === "Rejected" && "❌ 驳回"}
+                        {mid.status === "RolledBack" && (
+                          <span style={{ color: "#999", textDecoration: "line-through" }}>↩ 已回退</span>
+                        )}
                         {mid.status === "Approved" && "✅ 已批准"}
                       </span>
+                      {/* 回退按钮：已完成或已批准的节点可以回退 */}
+                      {(mid.status === "Completed" || mid.status === "Approved") && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            const tagName = mid.git_tag || `metheus/${mid.version}`;
+                            setRollbackTarget({
+                              tagName,
+                              version: mid.version,
+                            });
+                          }}
+                          title="回退到此节点"
+                          style={{
+                            marginLeft: "8px",
+                            padding: "2px 8px",
+                            fontSize: "12px",
+                            border: "1px solid #ccc",
+                            borderRadius: "4px",
+                            background: "#f8f8f8",
+                            cursor: "pointer",
+                            color: "#888",
+                          }}
+                        >
+                          ↩ 回退到此
+                        </button>
+                      )}
                       {/* 中阶段操作区：选中后显示操作区域 */}
                       {selectedMidStageId === mid.id && (
                         <div className="mid-stage-actions">
@@ -427,6 +490,49 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
           ))}
         </ul>
       )}
+      {/* ===== 回退确认弹窗 ===== */}
+      <Modal
+        isOpen={rollbackTarget !== null}
+        onClose={() => setRollbackTarget(null)}
+        title="确认回退"
+      >
+        <div style={{ padding: '16px' }}>
+          <p>项目将回退到 <strong>{rollbackTarget?.tagName}</strong></p>
+          <p style={{ color: '#e74c3c', fontSize: '14px', marginTop: '8px' }}>
+            该节点之后的所有已完成节点将被标记为"已回退"。
+          </p>
+          <p style={{ color: '#888', fontSize: '13px', marginTop: '4px' }}>
+            如果工作区有未提交的变更，它们将被临时存储。
+          </p>
+          <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '16px' }}>
+            <button
+              onClick={() => setRollbackTarget(null)}
+              style={{
+                padding: '6px 16px',
+                border: '1px solid #ccc',
+                borderRadius: '4px',
+                background: '#fff',
+                cursor: 'pointer',
+              }}
+            >
+              取消
+            </button>
+            <button
+              onClick={handleRollback}
+              style={{
+                padding: '6px 16px',
+                border: 'none',
+                borderRadius: '4px',
+                background: '#e74c3c',
+                color: '#fff',
+                cursor: 'pointer',
+              }}
+            >
+              确认回退
+            </button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }
