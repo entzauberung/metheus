@@ -9,8 +9,6 @@ use std::env;
 use std::fs;
 mod project;
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -31,7 +29,7 @@ const DOMAIN_LEAD_PROMPT: &str = "\
 每个中阶段是一个技术上的垂直切片——从数据库到前端界面的完整链路。\
 输出格式：JSON 数组，每个元素包含：version（字符串，格式 v0.1.1、v0.1.2…）、\
 title（字符串）、description（字符串）、tech_focus（字符串）。\
-你只输出 JSON 数组，不要包含 markdown 代码块标记。";
+你只输出 JSON 数组，不要包含 markdown 代码块标记。不要任何解释文字。输出必须以 [ 开头。";
 const TECH_PROMPT: &str = "\
 你是全栈技术专家，角色名「开发工程师」。\
 你的职责是把产品经理定义的大阶段拆成可执行的小阶段（Subtask），每个小阶段生成精确的提示词供 Claude Code 执行。\
@@ -271,9 +269,10 @@ async fn generate_milestones(
         .as_str()
         .ok_or("AI回复格式异常".to_string())?
         .to_string();
-    //（上面的文字）JSON数组转化为Rust数组
-    let raw_milestones: Vec<serde_json::Value> =
-        serde_json::from_str(&content).map_err(|e| format!("解析JSON 失败：{}", e))?;
+    //（上面的文字）JSON数组转化为Rust数组,json改动替换
+    let raw_milestones: Vec<serde_json::Value> = parse_json_with_retry(&content)
+        .await
+        .map_err(|e| format!("解析大阶段 JSON 失败：{}", e))?;
     //创建一个空的、可变的、专门用来存放 project::Milestone 结构体的数组，变量名叫 milestones
     let mut milestones: Vec<project::Milestone> = Vec::new();
     //把这个数组里面的每个对象，转化为Rust里Milestone结构体（补上id,状态...）
@@ -346,9 +345,10 @@ async fn generate_mid_stages(
         .as_str()
         .ok_or("AI回复格式异常".to_string())?
         .to_string();
-    // 5. 解析 JSON
-    let raw_mid_stages: Vec<serde_json::Value> =
-        serde_json::from_str(&content).map_err(|e| format!("解析JSON失败: {}", e))?;
+    // 5. 解析 JSON,json 解析改动
+    let raw_mid_stages: Vec<serde_json::Value> = parse_json_with_retry(&content)
+        .await
+        .map_err(|e| format!("解析中阶段 JSON 失败：{}", e))?;
     // 6. 转换成 MidStage 结构体
     let mut mid_stages: Vec<project::MidStage> = Vec::new();
     for raw in raw_mid_stages {
@@ -597,87 +597,135 @@ fn save_tag_to_mid_stage(
     Ok(())
 }
 
-/// 调用本地的 claude 命令行工具，让它根据提示词（prompt）在项目目录里执行一些操作（比如写代码、改文件）
-/// 然后判断是否成功，并返回执行结果（成功/失败、输出日志、改动文件列表）。
+/// “可暂停”的 Claude Code 执行器：启动进程后边等待边监听暂停信号，暂停时立即杀进程；
+/// 正常结束则返回改动的文件和执行日志
+/// 执行子任务的内部实现（可被暂停中断）
+/// 用 tokio::process::Command 替代 std::process::Command，
+/// spawn 后进入轮询循环，每 500ms 检查暂停标志，
+/// 检测到暂停时立即 kill Claude Code 进程并返回 SubTaskError::UserPaused。
+async fn execute_subtask_inner(
+    project_path: &str,
+    prompt: &str,
+    subtask_id: &str,
+    state: Arc<Mutex<Option<PipelineState>>>,
+) -> Result<project::ExecutionResult, project::SubTaskError> {
+    // 1. 执行前记录文件列表
+    let before_files = get_tracked_files(project_path);
+    // 2. 拼接完整 prompt
+    let full_prompt = format!(
+        "{}\n\n=== 重要约束 ===\n请直接执行，不要询问确认。所有决策由你自行判断。完成后不要输出总结，直接结束",
+        prompt
+    );
+    // 3. 用 tokio::process::Command 启动 Claude Code（非阻塞）
+    let mut child = tokio::process::Command::new("claude")
+        .args(["--dangerously-skip-permissions", &full_prompt])
+        .current_dir(project_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| project::SubTaskError::ExecutionFailed {
+            message: format!(
+                "无法启动 Claude Code CLI: {}\n请确认 claude 已安装并在 PATH 中",
+                e
+            ),
+        })?;
+    // 4. 自动应答：信任确认 + 文件写入确认（异步写入 stdin）
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(b"1\n").await.ok();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        for _ in 0..10 {
+            stdin.write_all(b"yes\n").await.ok();
+        }
+        // stdin 在这里 drop，关闭管道
+    }
+    // 5. 轮询等待进程结束，期间检查暂停标志
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // 进程已结束 → 读取 stdout/stderr
+                let output = child.wait_with_output().await.map_err(|e| {
+                    project::SubTaskError::ExecutionFailed {
+                        message: format!("读取 Claude Code 输出失败: {}", e),
+                    }
+                })?;
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let success = status.success();
+                // 获取改动文件列表
+                let after_files = get_tracked_files(project_path);
+                let file_changes = if success {
+                    detect_changes(&before_files, &after_files, project_path)
+                } else {
+                    vec![]
+                };
+                let error_log = if success {
+                    String::new()
+                } else {
+                    format!(
+                        "Claude Code 执行失败 (exit code: {:?})\nstderr:\n{}",
+                        status.code(),
+                        stderr
+                    )
+                };
+                let combined_output = format!(
+                    "=== 执行日志 ===\n小阶段 ID：{}\n\n=== 提示词 ===\n{}\n\n=== stdout ===\n{}\n=== stderr ===\n{}",
+                    subtask_id, full_prompt, stdout, stderr
+                );
+                return Ok(project::ExecutionResult {
+                    success,
+                    output: combined_output,
+                    error_log,
+                    file_changes,
+                });
+            }
+            Ok(None) => {
+                // 进程还在运行 → 检查暂停标志
+                let paused = {
+                    let guard = state.lock().await;
+                    guard
+                        .as_ref()
+                        .map_or(false, |s| s.status == PipelineStatus::Paused)
+                };
+                if paused {
+                    // 用户点了暂停 → 强制终止 Claude Code
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    return Err(project::SubTaskError::UserPaused);
+                }
+                // 没暂停 → 等 500ms 再检查
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                let _ = child.start_kill();
+                return Err(project::SubTaskError::ExecutionFailed {
+                    message: format!("Claude Code 进程异常: {}", e),
+                });
+            }
+        }
+    }
+}
+
+/// Tauri command 壳：前端调用入口，内部委托给 execute_subtask_inner。
+/// 前端直接调时没有暂停状态，传一个临时空 state。
 #[tauri::command]
 async fn execute_subtask(
     project_path: String,
     prompt: String,
     subtask_id: String,
     _milestone_id: String,
-    mid_stage_id: String,
+    _mid_stage_id: String,
 ) -> Result<project::ExecutionResult, String> {
-    // 1. 在执行前记录文件列表
-    let before_files = get_tracked_files(&project_path);
-    // 2. 在prompt 末尾加约束，避免 Claude Code 交互式确认
-    let full_prompt = format!(
-    "{}\n\n=== 重要约束 ===\n请直接执行，不要询问确认。所有决策由你自行判断。完成后不要输出总结，直接结束",
-    prompt
-    );
-    // 3. 调用 claude code（带管道输入，自动应答确认提示）
-
-    let mut child = Command::new("claude")
-        .args(["--dangerously-skip-permissions", &full_prompt])
-        .current_dir(&project_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "无法启动 Claude Code CLI: {}\n请确认 claude 已安装并在 PATH 中",
-                e
-            )
-        })?;
-
-    // 自动应答：选 "1. Yes, I trust this folder" + 确认文件写入
-    if let Some(mut stdin) = child.stdin.take() {
-        // 信任确认：选第1项
-        writeln!(stdin, "1").ok();
-        // 给 Claude 一点时间处理输入
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        // 多次发送 yes 以应对后续多个确认提示
-        for _ in 0..10 {
-            writeln!(stdin, "yes").ok();
-        }
-    }
-    // 等待完成
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("等待 Claude Code 完成失败: {}", e))?;
-    // 4. 捕获输出
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    // 5. 判断成功/失败（exit code 0 为成功）
-    let success = output.status.success();
-    // 6. 获取改动文件列表
-    let after_files = get_tracked_files(&project_path);
-    let file_changes = if success {
-        detect_changes(&before_files, &after_files, &project_path)
-    } else {
-        vec![]
-    };
-    // 7. 构建错误日志
-    let error_log = if success {
-        String::new()
-    } else {
-        format!(
-            "Claude Code 执行失败 (exit code: {:?})\nstderr:\n{}",
-            output.status.code(),
-            stderr
-        )
-    };
-    // 8. 构建输出日志
-    let combined_output = format!(
-        "=== 执行日志 ===\n小阶段 ID：{}\n中阶段 ID：{}\n\n=== 提示词 ===\n{}\n\n=== stdout ===\n{}\n=== stderr ===\n{}",
-        subtask_id, mid_stage_id, full_prompt, stdout, stderr
-    );
-    Ok(project::ExecutionResult {
-        success,
-        output: combined_output,
-        error_log,
-        file_changes,
-    })
+    // 前端直接调用时，没有流水线上下文，传空 state
+    let dummy_state = Arc::new(Mutex::new(None));
+    execute_subtask_inner(&project_path, &prompt, &subtask_id, dummy_state)
+        .await
+        .map_err(|e| match e {
+            project::SubTaskError::UserPaused => "用户暂停".to_string(),
+            project::SubTaskError::ExecutionFailed { message } => message,
+            project::SubTaskError::Timeout => "执行超时".to_string(),
+        })
 }
 
 /// excute_subtask辅助函数
@@ -700,7 +748,15 @@ fn detect_changes(before: &[String], after: &[String], project_path: &str) -> Ve
 
     changes
 }
-
+/// 调用方（如 check_subtask）
+///    ↓
+/// run_test_command("cargo", &["test"], "/project", 120)  → 得到 (code, stdout, stderr)
+///    ↓
+/// summarize_test_output(code, &stdout, &stderr)           → 得到精简摘要
+///    ↓
+/// format_test_result("cargo test", code, &summary)        → 得到最终字符串
+///    ↓
+/// 返回给 AI 或前端
 /// 模拟一个“测试工程师”角色：
 /// 自动检查当前项目里所有改动的代码，判断是否达到了子任务的目标，并返回测试结果（通过/问题/建议）
 /// 扫描项目目录，递归返回所有文件路径列表（跳过 .git / node_modules / target）
@@ -729,11 +785,143 @@ fn get_tracked_files(project_path: &str) -> Vec<String> {
     files.sort();
     files
 }
+/// 执行测试命令，带超时控制（spawn + try_wait 轮询）
+/// 返回: (exit_code, stdout, stderr)
+/// 测试辅助函数
+fn run_test_command(
+    cmd: &str,
+    args: &[&str],
+    cwd: &str,
+    timeout_secs: u64,
+) -> Result<(i32, String, String), String> {
+    use std::io::Read;
+    // 创建子进程，以便捕获输出
+    let mut child = std::process::Command::new(cmd)
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("无法启动进程 '{}': {}", cmd, e))?;
+    // 记录开始时间
+    let start = std::time::Instant::now();
+    // 进入循环
+    loop {
+        // 检查进程是否结束（非阻塞）
+        match child.try_wait() {
+            // 如果已结束（Ok(Some(status))）：读取 stdout/stderr 剩余内容，返回 (exit_code, stdout, stderr)
+            Ok(Some(status)) => {
+                let mut out_str = String::new();
+                let mut err_str = String::new();
+                if let Some(mut out) = child.stdout.take() {
+                    out.read_to_string(&mut out_str).ok();
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    err.read_to_string(&mut err_str).ok();
+                }
+                let code = status.code().unwrap_or(-1);
+                return Ok((code, out_str, err_str));
+            }
+            // 如果还在运行（Ok(None)）：检查是否超时，若超时则 child.kill() 并返回错误；否则休眠 500 毫秒后继续轮询
+            Ok(None) => {
+                if start.elapsed() > std::time::Duration::from_secs(timeout_secs) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("测试超时（超过 {} 秒），已强制终止", timeout_secs));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            // 出错（Err(e)）：终止进程并返回错误
+            Err(e) => {
+                let _ = child.kill();
+                return Err(format!("进程异常: {}", e));
+            }
+        }
+    }
+}
+
+/// 从测试输出中提取关键信息
+/// 通过 → 截取最后 500 字符
+/// 失败 → 截取最后 3000 字符 + 提取含失败关键词的行
+fn summarize_test_output(exit_code: i32, stdout: &str, stderr: &str) -> String {
+    let combined = format!("{}{}", stdout, stderr);
+    // 如果测试通过（exit_code == 0）：只保留最后 500 个字符
+    if exit_code == 0 {
+        // 通过：保留最后 500 字符
+        if combined.len() > 500 {
+            format!(
+                "…(省略前面 {} 字符)…\n\n{}",
+                combined.len() - 500,
+                &combined[combined.len() - 500..]
+            )
+        } else {
+            combined
+        }
+    // 如果测试失败（exit_code != 0）
+    } else {
+        // 失败：保留最后 3000 字符
+        let tail = if combined.len() > 3000 {
+            &combined[combined.len() - 3000..]
+        } else {
+            &combined
+        };
+
+        // 提取含失败关键词的行
+        let keywords = [
+            "FAIL",
+            "Error",
+            "error:",
+            "assertion",
+            "✕",
+            "✗",
+            "fail:",
+            "FAILED",
+            "--- FAIL",
+            "[ERROR]",
+            "panic",
+            "Panic",
+        ];
+        let mut key_lines: Vec<&str> = Vec::new();
+        for line in tail.lines() {
+            // 如果有这样的行，把它们单独列出来作为“关键失败行”；否则只返回退出码和尾部输出
+            if keywords.iter().any(|k| line.contains(k)) {
+                key_lines.push(line);
+            }
+        }
+
+        if key_lines.is_empty() {
+            format!("退出码: {}\n\n{}", exit_code, tail)
+        } else {
+            format!(
+                "退出码: {}\n\n## 关键失败行\n{}\n\n## 完整输出（尾部）\n{}",
+                exit_code,
+                key_lines.join("\n"),
+                tail
+            )
+        }
+    }
+}
+
+/// 格式化测试结果
+fn format_test_result(_label: &str, command: &str, exit_code: i32, summary: &str) -> String {
+    let status = if exit_code == 0 {
+        "✅ 通过"
+    } else {
+        "❌ 失败"
+    };
+    format!(
+        "测试命令: {}\n状态: {} (exit code: {})\n\n输出:\n{}",
+        command, status, exit_code, summary
+    )
+}
+/// 测试
 #[tauri::command]
 async fn check_subtask(
-    project_path: String,
-    _subtask_id: String,
-    subtask_goal: String,
+    project_path: &str,
+    _subtask_goal: &str,
+    _subtask_id: &str,
+    _milestone_id: &str,
+    _mid_stage_id: &str,
 ) -> Result<project::TestResult, String> {
     // 1.尝试 git diff --name-only 获取改动文件
     let files: Vec<String> = {
@@ -807,19 +995,185 @@ async fn check_subtask(
         };
         file_contents.push_str(&format!("\n=== {} ===\n{}\n", file, truncated));
     }
+    // ===== 真测试：检测项目类型，执行对应的测试命令 =====
+    let test_output: Option<String> = {
+        let project_root = std::path::Path::new(project_path);
+
+        // 优先检测自定义测试命令文件 .metheus-test
+        let metheus_test_file = project_root.join(".metheus-test");
+        if metheus_test_file.exists() {
+            match std::fs::read_to_string(&metheus_test_file) {
+                Ok(contents) => {
+                    let cmd_line = contents.trim().to_string();
+                    if cmd_line.is_empty() || cmd_line.starts_with('#') {
+                        eprintln!("[check_subtask] .metheus-test 为空或注释，跳过");
+                        None
+                    } else {
+                        let parts: Vec<&str> = cmd_line.split_whitespace().collect();
+                        let cmd = parts[0];
+                        let cmd_args = &parts[1..];
+                        eprintln!("[check_subtask] 使用自定义测试命令: {}", cmd_line);
+                        match run_test_command(cmd, cmd_args, project_path, 300) {
+                            Ok((code, stdout, stderr)) => {
+                                let summary = summarize_test_output(code, &stdout, &stderr);
+                                Some(format_test_result("自定义测试", &cmd_line, code, &summary))
+                            }
+                            Err(e) => Some(format!("自定义测试执行失败：{}", e)),
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[check_subtask] 读取 .metheus-test 失败: {}", e);
+                    None
+                }
+            }
+        } else if project_root.join("package.json").exists() {
+            // JS/TS 项目：自动识别包管理器
+            let pm = if project_root.join("pnpm-lock.yaml").exists() {
+                "pnpm"
+            } else if project_root.join("yarn.lock").exists() {
+                "yarn"
+            } else {
+                "npm"
+            };
+            let label = format!("{} test", pm);
+            match run_test_command(pm, &["test"], project_path, 300) {
+                Ok((code, stdout, stderr)) => {
+                    let summary = summarize_test_output(code, &stdout, &stderr);
+                    Some(format_test_result(&label, &label, code, &summary))
+                }
+                Err(e) => Some(format!("{} test 执行失败：{}", pm, e)),
+            }
+        } else if project_root.join("Cargo.toml").exists() {
+            // Rust 项目
+            match run_test_command("cargo", &["test"], project_path, 600) {
+                Ok((code, stdout, stderr)) => {
+                    let summary = summarize_test_output(code, &stdout, &stderr);
+                    Some(format_test_result(
+                        "cargo test",
+                        "cargo test",
+                        code,
+                        &summary,
+                    ))
+                }
+                Err(e) => Some(format!("cargo test 执行失败：{}", e)),
+            }
+        } else if project_root.join("go.mod").exists() {
+            // Go 项目
+            match run_test_command("go", &["test", "./..."], project_path, 300) {
+                Ok((code, stdout, stderr)) => {
+                    let summary = summarize_test_output(code, &stdout, &stderr);
+                    Some(format_test_result(
+                        "go test",
+                        "go test ./...",
+                        code,
+                        &summary,
+                    ))
+                }
+                Err(e) => Some(format!("go test 执行失败：{}", e)),
+            }
+        } else if project_root.join("pyproject.toml").exists()
+            || project_root.join("setup.py").exists()
+            || project_root.join("setup.cfg").exists()
+        {
+            // Python 项目：先检测 pytest 是否可用
+            let (cmd, args): (&str, Vec<&str>) = if std::process::Command::new("python")
+                .args(["-m", "pytest", "--version"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                ("python", vec!["-m", "pytest"])
+            } else {
+                ("python", vec!["-m", "unittest", "discover"])
+            };
+            let label = if args.contains(&"pytest") {
+                "pytest"
+            } else {
+                "unittest"
+            };
+            let full_cmd = format!("{} {}", cmd, args.join(" "));
+            let args_slice: Vec<&str> = args.iter().map(|s| *s).collect();
+            match run_test_command(cmd, &args_slice, project_path, 300) {
+                Ok((code, stdout, stderr)) => {
+                    let summary = summarize_test_output(code, &stdout, &stderr);
+                    Some(format_test_result(label, &full_cmd, code, &summary))
+                }
+                Err(e) => Some(format!("{} 执行失败：{}", label, e)),
+            }
+        } else if project_root.join("CMakeLists.txt").exists() {
+            // C++ 项目
+            match run_test_command("ctest", &[], project_path, 300) {
+                Ok((code, stdout, stderr)) => {
+                    let summary = summarize_test_output(code, &stdout, &stderr);
+                    Some(format_test_result("ctest", "ctest", code, &summary))
+                }
+                Err(e) => Some(format!("ctest 执行失败：{}", e)),
+            }
+        } else if project_root.join("pom.xml").exists() {
+            // Java Maven
+            match run_test_command("mvn", &["test"], project_path, 600) {
+                Ok((code, stdout, stderr)) => {
+                    let summary = summarize_test_output(code, &stdout, &stderr);
+                    Some(format_test_result("mvn test", "mvn test", code, &summary))
+                }
+                Err(e) => Some(format!("mvn test 执行失败：{}", e)),
+            }
+        } else if project_root.join("build.gradle").exists()
+            || project_root.join("build.gradle.kts").exists()
+        {
+            // Java Gradle
+            let gradle_cmd = if cfg!(windows) {
+                "gradlew.bat"
+            } else {
+                "./gradlew"
+            };
+            match run_test_command(gradle_cmd, &["test"], project_path, 600) {
+                Ok((code, stdout, stderr)) => {
+                    let summary = summarize_test_output(code, &stdout, &stderr);
+                    Some(format_test_result(
+                        "gradle test",
+                        "gradle test",
+                        code,
+                        &summary,
+                    ))
+                }
+                Err(e) => Some(format!("gradle test 执行失败：{}", e)),
+            }
+        } else {
+            eprintln!("[check_subtask] 未检测到已知测试框架，跳过真测试");
+            None
+        }
+    };
     // Mock 版本 -> 3.4.1c改动
     // 构建测试工程师prompt 的 user_message
-    let user_message = format!(
-        "## 小阶段目标\n{}\n\n## 改动文件列表\n{}\n\n## 文件内容\n{}",
-        subtask_goal,
-        files.join("\n"),
-        file_contents
-    );
+    // eprintln!("[check_subtask] 测试结果注入完成, test_output 长度: {}",
+    //     test_output.as_ref().map(|s| s.len()).unwrap_or(0));
+    let user_message = if let Some(ref test_result) = test_output {
+        format!(
+            "请检查以下代码改动。\n\n## 自动化测试结果\n项目自动化测试已执行，结果如下：\n\n{}\n\n---\n\n## 改动文件列表（共 {} 个文件）\n{}\n\n## 改动文件内容\n{}",
+            test_result,
+            files.len(),
+            files.join("\n"),
+            file_contents
+        )
+    } else {
+        format!(
+            "请检查以下代码改动：\n\n## 改动文件列表（共 {} 个文件）\n{}\n\n## 改动文件内容\n{}",
+            files.len(),
+            files.join("\n"),
+            file_contents
+        )
+    };
+    //     test_output.as_ref().map(|s| s.len()).unwrap_or(0));
     // 调用ai
     let reply = call_deepseek_api_json(TEST_PROMPT, &user_message).await?;
     // 解析JSON 响应
-    let test_result: project::TestResult = serde_json::from_str(&reply)
-        .map_err(|e| format!("解析测试结果失败：{}, 原始响应：{}", e, reply))?;
+    let test_result: project::TestResult = parse_json_with_retry(&reply)
+        .await
+        .map_err(|e| format!("解析测试结果失败：{}", e))?;
     Ok(test_result)
 }
 
@@ -850,8 +1204,9 @@ async fn generate_next_prompt(
     // 调用 AI
     let reply = call_deepseek_api_json(TECH_PROMPT, &user_message).await?;
     // 解析 JSON 响应
-    let generated: project::GeneratedSubtask = serde_json::from_str(&reply)
-        .map_err(|e| format!("解析生成结果失败: {}，原始响应: {}", e, reply))?;
+    let generated: project::GeneratedSubtask = parse_json_with_retry(&reply)
+        .await
+        .map_err(|e| format!("解析生成结果失败：{}", e))?;
     Ok(generated)
 }
 
@@ -1071,22 +1426,49 @@ async fn execute_mid_stage_pipeline(
                     s.current_log = format!("⚙️ {}", generated.title);
                 }
             }
-            // 执行子任务
-            // 调用 execute_subtask，返回文件变更等
-            let exec_result = execute_subtask(
-                project_path.clone(),
-                generated.prompt.clone(),
-                subtask_id.clone(),
-                String::new(),
-                String::new(),
+            // 执行子任务（可被暂停中断）
+            let exec_result = match execute_subtask_inner(
+                &project_path,
+                &generated.prompt,
+                &subtask_id,
+                state.clone(),
             )
-            .await?;
+            .await
+            {
+                Ok(r) => r,
+                Err(project::SubTaskError::UserPaused) => {
+                    // 用户暂停：Claude Code 已被 kill，进入等待恢复循环
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        let guard = state.lock().await;
+                        if let Some(s) = guard.as_ref() {
+                            if s.status != PipelineStatus::Paused {
+                                // 已恢复（或已取消）
+                                if s.status == PipelineStatus::Failed {
+                                    return Err("流水线已被取消".to_string());
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    // 恢复后重新执行当前子任务（不增加 retry_count）
+                    continue;
+                }
+                Err(e) => {
+                    let msg = match e {
+                        project::SubTaskError::ExecutionFailed { message } => message,
+                        project::SubTaskError::Timeout => "执行超时".to_string(),
+                        _ => format!("{:?}", e),
+                    };
+                    return Err(format!("Claude Code 执行失败：{}", msg));
+                }
+            };
+            subtasks[i].execution_result = Some(exec_result.clone());
             file_changes = exec_result.file_changes.clone();
-            // Claude Code 进程 失败 -> 不进入重试循环，直接中止
+            // Claude Code 进程失败 -> 不进入重试循环，直接中止
             if !exec_result.success {
                 return Err(format!("Claude Code 执行失败：{}", exec_result.error_log));
             }
-            subtasks[i].execution_result = Some(exec_result);
             // 运行测试
             // 调用 check_subtask，得到 test.passed
             {
@@ -1098,9 +1480,11 @@ async fn execute_mid_stage_pipeline(
             }
             // 检查
             let test = match check_subtask(
-                project_path.clone(),
-                subtask_id.clone(),
-                subtask_title.clone(),
+                &project_path,
+                &subtask_title,
+                &subtask_id,
+                "",
+                &mid_stage_id,
             )
             .await
             {
@@ -1271,6 +1655,93 @@ async fn call_deepseek_api_inner(
         .to_string();
 
     Ok(reply)
+}
+
+/// 清洗 AI 返回的文本，提取出纯净的 JSON 字符串
+/// 处理三种干扰：
+///   1. Markdown 代码块包裹（```json ... ```）
+///   2. 礼貌前缀（"好的，以下是JSON："）
+///   3. 末尾多余文字
+fn sanitize_json_response(raw: &str) -> String {
+    let text = raw.trim();
+    // 第一层：处理 Markdown 代码块包裹
+    let text = if text.starts_with("```") {
+        // 跳过第一行（可能是```json 或 ```）
+        let after_first_newline = text.find("\n").map(|i| &text[i + 1..]).unwrap_or(text);
+        // 找到最后一个```, 截断到它之前
+        match after_first_newline.rfind("\n```") {
+            Some(pos) => &after_first_newline[..pos],
+            None => after_first_newline,
+        }
+    } else {
+        text
+    };
+    // 第二层: 找到第一个 [ 或 {
+    let start = text.find('[').or_else(|| text.find('{')).unwrap_or(0);
+    // 第三层：找最后一个 ] 或 }
+    let end = text
+        .rfind(']')
+        .or_else(|| text.rfind('}'))
+        .map(|i| i + 1) // ← +1 包含闭合括号
+        .unwrap_or(text.len());
+    text[start..end].to_string()
+}
+
+/// 带重试的 JSON 解析
+/// 第 1 次：sanitize → 直接解析
+/// 第 2 次：把错误发给 AI 修正 → sanitize → 解析
+/// 第 3 次：再次发给 AI 修正（附"最后一次机会"）→ 解析
+/// 三次全失败则返回错误
+async fn parse_json_with_retry<T: serde::de::DeserializeOwned>(
+    response_text: &str,
+) -> Result<T, String> {
+    // 第一次尝试：直接 sanitize + 解析
+    let cleaned = sanitize_json_response(response_text);
+    match serde_json::from_str::<T>(&cleaned) {
+        Ok(value) => return Ok(value),
+        Err(first_err) => {
+            eprintln!("[parse_json_with_retry] 第一次解析失败：{}", first_err);
+        }
+    }
+    // 第二次尝试：请 AI 修正 JSON
+    let system_prompt = "你是一个 JSON 修复工具。用户会给你一段有格式错误的 JSON 文本和一个解析错误信息。请输出修正后的合法 JSON。只输出 JSON，不要 Markdown 包裹，不要任何解释文字。";
+    let user_message = format!(
+        "以下 JSON 解析失败。\n\n错误信息：\n解析失败，请检查 JSON 格式是否正确。\n\n原始内容：\n{}\n\n请修正后重新输出，只输出 JSON，不要任何其他内容。",
+        cleaned
+    );
+    match call_deepseek_api_inner(system_prompt, &user_message, false).await {
+        Ok(reply) => {
+            let cleaned2 = sanitize_json_response(&reply);
+            match serde_json::from_str::<T>(&cleaned2) {
+                Ok(value) => return Ok(value),
+                Err(second_err) => {
+                    eprintln!("[parse_json_with_retry] 第2次解析失败：{}", second_err);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[parse_json_with_retry] AI 修正失败：{}", e);
+        }
+    }
+    // 第三次尝试：最后机会
+    let user_message_last = format!(
+        "以下 JSON 解析仍然失败，这是最后一次修正机会。\n\n原始内容：\n{}\n\n请修正后只输出 JSON，不要任何其他内容。如果仍无法修正，请输出一个空 JSON 数组 []。",
+        cleaned
+    );
+    match call_deepseek_api_inner(system_prompt, &user_message_last, false).await {
+        Ok(reply) => {
+            let cleaned3 = sanitize_json_response(&reply);
+            serde_json::from_str::<T>(&cleaned3)
+                .map_err(|final_err| {
+                    format!(
+                        "JSON 解析失败，AI 两次修正后仍无效。最后一次错误：{}\n清洗后内容（前500字符）：{}",
+                        final_err,
+                        &cleaned3[..cleaned3.len().min(500)]
+                    )
+                })
+        }
+        Err(e) => Err(format!("AI 修正请求失败（第 3 次）：{}", e)),
+    }
 }
 
 ///包装器，前端传来的JSON项目数据保存

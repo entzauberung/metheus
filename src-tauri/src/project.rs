@@ -113,6 +113,22 @@ pub struct MidStage {
     #[serde(default)]
     pub git_tag: String, // ← 新增：Git tag 名，如 "metheus/v0.1.1"
 }
+/// 子任务执行错误类型
+/// 区分"用户主动暂停"和"真正的执行失败"
+/// 序列化格式与前端 types.ts 的 SubTaskError 对齐
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SubTaskError {
+    // 用户主动暂停 → 流水线优雅暂停，保留进度
+    UserPaused,
+    // 执行失败 → 按现有逻辑处理
+    ExecutionFailed {
+        // 错误信息
+        message: String,
+    },
+    // 超时（预留）
+    Timeout,
+}
 ///执行结果（claude code执行后的输出)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionResult {

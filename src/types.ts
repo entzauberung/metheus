@@ -11,6 +11,12 @@ export interface ExecutionResult {
   file_changes: string[];
 }
 
+// 子任务执行错误类型（与 Rust SubTaskError 枚举对应）
+export type SubTaskError =
+  | { type: "UserPaused" }
+  | { type: "ExecutionFailed"; message: string }
+  | { type: "Timeout" };
+
 export interface TestResult {
   passed: boolean;
   issues: string[];
