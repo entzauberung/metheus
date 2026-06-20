@@ -43,6 +43,28 @@ const TEST_PROMPT: &str = "\
 输出格式：通过/不通过 + 问题列表（如果不通过）。\
 回答风格：客观、具体，指出具体文件和行号。\
 请严格按 JSON 格式输出，不要包含 markdown 代码块标记：\n{\"passed\": true或false, \"issues\": [\"问题1\"], \"suggestion\": \"改进建议\"}";
+const SELF_CHECK_PROMPT: &str = "\
+你是版本方案自检专家。\
+请对照【用户与策略产品经理的讨论记录】检查【刚产出的版本方案】，从以下三个维度进行核查：\
+1. 遗漏检查：讨论记录中用户明确提出的功能需求和约束条件，是否都在版本方案中有所体现？如有遗漏，请补充。\
+2. 多余检查：版本方案中是否存在讨论记录中从未提及的内容？如果存在且不合理（属于幻觉或过度设计），请移除。\
+3. 偏好/约束检查：讨论记录中用户表达的偏好（如技术栈偏好、设计风格、目标平台等），版本方案是否遵循？如有偏离，请修正。\
+如果发现任何问题，请输出修正后的完整版本方案（Markdown格式，包含所有章节标题和内容）。\
+如果方案完全对齐无问题，请直接原样输出版本方案。\
+你只输出版本方案的Markdown内容，不要包含任何解释、前言或后缀文字。";
+const QA_CHECK_PROMPT: &str = "\
+你是需求质检员。\
+请对照【原始需求（版本方案）】检查【当前产出（大阶段列表）】，判断两者是否对齐。\
+检查要点：\
+1. 大阶段列表中的所有内容是否都能在版本方案中找到对应依据。\
+2. 版本方案中的所有关键需求是否在大阶段列表中都有对应覆盖。\
+3. 大阶段列表中是否存在版本方案中不存在的内容（过度设计）。\
+输出格式：JSON 对象，包含以下字段：\
+- passed：布尔值，是否通过质检。\
+- reason：字符串，未通过时写具体偏差内容，通过时写\"全部对齐\"。\
+- details：数组，每个元素包含 issue_type（字符串，如\"遗漏\"、\"多余\"、\"偏离\"）、description（字符串）、related_requirement（字符串）。\
+- attention_points：字符串数组，从版本方案中提取的需特别关注的要点。\
+只输出 JSON，不要任何其他文字。";
 
 ///获取项目文件的存储路径
 fn get_project_path(name: &str) -> String {
@@ -192,10 +214,70 @@ async fn generate_version_plan(messages: Vec<project::Message>) -> Result<String
         .json()
         .await
         .map_err(|e| format!("解析响应失败：{}", e))?;
-    let plan = response_data["choices"][0]["message"]["content"]
+    let mut plan = response_data["choices"][0]["message"]["content"]
         .as_str()
         .ok_or("AI回复异常".to_string())?
         .to_string();
+
+    // === 自检逻辑：对照讨论记录检查版本方案是否遗漏内容 ===
+    // 第一步：拼接讨论记录字符串
+    let mut discussion = String::new();
+    for msg in &messages {
+        let display_name = if msg.role == "user" {
+            "用户"
+        } else {
+            &msg.role
+        };
+        discussion.push_str(&format!("{}：{}\n", display_name, msg.content));
+    }
+    // 讨论记录超过3000字符则只保留最后3000字符（统一按字符数截断，不依赖字节长度）
+    {
+        let discussion_chars: Vec<char> = discussion.chars().collect();
+        if discussion_chars.len() > 3000 {
+            discussion = discussion_chars[discussion_chars.len() - 3000..].iter().collect();
+        }
+    }
+
+    // 第二步：构造自检请求用的用户消息内容
+    let mut self_check_user_message = format!(
+        "【用户与策略产品经理的讨论记录】\n{}\n\n【刚产出的版本方案】\n{}",
+        discussion, plan
+    );
+
+    // 如果自检消息总长超过8000字符，截断plan部分（保留前4000字符）
+    if self_check_user_message.chars().count() > 8000 {
+        let plan_chars: Vec<char> = plan.chars().collect();
+        let truncated_plan: String = if plan_chars.len() > 4000 {
+            format!(
+                "{}...（以下省略）",
+                plan_chars[..4000].iter().collect::<String>()
+            )
+        } else {
+            plan.clone()
+        };
+        self_check_user_message = format!(
+            "【用户与策略产品经理的讨论记录】\n{}\n\n【刚产出的版本方案】\n{}",
+            discussion, truncated_plan
+        );
+    }
+
+    // 第三步：调用自检 API（不强制 JSON 输出的纯文本版本）
+    match call_deepseek_api(SELF_CHECK_PROMPT, &self_check_user_message).await {
+        Ok(reply) => {
+            let trimmed = reply.trim();
+            if trimmed.is_empty() {
+                // 第四步：自检返回空内容，保留原始方案
+                eprintln!("[generate_version_plan] 自检返回空内容，保留原始方案");
+            } else {
+                plan = trimmed.to_string();
+            }
+        }
+        Err(e) => {
+            // 第四步：自检调用失败，保留原始方案
+            eprintln!("[generate_version_plan] 自检调用失败：{}，使用原始版本方案", e);
+        }
+    }
+
     Ok(plan)
 }
 
@@ -292,10 +374,192 @@ async fn generate_milestones(
             //vec!创建空的Vec数组= vec::new()
             mid_stages: vec![],
             subtasks: vec![],
+            qa_result: None,
             //创建空的可变的字符串
             git_commit_hash: "".to_string(),
         });
     }
+
+    // === 质检逻辑：对比版本方案检查大阶段列表是否对齐 ===
+    // 步骤 1：将 milestones 序列化为 JSON 字符串
+    let milestones_json = match serde_json::to_string(&milestones) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!("[generate_milestones] 大阶段 JSON 序列化失败：{}，跳过质检", e);
+            return Ok(milestones);
+        }
+    };
+
+    // 步骤 2：构造质检请求的 user_message
+    let qa_user_message = format!(
+        "【原始需求（版本方案）】\n{}\n\n【当前产出（大阶段列表）】\n{}",
+        version_plan, milestones_json
+    );
+
+    // 步骤 3：调用 DeepSeek Flash 执行质检（纯文本模式，低 temperature）
+    let qa_response = match call_deepseek_api_inner(QA_CHECK_PROMPT, &qa_user_message, false, 0.1).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            eprintln!("[generate_milestones] 质检 API 调用失败：{}，跳过质检", e);
+            return Ok(milestones);
+        }
+    };
+
+    // 步骤 4：清洗并解析 AI 返回的 QAResult JSON
+    let qa_result = {
+        let cleaned = sanitize_json_response(&qa_response);
+        match serde_json::from_str::<project::QAResult>(&cleaned) {
+            Ok(mut result) => {
+                result.checked_at = chrono::Utc::now().to_rfc3339();
+                result
+            }
+            Err(e) => {
+                eprintln!("[generate_milestones] 质检 JSON 解析失败：{}，使用默认通过结果", e);
+                project::QAResult {
+                    passed: true,
+                    reason: "质检结果解析失败，默认通过".to_string(),
+                    details: vec![],
+                    attention_points: vec![],
+                    checked_at: chrono::Utc::now().to_rfc3339(),
+                }
+            }
+        }
+    };
+
+    // 步骤 5：将 QAResult 写入每个 Milestone
+    for milestone in &mut milestones {
+        milestone.qa_result = Some(qa_result.clone());
+    }
+
+    Ok(milestones)
+}
+
+///根据质检驳回的反馈，重新让产品经理拆解大阶段
+///与 generate_milestones 的区别：user_message 中包含驳回原因，引导 AI 修正
+#[tauri::command]
+async fn regenerate_milestones_with_feedback(
+    version_plan: String,
+    mode: String,
+    feedback: String,
+) -> Result<Vec<project::Milestone>, String> {
+    // 1. 读取 API 密钥
+    let api_key = env::var("API_KEY").map_err(|_| "API_KEY 环境变量未设置".to_string())?;
+    // 2. 构造 system prompt （产品经理角色 + 模式信息）
+    let system_prompt = format!(
+        "{}\n\n当前项目模式：{}。\
+         如果是专业模式，输出的每个大阶段应包含 mid_stages 字段（空列表）；\
+         如果是快速模式，输出的每个大阶段应包含 subtasks 字段（空列表）。\
+         每个大阶段的 version 字段格式为 v0.1、v0.2 等。\
+         你只输出 JSON 数组，不要输出其他文字，不要包含 markdown 代码块标记。\
+         每个大阶段包含：version（字符串）, title（字符串）, description（字符串）, tech_stack（字符串）。",
+        PM_PROMPT, mode
+    );
+    // 3. 构造 API 消息（包含驳回反馈）
+    let request_body = serde_json::json!({
+        "model": "deepseek-v4-flash",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": format!(
+                    "上次拆解被需求质检驳回，原因：\n{}\n\n请根据此反馈，重新根据以下版本方案拆解为3-5个大阶段：\n{}",
+                    feedback, version_plan
+                )}
+            ]
+    });
+    // 4. 发送请求
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.deepseek.com/v1/chat/completions")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("网络请求失败: {}", e))?;
+    let response_data: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("解析响应失败: {}", e))?;
+    let content = response_data["choices"][0]["message"]["content"]
+        .as_str()
+        .ok_or("AI回复格式异常".to_string())?
+        .to_string();
+    // 5. 解析 JSON 数组
+    let raw_milestones: Vec<serde_json::Value> = parse_json_with_retry(&content)
+        .await
+        .map_err(|e| format!("解析大阶段 JSON 失败：{}", e))?;
+    // 6. 构造 Milestone 结构体
+    let mut milestones: Vec<project::Milestone> = Vec::new();
+    for raw in raw_milestones {
+        milestones.push(project::Milestone {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: raw["version"].as_str().unwrap_or("v0.0").to_string(),
+            title: raw["title"].as_str().unwrap_or("未命名").to_string(),
+            description: raw["description"].as_str().unwrap_or("").to_string(),
+            tech_stack: raw["tech_stack"].as_str().unwrap_or("").to_string(),
+            status: project::MilestoneStatus::Pending,
+            mode: if mode == "Quick" {
+                project::StageMode::Quick
+            } else {
+                project::StageMode::Professional
+            },
+            mid_stages: vec![],
+            subtasks: vec![],
+            qa_result: None,
+            git_commit_hash: "".to_string(),
+        });
+    }
+
+    // === 质检逻辑：对比版本方案检查大阶段列表是否对齐 ===
+    // 步骤 7.1：将 milestones 序列化为 JSON 字符串
+    let milestones_json = match serde_json::to_string(&milestones) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!("[regenerate_milestones_with_feedback] 大阶段 JSON 序列化失败：{}，跳过质检", e);
+            return Ok(milestones);
+        }
+    };
+
+    // 步骤 7.2：构造质检请求的 user_message
+    let qa_user_message = format!(
+        "【原始需求（版本方案）】\n{}\n\n【当前产出（大阶段列表）】\n{}",
+        version_plan, milestones_json
+    );
+
+    // 步骤 7.3：调用 DeepSeek Flash 执行质检（纯文本模式，低 temperature）
+    let qa_response = match call_deepseek_api_inner(QA_CHECK_PROMPT, &qa_user_message, false, 0.1).await {
+        Ok(reply) => reply,
+        Err(e) => {
+            eprintln!("[regenerate_milestones_with_feedback] 质检 API 调用失败：{}，跳过质检", e);
+            return Ok(milestones);
+        }
+    };
+
+    // 步骤 7.4：清洗并解析 AI 返回的 QAResult JSON
+    let qa_result = {
+        let cleaned = sanitize_json_response(&qa_response);
+        match serde_json::from_str::<project::QAResult>(&cleaned) {
+            Ok(mut result) => {
+                result.checked_at = chrono::Utc::now().to_rfc3339();
+                result
+            }
+            Err(e) => {
+                eprintln!("[regenerate_milestones_with_feedback] 质检 JSON 解析失败：{}，使用默认通过结果", e);
+                project::QAResult {
+                    passed: true,
+                    reason: "质检结果解析失败，默认通过".to_string(),
+                    details: vec![],
+                    attention_points: vec![],
+                    checked_at: chrono::Utc::now().to_rfc3339(),
+                }
+            }
+        }
+    };
+
+    // 步骤 7.5：将 QAResult 写入每个 Milestone
+    for milestone in &mut milestones {
+        milestone.qa_result = Some(qa_result.clone());
+    }
+
     Ok(milestones)
 }
 
@@ -307,15 +571,23 @@ async fn generate_mid_stages(
     milestone_description: String,
     version_plan: String,
     mode: String,
+    attention_points: Vec<String>,
 ) -> Result<Vec<project::MidStage>, String> {
     // 1. 读取 API 密钥
     let api_key = env::var("API_KEY").map_err(|_| "API_KEY 环境变量未设置".to_string())?;
     // 2. 构造 system prompt
-    let system_prompt = format!(
+    let mut system_prompt = format!(
         "{}\n\n当前项目模式：{}。请根据版本方案，将大阶段拆解为 3-6 个中阶段。\
          每个中阶段是一个垂直切片。",
         DOMAIN_LEAD_PROMPT, mode
     );
+    // 注入 attention_points（若不为空）
+    if !attention_points.is_empty() {
+        system_prompt.push_str("\n【需求关注点】\n该大阶段在需求对齐检查中确认了以下要点，请在拆分中阶段时确保覆盖：\n");
+        for point in &attention_points {
+            system_prompt.push_str(&format!("- {}\n", point));
+        }
+    }
     // 3. 构造请求体
     let request_body = serde_json::json!({
         "model": "deepseek-v4-flash",
@@ -849,10 +1121,18 @@ fn summarize_test_output(exit_code: i32, stdout: &str, stderr: &str) -> String {
     if exit_code == 0 {
         // 通过：保留最后 500 字符
         if combined.len() > 500 {
+            let suffix: String = combined
+                .chars()
+                .rev()
+                .take(500)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
             format!(
                 "…(省略前面 {} 字符)…\n\n{}",
-                combined.len() - 500,
-                &combined[combined.len() - 500..]
+                combined.chars().count().saturating_sub(500),
+                suffix
             )
         } else {
             combined
@@ -860,10 +1140,17 @@ fn summarize_test_output(exit_code: i32, stdout: &str, stderr: &str) -> String {
     // 如果测试失败（exit_code != 0）
     } else {
         // 失败：保留最后 3000 字符
-        let tail = if combined.len() > 3000 {
-            &combined[combined.len() - 3000..]
+        let tail: String = if combined.len() > 3000 {
+            combined
+                .chars()
+                .rev()
+                .take(3000)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect()
         } else {
-            &combined
+            combined
         };
 
         // 提取含失败关键词的行
@@ -985,10 +1272,11 @@ async fn check_subtask(
         let content = std::fs::read_to_string(std::path::Path::new(&project_path).join(file))
             .unwrap_or_default();
         let truncated = if content.len() > 4000 {
+            let prefix: String = content.chars().take(1000).collect();
             format!(
                 "{}...(省略后续 {} 字符)",
-                &content[..4000],
-                content.len() - 4000
+                prefix,
+                content.chars().count().saturating_sub(1000)
             )
         } else {
             content
@@ -1596,12 +1884,12 @@ async fn execute_mid_stage_pipeline(
 /// 给它系统提示词和用户消息，它返回 AI 生成的文本（JSON 格式），并处理所有网络和解析错误。
 // ===== 纯文本对话用（不强制 JSON） =====
 async fn call_deepseek_api(system_prompt: &str, user_message: &str) -> Result<String, String> {
-    call_deepseek_api_inner(system_prompt, user_message, false).await
+    call_deepseek_api_inner(system_prompt, user_message, false, 0.1).await
 }
 
 // ===== 结构化输出用（强制 JSON） =====
 async fn call_deepseek_api_json(system_prompt: &str, user_message: &str) -> Result<String, String> {
-    call_deepseek_api_inner(system_prompt, user_message, true).await
+    call_deepseek_api_inner(system_prompt, user_message, true, 0.5).await
 }
 
 // ===== 内部实现 =====
@@ -1609,6 +1897,7 @@ async fn call_deepseek_api_inner(
     system_prompt: &str,
     user_message: &str,
     force_json: bool,
+    temperature: f64,
 ) -> Result<String, String> {
     let api_key = env::var("API_KEY").map_err(|_| "API_KEY 环境变量未设置".to_string())?;
     let client = reqwest::Client::new();
@@ -1628,7 +1917,7 @@ async fn call_deepseek_api_inner(
     let mut body = serde_json::json!({
         "model": "deepseek-v4-flash",
         "messages": messages,
-        "temperature": 0.5,
+        "temperature": temperature,
     });
 
     if force_json {
@@ -1678,12 +1967,26 @@ fn sanitize_json_response(raw: &str) -> String {
     };
     // 第二层: 找到第一个 [ 或 {
     let start = text.find('[').or_else(|| text.find('{')).unwrap_or(0);
-    // 第三层：找最后一个 ] 或 }
-    let end = text
-        .rfind(']')
-        .or_else(|| text.rfind('}'))
-        .map(|i| i + 1) // ← +1 包含闭合括号
-        .unwrap_or(text.len());
+    // 第三层：用括号计数器找到匹配的闭合位置
+    // 使用字节迭代器：{ } [ ] 都是 ASCII 单字节字符，byte_offset 与 start（字节索引）单位一致
+    let end = {
+        let mut depth: i32 = 0;
+        let mut found_end = text.len();
+        for (byte_offset, byte) in text[start..].bytes().enumerate() {
+            match byte {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        found_end = start + byte_offset + 1; // 同为字节索引，相加正确
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        found_end
+    };
     text[start..end].to_string()
 }
 
@@ -1709,7 +2012,7 @@ async fn parse_json_with_retry<T: serde::de::DeserializeOwned>(
         "以下 JSON 解析失败。\n\n错误信息：\n解析失败，请检查 JSON 格式是否正确。\n\n原始内容：\n{}\n\n请修正后重新输出，只输出 JSON，不要任何其他内容。",
         cleaned
     );
-    match call_deepseek_api_inner(system_prompt, &user_message, false).await {
+    match call_deepseek_api_inner(system_prompt, &user_message, false, 0.5).await {
         Ok(reply) => {
             let cleaned2 = sanitize_json_response(&reply);
             match serde_json::from_str::<T>(&cleaned2) {
@@ -1728,7 +2031,7 @@ async fn parse_json_with_retry<T: serde::de::DeserializeOwned>(
         "以下 JSON 解析仍然失败，这是最后一次修正机会。\n\n原始内容：\n{}\n\n请修正后只输出 JSON，不要任何其他内容。如果仍无法修正，请输出一个空 JSON 数组 []。",
         cleaned
     );
-    match call_deepseek_api_inner(system_prompt, &user_message_last, false).await {
+    match call_deepseek_api_inner(system_prompt, &user_message_last, false, 0.5).await {
         Ok(reply) => {
             let cleaned3 = sanitize_json_response(&reply);
             serde_json::from_str::<T>(&cleaned3)
@@ -1878,6 +2181,7 @@ pub fn run() {
             approve_version_plan,
             persist_project,
             generate_milestones,
+            regenerate_milestones_with_feedback,
             generate_mid_stages,
             execute_subtask,
             check_subtask,

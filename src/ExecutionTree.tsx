@@ -6,7 +6,7 @@
 // ...
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Milestone, Subtask, PipelineState, GeneratedSubtask } from "./types";
+import { Milestone, Subtask, PipelineState, GeneratedSubtask, QAResult } from "./types";
 import { Modal } from './components/Modal';
 
 interface Props {
@@ -14,11 +14,12 @@ interface Props {
   onSelectMilestone: (id: string) => void;
   onVersionEdit?: (id: string, newVersion: string) => void;
   onGenerateMidStages?: (id: string) => void;
+  onRegenerateMilestones?: (feedback: string) => void;
   projectPath?: string;
   projectId?: string;
 }
 
-function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerateMidStages, projectPath, projectId }: Props) {
+function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerateMidStages, onRegenerateMilestones, projectPath, projectId }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
   // === 3Phase 3 新增状态 ===
@@ -32,6 +33,12 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
   const [rollbackTarget, setRollbackTarget] = useState<{
     tagName: string;
     version: string;
+  } | null>(null);
+
+  // 新增：质检弹窗状态
+  const [qaModalData, setQaModalData] = useState<{
+    milestoneId: string;
+    qaResult: QAResult;
   } | null>(null);
 
   // === Phase 3 轮询执行状态 ===
@@ -261,6 +268,22 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
               <span className={`tree-icon ${getStatusColor(ms.status)}`}>
                 {getStatusIcon(ms.status)}
               </span>
+
+              {/* 质检标记 */}
+              {ms.qa_result != null && ms.qa_result.passed === true && (
+                <span className="qa-passed">✅ 质检通过</span>
+              )}
+              {ms.qa_result != null && ms.qa_result.passed === false && (
+                <span
+                  className="qa-rejected"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setQaModalData({ milestoneId: ms.id, qaResult: ms.qa_result! });
+                  }}
+                >
+                  ❌ 质检驳回
+                </span>
+              )}
 
               {/* 可编辑的版本号 */}
               <span
@@ -529,6 +552,83 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
               }}
             >
               确认回退
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* ===== 质检驳回弹窗 ===== */}
+      <Modal
+        isOpen={qaModalData !== null}
+        onClose={() => setQaModalData(null)}
+        title="需求质检结果"
+      >
+        <div style={{ padding: '16px' }}>
+          <p style={{ fontWeight: 600, marginBottom: '8px' }}>质检员发现以下问题：</p>
+          <p style={{ color: '#e74c3c', marginBottom: '16px' }}>{qaModalData?.qaResult.reason}</p>
+
+          {qaModalData?.qaResult.details && qaModalData.qaResult.details.length > 0 && (
+            <>
+              <p style={{ fontWeight: 600, marginBottom: '8px' }}>详细偏差：</p>
+              {qaModalData.qaResult.details.map((detail, idx) => (
+                <div key={idx} style={{ marginBottom: '8px', paddingLeft: '8px', borderLeft: '3px solid #e74c3c' }}>
+                  <p style={{ margin: 0 }}>[{detail.issue_type}] {detail.description}</p>
+                  <p style={{ margin: 0, color: '#888', fontSize: '13px' }}>关联需求：{detail.related_requirement}</p>
+                </div>
+              ))}
+            </>
+          )}
+
+          {qaModalData?.qaResult.attention_points && qaModalData.qaResult.attention_points.length > 0 && (
+            <>
+              <p style={{ fontWeight: 600, marginBottom: '8px', marginTop: '16px' }}>需特别关注的要点：</p>
+              {qaModalData.qaResult.attention_points.map((point, idx) => (
+                <p key={idx} style={{ margin: '4px 0', paddingLeft: '8px' }}>· {point}</p>
+              ))}
+            </>
+          )}
+
+          <hr style={{ margin: '16px 0', border: 'none', borderTop: '1px solid #eee' }} />
+          <p style={{ fontWeight: 600, marginBottom: '12px' }}>你希望怎么处理？</p>
+          <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+            <button
+              onClick={() => setQaModalData(null)}
+              style={{
+                padding: '6px 16px',
+                border: '1px solid #ccc',
+                borderRadius: '4px',
+                background: '#fff',
+                cursor: 'pointer',
+              }}
+            >
+              ✅ 无视，继续推进
+            </button>
+            <button
+              onClick={() => {
+                const reason = qaModalData?.qaResult.reason ?? '';
+                const details = qaModalData?.qaResult.details;
+                let feedback = reason;
+                if (details && details.length > 0) {
+                  const detailsText = details
+                    .map((d) => `[${d.issue_type}] ${d.description}（关联需求：${d.related_requirement}）`)
+                    .join('\n');
+                  feedback = `${reason}\n\n具体偏差：\n${detailsText}`;
+                }
+                setQaModalData(null);
+                if (onRegenerateMilestones) {
+                  onRegenerateMilestones(feedback);
+                }
+              }}
+              style={{
+                padding: '6px 16px',
+                border: 'none',
+                borderRadius: '4px',
+                background: '#e74c3c',
+                color: '#fff',
+                cursor: 'pointer',
+              }}
+            >
+              🔄 采纳意见，重新拆解
             </button>
           </div>
         </div>

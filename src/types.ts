@@ -61,6 +61,22 @@ export interface MidStage {
 export type StageMode = "Quick" | "Professional";
 export type ProjectMode = "Quick" | "Professional";
 
+// ========== 需求质检相关 ==========
+
+export interface QADetail {
+  issue_type: "遗漏" | "多余" | "偏离";
+  description: string;
+  related_requirement: string;
+}
+
+export interface QAResult {
+  passed: boolean;
+  reason: string;
+  details: QADetail[];
+  attention_points: string[];
+  checked_at: string;
+}
+
 export interface Milestone {
   id: string;
   version: string;
@@ -71,6 +87,7 @@ export interface Milestone {
   mode: StageMode;
   mid_stages: MidStage[];
   subtasks: Subtask[];
+  qa_result?: QAResult;  // ← 需求质检
   git_commit_hash: string;
 }
 

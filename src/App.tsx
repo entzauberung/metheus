@@ -89,7 +89,7 @@ function App() {
   const handleReject = () => {
     if (!project) return;
     //直接把方案清空
-    setProject({ ...project, version_plan: "", status: "Discussing" })
+    setProject({ ...project, version_plan: "", status: "Discussing" });
   }
 
   //根据版本方案拆解大阶段
@@ -139,6 +139,7 @@ function App() {
         milestoneDescription: milestone.description,
         versionPlan: project.version_plan,
         mode: project.mode,
+        attentionPoints: milestone.qa_result?.attention_points ?? [],
       });
       const updatedMilestones = project.milestones.map(ms =>
         ms.id === milestoneId ? { ...ms, mid_stages: midStages as any[] } : ms
@@ -148,6 +149,22 @@ function App() {
       console.error("拆解中阶段失败：", err);
     }
   }
+
+  //当质检驳回后，用户选择「采纳意见，重新拆解」时调用
+  const handleRegenerateMilestones = async (feedback: string) => {
+    if (!project) return;
+    try {
+      const newMilestones = await invoke("regenerate_milestones_with_feedback", {
+        versionPlan: project.version_plan,
+        mode: project.mode,
+        feedback: feedback,
+      });
+      setProject({ ...project, milestones: newMilestones as any[] });
+    } catch (err) {
+      console.error("重新拆解失败：", err);
+      alert("重新拆解失败：" + err);
+    }
+  };
 
   //根据项目状态返回默认对话角色
   const getDefaultRole = (status: string): string => {
@@ -185,6 +202,7 @@ function App() {
           onSelectMilestone={handleSelectMilestone}
           onVersionEdit={handleVersionEdit}
           onGenerateMidStages={handleGenerateMidStages}
+          onRegenerateMilestones={handleRegenerateMilestones}
           projectPath={projectPath}
           projectId={project.name}
         />

@@ -722,3 +722,19 @@
 .btn-resume:hover {
   background: #e68600;
 }
+
+/* ===== 质检标记样式 ===== */
+.qa-passed {
+  color: #27ae60;
+  font-size: 0.75rem;
+}
+
+.qa-rejected {
+  color: #e74c3c;
+  font-size: 0.75rem;
+  cursor: pointer;
+}
+
+.qa-rejected:hover {
+  text-decoration: underline;
+}

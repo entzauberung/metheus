@@ -171,6 +171,9 @@ pub struct Milestone {
     pub mid_stages: Vec<MidStage>,
     ///小阶段列表
     pub subtasks: Vec<Subtask>,
+    ///需求质检结果（None=尚未质检）
+    #[serde(default)]
+    pub qa_result: Option<QAResult>,
     ///Git 提交哈希（完成后记录）
     pub git_commit_hash: String,
 }
@@ -244,4 +247,30 @@ impl Project {
             project_path: "".to_string(), // 暂时给空，等实际使用时再设置
         }
     }
+}
+
+/// 需求质检：单条偏差记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QADetail {
+    /// 偏差类型：遗漏/多余/偏离
+    pub issue_type: String,
+    /// 具体偏差描述
+    pub description: String,
+    /// 关联的原始需求描述（引用版本方案原文）
+    pub related_requirement: String,
+}
+
+/// 需求质检：完整的检查结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QAResult {
+    /// 是否通过质检
+    pub passed: bool,
+    /// 总结原因（通过时="全部对齐"，驳回时写概述）
+    pub reason: String,
+    /// 偏差明细列表
+    pub details: Vec<QADetail>,
+    /// 后续实现需关注的要点
+    pub attention_points: Vec<String>,
+    /// 质检时间（ISO 8601 格式）
+    pub checked_at: String,
 }
