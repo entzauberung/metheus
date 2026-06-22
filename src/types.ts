@@ -1,6 +1,6 @@
 // 与 Rust 后端 project.rs 的数据结构一一对应
 
-export type ProjectStatus = "Idle" | "Discussing" | "Planning" | "MilestoneReady" | "Executing" | "Paused";
+export type ProjectStatus = "Idle" | "Discussing" | "Planning" | "MilestoneReady" | "Executing" | "Paused" | "Completed";
 
 export type MilestoneStatus = "Pending" | "InProgress" | "Completed" | "Paused";
 

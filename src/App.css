@@ -523,7 +523,8 @@
   border-color: #4a90d9;
 }
 
-.mid-stage-actions {
+.mid-stage-actions,
+.quick-mode-actions {
   margin-top: 8px;
   padding: 8px 12px;
   background: #f0f4ff;
@@ -676,6 +677,23 @@
   display: flex;
   gap: 10px;
   margin-top: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.auto-advance-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: #666;
+  cursor: pointer;
+  margin-left: auto;
+  user-select: none;
+}
+
+.auto-advance-toggle input[type="checkbox"] {
+  cursor: pointer;
 }
 
 .btn-approve,

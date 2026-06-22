@@ -159,7 +159,7 @@ function App() {
         mode: project.mode,
         feedback: feedback,
       });
-      setProject({ ...project, milestones: newMilestones as any[] });
+      setProject({ ...project, status: "MilestoneReady", milestones: newMilestones as any[] });
     } catch (err) {
       console.error("重新拆解失败：", err);
       alert("重新拆解失败：" + err);

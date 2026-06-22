@@ -35,7 +35,7 @@ const TECH_PROMPT: &str = "\
 你的职责是把产品经理定义的大阶段拆成可执行的小阶段（Subtask），每个小阶段生成精确的提示词供 Claude Code 执行。\
 每个小阶段控制在 10-30 行代码以内，确保可以被一次性正确执行。\
 回答风格：精确、技术向，输出可直接执行的提示词。\
-请严格按 JSON 格式输出，不要包含 markdown 代码块标记：\n{\"title\": \"子任务标题\", \"prompt\": \"可执行的 Claude Code 提示词\"}";
+请严格按 JSON 格式输出，不要包含 markdown 代码块标记：\n{\"title\": \"子任务标题\", \"prompt\": \"可执行的 Claude Code 提示词\"}\n\n**重要约束：**\n- 不得在提示词中包含完整的代码块\n- 提示词应描述「做什么」（功能目标），而不是「写什么」（具体代码实现）\n- 必须指定要操作的文件路径（相对于项目根目录）\n- 涉及修改已有函数时，需要提供现有函数签名作为参考";
 const TEST_PROMPT: &str = "\
 你是测试工程师，角色名「测试工程师」。\
 你的职责是检查代码质量和功能正确性。\
@@ -751,6 +751,58 @@ async fn git_rollback_to_mid_stage(
             String::from_utf8_lossy(&reset_output.stderr)
         ));
     }
+    // 2.5 清理被跳过节点的 Git tag
+    // 遍历所有 mid_stage，删除版本号大于目标版本的节点的 git tag
+    {
+        let target_version = tag_name
+            .strip_prefix("metheus/")
+            .unwrap_or(&tag_name)
+            .to_string();
+        let pp = std::path::Path::new(&project_path);
+        let md = pp.join(".metheus");
+        let pf = md.join(format!("{}.json", project_id));
+        if pf.exists() {
+            if let Ok(content) = std::fs::read_to_string(&pf) {
+                if let Ok(proj) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(milestones) = proj["milestones"].as_array() {
+                        for milestone in milestones {
+                            if let Some(mid_stages) = milestone["mid_stages"].as_array() {
+                                for mid in mid_stages {
+                                    let version = mid["version"].as_str().unwrap_or("");
+                                    let git_tag = mid["git_tag"].as_str().unwrap_or("");
+                                    if !git_tag.is_empty()
+                                        && compare_version_strings(version, &target_version) > 0
+                                    {
+                                        match std::process::Command::new("git")
+                                            .args(["tag", "-d", git_tag])
+                                            .current_dir(&project_path)
+                                            .output()
+                                        {
+                                            Ok(output) => {
+                                                if !output.status.success() {
+                                                    eprintln!(
+                                                        "警告: 删除 git tag {} 失败: {}",
+                                                        git_tag,
+                                                        String::from_utf8_lossy(&output.stderr)
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "警告: 执行 git tag -d {} 失败: {}",
+                                                    git_tag, e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     // 3. 更新 project.json 中的执行树状态
     // 从tag_name 中提取版本号，去掉 "metheus/" 前缀
     let target_version = tag_name
@@ -869,7 +921,7 @@ fn save_tag_to_mid_stage(
     Ok(())
 }
 
-/// “可暂停”的 Claude Code 执行器：启动进程后边等待边监听暂停信号，暂停时立即杀进程；
+/// "可暂停"的 Claude Code 执行器：启动进程后边等待边监听暂停信号，暂停时立即杀进程；
 /// 正常结束则返回改动的文件和执行日志
 /// 执行子任务的内部实现（可被暂停中断）
 /// 用 tokio::process::Command 替代 std::process::Command，
@@ -907,7 +959,11 @@ async fn execute_subtask_inner(
         use tokio::io::AsyncWriteExt;
         stdin.write_all(b"1\n").await.ok();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        for _ in 0..10 {
+        /* 安全上限：最大自动应答次数。Claude Code 通常只会在开始前询问 1-3 次确认，
+           此处设 20 为兜底。后续可改为动态检测 stdout 中是否包含 "?" 或 "确认" 等
+           提示语来决定是否需要继续应答。 */
+        const MAX_AUTO_CONFIRM: u32 = 20;
+        for _ in 0..MAX_AUTO_CONFIRM {
             stdin.write_all(b"yes\n").await.ok();
         }
         // stdin 在这里 drop，关闭管道
@@ -1029,7 +1085,7 @@ fn detect_changes(before: &[String], after: &[String], project_path: &str) -> Ve
 /// format_test_result("cargo test", code, &summary)        → 得到最终字符串
 ///    ↓
 /// 返回给 AI 或前端
-/// 模拟一个“测试工程师”角色：
+/// 模拟一个"测试工程师"角色：
 /// 自动检查当前项目里所有改动的代码，判断是否达到了子任务的目标，并返回测试结果（通过/问题/建议）
 /// 扫描项目目录，递归返回所有文件路径列表（跳过 .git / node_modules / target）
 fn get_tracked_files(project_path: &str) -> Vec<String> {
@@ -1139,52 +1195,51 @@ fn summarize_test_output(exit_code: i32, stdout: &str, stderr: &str) -> String {
         }
     // 如果测试失败（exit_code != 0）
     } else {
-        // 失败：保留最后 3000 字符
-        let tail: String = if combined.len() > 3000 {
-            combined
-                .chars()
-                .rev()
-                .take(3000)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect()
-        } else {
-            combined
-        };
+        // 失败：搜索关键词，截取失败点附近的上下文
+        let keywords = ["FAIL", "Error", "失败", "error", "panic", "Exception"];
 
-        // 提取含失败关键词的行
-        let keywords = [
-            "FAIL",
-            "Error",
-            "error:",
-            "assertion",
-            "✕",
-            "✗",
-            "fail:",
-            "FAILED",
-            "--- FAIL",
-            "[ERROR]",
-            "panic",
-            "Panic",
-        ];
-        let mut key_lines: Vec<&str> = Vec::new();
-        for line in tail.lines() {
-            // 如果有这样的行，把它们单独列出来作为“关键失败行”；否则只返回退出码和尾部输出
-            if keywords.iter().any(|k| line.contains(k)) {
-                key_lines.push(line);
+        // 从末尾向前搜索关键词，取最靠近末尾的匹配位置
+        let mut best_pos: Option<usize> = None;
+        for kw in &keywords {
+            if let Some(pos) = combined.rfind(kw) {
+                match best_pos {
+                    None => best_pos = Some(pos),
+                    Some(current) if pos > current => best_pos = Some(pos),
+                    _ => {}
+                }
             }
         }
 
-        if key_lines.is_empty() {
-            format!("退出码: {}\n\n{}", exit_code, tail)
-        } else {
-            format!(
-                "退出码: {}\n\n## 关键失败行\n{}\n\n## 完整输出（尾部）\n{}",
-                exit_code,
-                key_lines.join("\n"),
-                tail
-            )
+        match best_pos {
+            Some(kw_byte_pos) => {
+                // 将字节偏移转换为字符索引
+                let kw_char_idx = combined[..kw_byte_pos].chars().count();
+                let total_chars = combined.chars().count();
+                let start_char = kw_char_idx.saturating_sub(500);
+                let end_char = (kw_char_idx + 500).min(total_chars);
+                let snippet: String = combined
+                    .chars()
+                    .skip(start_char)
+                    .take(end_char - start_char)
+                    .collect();
+                format!("退出码: {}\n\n{}", exit_code, snippet)
+            }
+            None => {
+                // 回退：未找到关键词，截取最后 3000 字符
+                let tail: String = if combined.len() > 3000 {
+                    combined
+                        .chars()
+                        .rev()
+                        .take(3000)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect()
+                } else {
+                    combined
+                };
+                format!("退出码: {}\n\n{}", exit_code, tail)
+            }
         }
     }
 }
@@ -1595,7 +1650,7 @@ async fn start_execution(
 ///   │    └─ 如果失败 → 重试次数+1，继续重试
 ///   └─ 2.3 更新状态：这道菜完成
 ///   ↓
-/// 3. 全部子任务完成 → 更新最终状态为“完成”
+/// 3. 全部子任务完成 → 更新最终状态为"完成"
 #[tauri::command]
 async fn get_execution_status(
     state: tauri::State<'_, AppState>,
@@ -1836,7 +1891,7 @@ async fn execute_mid_stage_pipeline(
         }
     }
     // 写回 project 文件
-    // 流水线跑完后，找到项目文件里对应的那个“中阶段”（MidStage），
+    // 流水线跑完后，找到项目文件里对应的那个"中阶段"（MidStage），
     // 把每个子任务的执行结果、测试结果、重试次数填进去，
     // 然后把中阶段状态改成 "completed"，最后保存文件
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -2061,7 +2116,7 @@ async fn persist_project(project_json: String) -> Result<String, String> {
 /// 审批命令
 /// 根据 project_id 和 mid_stage_id，找到对应的中阶段，把它的状态改为 "approved"，然后保存回文件
 #[tauri::command]
-async fn approve_mid_stage(project_id: String, mid_stage_id: String) -> Result<(), String> {
+async fn approve_mid_stage(project_id: String, mid_stage_id: String) -> Result<String, String> {
     // 1. 获取home 目录
     let app_dir = dirs::home_dir().ok_or("无法获取 home 目录".to_string())?;
     // 2. 构造项目文件路径
@@ -2074,13 +2129,13 @@ async fn approve_mid_stage(project_id: String, mid_stage_id: String) -> Result<(
     // 4. 解析为 Project 结构
     let mut project: project::Project =
         serde_json::from_str(&content).map_err(|e| format!("解析项目文件失败：{}", e))?;
-    // 找到对应的 MidStage
-    // 5. 双层循环查找mid_stage
+    // 5. 双层循环查找并批准 mid_stage
     let mut found = false;
-    for milestone in &mut project.milestones {
-        for mid_stage in &mut milestone.mid_stages {
+    let mut current_milestone_index = 0;
+    for (mi, milestone) in project.milestones.iter().enumerate() {
+        for mid_stage in &milestone.mid_stages {
             if mid_stage.id == mid_stage_id {
-                mid_stage.status = project::MidStageStatus::Approved;
+                current_milestone_index = mi;
                 found = true;
                 break;
             }
@@ -2092,10 +2147,89 @@ async fn approve_mid_stage(project_id: String, mid_stage_id: String) -> Result<(
     if !found {
         return Err("未找到指定的中阶段".to_string());
     }
+    // 将当前 mid_stage 标记为 Approved
+    {
+        let milestone = &mut project.milestones[current_milestone_index];
+        for mid_stage in &mut milestone.mid_stages {
+            if mid_stage.id == mid_stage_id {
+                mid_stage.status = project::MidStageStatus::Approved;
+                break;
+            }
+        }
+    }
+    // 6. 查找下一个可推进的中阶段（在当前 milestone 内）
+    let mut next_mid_stage_id: Option<String> = None;
+    let mut next_milestone_id: Option<String> = None;
+    let mut project_completed = false;
+
+    {
+        let milestone = &project.milestones[current_milestone_index];
+        let mut found_current = false;
+        for mid_stage in &milestone.mid_stages {
+            if mid_stage.id == mid_stage_id {
+                found_current = true;
+                continue;
+            }
+            if found_current
+                && (mid_stage.status == project::MidStageStatus::Pending
+                    || mid_stage.status == project::MidStageStatus::Ready)
+            {
+                next_mid_stage_id = Some(mid_stage.id.clone());
+                next_milestone_id = Some(milestone.id.clone());
+                break;
+            }
+        }
+    }
+
+    // 如果当前 milestone 内没有下一个 mid_stage，标记当前 milestone 为 Completed
+    if next_mid_stage_id.is_none() {
+        project.milestones[current_milestone_index].status = project::MilestoneStatus::Completed;
+
+        // 查找下一个 Pending/Ready 的大阶段
+        for mi in (current_milestone_index + 1)..project.milestones.len() {
+            let ms = &project.milestones[mi];
+            if ms.status == project::MilestoneStatus::Pending
+                || ms.status == project::MilestoneStatus::InProgress
+            {
+                // 找到下一个大阶段，将其第一个 mid_stage 设为 Ready
+                if let Some(first_mid) = ms.mid_stages.first() {
+                    next_mid_stage_id = Some(first_mid.id.clone());
+                    next_milestone_id = Some(ms.id.clone());
+                    break;
+                }
+            }
+        }
+
+        // 如果仍然没有找到下一个，标记项目完成
+        if next_mid_stage_id.is_none() {
+            project.status = project::ProjectStatus::Completed;
+            project_completed = true;
+        }
+    }
+
+    // 将找到的下一中阶段设为 Ready
+    if let Some(ref next_mid_id) = next_mid_stage_id {
+        for milestone in &mut project.milestones {
+            for mid_stage in &mut milestone.mid_stages {
+                if mid_stage.id == *next_mid_id {
+                    mid_stage.status = project::MidStageStatus::Ready;
+                    break;
+                }
+            }
+        }
+    }
+
     // 序列化回 JSON 并写回文件
     let json = serde_json::to_string_pretty(&project).map_err(|e| format!("序列化失败：{}", e))?;
     std::fs::write(&project_file, json).map_err(|e| format!("保存失败：{}", e))?;
-    Ok(())
+
+    // 构造返回值
+    let result = serde_json::json!({
+        "next_milestone_id": next_milestone_id,
+        "next_mid_stage_id": next_mid_stage_id,
+        "project_completed": project_completed,
+    });
+    Ok(result.to_string())
 }
 /// 拒绝指定的中阶段：把它的状态改成 "rejected"，然后保存回项目文件
 #[tauri::command]

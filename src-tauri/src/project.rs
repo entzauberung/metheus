@@ -20,6 +20,8 @@ pub enum ProjectStatus {
     Executing,
     ///暂停中
     Paused,
+    ///项目完成
+    Completed,
 }
 ///小阶段状态
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
