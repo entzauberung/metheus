@@ -32,11 +32,12 @@ export interface Subtask {
   id: string;
   title: string;
   prompt: string;
-  status: "Pending" | "Executing" | "Passed" | "Rejected";
+  status: "Pending" | "Executing" | "Passed" | "Rejected" | "RolledBack";
   test_report: string;
   execution_result?: ExecutionResult;
   test_result?: TestResult;
   retry_count: number;
+  auto_tag?: string;  // 小阶段 auto tag，格式 metheus/auto/v0.1.1/task-0
 }
 
 export type MidStageStatus = "Pending" | "Ready" | "InProgress" | "Completed" | "Rejected" | "Approved" | "RolledBack";
@@ -136,4 +137,27 @@ export interface PipelineState {
   total_subtasks: number;
   subtask_statuses: SubtaskStatusItem[];
   current_log: string;
+}
+
+// ========== 阶段一新增：DiffSummary ==========
+
+export interface DiffSummary {
+  new_files: string[];
+  modified_files: string[];
+  deleted_files: string[];
+  new_functions: string[];
+  modified_functions: string[];
+  deleted_functions: string[];
+  changed_dependencies: string[];
+}
+
+// ========== 阶段三新增：小阶段回退 ==========
+
+export interface RollbackToSubtaskPayload {
+  projectPath: string;
+  projectId: string;
+  tagName: string;
+  subtaskTitle: string;
+  midStageVersion: string;
+  subtaskIndex: number;
 }

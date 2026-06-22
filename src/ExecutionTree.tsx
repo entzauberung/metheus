@@ -4,10 +4,12 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // ...
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Milestone, Subtask, PipelineState, GeneratedSubtask, QAResult } from "./types";
+import { Milestone, Subtask, PipelineState, GeneratedSubtask, QAResult, RollbackToSubtaskPayload } from "./types";
 import { Modal } from './components/Modal';
+
+const COPIED_TIMEOUT_MS = 2000;
 
 interface Props {
   milestones: Milestone[];
@@ -36,6 +38,55 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
     tagName: string;
     version: string;
   } | null>(null);
+
+  // 小阶段回退状态
+  const [subtaskRollbackTarget, setSubtaskRollbackTarget] = useState<Omit<RollbackToSubtaskPayload, 'projectPath' | 'projectId'> | null>(null);
+  const [copiedTag, setCopiedTag] = useState<string | null>(null);
+  const copyTimeoutRef = useRef<number | null>(null);
+
+  const handleCopyTag = (tag: string) => {
+    if (copyTimeoutRef.current) {
+      clearTimeout(copyTimeoutRef.current);
+      copyTimeoutRef.current = null;
+    }
+    const onCopied = () => {
+      setCopiedTag(tag);
+      copyTimeoutRef.current = window.setTimeout(() => {
+        setCopiedTag(null);
+        copyTimeoutRef.current = null;
+      }, COPIED_TIMEOUT_MS);
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(tag).then(onCopied).catch(() => {
+        // Fallback for environments without clipboard API (e.g., HTTP)
+        const textarea = document.createElement('textarea');
+        textarea.value = tag;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        try { document.execCommand('copy'); } catch (_) { /* ignore */ }
+        document.body.removeChild(textarea);
+        onCopied();
+      });
+    } else {
+      // Fallback for environments without navigator.clipboard
+      const textarea = document.createElement('textarea');
+      textarea.value = tag;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      try { document.execCommand('copy'); } catch (_) { /* ignore */ }
+      document.body.removeChild(textarea);
+      onCopied();
+    }
+  };
+
+  // 宪法查看弹窗状态
+  const [constitutionModalOpen, setConstitutionModalOpen] = useState(false);
+  const [constitutionContent, setConstitutionContent] = useState<string | null>(null);
+  const [constitutionLoading, setConstitutionLoading] = useState(false);
 
   // 新增：质检弹窗状态
   const [qaModalData, setQaModalData] = useState<{
@@ -308,6 +359,43 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
     }
   };
 
+  // 小阶段回退处理函数
+  const handleSubtaskRollback = async () => {
+    if (!subtaskRollbackTarget || !projectId) return;
+    try {
+      const result = await invoke('git_rollback_to_subtask', {
+        projectPath: projectPath || '',
+        projectId: projectId,
+        tagName: subtaskRollbackTarget.tagName,
+      });
+      console.log('小阶段回退成功:', result);
+      setSubtaskRollbackTarget(null);
+      // TODO: 触发父组件刷新
+    } catch (err) {
+      console.error('小阶段回退失败:', err);
+      alert('小阶段回退失败: ' + err);
+      setSubtaskRollbackTarget(null);
+    }
+  };
+
+  const handleViewConstitution = async () => {
+    if (!projectPath) {
+      alert("请先设置项目目录");
+      return;
+    }
+    setConstitutionLoading(true);
+    setConstitutionModalOpen(true);
+    setConstitutionContent(null);
+    try {
+      const content = await invoke<string>("read_constitution", { projectPath });
+      setConstitutionContent(content);
+    } catch (err) {
+      setConstitutionContent("读取失败：" + err);
+    } finally {
+      setConstitutionLoading(false);
+    }
+  };
+
   const getSubtaskStatusIcon = (status: string) => {
     switch (status) {
       case "waiting":
@@ -349,7 +437,23 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
   */
   return (
     <div className="execution-tree">
-      <h3 className="tree-title">执行树</h3>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <h3 className="tree-title" style={{ margin: 0 }}>执行树</h3>
+        <button
+          onClick={handleViewConstitution}
+          title="查看项目宪法"
+          style={{
+            background: 'transparent',
+            border: '1px solid #ddd',
+            borderRadius: '4px',
+            padding: '2px 8px',
+            cursor: 'pointer',
+            fontSize: '16px',
+          }}
+        >
+          📋
+        </button>
+      </div>
       {milestones.length === 0 ? (
         <p className="tree-empty">暂无大阶段，输入你的灵感吧</p>
       ) : (
@@ -654,6 +758,92 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
                               </div>
                             </div>
                           )}
+                          {/* 小阶段列表（已完成的中阶段显示，含回退按钮） */}
+                          {(mid.status === 'Completed' || mid.status === 'Approved') && mid.subtasks && mid.subtasks.length > 0 && (
+                            <div className="subtask-list-section" onClick={(e) => e.stopPropagation()}>
+                              <h4>📋 小阶段</h4>
+                              {mid.subtasks.map((st, idx) => {
+                                const isRolledBack = st.status === 'RolledBack';
+                                return (
+                                  <div
+                                    key={st.id}
+                                    className="subtask-list-item"
+                                    style={{
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      gap: '8px',
+                                      padding: '4px 0',
+                                      fontSize: '13px',
+                                      color: isRolledBack ? '#999' : '#333',
+                                      textDecoration: isRolledBack ? 'line-through' : 'none',
+                                    }}
+                                  >
+                                    <span>{idx + 1}.</span>
+                                    <span>{st.title}</span>
+                                    {/* Tag 展示：已完成且有 auto_tag 的小阶段 */}
+                                    {st.status === 'Passed' && st.auto_tag && (
+                                      <>
+                                        <span
+                                          title="点击复制 Tag 名称"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleCopyTag(st.auto_tag!);
+                                          }}
+                                          style={{
+                                            fontSize: '11px',
+                                            color: '#888',
+                                            fontFamily: 'monospace',
+                                            marginLeft: '8px',
+                                            whiteSpace: 'nowrap',
+                                            padding: '1px 4px',
+                                            background: '#f5f5f5',
+                                            borderRadius: '3px',
+                                            border: '0.5px solid #ddd',
+                                            cursor: 'pointer',
+                                          }}
+                                        >
+                                          {st.auto_tag}
+                                        </span>
+                                        {copiedTag === st.auto_tag && (
+                                          <span style={{ color: '#4caf50', fontSize: '10px', marginLeft: '4px' }}>
+                                            ✓ 已复制
+                                          </span>
+                                        )}
+                                      </>
+                                    )}
+                                    {st.auto_tag && !isRolledBack && (
+                                      <button
+                                        onClick={() => {
+                                          setSubtaskRollbackTarget({
+                                            tagName: st.auto_tag!,
+                                            subtaskTitle: st.title,
+                                            midStageVersion: mid.version,
+                                            subtaskIndex: idx + 1,
+                                          });
+                                        }}
+                                        title={`回退到小阶段 ${idx + 1}`}
+                                        style={{
+                                          marginLeft: 'auto',
+                                          padding: '1px 6px',
+                                          fontSize: '11px',
+                                          border: '1px solid #ccc',
+                                          borderRadius: '3px',
+                                          background: '#f8f8f8',
+                                          cursor: 'pointer',
+                                          color: '#888',
+                                        }}
+                                      >
+                                        ↩
+                                      </button>
+                                    )}
+                                    {isRolledBack && (
+                                      <span style={{ marginLeft: 'auto', color: '#ccc', fontSize: '11px' }}>已回退</span>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
                         </div>
                       )}
                     </li>
@@ -703,6 +893,53 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
               }}
             >
               确认回退
+            </button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* ===== 小阶段回退确认弹窗 ===== */}
+      <Modal
+        isOpen={subtaskRollbackTarget !== null}
+        onClose={() => setSubtaskRollbackTarget(null)}
+        title="确认回退"
+      >
+        <div style={{ padding: '16px' }}>
+          <p>
+            将回退到 <strong>{subtaskRollbackTarget?.midStageVersion}</strong> 的
+            小阶段 {subtaskRollbackTarget?.subtaskIndex}：{subtaskRollbackTarget?.subtaskTitle}
+          </p>
+          <p style={{ color: '#e74c3c', fontSize: '14px', marginTop: '8px' }}>
+            该小阶段之后的所有变更将被清除。
+          </p>
+          <p style={{ color: '#888', fontSize: '13px', marginTop: '4px' }}>
+            如果工作区有未提交的变更，它们将被临时存储。
+          </p>
+          <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '16px' }}>
+            <button
+              onClick={() => setSubtaskRollbackTarget(null)}
+              style={{
+                padding: '6px 16px',
+                border: '1px solid #ccc',
+                borderRadius: '4px',
+                background: '#fff',
+                cursor: 'pointer',
+              }}
+            >
+              ❌ 取消
+            </button>
+            <button
+              onClick={handleSubtaskRollback}
+              style={{
+                padding: '6px 16px',
+                border: 'none',
+                borderRadius: '4px',
+                background: '#e74c3c',
+                color: '#fff',
+                cursor: 'pointer',
+              }}
+            >
+              ✅ 确认回退
             </button>
           </div>
         </div>
@@ -795,6 +1032,92 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
           </div>
         </div>
       </Modal>
+      {/* ===== 宪法查看弹窗 ===== */}
+      {constitutionModalOpen && (
+        <div
+          onClick={() => setConstitutionModalOpen(false)}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.4)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 1000,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              background: '#fff',
+              borderRadius: '8px',
+              width: '60vw',
+              maxHeight: '70vh',
+              display: 'flex',
+              flexDirection: 'column',
+              boxShadow: '0 4px 24px rgba(0,0,0,0.2)',
+            }}
+          >
+            {/* 标题栏 */}
+            <div
+              style={{
+                padding: '12px 16px',
+                borderBottom: '1px solid #eee',
+                fontWeight: 600,
+                fontSize: '16px',
+                display: 'flex',
+                justifyContent: 'space-between',
+                alignItems: 'center',
+              }}
+            >
+              <span>📋 项目宪法 - CONSTITUTION.md</span>
+              <button
+                onClick={() => setConstitutionModalOpen(false)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  fontSize: '18px',
+                  cursor: 'pointer',
+                  color: '#888',
+                }}
+              >
+                ✕
+              </button>
+            </div>
+            {/* 内容区 */}
+            <div
+              style={{
+                padding: '16px',
+                overflow: 'auto',
+                flex: 1,
+              }}
+            >
+              {constitutionLoading ? (
+                <div style={{ textAlign: 'center', color: '#888', padding: '40px 0' }}>
+                  ⏳ 加载中...
+                </div>
+              ) : (
+                <pre
+                  style={{
+                    whiteSpace: 'pre-wrap',
+                    fontFamily: 'monospace',
+                    fontSize: '13px',
+                    lineHeight: '1.6',
+                    color: '#333',
+                    margin: 0,
+                    padding: '8px',
+                    background: '#fafafa',
+                    borderRadius: '4px',
+                    border: '1px solid #eee',
+                  }}
+                >
+                  {constitutionContent}
+                </pre>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

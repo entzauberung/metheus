@@ -34,6 +34,8 @@ pub enum SubtaskStatus {
     Passed,
     ///已驳回
     Rejected,
+    ///已回退
+    RolledBack,
 }
 ///大阶段状态
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -95,6 +97,9 @@ pub struct Subtask {
     pub test_result: Option<TestResult>,
     #[serde(default)]
     pub retry_count: u32,
+    /// 小阶段执行完成后的 Git tag 名，格式 metheus/auto/v0.1.1/task-0
+    #[serde(default)]
+    pub auto_tag: Option<String>,
 }
 ///中阶段（域负责人拆解的技术实现模块）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -275,4 +280,31 @@ pub struct QAResult {
     pub attention_points: Vec<String>,
     /// 质检时间（ISO 8601 格式）
     pub checked_at: String,
+}
+
+/// git diff 解析结果摘要
+/// 由 extract_diff_summary 函数解析 git diff 输出后填充
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffSummary {
+    /// 新增文件列表（相对路径）
+    #[serde(default)]
+    pub new_files: Vec<String>,
+    /// 修改文件列表（相对路径）
+    #[serde(default)]
+    pub modified_files: Vec<String>,
+    /// 删除文件列表（相对路径）
+    #[serde(default)]
+    pub deleted_files: Vec<String>,
+    /// 新增函数/方法签名列表
+    #[serde(default)]
+    pub new_functions: Vec<String>,
+    /// 修改函数/方法签名列表
+    #[serde(default)]
+    pub modified_functions: Vec<String>,
+    /// 删除函数/方法签名列表
+    #[serde(default)]
+    pub deleted_functions: Vec<String>,
+    /// 依赖变更条目列表（从 package.json / Cargo.toml 等文件中提取）
+    #[serde(default)]
+    pub changed_dependencies: Vec<String>,
 }

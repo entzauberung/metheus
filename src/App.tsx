@@ -61,6 +61,7 @@ function App() {
     try {
       const plan = await invoke("generate_version_plan", {
         messages: currentThread.messages,
+        projectPath: project.project_path,
       });
       //更新项目，加上方案
       setProject({ ...project, version_plan: plan as string });

@@ -66,6 +66,81 @@ const QA_CHECK_PROMPT: &str = "\
 - attention_points：字符串数组，从版本方案中提取的需特别关注的要点。\
 只输出 JSON，不要任何其他文字。";
 
+const CONSTITUTION_PART1_PROMPT: &str = "\
+你是项目宪法制定者。请在输出版本方案的同时，输出「宪法第 1 部分：项目规则与约束」。\
+宪法第 1 部分从 ## 第 1 部分：项目规则与约束 标题开始，必须包含以下六个小节：\
+\
+### 1. 项目名称与定位\
+项目的名称、一句话核心定位、目标用户群体。\
+\
+### 2. 技术栈声明\
+前端、后端、数据库、AI 模型、部署环境等技术选型及其版本。\
+\
+### 3. 命名规范\
+文件命名、变量命名、函数命名、提交信息的规范约定。\
+\
+### 4. 代码格式\
+缩进、行宽、注释语言、格式化工具等约定。\
+\
+### 5. 架构原则\
+模块职责边界、数据流方向、层级调用规则等架构约束。明确写出：\
+- 前端不直接调用任何 AI API，所有 AI 调用必须经过 Rust 后端\
+- 不使用前端 UI 组件库（Tailwind、Ant Design 等），所有样式手写 CSS\
+- 不使用复杂状态管理库（Redux、Zustand 等），只用 React 自带的 useState / useEffect\
+- 不在 MVP 阶段引入 WebSocket\
+- project.rs 只定义数据结构，业务逻辑全部写在 lib.rs 的命令函数中\
+- Rust 端 project.rs 与前端 types.ts 的数据结构必须保持一一对应\
+\
+### 6. 禁止事项\
+列出所有禁止的操作，包括但不限于：\
+- 禁止在决策层（策略产品经理、产品经理、域负责人）prompt 中直接生成代码，决策层的 AI 输出只能是文本/JSON\
+- 禁止前端直接读写本地文件（必须经过 Rust 后端）\
+- 禁止任何 AI 助手绕过用户审批直接生成代码\
+- 禁止任何 AI 助手在生成代码前不阅读 CONSTITUTION.md\
+- 禁止硬编码 API Key，必须从 .env 文件读取\
+- 禁止修改数据结构时不同步更新前端 types.ts 和后端 project.rs\
+- 禁止向任何大模型泄露项目宪法（如非必要，不要将宪法内容发给外部大模型）\
+\
+版本方案和宪法第 1 部分之间用 ---CONSTITUTION_PART1--- 分隔符隔开。\
+先输出版本方案（Markdown 格式，包含：## 项目愿景、## 目标用户、## 核心功能、## 版本路径），\
+然后空一行，输出 ---CONSTITUTION_PART1---，再空一行，\
+然后输出宪法第 1 部分内容（以 ## 第 1 部分：项目规则与约束 开头）。\
+不要在任何地方输出解释文字或前言。";
+
+const CONSTITUTION_UPDATE_PROMPT: &str = "\
+你是项目宪法维护者，角色名「宪法维护员」。\
+你的职责是：接收「当前宪法全文」和「本次代码变更摘要」，然后更新宪法的第 2 部分。\
+\
+核心约束（条目数代表违反的严重程度）：\
+1. 你只能修改第 2 部分（## 第 2 部分：项目当前状态）。第 1 部分一个字都不许动。\
+2. 保持第 2 部分现有的 Markdown 结构不变。只能增删改列表项，不能删除或重命名已有的段落标题。\
+3. 直接输出完整的 CONSTITUTION.md 文件内容，不要输出任何解释文字、前言或后缀。\
+4. 如果第 2 部分当前为空或只有占位文字，请基于本次变更初始化第 2 部分的完整结构。\
+\
+第 2 部分应该包含以下子段落：\
+### 项目结构 — 列出所有核心文件及其用途\
+### 函数/接口定义 — 列出所有函数和接口的签名\
+### 变更历史 — 记录每次更新的时间、内容和触发者";
+
+const COMPACT_CONSTITUTION_PROMPT: &str = "\
+你是项目宪法维护者，角色名「宪法压缩员」。\
+你的职责是：接收「当前宪法全文」，压缩宪法的第 2 部分以控制其膨胀。\
+\
+核心约束（条目数代表违反的严重程度）：\
+1. 你只能修改第 2 部分（## 第 2 部分：项目当前状态）。第 1 部分一个字都不许动。\
+2. 保留最新的项目结构（文件树），删除已被后续覆盖的过时条目。\
+3. 如果旧函数名已被新函数替代，只保留最新的函数定义。\
+4. 变更历史：保留最近 5 条完整记录，更早的合并为一行概述（如「v0.1.1/task-1~5：完成了用户认证模块的初始开发」）。\
+5. 保持 Markdown 结构和标题层级不变（### 项目结构、### 函数/接口定义、### 变更历史）。\
+6. 压缩后第 2 部分的目标：约 1500 token。\
+7. 直接输出完整的 CONSTITUTION.md 文件内容，不要输出任何解释文字、前言或后缀。\
+\
+压缩技巧：\
+- 合并相似的文件条目（如多个测试文件合并为「测试文件：test_*.rs」）。\
+- 删除已被后续提交覆盖的条目（如 v0.1.1/task-1 新增的 foo.rs，v0.1.1/task-3 又删除了它——两者都可以从历史中移除）。\
+- 函数签名相同的重复条目只保留一个。\
+- 变更历史的早期条目用一句话概括每个小阶段的关键变更。";
+
 ///获取项目文件的存储路径
 fn get_project_path(name: &str) -> String {
     let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -171,18 +246,25 @@ async fn chat_with_role(
 }
 
 #[tauri::command]
-async fn generate_version_plan(messages: Vec<project::Message>) -> Result<String, String> {
+async fn generate_version_plan(
+    messages: Vec<project::Message>,
+    project_path: String,
+) -> Result<String, String> {
     //1.读群API密钥
     let api_key = env::var("API_KEY").map_err(|_| "API_KEY 环境变量未设置".to_string())?;
     //2.构造API消息列表：system_prompt + 对话历史
     let mut api_messages: Vec<serde_json::Value> = vec![serde_json::json!({
         "role": "system",
-        "content": "你是一个产品战略顾问，角色名「策略产品经理」。\
-                    请根据以下对话历史，输出一份结构化的「版本方案摘要」。\
-                    使用 Markdown 格式，包含以下章节：\
-                    ## 项目愿景\n## 目标用户\n## 核心功能\n## 版本路径\n\
-                    每个版本路径下的版本要清晰列出。\
-                    回答风格：结构化、清晰、可直接用于执行。"
+        "content": format!(
+            "{} {}",
+            "你是一个产品战略顾问，角色名「策略产品经理」。\
+             请根据以下对话历史，输出一份结构化的「版本方案摘要」。\
+             使用 Markdown 格式，包含以下章节：\
+             ## 项目愿景\n## 目标用户\n## 核心功能\n## 版本路径\n\
+             每个版本路径下的版本要清晰列出。\
+             回答风格：结构化、清晰、可直接用于执行。",
+            CONSTITUTION_PART1_PROMPT
+        )
     })];
     //把对话历史换成API格式
     for msg in &messages {
@@ -218,6 +300,37 @@ async fn generate_version_plan(messages: Vec<project::Message>) -> Result<String
         .as_str()
         .ok_or("AI回复异常".to_string())?
         .to_string();
+
+    // === 宪法第 1 部分拆分与写入 ===
+    // 按分隔符将 AI 返回内容拆成两部分：版本方案 + 宪法第 1 部分
+    if let Some(constitution_start) = plan.find("---CONSTITUTION_PART1---") {
+        let constitution_part1 = plan[constitution_start + "---CONSTITUTION_PART1---".len()..]
+            .trim()
+            .to_string();
+        plan = plan[..constitution_start].trim().to_string();
+
+        // 构造完整宪法内容（第 1 部分 + 第 2 部分占位）
+        let constitution_full = if !constitution_part1.is_empty() {
+            format!(
+                "{}\n\n## 第 2 部分：项目当前状态\n（每个小阶段执行通过后自动更新）\n",
+                constitution_part1.trim()
+            )
+        } else {
+            // 第 1 部分为空也写入占位模板
+            "## 第 1 部分：项目规则与约束\n（由策略产品经理在版本方案阶段自动生成）\n\n## 第 2 部分：项目当前状态\n（每个小阶段执行通过后自动更新）\n".to_string()
+        };
+
+        // 写入项目根目录的 CONSTITUTION.md
+        // 写入失败只记录警告，不中断版本方案返回
+        let constitution_path = std::path::Path::new(&project_path).join("CONSTITUTION.md");
+        if let Err(e) = std::fs::write(&constitution_path, &constitution_full) {
+            eprintln!(
+                "[generate_version_plan] 警告：写入 CONSTITUTION.md 失败：{}",
+                e
+            );
+        }
+    }
+    // 如果 AI 返回中不包含分隔符，不写入 CONSTITUTION.md，流程继续
 
     // === 自检逻辑：对照讨论记录检查版本方案是否遗漏内容 ===
     // 第一步：拼接讨论记录字符串
@@ -704,6 +817,66 @@ async fn git_save_node(
     // 返回 tag 名， 让调用方决定写回哪个节点
     Ok(tag_name)
 }
+
+/// 小阶段 Git 存档命令
+///
+/// 在项目目录下执行 git add . → git commit --allow-empty → git tag -f
+/// tag 格式：metheus/auto/{mid_stage_version}/task-{subtask_index}
+/// 返回 tag 名，调用方可写回 Subtask.auto_tag
+#[tauri::command]
+async fn git_save_subtask(
+    project_path: String,
+    subtask_index: u32,
+    mid_stage_version: String,
+    subtask_title: String,
+) -> Result<String, String> {
+    // 1. git add . 暂存所有变更
+    let add_output = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&project_path)
+        .output()
+        .map_err(|e| format!("git add 失败: {}", e))?;
+    if !add_output.status.success() {
+        return Err(format!(
+            "git add 执行失败：\n{}",
+            String::from_utf8_lossy(&add_output.stderr)
+        ));
+    }
+
+    // 2. git commit（--allow-empty 确保即使无文件变更也能提交）
+    let commit_message = format!(
+        "【弥】小阶段 {}/{}：{}",
+        subtask_index, mid_stage_version, subtask_title
+    );
+    let commit_output = std::process::Command::new("git")
+        .args(["commit", "-m", &commit_message, "--allow-empty"])
+        .current_dir(&project_path)
+        .output()
+        .map_err(|e| format!("git commit 执行失败：{}", e))?;
+    if !commit_output.status.success() {
+        let stderr = String::from_utf8_lossy(&commit_output.stderr);
+        if !stderr.contains("nothing to commit") {
+            return Err(format!("git commit 执行失败:\n{}", stderr));
+        }
+    }
+
+    // 3. git tag -f（覆盖已有 tag）
+    let tag_name = format!("metheus/auto/{}/task-{}", mid_stage_version, subtask_index);
+    let tag_output = std::process::Command::new("git")
+        .args(["tag", "-f", &tag_name])
+        .current_dir(&project_path)
+        .output()
+        .map_err(|e| format!("git tag 失败: {}", e))?;
+    if !tag_output.status.success() {
+        return Err(format!(
+            "git tag 执行失败:\n{}",
+            String::from_utf8_lossy(&tag_output.stderr)
+        ));
+    }
+
+    Ok(tag_name)
+}
+
 /// Git 回退命令
 ///
 /// 把项目代码和执行树状态一起回退到指定 tag 对应的版本
@@ -846,6 +1019,144 @@ async fn git_rollback_to_mid_stage(
     };
     Ok(format!("已回退到 {}{}", tag_name, stash_note))
 }
+
+/// Git 回退到指定小阶段
+///
+/// 把项目代码回退到指定 subtask auto_tag 对应的版本。
+/// 与 git_rollback_to_mid_stage 的区别：回退粒度更细，只回退到某个小阶段（而非中阶段）。
+/// 1. 检查工作区是否有未提交变更 → 有则 stash
+/// 2. git reset --hard 到目标 tag → 代码回退
+/// 3. 遍历 project.json → 回退点之后的 subtasks 和 mid_stages 标记为 RolledBack
+#[tauri::command]
+async fn git_rollback_to_subtask(
+    project_path: String,
+    project_id: String,
+    tag_name: String,
+) -> Result<String, String> {
+    // 1. 检查工作区是否有未提交变更
+    let status_output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&project_path)
+        .output()
+        .map_err(|e| format!("git status 失败: {}", e))?;
+    let status = String::from_utf8_lossy(&status_output.stdout);
+    let has_uncommitted = !status.trim().is_empty();
+    // 如有未提交变更，先 stash 起来
+    if has_uncommitted {
+        let stash_output = std::process::Command::new("git")
+            .args(["stash", "push", "-m", "metheus_rollback_auto_stash"])
+            .current_dir(&project_path)
+            .output()
+            .map_err(|e| format!("git stash 失败: {}", e))?;
+        if !stash_output.status.success() {
+            return Err(format!(
+                "git stash 执行失败:\n{}",
+                String::from_utf8_lossy(&stash_output.stderr)
+            ));
+        }
+    }
+
+    // 2. git reset --hard 到目标 tag
+    let reset_output = std::process::Command::new("git")
+        .args(["reset", "--hard", &tag_name])
+        .current_dir(&project_path)
+        .output()
+        .map_err(|e| format!("git reset 失败: {}", e))?;
+    if !reset_output.status.success() {
+        // reset 失败，尝试恢复 stash
+        if has_uncommitted {
+            let _ = std::process::Command::new("git")
+                .args(["stash", "pop"])
+                .current_dir(&project_path)
+                .output();
+        }
+        return Err(format!(
+            "回退到 {} 失败:\n{}",
+            tag_name,
+            String::from_utf8_lossy(&reset_output.stderr)
+        ));
+    }
+
+    // 3. 更新 project.json 中的执行树状态
+    // 解析 tag_name 获取目标信息：格式 metheus/auto/{version}/task-{index}
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let project_file = std::path::Path::new(&home)
+        .join(".metheus")
+        .join(format!("{}.json", project_id));
+    if !project_file.exists() {
+        return Err(format!("项目文件不存在: {}", project_file.display()));
+    }
+    let content =
+        std::fs::read_to_string(&project_file).map_err(|e| format!("读取项目文件失败: {}", e))?;
+    let mut project: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("解析项目文件失败: {}", e))?;
+
+    // 找到目标 subtask 所属的 mid_stage，标记其后的 subtasks 和 mid_stages 为 RolledBack
+    let mut target_found = false;
+    let mut target_mid_stage_id = String::new();
+    let mut passed_target = false;
+
+    if let Some(milestones) = project["milestones"].as_array_mut() {
+        for milestone in milestones.iter_mut() {
+            if let Some(mid_stages) = milestone["mid_stages"].as_array_mut() {
+                for mid in mid_stages.iter_mut() {
+                    // 提前提取 mid_id，避免后续 borrow checker 冲突
+                    let mid_id =
+                        mid["id"].as_str().unwrap_or("").to_string();
+
+                    if passed_target {
+                        // 目标之后的 mid_stage → 标记为 RolledBack
+                        mid["status"] =
+                            serde_json::Value::String("RolledBack".to_string());
+                        continue;
+                    }
+
+                    if let Some(subtasks) = mid["subtasks"].as_array_mut() {
+                        for subtask in subtasks.iter_mut() {
+                            let auto_tag =
+                                subtask["auto_tag"].as_str().unwrap_or("");
+                            if auto_tag == tag_name {
+                                target_found = true;
+                                target_mid_stage_id = mid_id.clone();
+                                // 当前 subtask 保持原状态
+                            } else if target_found
+                                && mid_id == target_mid_stage_id
+                            {
+                                // 同一 mid_stage 内，目标 subtask 之后的 subtask
+                                subtask["status"] =
+                                    serde_json::Value::String("RolledBack".to_string());
+                            }
+                        }
+                    }
+
+                    if target_found && mid_id == target_mid_stage_id {
+                        // 当前 mid_stage 完成后，后续 mid_stages 标记为 RolledBack
+                        passed_target = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !target_found {
+        return Err(format!("未找到 tag {} 对应的小阶段", tag_name));
+    }
+
+    // 写回文件
+    let json_str = serde_json::to_string_pretty(&project)
+        .map_err(|e| format!("序列化项目文件失败: {}", e))?;
+    std::fs::write(&project_file, &json_str)
+        .map_err(|e| format!("写入项目文件失败: {}", e))?;
+
+    // 组装返回消息
+    let stash_note = if has_uncommitted {
+        "\n（你有未提交的变更已被临时存储，回退完成后可执行 git stash pop 恢复）"
+    } else {
+        ""
+    };
+    Ok(format!("已回退到 {}{}", tag_name, stash_note))
+}
+
 /// 比较两个版本号字符串（eg: "v0.1.1"  "v0.1.3"）
 /// 返回 -1：a < b，0：a == b，1：a > b
 fn compare_version_strings(a: &str, b: &str) -> i32 {
@@ -872,6 +1183,388 @@ fn compare_version_strings(a: &str, b: &str) -> i32 {
         }
     }
     0
+}
+
+/// 解析 git diff 的完整 stdout，提取变更摘要
+///
+/// 扫描 diff 输出中的文件增删改、函数增删改、依赖变更，
+/// 自动跳过 node_modules/、target/、__pycache__/、.git/ 和 .lock 文件。
+/// 纯文本解析，不涉及 I/O 或 AI 调用。
+fn extract_diff_summary(diff_stdout: &str) -> project::DiffSummary {
+    let mut summary = project::DiffSummary {
+        new_files: Vec::new(),
+        modified_files: Vec::new(),
+        deleted_files: Vec::new(),
+        new_functions: Vec::new(),
+        modified_functions: Vec::new(),
+        deleted_functions: Vec::new(),
+        changed_dependencies: Vec::new(),
+    };
+
+    if diff_stdout.trim().is_empty() {
+        return summary;
+    }
+
+    // 需要跳过的目录和文件模式
+    let skip_patterns = ["node_modules/", "target/", "__pycache__/", ".git/"];
+    let is_skipped = |path: &str| -> bool {
+        if path.ends_with(".lock") {
+            return true;
+        }
+        for pat in &skip_patterns {
+            if path.contains(pat) {
+                return true;
+            }
+        }
+        false
+    };
+
+    // 收集文件名集合用于去重
+    let mut new_files_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deleted_files_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut modified_files_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut new_funcs_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deleted_funcs_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut modified_funcs_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deps_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 依赖文件名集合
+    let dep_files: std::collections::HashSet<&str> = [
+        "package.json",
+        "Cargo.toml",
+        "go.mod",
+        "requirements.txt",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+    ]
+    .iter()
+    .cloned()
+    .collect();
+
+    let lines: Vec<&str> = diff_stdout.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+
+        // 检测新增文件
+        if line.starts_with("new file mode") {
+            // 下一行可能包含路径
+            if i + 1 < lines.len() && lines[i + 1].starts_with("+++ b/") {
+                let path = lines[i + 1]
+                    .strip_prefix("+++ b/")
+                    .unwrap_or("")
+                    .replace('\\', "/");
+                if !path.is_empty() && !is_skipped(&path) {
+                    new_files_set.insert(path);
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // 检测删除文件
+        if line.starts_with("deleted file mode") {
+            if i + 1 < lines.len() && lines[i + 1].starts_with("--- a/") {
+                let path = lines[i + 1]
+                    .strip_prefix("--- a/")
+                    .unwrap_or("")
+                    .replace('\\', "/");
+                if !path.is_empty() && !is_skipped(&path) {
+                    deleted_files_set.insert(path);
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // 检测 --- /dev/null（新增文件，无 new file mode 前缀时）
+        if line.starts_with("--- /dev/null") {
+            if i + 1 < lines.len() && lines[i + 1].starts_with("+++ b/") {
+                let path = lines[i + 1]
+                    .strip_prefix("+++ b/")
+                    .unwrap_or("")
+                    .replace('\\', "/");
+                if !path.is_empty() && !is_skipped(&path) {
+                    new_files_set.insert(path);
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // 检测 +++ /dev/null（删除文件）
+        if line.starts_with("+++ /dev/null") {
+            if i >= 1 && lines[i - 1].starts_with("--- a/") {
+                let path = lines[i - 1]
+                    .strip_prefix("--- a/")
+                    .unwrap_or("")
+                    .replace('\\', "/");
+                if !path.is_empty() && !is_skipped(&path) {
+                    deleted_files_set.insert(path);
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // 检测 --- a/ 和 +++ b/ 同时出现 → 修改文件
+        if line.starts_with("--- a/") {
+            if i + 1 < lines.len() && lines[i + 1].starts_with("+++ b/") {
+                let old_path = line
+                    .strip_prefix("--- a/")
+                    .unwrap_or("")
+                    .replace('\\', "/");
+                let new_path = lines[i + 1]
+                    .strip_prefix("+++ b/")
+                    .unwrap_or("")
+                    .replace('\\', "/");
+                let path = if !new_path.is_empty() { new_path } else { old_path };
+                if !path.is_empty() && !is_skipped(&path) {
+                    modified_files_set.insert(path.clone());
+
+                    // 检测是否为依赖文件变更
+                    if let Some(filename) = std::path::Path::new(&path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                    {
+                        if dep_files.contains(filename) {
+                            // 扫描该 diff 块内的 +/- 行
+                            let mut j = i + 2;
+                            while j < lines.len() {
+                                let l = lines[j];
+                                if l.starts_with("diff --git") || l.starts_with("--- a/") {
+                                    break;
+                                }
+                                let content = if l.starts_with('+') && !l.starts_with("+++") {
+                                    Some(l[1..].trim())
+                                } else if l.starts_with('-') && !l.starts_with("---") {
+                                    Some(l[1..].trim())
+                                } else {
+                                    None
+                                };
+                                if let Some(c) = content {
+                                    if !c.is_empty()
+                                        && c != "---"
+                                        && c != "+++"
+                                    {
+                                        deps_set.insert(c.to_string());
+                                    }
+                                }
+                                j += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // 提取新增函数（以 + 开头的行）
+        if line.starts_with('+') && !line.starts_with("+++") {
+            let content = &line[1..];
+            if let Some(func_sig) = extract_function_signature(content) {
+                new_funcs_set.insert(func_sig);
+            }
+        }
+
+        // 提取删除函数（以 - 开头的行）
+        if line.starts_with('-') && !line.starts_with("---") {
+            let content = &line[1..];
+            if let Some(func_sig) = extract_function_signature(content) {
+                deleted_funcs_set.insert(func_sig);
+            }
+        }
+
+        // 从 @@ 上下文行中提取可能被修改的函数名
+        if line.starts_with("@@") {
+            // 守卫：只处理包含已知语言函数定义关键字的 @@ 行
+            let lang_keywords = ["fn ", "def ", "func ", "function ", "class "];
+            let has_lang_keyword = lang_keywords.iter().any(|kw| line.contains(kw));
+            if has_lang_keyword {
+                if let Some(at_end) = line.rfind("@@") {
+                    let ctx = &line[at_end + 2..];
+                    let mut start = 0;
+                    while start < ctx.len() {
+                        if let Some(rest) = ctx.get(start..) {
+                            if let Some(paren) = rest.find('(') {
+                                let before = &rest[..paren];
+                                // 向前找函数名起始（仅允许 ASCII 字母数字下划线）
+                                if let Some(func_start) = before.rfind(|c: char| {
+                                    !c.is_ascii_alphanumeric() && c != '_'
+                                }) {
+                                    let fname = before[func_start + 1..].to_string();
+                                    // 长度过滤：2-80 字符，且以字母或下划线开头
+                                    if fname.len() >= 2
+                                        && fname.len() <= 80
+                                        && fname
+                                            .chars()
+                                            .next()
+                                            .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+                                    {
+                                        modified_funcs_set.insert(fname);
+                                    }
+                                } else if !before.is_empty()
+                                    && before.len() >= 2
+                                    && before.len() <= 80
+                                    && before
+                                        .chars()
+                                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                                {
+                                    modified_funcs_set.insert(before.to_string());
+                                }
+                                start += paren + 1;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    // 从 modified_files 中排除已归类为 new/deleted 的文件
+    for f in &new_files_set {
+        modified_files_set.remove(f);
+    }
+    for f in &deleted_files_set {
+        modified_files_set.remove(f);
+    }
+
+    // 填充结果
+    summary.new_files = new_files_set.into_iter().collect();
+    summary.new_files.sort();
+    summary.deleted_files = deleted_files_set.into_iter().collect();
+    summary.deleted_files.sort();
+    summary.modified_files = modified_files_set.into_iter().collect();
+    summary.modified_files.sort();
+    summary.new_functions = new_funcs_set.into_iter().collect();
+    summary.new_functions.sort();
+    summary.deleted_functions = deleted_funcs_set.into_iter().collect();
+    summary.deleted_functions.sort();
+    summary.modified_functions = modified_funcs_set.into_iter().collect();
+    summary.modified_functions.sort();
+    summary.changed_dependencies = deps_set.into_iter().collect();
+    summary.changed_dependencies.sort();
+
+    summary
+}
+
+/// 从一行代码中提取函数/方法签名
+/// 支持 Rust / TypeScript / JavaScript / Python / Go / C++ / Java
+/// 返回 None 表示该行不包含函数定义
+fn extract_function_signature(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+
+    // 跳过注释行
+    if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with("/*") {
+        return None;
+    }
+
+    // Rust: fn / pub fn / pub async fn / unsafe fn
+    if let Some(rest) = trimmed
+        .strip_prefix("pub async fn ")
+        .or_else(|| trimmed.strip_prefix("pub fn "))
+        .or_else(|| trimmed.strip_prefix("async fn "))
+        .or_else(|| trimmed.strip_prefix("unsafe fn "))
+        .or_else(|| trimmed.strip_prefix("fn "))
+    {
+        let sig = rest.trim();
+        if !sig.is_empty() && sig.contains('(') {
+            let end = sig.find('{').unwrap_or(sig.len());
+            let end = sig[..end].find(';').unwrap_or(end);
+            return Some(format!("fn {}", sig[..end].trim()));
+        }
+    }
+
+    // TypeScript/JS: function / export function / async function
+    if let Some(rest) = trimmed
+        .strip_prefix("export async function ")
+        .or_else(|| trimmed.strip_prefix("export function "))
+        .or_else(|| trimmed.strip_prefix("async function "))
+        .or_else(|| trimmed.strip_prefix("function "))
+    {
+        let sig = rest.trim();
+        if !sig.is_empty() && sig.contains('(') {
+            let end = sig.find('{').unwrap_or(sig.len());
+            return Some(format!("function {}", sig[..end].trim()));
+        }
+    }
+
+    // TypeScript 箭头函数: const name = (...) =>
+    if trimmed.starts_with("const ") && trimmed.contains('=')
+        && (trimmed.contains("=>") || trimmed.contains(": ("))
+    {
+        let after_const = &trimmed[6..].trim();
+        if let Some(eq) = after_const.find('=') {
+            let name = after_const[..eq].trim();
+            let name = name
+                .split(':')
+                .next()
+                .unwrap_or(name)
+                .trim();
+            if !name.is_empty()
+                && name.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_')
+            {
+                return Some(format!("const {} = (...) => {{...}}", name));
+            }
+        }
+    }
+
+    // Python: def / async def
+    if let Some(rest) = trimmed
+        .strip_prefix("async def ")
+        .or_else(|| trimmed.strip_prefix("def "))
+    {
+        let sig = rest.trim();
+        if !sig.is_empty() && sig.contains('(') {
+            let end = sig.find(':').unwrap_or(sig.len());
+            return Some(format!("def {}", sig[..end].trim()));
+        }
+    }
+
+    // Go: func / func (
+    if let Some(rest) = trimmed.strip_prefix("func ") {
+        let sig = rest.trim();
+        if !sig.is_empty() && sig.contains('(') {
+            let end = sig.find('{').unwrap_or(sig.len());
+            return Some(format!("func {}", sig[..end].trim()));
+        }
+    }
+
+    // Java: public/private/protected/static 后跟 (
+    let java_modifiers = ["public ", "private ", "protected "];
+    for modifier in &java_modifiers {
+        if trimmed.starts_with(modifier) && trimmed.contains('(') {
+            let rest = &trimmed[modifier.len()..];
+            // 确保不是 class/interface/enum 声明
+            if !rest.trim().starts_with("class ")
+                && !rest.trim().starts_with("interface ")
+                && !rest.trim().starts_with("enum ")
+            {
+                let end = rest.find('{').unwrap_or(rest.len());
+                return Some(format!("{}{}", modifier, rest[..end].trim()));
+            }
+        }
+    }
+
+    // C++: ClassName::methodName(...) 模式
+    if trimmed.contains("::") && trimmed.contains('(') && !trimmed.starts_with("//") {
+        let end = trimmed.find('{').unwrap_or(trimmed.len());
+        let end = trimmed[..end].find(';').unwrap_or(end);
+        let candidate = trimmed[..end].trim();
+        if candidate.contains('(') && candidate.contains("::") {
+            return Some(candidate.to_string());
+        }
+    }
+
+    None
 }
 
 // src-tauri/src/lib.rs
@@ -1703,6 +2396,30 @@ async fn execute_mid_stage_pipeline(
     let mut file_changes: Vec<String> = vec![];
     let mut last_test_result = String::new();
     let mut mid_stage_version = String::new();
+
+    // 提前从 project 文件中提取 mid_stage_version（避免只在函数末尾获取）
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        let project_file = std::path::Path::new(&home)
+            .join(".metheus")
+            .join(format!("{}.json", project_id));
+        if let Ok(content) = std::fs::read_to_string(&project_file) {
+            if let Ok(project) = serde_json::from_str::<project::Project>(&content) {
+                for milestone in &project.milestones {
+                    for mid_stage in &milestone.mid_stages {
+                        if mid_stage.id == mid_stage_id {
+                            mid_stage_version = mid_stage.version.clone();
+                            break;
+                        }
+                    }
+                    if !mid_stage_version.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     for i in 0..subtasks.len() {
         let subtask_title = subtasks[i].title.clone();
         let subtask_id = subtasks[i].id.clone();
@@ -1856,6 +2573,145 @@ async fn execute_mid_stage_pipeline(
                 previous_title = subtask_title.clone();
                 subtasks[i].test_result = Some(test);
                 subtasks[i].retry_count = retry_count;
+
+                // === 宪法更新链 ===
+                let mut constitution_updated = false;
+                let mut old_constitution = String::new();
+                // 步骤 1：获取 git diff
+                match std::process::Command::new("git")
+                    .args(["diff", "HEAD"])
+                    .current_dir(&project_path)
+                    .output()
+                {
+                    Ok(output) => {
+                        let diff_stdout =
+                            String::from_utf8_lossy(&output.stdout).to_string();
+                        // 步骤 2：提取变更摘要
+                        let diff_summary = extract_diff_summary(&diff_stdout);
+                        // 步骤 3：检查是否有实际变更
+                        if diff_summary.new_files.is_empty()
+                            && diff_summary.modified_files.is_empty()
+                            && diff_summary.deleted_files.is_empty()
+                            && diff_summary.new_functions.is_empty()
+                            && diff_summary.modified_functions.is_empty()
+                            && diff_summary.deleted_functions.is_empty()
+                            && diff_summary.changed_dependencies.is_empty()
+                        {
+                            eprintln!("[constitution] 宪法更新跳过（无变更）");
+                        } else {
+                            // 步骤 4：读取当前 CONSTITUTION.md
+                            let constitution_path = std::path::Path::new(&project_path)
+                                .join("CONSTITUTION.md");
+                            let constitution_content =
+                                std::fs::read_to_string(&constitution_path)
+                                    .unwrap_or_default();
+                            old_constitution = constitution_content.clone();
+                            // 步骤 5：调用 update_constitution
+                            match update_constitution(
+                                constitution_content.clone(),
+                                diff_summary,
+                            )
+                            .await
+                            {
+                                Ok(updated_content) => {
+                                    // 步骤 6：写回 CONSTITUTION.md
+                                    if let Err(e) = std::fs::write(
+                                        &constitution_path,
+                                        &updated_content,
+                                    ) {
+                                        eprintln!(
+                                            "[constitution] 写入 CONSTITUTION.md 失败：{}",
+                                            e
+                                        );
+                                    } else {
+                                        constitution_updated = true;
+                                        // 步骤 6b：检查是否需要剪枝
+                                        // 提取第 2 部分，超过阈值则触发 compact_constitution
+                                        if let Some(part2_start) =
+                                            updated_content.find("## 第 2 部分")
+                                        {
+                                            let part2 =
+                                                &updated_content[part2_start..];
+                                            if estimate_tokens(part2) > COMPACTION_TRIGGER_TOKENS {
+                                                match compact_constitution(
+                                                    updated_content.clone(),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(compacted) => {
+                                                        if let Err(e) = std::fs::write(
+                                                            &constitution_path,
+                                                            &compacted,
+                                                        ) {
+                                                            eprintln!(
+                                                                "[constitution] 写入剪枝后宪法失败：{}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!(
+                                                            "[constitution] 宪法剪枝失败，保留膨胀版本：{}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[constitution] 宪法更新失败：{}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[constitution] git diff 失败，跳过宪法更新：{}",
+                            e
+                        );
+                    }
+                }
+
+                // === git_save_subtask ===
+                match git_save_subtask(
+                    project_path.clone(),
+                    (i + 1) as u32,
+                    mid_stage_version.clone(),
+                    subtask_title.clone(),
+                )
+                .await
+                {
+                    Ok(tag_name) => {
+                        subtasks[i].auto_tag = Some(tag_name);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[constitution] git_save_subtask 失败：{}",
+                            e
+                        );
+                        // 如果宪法在此次流水线中被更新过，回退宪法到更新前的内容
+                        if constitution_updated {
+                            let constitution_path = std::path::Path::new(&project_path)
+                                .join("CONSTITUTION.md");
+                            if let Err(e2) = std::fs::write(
+                                &constitution_path,
+                                &old_constitution,
+                            ) {
+                                eprintln!(
+                                    "[constitution] 宪法回退写入也失败，宪法可能处于不一致状态：{}",
+                                    e2
+                                );
+                            } else {
+                                eprintln!(
+                                    "[constitution] git_save_subtask 失败，宪法已回退到更新前状态"
+                                );
+                            }
+                        }
+                    }
+                }
+
                 break;
             } else {
                 retry_count += 1;
@@ -1910,6 +2766,7 @@ async fn execute_mid_stage_pipeline(
                                 subtask.execution_result = subtasks[i].execution_result.clone();
                                 subtask.test_result = subtasks[i].test_result.clone();
                                 subtask.retry_count = subtasks[i].retry_count;
+                                subtask.auto_tag = subtasks[i].auto_tag.clone();
                             }
                         }
                         mid_stage.status = project::MidStageStatus::Completed;
@@ -2263,8 +3120,638 @@ async fn reject_mid_stage(project_id: String, mid_stage_id: String) -> Result<()
     Ok(())
 }
 
+/// 校验 AI 更新的宪法内容是否合法
+///
+/// 检查三个维度：
+/// 1. 第 1 部分是否被修改（防 AI 越界修改）
+/// 2. 第 2 部分结构是否完整
+/// 3. 返回内容是否为空或过短
+fn validate_constitution_update(
+    before: &str,
+    after: &str,
+) -> ValidationResult {
+    // 第 1 层：空内容检查
+    if after.trim().len() < 100 {
+        return ValidationResult::Empty(format!(
+            "返回内容仅 {} 字符，过短",
+            after.trim().len()
+        ));
+    }
+
+    // 提取"更新前"第 1 部分
+    fn extract_part1(text: &str) -> Option<&str> {
+        let start = text.find("## 第 1 部分")?;
+        let after_start = &text[start..];
+        let end = after_start.find("## 第 2 部分")?;
+        Some(&after_start[..end])
+    }
+
+    let before_part1 = extract_part1(before);
+    let after_part1 = extract_part1(after);
+
+    // 第 2 层：第 1 部分比对
+    match (before_part1, after_part1) {
+        (Some(b), Some(a)) => {
+            // 标准化：统一换行、去除首尾空白
+            let norm_b: String = b
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let norm_a: String = a
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if norm_b != norm_a {
+                // 构造差异描述
+                let diff_desc = if norm_b.len().abs_diff(norm_a.len()) > 100 {
+                    format!(
+                        "第 1 部分长度变化：{} → {} 字符",
+                        norm_b.len(),
+                        norm_a.len()
+                    )
+                } else {
+                    // 找第一个不同的字符位置
+                    let mut diff_pos: usize = 0;
+                    for (cb, ca) in norm_b.chars().zip(norm_a.chars()) {
+                        if cb != ca {
+                            break;
+                        }
+                        diff_pos += 1;
+                    }
+                    let ctx_start = diff_pos.saturating_sub(30);
+                    format!(
+                        "第 1 部分在偏移 {} 处出现差异：...{}...",
+                        diff_pos,
+                        &norm_a[ctx_start..norm_a.len().min(ctx_start + 200)]
+                    )
+                };
+                return ValidationResult::Part1Modified(diff_desc);
+            }
+        }
+        (Some(_), None) => {
+            return ValidationResult::Part1Modified(
+                "AI 返回中缺少第 1 部分".to_string(),
+            );
+        }
+        (None, Some(_)) => {
+            // 之前没有第 1 部分（首次）——放行，由调用方处理
+        }
+        (None, None) => {
+            // 都没有第 1 部分——放行
+        }
+    }
+
+    // 第 3 层：第 2 部分结构检查
+    match after.find("## 第 2 部分") {
+        Some(pos) => {
+            let part2 = &after[pos..];
+            // 检查是否至少有一个 ### 子标题
+            if !part2.contains("###") {
+                return ValidationResult::StructureDamaged(
+                    "第 2 部分缺少子标题（###）".to_string(),
+                );
+            }
+        }
+        None => {
+            return ValidationResult::StructureDamaged(
+                "缺少第 2 部分标记".to_string(),
+            );
+        }
+    }
+
+    ValidationResult::Passed
+}
+
+/// 兜底机械更新：不调用 AI，直接将 DiffSummary 的信息追加到宪法第 2 部分
+///
+/// 在 AI 连续失败时的降级方案。在「变更历史」段落标注 [机械更新]。
+fn mechanical_update_constitution(
+    current_constitution: &str,
+    diff: &project::DiffSummary,
+) -> Result<String, String> {
+    let mut result = current_constitution.to_string();
+    let timestamp = chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
+
+    // 确保第 2 部分存在
+    if !result.contains("## 第 2 部分") {
+        result.push_str("\n\n## 第 2 部分：项目当前状态\n");
+    }
+
+    // 确保三个子段落存在
+    let ensure_section = |text: &mut String, section_title: &str| {
+        if !text.contains(section_title) {
+            // 在 "## 第 2 部分" 之后插入
+            if let Some(pos) = text.find("## 第 2 部分") {
+                let insert_pos = text[pos..]
+                    .find('\n')
+                    .map(|n| pos + n + 1)
+                    .unwrap_or(text.len());
+                text.insert_str(insert_pos, &format!("\n{}\n", section_title));
+            }
+        }
+    };
+    ensure_section(&mut result, "### 项目结构");
+    ensure_section(&mut result, "### 函数/接口定义");
+    ensure_section(&mut result, "### 变更历史");
+
+    // 处理新增文件
+    for f in &diff.new_files {
+        let entry = format!("\n- [新增] {}", f);
+        if !result.contains(&entry) {
+            if let Some(section_pos) = result.find("### 项目结构") {
+                // 在项目结构段落末尾插入
+                let next_section = result[section_pos..]
+                    .find("\n###")
+                    .map(|p| section_pos + p);
+                match next_section {
+                    Some(ins_pos) => result.insert_str(ins_pos, &entry),
+                    None => result.push_str(&entry),
+                }
+            }
+        }
+    }
+
+    // 处理删除文件
+    for f in &diff.deleted_files {
+        let search = format!("- [新增] {}", f);
+        let replace_with = format!("- [已删除] {}", f);
+        if result.contains(&search) {
+            result = result.replace(&search, &replace_with);
+        } else {
+            let entry = format!("\n- [已删除] {}", f);
+            if !result.contains(&entry) {
+                if let Some(section_pos) = result.find("### 项目结构") {
+                    let next_section = result[section_pos..]
+                        .find("\n###")
+                        .map(|p| section_pos + p);
+                    match next_section {
+                        Some(ins_pos) => result.insert_str(ins_pos, &entry),
+                        None => result.push_str(&entry),
+                    }
+                }
+            }
+        }
+    }
+
+    // 处理修改文件
+    for f in &diff.modified_files {
+        let search_new = format!("- [新增] {}", f);
+        let search_del = format!("- [已删除] {}", f);
+        let _marker = format!("- {}（已修改）", f);
+        if !result.contains("（已修改）") && !result.contains(f) {
+            // 找到该文件的条目，追加修改标记
+            let file_entry = format!("- {}", f);
+            if let Some(entry_pos) = result.find(&file_entry) {
+                let line_end = result[entry_pos..].find('\n').unwrap_or(result[entry_pos..].len());
+                let existing = &result[entry_pos..entry_pos + line_end];
+                if !existing.contains("（已修改）") {
+                    let new_entry = format!("- {}（已修改）", f);
+                    result.replace_range(entry_pos..entry_pos + line_end, &new_entry);
+                }
+            } else {
+                let entry = format!("\n- {}（已修改）", f);
+                result.push_str(&entry);
+            }
+        }
+        // 移除可能触发的 unused warning
+        let _ = search_new;
+        let _ = search_del;
+    }
+
+    // 处理新增函数
+    for func in &diff.new_functions {
+        let entry = format!("\n- [新增] {}", func);
+        if !result.contains(&entry) {
+            if let Some(section_pos) = result.find("### 函数/接口定义") {
+                let next_section = result[section_pos..]
+                    .find("\n###")
+                    .map(|p| section_pos + p);
+                match next_section {
+                    Some(ins_pos) => result.insert_str(ins_pos, &entry),
+                    None => result.push_str(&entry),
+                }
+            }
+        }
+    }
+
+    // 处理删除函数
+    for func in &diff.deleted_functions {
+        let search = format!("- [新增] {}", func);
+        let replace_with = format!("- [已删除] {}", func);
+        if result.contains(&search) {
+            result = result.replace(&search, &replace_with);
+        } else {
+            let entry = format!("\n- [已删除] {}", func);
+            if !result.contains(&entry) {
+                if let Some(section_pos) = result.find("### 函数/接口定义") {
+                    let next_section = result[section_pos..]
+                        .find("\n###")
+                        .map(|p| section_pos + p);
+                    match next_section {
+                        Some(ins_pos) => result.insert_str(ins_pos, &entry),
+                        None => result.push_str(&entry),
+                    }
+                }
+            }
+        }
+    }
+
+    // 追加变更历史条目
+    let history_entry = format!(
+        "\n- [机械更新] 小阶段自动更新，AI 更新失败后降级处理 — {}",
+        timestamp
+    );
+    if let Some(section_pos) = result.find("### 变更历史") {
+        let next_section = result[section_pos..]
+            .find("\n###")
+            .map(|p| section_pos + p);
+        match next_section {
+            Some(ins_pos) => result.insert_str(ins_pos, &history_entry),
+            None => result.push_str(&history_entry),
+        }
+    } else {
+        result.push_str(&history_entry);
+    }
+
+    Ok(result)
+}
+
+/// 宪法更新主函数
+///
+/// 接收当前宪法全文和变更摘要，调用 AI 更新第 2 部分。
+/// 流程：检查 → AI 调用 → 校验 → 重试 → 兜底
+#[tauri::command]
+async fn update_constitution(
+    constitution_content: String,
+    diff_summary: project::DiffSummary,
+) -> Result<String, String> {
+    // 第一步：所有字段为空 → 跳过 AI 调用
+    if diff_summary.new_files.is_empty()
+        && diff_summary.modified_files.is_empty()
+        && diff_summary.deleted_files.is_empty()
+        && diff_summary.new_functions.is_empty()
+        && diff_summary.modified_functions.is_empty()
+        && diff_summary.deleted_functions.is_empty()
+        && diff_summary.changed_dependencies.is_empty()
+    {
+        return Ok(constitution_content);
+    }
+
+    // 第二步：构造 user message
+    let mut change_desc = String::new();
+    if !diff_summary.new_files.is_empty() {
+        change_desc.push_str("### 新增文件\n");
+        for f in &diff_summary.new_files {
+            change_desc.push_str(&format!("- {}\n", f));
+        }
+    }
+    if !diff_summary.modified_files.is_empty() {
+        change_desc.push_str("### 修改文件\n");
+        for f in &diff_summary.modified_files {
+            change_desc.push_str(&format!("- {}\n", f));
+        }
+    }
+    if !diff_summary.deleted_files.is_empty() {
+        change_desc.push_str("### 删除文件\n");
+        for f in &diff_summary.deleted_files {
+            change_desc.push_str(&format!("- {}\n", f));
+        }
+    }
+    if !diff_summary.new_functions.is_empty() {
+        change_desc.push_str("### 新增函数\n");
+        for f in &diff_summary.new_functions {
+            change_desc.push_str(&format!("- {}\n", f));
+        }
+    }
+    if !diff_summary.modified_functions.is_empty() {
+        change_desc.push_str("### 修改函数\n");
+        for f in &diff_summary.modified_functions {
+            change_desc.push_str(&format!("- {}\n", f));
+        }
+    }
+    if !diff_summary.deleted_functions.is_empty() {
+        change_desc.push_str("### 删除函数\n");
+        for f in &diff_summary.deleted_functions {
+            change_desc.push_str(&format!("- {}\n", f));
+        }
+    }
+    if !diff_summary.changed_dependencies.is_empty() {
+        change_desc.push_str("### 依赖变更\n");
+        for d in &diff_summary.changed_dependencies {
+            change_desc.push_str(&format!("- {}\n", d));
+        }
+    }
+
+    let user_message = format!(
+        "【当前宪法】\n{}\n\n【本次变更】\n{}\n\n严格约束：你只能修改第 2 部分。第 1 部分一个字都不要动。",
+        constitution_content, change_desc
+    );
+
+    // 第三步：调用 AI（Flash 模型，低 temperature，纯文本模式）
+    let ai_result = match call_deepseek_api_inner(
+        CONSTITUTION_UPDATE_PROMPT,
+        &user_message,
+        false,
+        0.1,
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(e) => {
+            // AI 调用失败 → 直接兜底
+            eprintln!(
+                "[constitution] AI 调用失败，降级为机械更新：{}",
+                e
+            );
+            return mechanical_update_constitution(&constitution_content, &diff_summary);
+        }
+    };
+
+    // 第四步：校验
+    let validation = validate_constitution_update(&constitution_content, &ai_result);
+    match validation {
+        ValidationResult::Passed => {
+            eprintln!("[constitution] 宪法更新成功");
+            return Ok(ai_result);
+        }
+        ref result @ _ => {
+            let err_desc = match result {
+                ValidationResult::Part1Modified(desc) => desc.clone(),
+                ValidationResult::StructureDamaged(desc) => desc.clone(),
+                ValidationResult::Empty(desc) => desc.clone(),
+                ValidationResult::Passed => unreachable!(),
+            };
+            eprintln!(
+                "[constitution] 第一次校验不通过：{}，进入重试",
+                err_desc
+            );
+
+            // 第五步：重试
+            let retry_message = format!(
+                "{}\n\n你上一次更新宪法时出现了以下错误：{}\n请修正后重新输出。务必严格遵守约束：只修改第 2 部分。",
+                user_message, err_desc
+            );
+
+            match call_deepseek_api_inner(
+                CONSTITUTION_UPDATE_PROMPT,
+                &retry_message,
+                false,
+                0.1,
+            )
+            .await
+            {
+                Ok(retry_reply) => {
+                    let validation2 =
+                        validate_constitution_update(&constitution_content, &retry_reply);
+                    match validation2 {
+                        ValidationResult::Passed => {
+                            eprintln!("[constitution] 宪法更新成功（重试后）");
+                            return Ok(retry_reply);
+                        }
+                        ref result2 @ _ => {
+                            let err_desc2 = match result2 {
+                                ValidationResult::Part1Modified(desc) => desc.clone(),
+                                ValidationResult::StructureDamaged(desc) => desc.clone(),
+                                ValidationResult::Empty(desc) => desc.clone(),
+                                ValidationResult::Passed => unreachable!(),
+                            };
+                            eprintln!(
+                                "[constitution] 宪法更新降级（机械更新），原因：{}",
+                                err_desc2
+                            );
+                            return mechanical_update_constitution(
+                                &constitution_content,
+                                &diff_summary,
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[constitution] AI 调用失败，降级为机械更新：{}",
+                        e
+                    );
+                    return mechanical_update_constitution(&constitution_content, &diff_summary);
+                }
+            }
+        }
+    }
+}
+
+/// 估算文本的 token 数量
+///
+/// 中文字符按 1.0 token，ASCII 可打印字符按 0.25 token，其他按 0.5 token。
+/// 纯计算函数，无 I/O。
+fn estimate_tokens(text: &str) -> f64 {
+    let mut tokens = 0.0;
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c.is_ascii_punctuation() || c == ' ' || c == '\n' {
+            tokens += 0.25;
+        } else if matches!(c,
+            '\u{4e00}'..='\u{9fff}'
+            | '\u{3400}'..='\u{4dbf}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{20000}'..='\u{2a6df}'
+            | '\u{2a700}'..='\u{2b73f}'
+            | '\u{2b740}'..='\u{2b81f}'
+            | '\u{2b820}'..='\u{2ceaf}'
+            | '\u{3000}'..='\u{303f}'
+        ) {
+            tokens += 1.0;
+        } else {
+            tokens += 0.5;
+        }
+    }
+    tokens
+}
+
+/// 宪法剪枝主函数
+///
+/// 接收当前宪法全文，当第 2 部分超过阈值时调用 AI 压缩。
+/// 流程：阈值检查 → AI 调用 → 校验 → 重试 → 返回
+/// 与 update_constitution 不同：剪枝失败不降级为机械更新，而是保留膨胀版本。
+const COMPACTION_TRIGGER_TOKENS: f64 = 3000.0;
+
+#[tauri::command]
+async fn compact_constitution(
+    constitution_content: String,
+) -> Result<String, String> {
+    // 第一步：提取第 2 部分
+    let part2_start = match constitution_content.find("## 第 2 部分") {
+        Some(pos) => pos,
+        None => {
+            eprintln!("[constitution] 宪法中缺少第 2 部分，跳过剪枝");
+            return Ok(constitution_content);
+        }
+    };
+    let part2 = &constitution_content[part2_start..];
+
+    // 第二步：阈值检查（基于 token 估算）
+    let estimated_tokens = estimate_tokens(part2);
+    if estimated_tokens < COMPACTION_TRIGGER_TOKENS {
+        eprintln!(
+            "[constitution] 宪法第 2 部分未超过阈值（估算 {:.0} < {:.0} token），跳过剪枝",
+            estimated_tokens,
+            COMPACTION_TRIGGER_TOKENS
+        );
+        return Ok(constitution_content);
+    }
+
+    // 第三步：构造 AI 调用消息
+    let user_message = format!(
+        "【当前宪法】\n{}\n\n【压缩指令】\n\
+        压缩第 2 部分，操作规则：\n\
+        1. 保留最新的项目结构（文件树）\n\
+        2. 保留所有仍然有效的函数/接口定义（删除已被后续覆盖的过时条目）\n\
+        3. 如果旧函数名已被新函数替代，只保留最新的函数定义\n\
+        4. 变更历史：保留最近 5 条完整记录，更早的合并为一行概述\n\
+        5. 保持 Markdown 结构和标题层级不变\n\
+        6. 压缩后第 2 部分的目标：约 1500 token\n\
+        7. 直接输出完整的 CONSTITUTION.md 文件内容\n\
+        \n严格约束：你只能修改第 2 部分。第 1 部分一个字都不要动。",
+        constitution_content
+    );
+
+    // 第四步：调用 AI
+    let ai_result = match call_deepseek_api_inner(
+        COMPACT_CONSTITUTION_PROMPT,
+        &user_message,
+        false,
+        0.1,
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(e) => {
+            eprintln!(
+                "[constitution] 宪法剪枝 AI 调用失败：{}，保留膨胀版本",
+                e
+            );
+            return Err(format!("AI 调用失败：{}", e));
+        }
+    };
+
+    // 第五步：校验
+    let validation = validate_constitution_update(&constitution_content, &ai_result);
+    match validation {
+        ValidationResult::Passed => {
+            eprintln!("[constitution] 宪法剪枝成功");
+            return Ok(ai_result);
+        }
+        ref result @ _ => {
+            let err_desc = match result {
+                ValidationResult::Part1Modified(desc) => desc.clone(),
+                ValidationResult::StructureDamaged(desc) => desc.clone(),
+                ValidationResult::Empty(desc) => desc.clone(),
+                ValidationResult::Passed => unreachable!(),
+            };
+            eprintln!(
+                "[constitution] 宪法剪枝第一次校验不通过：{}，进入重试",
+                err_desc
+            );
+
+            // 第六步：重试（仅 1 次）
+            let retry_message = format!(
+                "{}\n\n你上一次剪枝宪法时出现了以下错误：{}\n请修正后重新输出。务必严格遵守约束：只修改第 2 部分。",
+                user_message, err_desc
+            );
+
+            match call_deepseek_api_inner(
+                COMPACT_CONSTITUTION_PROMPT,
+                &retry_message,
+                false,
+                0.1,
+            )
+            .await
+            {
+                Ok(retry_reply) => {
+                    let validation2 =
+                        validate_constitution_update(&constitution_content, &retry_reply);
+                    match validation2 {
+                        ValidationResult::Passed => {
+                            eprintln!("[constitution] 宪法剪枝成功（重试后）");
+                            return Ok(retry_reply);
+                        }
+                        ref result2 @ _ => {
+                            let err_desc2 = match result2 {
+                                ValidationResult::Part1Modified(desc) => desc.clone(),
+                                ValidationResult::StructureDamaged(desc) => desc.clone(),
+                                ValidationResult::Empty(desc) => desc.clone(),
+                                ValidationResult::Passed => unreachable!(),
+                            };
+                            eprintln!(
+                                "[constitution] 宪法剪枝失败，保留膨胀版本：{}",
+                                err_desc2
+                            );
+                            return Err(format!("剪枝校验两次不通过：{}", err_desc2));
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[constitution] 宪法剪枝重试 AI 调用失败：{}，保留膨胀版本",
+                        e
+                    );
+                    return Err(format!("重试 AI 调用失败：{}", e));
+                }
+            }
+        }
+    }
+}
+
+/// 读取项目目录下的 CONSTITUTION.md 文件，返回完整内容。
+/// 文件不存在或为空时返回友好提示（Ok），而非报错。
+#[tauri::command]
+async fn read_constitution(
+    project_path: String,
+) -> Result<String, String> {
+    use std::fs;
+    use std::path::Path;
+
+    let file_path = Path::new(&project_path).join("CONSTITUTION.md");
+
+    match fs::read(&file_path) {
+        Ok(bytes) => {
+            if bytes.is_empty() {
+                return Ok("项目宪法为空。".to_string());
+            }
+            match String::from_utf8(bytes) {
+                Ok(content) => Ok(content),
+                Err(_) => Err("项目宪法文件编码异常，无法读取。".to_string()),
+            }
+        }
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok("项目宪法尚未生成，请先完成一个阶段的任务。".to_string())
+            } else {
+                Err(format!("项目宪法文件读取失败：{}", e))
+            }
+        }
+    }
+}
+
 /// 3.3 执行状态结构体
 // ========== Phase 3 新增：执行状态结构体 ==========
+
+/// 宪法更新校验结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ValidationResult {
+    /// 校验通过
+    Passed,
+    /// 第 1 部分被修改，携带差异描述
+    Part1Modified(String),
+    /// 第 2 部分结构损坏，携带错误描述
+    StructureDamaged(String),
+    /// 返回内容为空或过短，携带原因描述
+    Empty(String),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PipelineStatus {
@@ -2327,7 +3814,12 @@ pub fn run() {
             approve_mid_stage,
             reject_mid_stage,
             git_save_node,
-            git_rollback_to_mid_stage
+            git_save_subtask,
+            git_rollback_to_mid_stage,
+            git_rollback_to_subtask,
+            update_constitution,
+            compact_constitution,
+            read_constitution
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
