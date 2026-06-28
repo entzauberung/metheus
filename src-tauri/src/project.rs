@@ -89,6 +89,7 @@ pub struct Subtask {
     pub title: String,
     pub prompt: String,
     pub status: SubtaskStatus,
+    #[serde(default)]
     pub test_report: String,
     // === 新增字段 ===
     #[serde(default)]
@@ -114,6 +115,7 @@ pub struct MidStage {
     pub created_at: String,
     pub description: String,
     pub tech_focus: String,
+    #[serde(default)]
     pub test_report: String,
     pub completed_at: Option<String>,
     pub approved_at: Option<String>,
@@ -145,14 +147,19 @@ pub struct ExecutionResult {
     pub file_changes: Vec<String>,
 }
 ///测试工程师的检查结果
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TestResult {
     pub passed: bool,
+    #[serde(default)]
     pub issues: Vec<String>,
+    #[serde(default)]
     pub suggestion: String,
+    /// 诊断/警告信息（非阻塞），用于向后端调用方和前端传递非致命的诊断信息
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 ///开发工程师动态生成下一个小阶段
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GeneratedSubtask {
     pub title: String,
     pub prompt: String,
@@ -280,6 +287,9 @@ pub struct QAResult {
     pub attention_points: Vec<String>,
     /// 质检时间（ISO 8601 格式）
     pub checked_at: String,
+    /// 诊断/警告信息（非阻塞），用于向后端调用方和前端传递非致命的诊断信息
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// git diff 解析结果摘要
@@ -307,4 +317,57 @@ pub struct DiffSummary {
     /// 依赖变更条目列表（从 package.json / Cargo.toml 等文件中提取）
     #[serde(default)]
     pub changed_dependencies: Vec<String>,
+}
+
+/// 宪法摘要信息
+/// 从 CONSTITUTION.md 第 2 部分提取的项目状态快照
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConstitutionSummary {
+    /// 项目结构简述（文件树部分文本）
+    #[serde(default)]
+    pub structure_description: String,
+    /// 公开函数数量
+    #[serde(default)]
+    pub function_count: u32,
+    /// 变更历史中最近 5 条
+    #[serde(default)]
+    pub recent_changes: Vec<String>,
+    /// 当前宪法第 2 部分的 token 估算值
+    #[serde(default)]
+    pub total_tokens: f64,
+}
+
+/// Git tag 信息
+/// 从 git tag 列表中解析的单条 tag 记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitTagInfo {
+    /// tag 名称（如 "metheus/v0.1.1"）
+    pub name: String,
+    /// 创建日期（如 "2026-01-15"）
+    pub date: String,
+    /// commit 主题行
+    pub subject: String,
+}
+
+/// 项目文件/目录条目
+/// 从 walkdir 遍历得到的单条文件或目录记录
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// 相对路径（相对于 project_path）
+    pub path: String,
+    /// 是否为目录
+    pub is_dir: bool,
+    /// 文件扩展名（如 "rs"、"tsx"，目录为空字符串）
+    #[serde(default)]
+    pub file_type: String,
+}
+
+/// 路径校验结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathValidationResult {
+    pub is_valid: bool,
+    pub exists: bool,
+    pub is_directory: bool,
+    pub is_git_repo: bool,
+    pub error_message: String,
 }

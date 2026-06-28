@@ -21,6 +21,7 @@ export interface TestResult {
   passed: boolean;
   issues: string[];
   suggestion: string;
+  warnings?: string[];
 }
 
 export interface GeneratedSubtask {
@@ -55,7 +56,7 @@ export interface MidStage {
   approved_at?: string;
   description: string;
   tech_focus: string;
-  test_report?: string;
+  test_report: string;
   git_tag?: string;  // ← 4.1.1b
 }
 
@@ -76,6 +77,7 @@ export interface QAResult {
   details: QADetail[];
   attention_points: string[];
   checked_at: string;
+  warnings?: string[];
 }
 
 export interface Milestone {
@@ -137,6 +139,7 @@ export interface PipelineState {
   total_subtasks: number;
   subtask_statuses: SubtaskStatusItem[];
   current_log: string;
+  last_error?: string;
 }
 
 // ========== 阶段一新增：DiffSummary ==========
@@ -153,6 +156,47 @@ export interface DiffSummary {
 
 // ========== 阶段三新增：小阶段回退 ==========
 
+// ========== Phase A 新增：后端命令返回值 ==========
+
+export interface ConstitutionSummary {
+  structure_description: string;
+  function_count: number;
+  recent_changes: string[];
+  total_tokens: number;
+}
+
+export interface GitTagInfo {
+  name: string;
+  date: string;
+  subject: string;
+}
+
+export interface FileEntry {
+  path: string;
+  is_dir: boolean;
+  file_type: string;
+}
+
+// ========== Phase C 新增：测试日志 + 视图模式 ==========
+
+export interface TestLog {
+  subtask_title: string;
+  status: 'passed' | 'rejected' | 'retried';
+  reason?: string;
+  files?: string[];
+  full_report?: string;
+}
+
+export type ViewPhase = 'discussion' | 'execution';
+export type DiscussionReason = 'idle' | 'active' | 'review' | 'paused';
+
+export interface ViewMode {
+  phase: ViewPhase;
+  reason?: DiscussionReason;
+}
+
+// ========== 阶段三新增：小阶段回退 ==========
+
 export interface RollbackToSubtaskPayload {
   projectPath: string;
   projectId: string;
@@ -160,4 +204,12 @@ export interface RollbackToSubtaskPayload {
   subtaskTitle: string;
   midStageVersion: string;
   subtaskIndex: number;
+}
+
+export interface PathValidationResult {
+  is_valid: boolean;
+  exists: boolean;
+  is_directory: boolean;
+  is_git_repo: boolean;
+  error_message: string;
 }

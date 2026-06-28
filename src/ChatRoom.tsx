@@ -5,7 +5,7 @@
 // (at your option) any later version.
 // ...
 import { useState } from "react";
-import { invoke } from "@tauri-apps/api/core"
+import { invokeWithTimeout } from "./utils/invokeWithTimeout"
 import { ChatMessage } from "./types"
 interface Props {
   messages: ChatMessage[];
@@ -67,7 +67,7 @@ function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, mod
     setInputValue("");
     setIsLoading(true);
     try {
-      const reply = await invoke("chat_with_role", {
+      const reply = await invokeWithTimeout("chat_with_role", {
         message: actualMessage,
         role: targetRole,
         threadId: "thread-init",

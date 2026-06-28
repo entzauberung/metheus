@@ -4,9 +4,9 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // ...
-import { useState, useEffect, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { Milestone, Subtask, PipelineState, GeneratedSubtask, QAResult, RollbackToSubtaskPayload } from "./types";
+import { useState, useRef } from "react";
+import { invokeWithTimeout } from "./utils/invokeWithTimeout";
+import { Milestone, Subtask, PipelineState, RollbackToSubtaskPayload } from "./types";
 import { Modal } from './components/Modal';
 
 const COPIED_TIMEOUT_MS = 2000;
@@ -19,27 +19,50 @@ interface Props {
   onRegenerateMilestones?: (feedback: string) => Promise<void>;
   projectPath?: string;
   projectId?: string;
+
+  // === Phase B: 从 App.tsx 传入的状态和回调 ===
+  selectedMidStageId: string | null;
+  onSelectMidStage: (id: string | null) => void;
+  quickGeneratedPlan: Map<string, Subtask[]>;
+  generatedPlan?: Map<string, Subtask[]>;
+  onGenerateQuickPlan: (milestone: any) => Promise<void>;
+  onStartQuickExecution: (milestone: any) => Promise<void>;
+  isExecuting: boolean;
+  isGeneratingPlan: boolean;
+  executionStatus: PipelineState | null;
 }
 
-function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerateMidStages, onRegenerateMilestones, projectPath, projectId }: Props) {
+function ExecutionTree({
+  milestones,
+  onSelectMilestone,
+  onVersionEdit,
+  onGenerateMidStages,
+  onRegenerateMilestones,
+  projectPath,
+  projectId,
+  selectedMidStageId,
+  onSelectMidStage,
+  quickGeneratedPlan,
+  generatedPlan,
+  onGenerateQuickPlan,
+  onStartQuickExecution,
+  isExecuting,
+  isGeneratingPlan,
+  executionStatus,
+}: Props) {
+  // Phase B: QA 弹窗已移至 App.tsx；onRegenerateMilestones 后续由 TaskConsole 使用
+  void onRegenerateMilestones;
+
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
-  // === 3Phase 3 新增状态 ===
-  const [selectedMidStageId, setSelectedMidStageId] = useState<string | null>(null);
-  const [generatedPlan, setGeneratedPlan] = useState<Map<string, Subtask[]>>(new Map());
-  const [quickGeneratedPlan, setQuickGeneratedPlan] = useState<Map<string, Subtask[]>>(new Map());
-  const [isExecuting, setIsExecuting] = useState(false);
-  const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
-  const [executionStatus, setExecutionStatus] = useState<PipelineState | null>(null);
-  const [autoAdvance, setAutoAdvance] = useState(false);
 
-  // 新增：回退相关状态
+  // 回退相关状态（保留在 ExecutionTree）
   const [rollbackTarget, setRollbackTarget] = useState<{
     tagName: string;
     version: string;
   } | null>(null);
 
-  // 小阶段回退状态
+  // 小阶段回退状态（保留在 ExecutionTree）
   const [subtaskRollbackTarget, setSubtaskRollbackTarget] = useState<Omit<RollbackToSubtaskPayload, 'projectPath' | 'projectId'> | null>(null);
   const [copiedTag, setCopiedTag] = useState<string | null>(null);
   const copyTimeoutRef = useRef<number | null>(null);
@@ -58,7 +81,6 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
     };
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(tag).then(onCopied).catch(() => {
-        // Fallback for environments without clipboard API (e.g., HTTP)
         const textarea = document.createElement('textarea');
         textarea.value = tag;
         textarea.style.position = 'fixed';
@@ -70,7 +92,6 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
         onCopied();
       });
     } else {
-      // Fallback for environments without navigator.clipboard
       const textarea = document.createElement('textarea');
       textarea.value = tag;
       textarea.style.position = 'fixed';
@@ -83,38 +104,10 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
     }
   };
 
-  // 宪法查看弹窗状态
+  // 宪法查看弹窗状态（保留在 ExecutionTree）
   const [constitutionModalOpen, setConstitutionModalOpen] = useState(false);
   const [constitutionContent, setConstitutionContent] = useState<string | null>(null);
   const [constitutionLoading, setConstitutionLoading] = useState(false);
-
-  // 新增：质检弹窗状态
-  const [qaModalData, setQaModalData] = useState<{
-    milestoneId: string;
-    qaResult: QAResult;
-  } | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-
-  // === Phase 3 轮询执行状态 ===
-  useEffect(() => {
-    if (!isExecuting) return;
-
-    const interval = setInterval(async () => {
-      try {
-        const status = await invoke<PipelineState | null>("get_execution_status");
-        setExecutionStatus(status);
-
-        if (status && (status.status === "Completed" || status.status === "Failed")) {
-          setIsExecuting(false);
-          clearInterval(interval);
-        }
-      } catch (e) {
-        console.error("轮询状态失败:", e);
-      }
-    }, 2000);
-
-    return () => clearInterval(interval);
-  }, [isExecuting]);
 
   const getStatusIcon = (status: string) => {
     switch (status) {
@@ -155,203 +148,17 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
     setEditValue("");
   };
 
-  // === 3Phase 3 新增函数 ===
-  const handleGeneratePlan = async (midStage: any) => {
-    setIsGeneratingPlan(true);
-    const generated: Subtask[] = [];
-    let prevTitle = "";
-    let prevResult = "";
-
-    for (let i = 0; i < 3; i++) {
-      try {
-        const next = await invoke<GeneratedSubtask>("generate_next_prompt", {
-          midStageTitle: midStage.title,
-          midStageDescription: midStage.description || "",
-          previousSubtaskTitle: prevTitle,
-          previousSubtaskResult: prevResult,
-          fileChanges: [],
-          testResult: "",
-          isRetry: false,
-          retryReason: "",
-        });
-        generated.push({
-          id: `${midStage.id}-st-${i + 1}`,
-          title: next.title,
-          prompt: next.prompt,
-          status: "Pending" as const,
-          test_report: "",
-          retry_count: 0,
-        });
-        prevTitle = next.title;
-        prevResult = "通过";
-      } catch (e) {
-        console.error("生成子任务失败:", e);
-        break;
-      }
-    }
-
-    setGeneratedPlan((prev) => {
-      const next = new Map(prev);
-      next.set(midStage.id, generated);
-      return next;
-    });
-    setIsGeneratingPlan(false);
-  };
-  const handleStartExecution = async (midStage: any) => {
-    if (!projectPath) {
-      alert("请先在主界面设置项目目录");
-      return;
-    }
-    const plan = generatedPlan.get(midStage.id);
-    if (!plan || plan.length === 0) {
-      alert("请先生成执行计划");
-      return;
-    }
-    try {
-      await invoke("start_execution", {
-        projectId: projectId,
-        projectPath: projectPath,
-        midStageId: midStage.id,
-        midStageTitle: midStage.title,
-        midStageDescription: midStage.description,
-        subtasksJson: JSON.stringify(plan),
-      });
-      setIsExecuting(true);
-    } catch (e) {
-      console.error("启动执行失败:", e);
-    }
-  };
-  // 快速模式：为大阶段生成执行计划（跳过中阶段）
-  const handleGenerateQuickPlan = async (milestone: any) => {
-    setIsGeneratingPlan(true);
-    const generated: Subtask[] = [];
-    let prevTitle = "";
-    let prevResult = "";
-
-    for (let i = 0; i < 3; i++) {
-      try {
-        const next = await invoke<GeneratedSubtask>("generate_next_prompt", {
-          midStageTitle: milestone.title,
-          midStageDescription: milestone.description || "",
-          previousSubtaskTitle: prevTitle,
-          previousSubtaskResult: prevResult,
-          fileChanges: [],
-          testResult: "",
-          isRetry: false,
-          retryReason: "",
-        });
-        generated.push({
-          id: `${milestone.id}-st-${i + 1}`,
-          title: next.title,
-          prompt: next.prompt,
-          status: "Pending" as const,
-          test_report: "",
-          retry_count: 0,
-        });
-        prevTitle = next.title;
-        prevResult = "通过";
-      } catch (e) {
-        console.error("快速模式生成子任务失败:", e);
-        break;
-      }
-    }
-
-    setQuickGeneratedPlan((prev) => {
-      const next = new Map(prev);
-      next.set(milestone.id, generated);
-      return next;
-    });
-    setIsGeneratingPlan(false);
-  };
-  // 快速模式：开始执行大阶段的子任务
-  const handleStartQuickExecution = async (milestone: any) => {
-    if (!projectPath) {
-      alert("请先在主界面设置项目目录");
-      return;
-    }
-    const plan = quickGeneratedPlan.get(milestone.id);
-    if (!plan || plan.length === 0) {
-      alert("请先生成执行计划");
-      return;
-    }
-    try {
-      await invoke("start_execution", {
-        projectId: projectId,
-        projectPath: projectPath,
-        midStageId: milestone.id,
-        midStageTitle: milestone.title,
-        midStageDescription: milestone.description,
-        subtasksJson: JSON.stringify(plan),
-      });
-      setIsExecuting(true);
-    } catch (e) {
-      console.error("快速模式启动执行失败:", e);
-    }
-  };
-  // 审批处理函数
-  const handleApprove = async (midStageId: string) => {
-    if (!projectId) return;
-    try {
-      const resultJson = await invoke<string>("approve_mid_stage", {
-        projectId: projectId,
-        midStageId: midStageId,
-      });
-      const result = JSON.parse(resultJson) as {
-        next_mid_stage_id: string | null;
-        next_milestone_id: string | null;
-        project_completed: boolean;
-      };
-
-      if (result.project_completed) {
-        alert("🎉 项目所有大阶段已完成！");
-        return;
-      }
-
-      if (result.next_mid_stage_id) {
-        setSelectedMidStageId(result.next_mid_stage_id);
-        if (autoAdvance) {
-          // 需要等待状态更新后再自动执行，通过查找对应的 midStage 数据
-          const nextMid = milestones
-            .flatMap((m) => m.mid_stages)
-            .find((ms) => ms.id === result.next_mid_stage_id);
-          if (nextMid) {
-            await handleStartExecution(nextMid);
-          }
-        } else {
-          alert("✅ 已批准，下一阶段已就绪，点击执行");
-        }
-      } else {
-        alert("✅ 已批准");
-      }
-    } catch (e: any) {
-      alert(`❌ 批准失败：${e}`);
-    }
-  };
-  const handleReject = async (midStageId: string) => {
-    if (!projectId) return;
-    try {
-      await invoke("reject_mid_stage", {
-        projectId: projectId,
-        midStageId: midStageId,
-      });
-      alert("已驳回");
-    } catch (e: any) {
-      alert(`❌ 驳回失败：${e}`);
-    }
-  };
-  // 回退处理函数
-  // 把项目回退到之前保存的某个中阶段（mid_stage）状态。
+  // 回退处理函数（保留在 ExecutionTree）
   const handleRollback = async () => {
     if (!rollbackTarget || !projectId) return;
     try {
-      const result = await invoke('git_rollback_to_mid_stage', {
+      const result = await invokeWithTimeout('git_rollback_to_mid_stage', {
         projectPath: projectPath || '',
         tagName: rollbackTarget.tagName,
         projectId: projectId,
       });
       console.log('回退成功:', result);
       setRollbackTarget(null);
-      // TODO: 触发父组件刷新（需新增 onRollback prop 或引入 useProject）
     } catch (err) {
       console.error('回退失败:', err);
       alert('回退失败: ' + err);
@@ -359,18 +166,17 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
     }
   };
 
-  // 小阶段回退处理函数
+  // 小阶段回退处理函数（保留在 ExecutionTree）
   const handleSubtaskRollback = async () => {
     if (!subtaskRollbackTarget || !projectId) return;
     try {
-      const result = await invoke('git_rollback_to_subtask', {
+      const result = await invokeWithTimeout('git_rollback_to_subtask', {
         projectPath: projectPath || '',
         projectId: projectId,
         tagName: subtaskRollbackTarget.tagName,
       });
       console.log('小阶段回退成功:', result);
       setSubtaskRollbackTarget(null);
-      // TODO: 触发父组件刷新
     } catch (err) {
       console.error('小阶段回退失败:', err);
       alert('小阶段回退失败: ' + err);
@@ -387,7 +193,7 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
     setConstitutionModalOpen(true);
     setConstitutionContent(null);
     try {
-      const content = await invoke<string>("read_constitution", { projectPath });
+      const content = await invokeWithTimeout<string>("read_constitution", { projectPath });
       setConstitutionContent(content);
     } catch (err) {
       setConstitutionContent("读取失败：" + err);
@@ -415,25 +221,9 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
 
   /**
   * ExecutionTree 组件结构（三层嵌套）
-  * 
-  * 1. 容器 .execution-tree
-  *    ├── 标题“执行树”
-  *    ├── 空状态：暂无大阶段
-  *    └── 大阶段列表 .tree-list
-  *        └── 每个大阶段 .tree-item
-  *            ├── 状态图标 + 可编辑版本号 + 标题
-  *            ├── 拆解中阶段按钮（专业模式且无中阶段时）
-  *            ├── 大阶段状态文字
-  *            └── 中阶段列表 .mid-stage-list
-  *                └── 每个中阶段 .mid-stage-item
-  *                    ├── 前缀图标 + 版本号 + 标题 + 技术焦点 + 状态
-  *                    └── 选中后显示操作区 .mid-stage-actions
-  *                        ├── 生成执行计划按钮
-  *                        ├── 已生成计划（子任务列表 + 开始执行）
-  *                        ├── 执行状态面板（进度点 + 当前日志）
-  *                        └── 完成后显示测试日志 + 审批按钮
-  *  回退按钮 midStage.status === 'Completed' || midStage.status 
-  *  回退弹窗 Model 末尾添加
+  *
+  * Phase B 后：专业模式执行面板和 QA 弹窗已移至 App.tsx/TaskConsole。
+  * ExecutionTree 只负责树结构渲染 + 版本编辑 + 回退 + 快速模式入口。
   */
   return (
     <div className="execution-tree">
@@ -471,17 +261,33 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
 
               {/* 质检标记 */}
               {ms.qa_result != null && ms.qa_result.passed === true && (
-                <span className="qa-passed">✅ 质检通过</span>
+                <span
+                  className="qa-passed"
+                  title={`✅ 质检通过：${ms.qa_result.reason || "全部对齐"}${
+                    (ms.qa_result.warnings && ms.qa_result.warnings.length > 0)
+                      ? "\n\n诊断信息：\n" + ms.qa_result.warnings.map(w => "• " + w).join("\n")
+                      : ""
+                  }`}
+                >
+                  ✅ 质检通过
+                  {ms.qa_result.warnings && ms.qa_result.warnings.length > 0 && (
+                    <span className="qa-warning-icon" title={ms.qa_result.warnings.join("\n")}> ⚠️</span>
+                  )}
+                </span>
               )}
               {ms.qa_result != null && ms.qa_result.passed === false && (
                 <span
                   className="qa-rejected"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setQaModalData({ milestoneId: ms.id, qaResult: ms.qa_result! });
-                  }}
+                  title={`❌ 质检驳回\n\n驳回原因：${ms.qa_result.reason || "未提供具体原因"}${
+                    (ms.qa_result.warnings && ms.qa_result.warnings.length > 0)
+                      ? "\n\n诊断信息：\n" + ms.qa_result.warnings.map(w => "• " + w).join("\n")
+                      : ""
+                  }`}
                 >
                   ❌ 质检驳回
+                  {ms.qa_result.warnings && ms.qa_result.warnings.length > 0 && (
+                    <span className="qa-warning-icon" title={ms.qa_result.warnings.join("\n")}> ⚠️</span>
+                  )}
                 </span>
               )}
 
@@ -526,13 +332,13 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
                 {ms.status === "Paused" && "暂停"}
               </span>
 
-              {/* 快速模式操作区（跳过中阶段，直接管理 subtasks） */}
+              {/* 快速模式操作区：通过 props 接收回调 */}
               {ms.mode === "Quick" && (
                 <div className="quick-mode-actions" onClick={(e) => e.stopPropagation()}>
                   {(!ms.subtasks || ms.subtasks.length === 0) && !quickGeneratedPlan.has(ms.id) && (
                     <button
                       className="btn-generate-plan"
-                      onClick={() => handleGenerateQuickPlan(ms)}
+                      onClick={() => onGenerateQuickPlan(ms)}
                       disabled={isExecuting || isGeneratingPlan}
                     >
                       {isGeneratingPlan ? "⏳ 生成中..." : "📋 生成执行计划"}
@@ -548,7 +354,7 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
                       ))}
                       <button
                         className="btn-start-execution"
-                        onClick={() => handleStartQuickExecution(ms)}
+                        onClick={() => onStartQuickExecution(ms)}
                         disabled={isExecuting}
                       >
                         ▶ 开始执行
@@ -573,6 +379,7 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
                   )}
                 </div>
               )}
+
               {/* 中阶段列表（第三级） */}
               {ms.mid_stages.length > 0 && (
                 <ul className="mid-stage-list">
@@ -581,7 +388,7 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
                       key={mid.id}
                       className={`mid-stage-item ${selectedMidStageId === mid.id ? "selected" : ""}`}
                       onClick={() =>
-                        setSelectedMidStageId(
+                        onSelectMidStage(
                           mid.id === selectedMidStageId ? null : mid.id
                         )
                       }
@@ -606,6 +413,7 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
                         )}
                         {mid.status === "Approved" && "✅ 已批准"}
                       </span>
+
                       {/* 回退按钮：已完成或已批准的节点可以回退 */}
                       {(mid.status === "Completed" || mid.status === "Approved") && (
                         <button
@@ -632,130 +440,20 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
                           ↩ 回退到此
                         </button>
                       )}
-                      {/* 中阶段操作区：选中后显示操作区域 */}
+
+                      {/* 中阶段操作区：保留但不含专业模式执行面板 */}
                       {selectedMidStageId === mid.id && (
                         <div className="mid-stage-actions">
-                          <button
-                            className="btn-generate-plan"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleGeneratePlan(mid);
-                            }}
-                            disabled={isExecuting || isGeneratingPlan}
-                          >
-                            {isGeneratingPlan ? "⏳ 生成中..." : "📋 生成执行计划"}
-                          </button>
-                          {/* 已生成的计划 */}
-                          {generatedPlan.get(mid.id) && (
-                            <div className="subtask-plan">
+                          {/* Phase B: 执行计划/执行/审批/测试日志已移至 TaskConsole */}
+                          {/* 专业模式 generatedPlan（仅当 subtasks 未持久化时显示） */}
+                          {generatedPlan && generatedPlan.has(mid.id) && (!mid.subtasks || mid.subtasks.length === 0) && (
+                            <div className="subtask-plan" onClick={(e) => e.stopPropagation()}>
                               {generatedPlan.get(mid.id)!.map((st, idx) => (
                                 <div key={st.id} className="subtask-plan-item">
                                   <span>{idx + 1}.</span>
-                                  <span>{st.title}</span>
+                                  <span>{st.title || `小阶段 ${idx + 1}`}</span>
                                 </div>
                               ))}
-                              <button
-                                className="btn-start-execution"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleStartExecution(mid);
-                                }}
-                                disabled={isExecuting}
-                              >
-                                ▶ 开始执行
-                              </button>
-                            </div>
-                          )}
-                          {/* 执行状态面板 */}
-                          {executionStatus && executionStatus.mid_stage_id === mid.id && (
-                            <div className="execution-panel">
-                              <div className="execution-progress">
-                                {executionStatus.subtask_statuses.map(
-                                  (st) => (
-                                    <span
-                                      key={st.subtask_id}
-                                      className="exec-step"
-                                      title={st.title}
-                                    >
-                                      {getSubtaskStatusIcon(st.status)}
-                                    </span>
-                                  )
-                                )}
-                              </div>
-                              <div className="execution-log">
-                                {executionStatus.current_log}
-                              </div>
-                              {executionStatus.status === "Running" && (
-                                <button
-                                  className="btn-pause"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    invoke("pause_execution").catch((err) =>
-                                      console.error("暂停失败:", err)
-                                    );
-                                  }}
-                                >
-                                  ⏸ 暂停
-                                </button>
-                              )}
-                              {executionStatus.status === "Paused" && (
-                                <button
-                                  className="btn-resume"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    invoke("resume_execution").catch((err) =>
-                                      console.error("恢复失败:", err)
-                                    );
-                                  }}
-                                >
-                                  ▶ 恢复
-                                </button>
-                              )}
-                            </div>
-                          )}
-                          {/* 完成后显示测试日志 + 审批 */}
-                          {executionStatus && executionStatus.mid_stage_id === mid.id && executionStatus.status === "Completed" && (
-                            <div className="test-log-section">
-                              <h4>📋 测试日志</h4>
-                              {executionStatus.subtask_statuses.map((st) => (
-                                <div key={st.subtask_id} className="test-log-item">
-                                  <div className="test-log-header">
-                                    <span>{st.test_result?.passed ? "✅" : st.status === "passed" ? "✅" : "❌"}</span>
-                                    <span className="test-log-title">{st.title}</span>
-                                    {st.retry_count > 0 && (
-                                      <span className="retry-badge">重试 {st.retry_count} 次</span>
-                                    )}
-                                  </div>
-                                  {st.test_result && st.test_result.issues.length > 0 && (
-                                    <ul className="test-issues">
-                                      {st.test_result.issues.map((issue, i) => (
-                                        <li key={i}>{issue}</li>
-                                      ))}
-                                    </ul>
-                                  )}
-                                  {st.test_result?.suggestion && (
-                                    <div className="test-suggestion">💡 {st.test_result.suggestion}</div>
-                                  )}
-                                </div>
-                              ))}
-                              {/* 汇总统计 */}
-                              <div className="test-summary">
-                                <span>✅ {executionStatus.subtask_statuses.filter(s => s.status === "passed").length}/{executionStatus.total_subtasks} 通过</span>
-                                <span>🔄 总重试次数：{executionStatus.subtask_statuses.reduce((sum, s) => sum + s.retry_count, 0)}</span>
-                              </div>
-                              {/* 审批按钮 */}
-                              <div className="approval-buttons">
-                                <button className="btn-approve" onClick={() => handleApprove(mid.id)}>✅ 批准</button>
-                                <button className="btn-reject" onClick={() => handleReject(mid.id)}>❌ 驳回</button>
-                                <label className="auto-advance-toggle" title="开启后，批准当前阶段将自动开始执行下一阶段">
-                                  <input
-                                    type="checkbox"
-                                    checked={autoAdvance}
-                                    onChange={(e) => setAutoAdvance(e.target.checked)}
-                                  />
-                                  <span>⚡ 自动推进下一阶段</span>
-                                </label>
-                              </div>
                             </div>
                           )}
                           {/* 小阶段列表（已完成的中阶段显示，含回退按钮） */}
@@ -854,6 +552,7 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
           ))}
         </ul>
       )}
+
       {/* ===== 回退确认弹窗 ===== */}
       <Modal
         isOpen={rollbackTarget !== null}
@@ -945,93 +644,6 @@ function ExecutionTree({ milestones, onSelectMilestone, onVersionEdit, onGenerat
         </div>
       </Modal>
 
-      {/* ===== 质检驳回弹窗 ===== */}
-      <Modal
-        isOpen={qaModalData !== null}
-        onClose={() => setQaModalData(null)}
-        title="需求质检结果"
-      >
-        <div style={{ padding: '16px' }}>
-          <p style={{ fontWeight: 600, marginBottom: '8px' }}>质检员发现以下问题：</p>
-          <p style={{ color: '#e74c3c', marginBottom: '16px' }}>{qaModalData?.qaResult.reason}</p>
-
-          {qaModalData?.qaResult.details && qaModalData.qaResult.details.length > 0 && (
-            <>
-              <p style={{ fontWeight: 600, marginBottom: '8px' }}>详细偏差：</p>
-              {qaModalData.qaResult.details.map((detail, idx) => (
-                <div key={idx} style={{ marginBottom: '8px', paddingLeft: '8px', borderLeft: '3px solid #e74c3c' }}>
-                  <p style={{ margin: 0 }}>[{detail.issue_type}] {detail.description}</p>
-                  <p style={{ margin: 0, color: '#888', fontSize: '13px' }}>关联需求：{detail.related_requirement}</p>
-                </div>
-              ))}
-            </>
-          )}
-
-          {qaModalData?.qaResult.attention_points && qaModalData.qaResult.attention_points.length > 0 && (
-            <>
-              <p style={{ fontWeight: 600, marginBottom: '8px', marginTop: '16px' }}>需特别关注的要点：</p>
-              {qaModalData.qaResult.attention_points.map((point, idx) => (
-                <p key={idx} style={{ margin: '4px 0', paddingLeft: '8px' }}>· {point}</p>
-              ))}
-            </>
-          )}
-
-          <hr style={{ margin: '16px 0', border: 'none', borderTop: '1px solid #eee' }} />
-          <p style={{ fontWeight: 600, marginBottom: '12px' }}>你希望怎么处理？</p>
-          <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
-            <button
-              onClick={() => setQaModalData(null)}
-              style={{
-                padding: '6px 16px',
-                border: '1px solid #ccc',
-                borderRadius: '4px',
-                background: '#fff',
-                cursor: 'pointer',
-              }}
-            >
-              ✅ 无视，继续推进
-            </button>
-            <button
-              onClick={async () => {
-                if (isSubmitting) return;
-                setIsSubmitting(true);
-                const reason = qaModalData?.qaResult.reason ?? '';
-                const details = qaModalData?.qaResult.details;
-                let feedback = reason;
-                if (details && details.length > 0) {
-                  const detailsText = details
-                    .map((d) => `[${d.issue_type}] ${d.description}（关联需求：${d.related_requirement}）`)
-                    .join('\n');
-                  feedback = `${reason}\n\n具体偏差：\n${detailsText}`;
-                }
-                try {
-                  if (onRegenerateMilestones) {
-                    await onRegenerateMilestones(feedback);
-                  }
-                  setQaModalData(null);
-                } catch (err) {
-                  console.error("重新拆解失败：", err);
-                  alert("重新拆解失败：" + err);
-                } finally {
-                  setIsSubmitting(false);
-                }
-              }}
-              disabled={isSubmitting}
-              style={{
-                padding: '6px 16px',
-                border: 'none',
-                borderRadius: '4px',
-                background: isSubmitting ? '#c0392b' : '#e74c3c',
-                color: '#fff',
-                cursor: isSubmitting ? 'not-allowed' : 'pointer',
-                opacity: isSubmitting ? 0.7 : 1,
-              }}
-            >
-              {isSubmitting ? "⏳ 正在重新拆解..." : "🔄 采纳意见，重新拆解"}
-            </button>
-          </div>
-        </div>
-      </Modal>
       {/* ===== 宪法查看弹窗 ===== */}
       {constitutionModalOpen && (
         <div
