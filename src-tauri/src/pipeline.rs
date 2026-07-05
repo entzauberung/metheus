@@ -5,6 +5,9 @@ use crate::project;
 use crate::AppState;
 use crate::check_project_path;
 
+/// 快速模式 Git tag 前缀，避免与专业模式的 metheus/auto/ 冲突
+const QUICK_TAG_PREFIX: &str = "metheus/q/";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PipelineStatus {
     Idle,
@@ -32,6 +35,9 @@ pub struct PipelineState {
     pub subtask_statuses: Vec<SubtaskStatusItem>,
     pub current_log: String,
     pub last_error: Option<String>,
+    /// 当前正在运行的子进程 PID，用于 stop_execution 快速终止
+    #[serde(default)]
+    pub child_pid: Option<u32>,
 }
 
 
@@ -41,7 +47,8 @@ pub(crate) async fn start_execution(
     state: tauri::State<'_, AppState>,
     project_id: String,
     project_path: String,
-    mid_stage_id: String,
+    stage_identifier: String,
+    is_quick_mode: bool,
     mid_stage_title: String,
     mid_stage_description: String,
     subtasks_json: String,
@@ -89,7 +96,7 @@ pub(crate) async fn start_execution(
     {
         let mut guard = pipeline_state.lock().await;
         *guard = Some(PipelineState {
-            mid_stage_id: mid_stage_id.clone(),
+            mid_stage_id: stage_identifier.clone(),
             status: PipelineStatus::Running,
             current_subtask_index: 0,
             total_subtasks: subtasks.len(),
@@ -105,21 +112,37 @@ pub(crate) async fn start_execution(
                 .collect(),
             current_log: "🚀 流水线已启动".to_string(),
             last_error: None,
+            child_pid: None,
         });
     }
     // 启动后台任务：
-    // 用 tokio::spawn 启动一个异步任务，调用 execute_mid_stage_pipeline 真正去执行这些子任务
+    // 用 tokio::spawn 启动一个异步任务，根据模式调用不同的流水线执行函数
+    let stage_id = stage_identifier.clone();
+    let project_id_clone = project_id.clone();
     tokio::spawn(async move {
-        let result = execute_mid_stage_pipeline(
-            project_id.clone(),
-            mid_stage_id.clone(),
-            project_path,
-            subtasks,
-            mid_stage_title,
-            mid_stage_description,
-            pipeline_state.clone(),
-        )
-        .await;
+        let result = if is_quick_mode {
+            execute_quick_pipeline(
+                project_id_clone,
+                stage_id,
+                project_path,
+                subtasks,
+                mid_stage_title,
+                mid_stage_description,
+                pipeline_state.clone(),
+            )
+            .await
+        } else {
+            execute_mid_stage_pipeline(
+                project_id_clone,
+                stage_id,
+                project_path,
+                subtasks,
+                mid_stage_title,
+                mid_stage_description,
+                pipeline_state.clone(),
+            )
+            .await
+        };
         if let Err(e) = result {
             let mut guard = pipeline_state.lock().await;
             // 捕获失败：如果后台任务执行失败，会将全局状态中的流水线标记为 Failed，并记录错误日志
@@ -176,19 +199,43 @@ pub(crate) async fn resume_execution(state: tauri::State<'_, AppState>) -> Resul
 /// 停止流水线执行
 #[tauri::command]
 pub(crate) async fn stop_execution(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let mut guard = state.pipeline_state.lock().await;
-    match guard.as_mut() {
-        Some(s) => {
-            s.status = PipelineStatus::Failed;
-            s.last_error = Some("用户手动停止".to_string());
-            s.current_log = "⏹ 已停止".to_string();
-            Ok(())
+    let child_pid = {
+        let mut guard = state.pipeline_state.lock().await;
+        match guard.as_mut() {
+            Some(s) => {
+                s.status = PipelineStatus::Failed;
+                s.last_error = Some("用户手动停止".to_string());
+                s.current_log = "⏹ 已停止".to_string();
+                let pid = s.child_pid.take();
+                s.child_pid = None;
+                pid
+            }
+            None => {
+                // 没有活跃执行，幂等返回成功
+                return Ok(());
+            }
         }
-        None => {
-            // 没有活跃执行，幂等返回成功
-            Ok(())
+    };
+
+    // 尝试通过 PID 立即终止子进程（轮询循环也会检测到 Failed 状态作为安全网）
+    if let Some(pid) = child_pid {
+        let pid_str = pid.to_string();
+        // Unix: 发送 SIGKILL；Windows: TerminateProcess
+        #[cfg(unix)]
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid_str])
+                .output();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/PID", &pid_str])
+                .output();
         }
     }
+
+    Ok(())
 }
 
 
@@ -228,21 +275,19 @@ pub(crate) async fn execute_mid_stage_pipeline(
 
     // 提前从 project 文件中提取 mid_stage_version（避免只在函数末尾获取）
     {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let project_file = std::path::Path::new(&home)
-            .join(".metheus")
-            .join(format!("{}.json", project_id));
-        if let Ok(content) = std::fs::read_to_string(&project_file) {
-            if let Ok(project) = serde_json::from_str::<project::Project>(&content) {
-                for milestone in &project.milestones {
-                    for mid_stage in &milestone.mid_stages {
-                        if mid_stage.id == mid_stage_id {
-                            mid_stage_version = mid_stage.version.clone();
+        if let Ok(project_file) = crate::project_data_path(&project_id) {
+            if let Ok(content) = std::fs::read_to_string(&project_file) {
+                if let Ok(project) = serde_json::from_str::<project::Project>(&content) {
+                    for milestone in &project.milestones {
+                        for mid_stage in &milestone.mid_stages {
+                            if mid_stage.id == mid_stage_id {
+                                mid_stage_version = mid_stage.version.clone();
+                                break;
+                            }
+                        }
+                        if !mid_stage_version.is_empty() {
                             break;
                         }
-                    }
-                    if !mid_stage_version.is_empty() {
-                        break;
                     }
                 }
             }
@@ -595,33 +640,31 @@ pub(crate) async fn execute_mid_stage_pipeline(
     // 流水线跑完后，找到项目文件里对应的那个"中阶段"（MidStage），
     // 把每个子任务的执行结果、测试结果、重试次数填进去，
     // 然后把中阶段状态改成 "completed"，最后保存文件
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let project_file = std::path::Path::new(&home)
-        .join(".metheus")
-        .join(format!("{}.json", project_id));
-    if let Ok(content) = std::fs::read_to_string(&project_file) {
-        if let Ok(mut project) = serde_json::from_str::<project::Project>(&content) {
-            // 找到对应的 MidStage，更新结果
-            for milestone in &mut project.milestones {
-                for mid_stage in &mut milestone.mid_stages {
-                    if mid_stage.id == mid_stage_id {
-                        mid_stage_version = mid_stage.version.clone();
-                        for (i, subtask) in mid_stage.subtasks.iter_mut().enumerate() {
-                            if i < subtasks.len() {
-                                subtask.execution_result = subtasks[i].execution_result.clone();
-                                subtask.test_result = subtasks[i].test_result.clone();
-                                subtask.retry_count = subtasks[i].retry_count;
-                                subtask.auto_tag = subtasks[i].auto_tag.clone();
+    if let Ok(project_file) = crate::project_data_path(&project_id) {
+        if let Ok(content) = std::fs::read_to_string(&project_file) {
+            if let Ok(mut project) = serde_json::from_str::<project::Project>(&content) {
+                // 找到对应的 MidStage，更新结果
+                for milestone in &mut project.milestones {
+                    for mid_stage in &mut milestone.mid_stages {
+                        if mid_stage.id == mid_stage_id {
+                            mid_stage_version = mid_stage.version.clone();
+                            for (i, subtask) in mid_stage.subtasks.iter_mut().enumerate() {
+                                if i < subtasks.len() {
+                                    subtask.execution_result = subtasks[i].execution_result.clone();
+                                    subtask.test_result = subtasks[i].test_result.clone();
+                                    subtask.retry_count = subtasks[i].retry_count;
+                                    subtask.auto_tag = subtasks[i].auto_tag.clone();
+                                }
                             }
+                            mid_stage.status = project::MidStageStatus::Completed;
+                            break;
                         }
-                        mid_stage.status = project::MidStageStatus::Completed;
-                        break;
                     }
                 }
-            }
-            // 保存
-            if let Ok(json) = serde_json::to_string_pretty(&project) {
-                let _ = std::fs::write(&project_file, json);
+                // 保存
+                if let Ok(json) = serde_json::to_string_pretty(&project) {
+                    let _ = std::fs::write(&project_file, json);
+                }
             }
         }
     }
@@ -634,5 +677,404 @@ pub(crate) async fn execute_mid_stage_pipeline(
     )
     .await?;
     crate::git_ops::save_tag_to_mid_stage(&project_id, &mid_stage_id, &tag_name)?;
+    Ok(())
+}
+
+/// 快速模式流水线：直接执行大阶段的子任务（跳过中阶段）
+///
+/// 与专业模式 `execute_mid_stage_pipeline` 的区别：
+/// 1. 使用大阶段 version 而非中阶段 version 打 tag
+/// 2. Git tag 使用 `metheus/q/` 前缀，避免与专业模式冲突
+/// 3. 完成后将结果写回 milestone.subtasks 而非 mid_stage.subtasks
+pub(crate) async fn execute_quick_pipeline(
+    project_id: String,
+    milestone_version: String,
+    project_path: String,
+    mut subtasks: Vec<project::Subtask>,
+    milestone_title: String,
+    milestone_description: String,
+    state: Arc<Mutex<Option<PipelineState>>>,
+) -> Result<(), String> {
+    let mut previous_result = String::new();
+    let mut previous_title = String::new();
+    let mut file_changes: Vec<String> = vec![];
+    let mut last_test_result = String::new();
+
+    for i in 0..subtasks.len() {
+        let subtask_title = subtasks[i].title.clone();
+        let subtask_id = subtasks[i].id.clone();
+        let mut retry_count = 0u32;
+        let max_retries = 3u32;
+
+        // 标记当前子任务为 "executing"
+        {
+            let mut guard = state.lock().await;
+            if let Some(s) = guard.as_mut() {
+                s.current_subtask_index = i;
+                if i > 0 {
+                    s.subtask_statuses[i - 1].status = "passed".to_string();
+                }
+                s.subtask_statuses[i].status = "executing".to_string();
+                s.current_log =
+                    format!("▶ 执行中 ({}/{})：{}", i + 1, subtasks.len(), subtask_title);
+            }
+        }
+
+        while retry_count < max_retries {
+            // 暂停检查
+            {
+                let guard = state.lock().await;
+                if let Some(s) = guard.as_ref() {
+                    if s.status == PipelineStatus::Paused {
+                        drop(guard);
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            let guard2 = state.lock().await;
+                            if let Some(s2) = guard2.as_ref() {
+                                if s2.status != PipelineStatus::Paused {
+                                    if s2.status == PipelineStatus::Failed {
+                                        return Err("流水线已被取消".to_string());
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 生成 prompt
+            let generated = crate::commands::milestone::generate_next_prompt(
+                milestone_title.clone(),
+                milestone_description.clone(),
+                previous_title.clone(),
+                previous_result.clone(),
+                file_changes.clone(),
+                last_test_result.clone(),
+                retry_count > 0,
+                if retry_count > 0 {
+                    last_test_result.clone()
+                } else {
+                    String::new()
+                },
+            )
+            .await?;
+
+            // 更新日志
+            {
+                let mut guard = state.lock().await;
+                if let Some(s) = guard.as_mut() {
+                    s.current_log = format!("⚙️ {}", generated.title);
+                }
+            }
+
+            // 执行子任务
+            let exec_result = match crate::executor::execute_subtask_inner(
+                &project_path,
+                &generated.prompt,
+                &subtask_id,
+                state.clone(),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(project::SubTaskError::UserPaused) => {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        let guard = state.lock().await;
+                        if let Some(s) = guard.as_ref() {
+                            if s.status != PipelineStatus::Paused {
+                                if s.status == PipelineStatus::Failed {
+                                    return Err("流水线已被取消".to_string());
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    let msg = match e {
+                        project::SubTaskError::ExecutionFailed { message } => message,
+                        project::SubTaskError::Timeout => "执行超时".to_string(),
+                        _ => format!("{:?}", e),
+                    };
+                    return Err(format!("Claude Code 执行失败：{}", msg));
+                }
+            };
+            subtasks[i].execution_result = Some(exec_result.clone());
+            file_changes = exec_result.file_changes.clone();
+
+            // 记录执行结果
+            {
+                let mut guard = state.lock().await;
+                if let Some(s) = guard.as_mut() {
+                    if exec_result.success {
+                        s.current_log = format!(
+                            "✅ 完成: {} (变更 {} 个文件)",
+                            subtask_title,
+                            file_changes.len()
+                        );
+                    } else {
+                        s.current_log = format!(
+                            "❌ 失败: {} — {}",
+                            subtask_title,
+                            exec_result.error_log.chars().take(100).collect::<String>()
+                        );
+                    }
+                }
+            }
+
+            if !exec_result.success {
+                return Err(format!("Claude Code 执行失败：{}", exec_result.error_log));
+            }
+
+            // 运行测试
+            {
+                let mut guard = state.lock().await;
+                if let Some(s) = guard.as_mut() {
+                    s.subtask_statuses[i].status = "testing".to_string();
+                    s.current_log = format!("🔍 测试: {}", subtask_title);
+                }
+            }
+
+            let test = match crate::test_runner::check_subtask(
+                &project_path,
+                &generated.prompt,
+                &subtask_id,
+                &subtask_title,
+                &milestone_version,
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(err) => project::TestResult {
+                    passed: false,
+                    issues: vec![format!("测试服务不可用: {}", err)],
+                    suggestion: "请手动检查".to_string(),
+                    warnings: vec![],
+                },
+            };
+
+            last_test_result = if test.passed {
+                "通过".to_string()
+            } else if test.issues.is_empty() {
+                "不通过（测试工程师未提供具体问题）".to_string()
+            } else {
+                let issues_text = test
+                    .issues
+                    .iter()
+                    .map(|issue| format!("- {}", issue))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let full = format!("不通过。具体问题：\n{}", issues_text);
+                if full.chars().count() > 1000 {
+                    format!("{}…（已截断）", full.chars().take(1000).collect::<String>())
+                } else {
+                    full
+                }
+            };
+
+            if test.passed {
+                {
+                    let mut guard = state.lock().await;
+                    if let Some(s) = guard.as_mut() {
+                        s.subtask_statuses[i].status = "passed".to_string();
+                        s.subtask_statuses[i].test_result = Some(test.clone());
+                        s.current_log = format!("✅ 通过: {}", subtask_title);
+                    }
+                }
+                previous_result = "通过".to_string();
+                previous_title = subtask_title.clone();
+                subtasks[i].test_result = Some(test);
+                subtasks[i].retry_count = retry_count;
+
+                // === 宪法更新链（与专业模式相同） ===
+                let mut constitution_updated = false;
+                let mut old_constitution = String::new();
+                match std::process::Command::new("git")
+                    .args(["diff", "HEAD"])
+                    .current_dir(&project_path)
+                    .output()
+                {
+                    Ok(output) => {
+                        let diff_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                        let diff_summary = crate::diff::extract_diff_summary(&diff_stdout);
+                        if diff_summary.new_files.is_empty()
+                            && diff_summary.modified_files.is_empty()
+                            && diff_summary.deleted_files.is_empty()
+                            && diff_summary.new_functions.is_empty()
+                            && diff_summary.modified_functions.is_empty()
+                            && diff_summary.deleted_functions.is_empty()
+                            && diff_summary.changed_dependencies.is_empty()
+                        {
+                            eprintln!("[constitution] 宪法更新跳过（无变更）");
+                        } else {
+                            let constitution_path =
+                                std::path::Path::new(&project_path).join("CONSTITUTION.md");
+                            let constitution_content =
+                                std::fs::read_to_string(&constitution_path).unwrap_or_default();
+                            old_constitution = constitution_content.clone();
+                            match crate::constitution::update_constitution(
+                                constitution_content.clone(),
+                                diff_summary,
+                            )
+                            .await
+                            {
+                                Ok(updated_content) => {
+                                    if let Err(e) =
+                                        std::fs::write(&constitution_path, &updated_content)
+                                    {
+                                        eprintln!("[constitution] 写入 CONSTITUTION.md 失败：{}", e);
+                                    } else {
+                                        constitution_updated = true;
+                                        if let Some(part2_start) =
+                                            updated_content.find("## 第 2 部分")
+                                        {
+                                            let part2 = &updated_content[part2_start..];
+                                            if crate::constitution::estimate_tokens(part2)
+                                                > crate::constants::COMPACTION_TRIGGER_TOKENS
+                                            {
+                                                match crate::constitution::compact_constitution(
+                                                    updated_content.clone(),
+                                                )
+                                                .await
+                                                {
+                                                    Ok(compacted) => {
+                                                        if let Err(e) = std::fs::write(
+                                                            &constitution_path,
+                                                            &compacted,
+                                                        ) {
+                                                            eprintln!(
+                                                                "[constitution] 写入剪枝后宪法失败：{}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!(
+                                                            "[constitution] 宪法剪枝失败，保留膨胀版本：{}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[constitution] 宪法更新失败：{}", e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[constitution] git diff 失败，跳过宪法更新：{}", e);
+                    }
+                }
+
+                // === git_save_subtask（快速模式 tag 前缀） ===
+                match crate::git_ops::git_save_subtask_inner(
+                    project_path.clone(),
+                    (i + 1) as u32,
+                    milestone_version.clone(),
+                    subtask_title.clone(),
+                    true, // is_quick_mode
+                )
+                .await
+                {
+                    Ok(tag_name) => {
+                        subtasks[i].auto_tag = Some(tag_name);
+                    }
+                    Err(e) => {
+                        eprintln!("[constitution] git_save_subtask 失败：{}", e);
+                        if constitution_updated {
+                            let constitution_path =
+                                std::path::Path::new(&project_path).join("CONSTITUTION.md");
+                            if let Err(e2) = std::fs::write(&constitution_path, &old_constitution) {
+                                eprintln!(
+                                    "[constitution] 宪法回退写入也失败，宪法可能处于不一致状态：{}",
+                                    e2
+                                );
+                            } else {
+                                eprintln!(
+                                    "[constitution] git_save_subtask 失败，宪法已回退到更新前状态"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                break;
+            } else {
+                retry_count += 1;
+                subtasks[i].retry_count = retry_count;
+                {
+                    let mut guard = state.lock().await;
+                    if let Some(s) = guard.as_mut() {
+                        s.subtask_statuses[i].status = "retrying".to_string();
+                        s.subtask_statuses[i].retry_count = retry_count;
+                        s.current_log = format!(
+                            "🔄 重试 {}/{}: {}",
+                            retry_count, max_retries, subtask_title
+                        );
+                    }
+                }
+                if retry_count >= max_retries {
+                    return Err(format!(
+                        "小阶段「{}」重试 {} 次仍未通过",
+                        subtask_title, max_retries
+                    ));
+                }
+            }
+        }
+    }
+
+    // 全部完成
+    {
+        let mut guard = state.lock().await;
+        if let Some(s) = guard.as_mut() {
+            s.status = PipelineStatus::Completed;
+            if let Some(last) = s.subtask_statuses.last_mut() {
+                last.status = "passed".to_string();
+            }
+            s.current_log = "✅ 所有小阶段执行完成！".to_string();
+        }
+    }
+
+    // 写回 project 文件：更新 milestone.subtasks
+    if let Ok(project_file) = crate::project_data_path(&project_id) {
+        if let Ok(content) = std::fs::read_to_string(&project_file) {
+            if let Ok(mut project) = serde_json::from_str::<project::Project>(&content) {
+                for milestone in &mut project.milestones {
+                    if milestone.version == milestone_version {
+                        for (i, subtask) in milestone.subtasks.iter_mut().enumerate() {
+                            if i < subtasks.len() {
+                                subtask.execution_result = subtasks[i].execution_result.clone();
+                                subtask.test_result = subtasks[i].test_result.clone();
+                                subtask.retry_count = subtasks[i].retry_count;
+                                subtask.auto_tag = subtasks[i].auto_tag.clone();
+                            }
+                        }
+                        milestone.status = project::MilestoneStatus::Completed;
+                        break;
+                    }
+                }
+                if let Ok(json) = serde_json::to_string_pretty(&project) {
+                    let _ = std::fs::write(&project_file, json);
+                }
+            }
+        }
+    }
+
+    // === 全部小阶段完成，自动 Git 存档（快速模式节点 tag） ===
+    let _tag_name = format!("{}{}", QUICK_TAG_PREFIX, milestone_version);
+    crate::git_ops::git_save_node(
+        project_path.to_string(),
+        format!("q/{}", milestone_version),
+        milestone_title.to_string(),
+    )
+    .await?;
+
     Ok(())
 }

@@ -1,16 +1,19 @@
-use std::env;
 use crate::project;
+use std::env;
 
 #[tauri::command]
 pub(crate) fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+/// 把前端发的消息，转交给api，之后把ai的原回复原封不动的拿回来
 #[tauri::command]
 pub(crate) async fn send_message(message: String) -> Result<String, String> {
     let api_key = env::var("API_KEY").map_err(|_| "API_KEY 环境变量未设置".to_string())?;
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(crate::constants::DEEPSEEK_API_TIMEOUT_SECS))
+        .timeout(std::time::Duration::from_secs(
+            crate::constants::DEEPSEEK_API_TIMEOUT_SECS,
+        ))
         .build()
         .unwrap_or_else(|e| {
             eprintln!(

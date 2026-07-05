@@ -21,6 +21,7 @@ interface Props {
   projectId?: string;
 
   // === Phase B: 从 App.tsx 传入的状态和回调 ===
+  selectedMilestoneId: string | null;
   selectedMidStageId: string | null;
   onSelectMidStage: (id: string | null) => void;
   quickGeneratedPlan: Map<string, Subtask[]>;
@@ -40,6 +41,7 @@ function ExecutionTree({
   onRegenerateMilestones,
   projectPath,
   projectId,
+  selectedMilestoneId,
   selectedMidStageId,
   onSelectMidStage,
   quickGeneratedPlan,
@@ -251,7 +253,8 @@ function ExecutionTree({
           {milestones.map((ms) => (
             <li
               key={ms.id}
-              className="tree-item"
+              className={`tree-item${selectedMilestoneId === ms.id ? " selected" : ""}`}
+              style={selectedMilestoneId === ms.id ? { borderLeft: '3px solid #4a90d9', backgroundColor: '#f0f7ff' } : undefined}
               onClick={() => onSelectMilestone(ms.id)}
             >
               {/* 大阶段头部 */}

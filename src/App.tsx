@@ -18,6 +18,24 @@ const DEFAULT_SIDEBAR_WIDTH = 280;
 const MIN_SIDEBAR_WIDTH = 220;
 const MAX_SIDEBAR_WIDTH = 800;
 
+// ============================================================
+// App.tsx — 「弥」的前端总指挥
+//
+// 职责：
+// 1. 管理所有核心状态（项目数据、模式切换、执行状态）
+// 2. 协调“讨论模式”和“执行模式”的动态切换（带动画过渡）
+// 3. 与 Rust 后端通信（通过 Tauri invoke）
+// 4. 轮询执行状态，实时更新界面
+// 5. 提供测试面板，方便开发阶段验证后端命令
+//
+// 子组件分工：
+// - ExecutionTree → 任务树展示与交互
+// - ChatRoom → AI 角色对话
+// - TaskConsole → 执行进度与日志
+// - FileTree → 项目文件树
+// - FloatingChatBalloon → 执行模式下的快捷聊天入口
+// ============================================================
+
 function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [projectPath, setProjectPath] = useState<string>("");
@@ -31,6 +49,9 @@ function App() {
   // Phase D: 动画控制
   const [animatingComponent, setAnimatingComponent] = useState<'chatroom' | 'taskconsole' | null>(null);
   const animationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // 测试日志去重：记录已处理过的子任务 ID
+  const processedSubtaskIdsRef = useRef<Set<string>>(new Set());
 
   // === 侧边栏拖拽缩放 ===
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
@@ -120,6 +141,7 @@ function App() {
   }, [isDragging, handleResizeMouseMove, handleResizeMouseUp]);
 
   // === Phase B：从 ExecutionTree 提升的 9 个状态 ===
+  const [selectedMilestoneId, setSelectedMilestoneId] = useState<string | null>(null);
   const [selectedMidStageId, setSelectedMidStageId] = useState<string | null>(null);
   const [generatedPlan, setGeneratedPlan] = useState<Map<string, Subtask[]>>(new Map());
   const [quickGeneratedPlan, setQuickGeneratedPlan] = useState<Map<string, Subtask[]>>(new Map());
@@ -131,7 +153,32 @@ function App() {
   const [_autoAdvance, _setAutoAdvance] = useState(false);
   const [qaModalData, setQaModalData] = useState<{ milestoneId: string; qaResult: QAResult } | null>(null);
   const [isSubmitting, _setIsSubmitting] = useState(false);
-  const [testLogs, _setTestLogs] = useState<TestLog[]>([]);
+  const [testLogs, setTestLogs] = useState<TestLog[]>([]);
+
+  // === 快照：保存 UI 状态到后端，用于刷新恢复和孤儿进程保护 ===
+  const takeSnapshot = () => {
+    if (!project) return;
+    const snapshotUi = {
+      view_phase: viewMode.phase,
+      selected_milestone_id: selectedMilestoneId ?? null,
+      selected_mid_stage_id: selectedMidStageId ?? null,
+      generated_plan_keys: Array.from(generatedPlan.keys()),
+      quick_generated_plan_keys: Array.from(quickGeneratedPlan.keys()),
+      saved_at: new Date().toISOString(),
+    };
+    invokeWithTimeout("save_snapshot_event", {
+      projectId: project.name,
+      uiJson: JSON.stringify(snapshotUi),
+    }).catch(err => console.warn("快照保存失败:", err));
+  };
+
+  // 自动快照：关键 UI 状态变更后持久化（React 18 自动批处理，一次用户操作只触发一次）
+  useEffect(() => {
+    if (!project) return;
+    takeSnapshot();
+    // takeSnapshot 通过闭包读取最新 state，不放入 deps 以避免循环
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project, viewMode.phase, selectedMilestoneId, selectedMidStageId, generatedPlan, quickGeneratedPlan]);
 
   // Phase B: 执行状态轮询 + 自动阶段切换
   useEffect(() => {
@@ -141,6 +188,38 @@ function App() {
       try {
         const status = await invokeWithTimeout<PipelineState | null>("get_execution_status");
         setExecutionStatus(status);
+
+        // 执行中定期刷新快照，确保 running_pid（孤儿进程保护用）保持最新
+        takeSnapshot();
+
+        // 从执行状态中提取测试日志（去重）
+        if (status && status.subtask_statuses) {
+          const newLogs: TestLog[] = [];
+          for (const item of status.subtask_statuses) {
+            if (processedSubtaskIdsRef.current.has(item.subtask_id)) continue;
+            if (item.test_result && (item.status === "passed" || item.status === "retrying")) {
+              processedSubtaskIdsRef.current.add(item.subtask_id);
+              const tr = item.test_result;
+              let reason: string;
+              if (tr.passed && (!tr.issues || tr.issues.length === 0)) {
+                reason = "通过测试";
+              } else if (!tr.passed) {
+                reason = "不通过: " + (tr.suggestion || "未提供建议");
+              } else {
+                reason = (tr.issues || []).join("\n");
+              }
+              newLogs.push({
+                subtask_title: item.title,
+                status: item.status === "retrying" ? "retried" : "passed",
+                reason,
+                full_report: tr.suggestion || undefined,
+              });
+            }
+          }
+          if (newLogs.length > 0) {
+            setTestLogs((prev) => [...prev, ...newLogs]);
+          }
+        }
 
         if (status) {
           if (status.status === "Paused") {
@@ -192,6 +271,47 @@ function App() {
         if (project && project.project_path) {
           setProjectPath(project.project_path);
         }
+        // 从持久化数据恢复执行计划到内存 Map，使刷新后「开始执行」按钮仍可见
+        if (project && project.milestones) {
+          setQuickGeneratedPlan((prev) => {
+            const next = new Map(prev);
+            for (const ms of project.milestones) {
+              if (ms.subtasks && ms.subtasks.length > 0) {
+                next.set(ms.id, ms.subtasks);
+              }
+            }
+            return next;
+          });
+          setGeneratedPlan((prev) => {
+            const next = new Map(prev);
+            for (const ms of project.milestones) {
+              for (const mid of ms.mid_stages) {
+                if (mid.subtasks && mid.subtasks.length > 0) {
+                  next.set(mid.id, mid.subtasks);
+                }
+              }
+            }
+            return next;
+          });
+        }
+        // 恢复 UI 状态快照（视图模式、选中阶段等）
+        return invokeWithTimeout<any>("restore_snapshot", { projectId: project.name });
+      })
+      .then((snapshot) => {
+        if (snapshot && snapshot.ui) {
+          const ui = snapshot.ui;
+          // 恢复视图模式（跳过动画，直接设置）
+          if (ui.view_phase === 'execution') {
+            setViewMode({ phase: 'execution', reason: 'active' });
+          }
+          // 恢复选中状态
+          if (ui.selected_milestone_id) {
+            setSelectedMilestoneId(ui.selected_milestone_id);
+          }
+          if (ui.selected_mid_stage_id) {
+            setSelectedMidStageId(ui.selected_mid_stage_id);
+          }
+        }
       })
       .catch((err) => {
         console.error("获取项目失败:", err);
@@ -201,7 +321,16 @@ function App() {
   }, []);
 
   const handleSelectMilestone = (id: string) => {
-    console.log("selected:", id);
+    // 点击已选中大阶段 → 幂等保持（不取消选中）
+    if (selectedMilestoneId === id) return;
+    setSelectedMilestoneId(id);
+    // 自动选中该大阶段的第一个中阶段（专业模式）
+    if (project) {
+      const ms = project.milestones.find(m => m.id === id);
+      if (ms && ms.mid_stages.length > 0) {
+        setSelectedMidStageId(ms.mid_stages[0].id);
+      }
+    }
   };
   //生成版本方案
   const handleGeneratePlan = async () => {
@@ -249,7 +378,10 @@ function App() {
   const handleReject = () => {
     if (!project) return;
     //直接把方案清空
-    setProject({ ...project, version_plan: "", status: "Discussing" });
+    const updatedProject = { ...project, version_plan: "", status: "Discussing" as const };
+    setProject(updatedProject);
+    invokeWithTimeout("persist_project", { projectJson: JSON.stringify(updatedProject) })
+      .catch(err => console.error("持久化驳回方案失败:", err));
   }
 
   //根据版本方案拆解大阶段
@@ -302,6 +434,8 @@ function App() {
     );
     const updatedProject = { ...project, milestones: updatedMilestones };
     setProject(updatedProject);
+    invokeWithTimeout("persist_project", { projectJson: JSON.stringify(updatedProject) })
+      .catch(err => console.error("持久化版本编辑失败:", err));
   };
 
   //点拆解中阶段，调后端拆解子阶段，更新到项目状态中
@@ -343,7 +477,13 @@ function App() {
         mode: project.mode,
         feedback: feedback,
       });
-      setProject({ ...project, status: "MilestoneReady", milestones: newMilestones as any[] });
+      const updatedProject = { ...project, status: "MilestoneReady" as const, milestones: newMilestones as any[] };
+      setProject(updatedProject);
+      try {
+        await invokeWithTimeout("persist_project", { projectJson: JSON.stringify(updatedProject) });
+      } catch (saveErr) {
+        console.error("持久化重新拆解失败:", saveErr);
+      }
     } catch (err) {
       console.error("重新拆解失败：", err);
       alert("重新拆解失败：" + err);
@@ -421,12 +561,14 @@ function App() {
       await invokeWithTimeout("start_execution", {
         projectId: project?.name ?? "",
         projectPath: projectPath,
-        midStageId: milestone.id,
+        stageIdentifier: milestone.version,
+        isQuickMode: true,
         midStageTitle: milestone.title,
         midStageDescription: milestone.description,
         subtasksJson: JSON.stringify(plan),
       });
       setIsExecuting(true);
+      enterExecutionMode();
     } catch (e) {
       console.error("快速模式启动执行失败:", e);
     }
@@ -515,12 +657,14 @@ function App() {
       await invokeWithTimeout("start_execution", {
         projectId: project?.name ?? "",
         projectPath: projectPath,
-        midStageId: midStageId,
+        stageIdentifier: midStageId,
+        isQuickMode: false,
         midStageTitle: mid?.title ?? midStageId,
         midStageDescription: mid?.description ?? "",
         subtasksJson: JSON.stringify(plan),
       });
       setIsExecuting(true);
+      enterExecutionMode();
     } catch (e) {
       console.error("启动执行失败:", e);
     }
@@ -535,7 +679,7 @@ function App() {
         id: Date.now().toString(),
         role: 'system',
         content: '⏸️ 执行已暂停。讨论修改方向后，点击恢复执行。',
-        timestamp: new Date().toISOString(),
+        timestamp: Date.now(),
       });
       enterDiscussionMode('paused');
     } catch (e) {
@@ -566,7 +710,7 @@ function App() {
       id: Date.now().toString(),
       role: 'system',
       content: '⏹️ 执行已被用户停止。可重新生成执行计划或返回讨论。',
-      timestamp: new Date().toISOString(),
+      timestamp: Date.now(),
     });
     enterDiscussionMode('paused');
   };
@@ -611,6 +755,7 @@ function App() {
           projectPath={projectPath}
           projectId={project.name}
           // Phase B: 从 App.tsx 传入的提升状态
+          selectedMilestoneId={selectedMilestoneId}
           selectedMidStageId={selectedMidStageId}
           onSelectMidStage={setSelectedMidStageId}
           quickGeneratedPlan={quickGeneratedPlan}

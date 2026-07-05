@@ -1,5 +1,4 @@
 use crate::project;
-use dirs;
 use serde_json;
 
 /// 在项目目录下执行 git add . → git commit --allow-empty → git tag -f
@@ -63,7 +62,8 @@ pub(crate) async fn git_save_node(
 /// 小阶段 Git 存档命令
 ///
 /// 在项目目录下执行 git add . → git commit --allow-empty → git tag -f
-/// tag 格式：metheus/auto/{mid_stage_version}/task-{subtask_index}
+/// 专业模式 tag 格式：metheus/auto/{mid_stage_version}/task-{subtask_index}
+/// 快速模式 tag 格式：metheus/q/{milestone_version}/task-{subtask_index}
 /// 返回 tag 名，调用方可写回 Subtask.auto_tag
 #[tauri::command]
 pub(crate) async fn git_save_subtask(
@@ -71,6 +71,17 @@ pub(crate) async fn git_save_subtask(
     subtask_index: u32,
     mid_stage_version: String,
     subtask_title: String,
+) -> Result<String, String> {
+    git_save_subtask_inner(project_path, subtask_index, mid_stage_version, subtask_title, false).await
+}
+
+/// 内部实现：支持快速/专业两种模式的 tag 前缀
+pub(crate) async fn git_save_subtask_inner(
+    project_path: String,
+    subtask_index: u32,
+    version: String,
+    subtask_title: String,
+    is_quick_mode: bool,
 ) -> Result<String, String> {
     // 1. git add . 暂存所有变更
     let add_output = std::process::Command::new("git")
@@ -88,7 +99,7 @@ pub(crate) async fn git_save_subtask(
     // 2. git commit（--allow-empty 确保即使无文件变更也能提交）
     let commit_message = format!(
         "【弥】小阶段 {}/{}：{}",
-        subtask_index, mid_stage_version, subtask_title
+        subtask_index, version, subtask_title
     );
     let commit_output = std::process::Command::new("git")
         .args(["commit", "-m", &commit_message, "--allow-empty"])
@@ -103,7 +114,8 @@ pub(crate) async fn git_save_subtask(
     }
 
     // 3. git tag -f（覆盖已有 tag）
-    let tag_name = format!("metheus/auto/{}/task-{}", mid_stage_version, subtask_index);
+    let tag_prefix = if is_quick_mode { "metheus/q/" } else { "metheus/auto/" };
+    let tag_name = format!("{}{}/task-{}", tag_prefix, version, subtask_index);
     let tag_output = std::process::Command::new("git")
         .args(["tag", "-f", &tag_name])
         .current_dir(&project_path)
@@ -173,9 +185,7 @@ pub(crate) async fn git_rollback_to_mid_stage(
             .strip_prefix("metheus/")
             .unwrap_or(&tag_name)
             .to_string();
-        let pp = std::path::Path::new(&project_path);
-        let md = pp.join(".metheus");
-        let pf = md.join(format!("{}.json", project_id));
+        let pf = crate::project_data_path(&project_id)?;
         if pf.exists() {
             if let Ok(content) = std::fs::read_to_string(&pf) {
                 if let Ok(proj) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -225,9 +235,7 @@ pub(crate) async fn git_rollback_to_mid_stage(
         .unwrap_or(&tag_name)
         .to_string();
     // 读取 project.json
-    let project_path_obj = std::path::Path::new(&project_path);
-    let metheus_dir = project_path_obj.join(".metheus");
-    let project_file = metheus_dir.join(format!("{}.json", project_id));
+    let project_file = crate::project_data_path(&project_id)?;
     if !project_file.exists() {
         return Err(format!("项目文件不存在: {}", project_file.display()));
     }
@@ -321,10 +329,7 @@ pub(crate) async fn git_rollback_to_subtask(
 
     // 3. 更新 project.json 中的执行树状态
     // 解析 tag_name 获取目标信息：格式 metheus/auto/{version}/task-{index}
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let project_file = std::path::Path::new(&home)
-        .join(".metheus")
-        .join(format!("{}.json", project_id));
+    let project_file = crate::project_data_path(&project_id)?;
     if !project_file.exists() {
         return Err(format!("项目文件不存在: {}", project_file.display()));
     }
@@ -526,10 +531,7 @@ pub(crate) fn save_tag_to_mid_stage(
     tag_name: &str,
 ) -> Result<(), String> {
     // 读取 project 文件, ~/.metheus/{project_id}.json
-    let app_dir = dirs::home_dir().ok_or("无法获取 home 目录".to_string())?;
-    let project_file = app_dir
-        .join(".metheus")
-        .join(format!("{}.json", project_id));
+    let project_file = crate::project_data_path(project_id)?;
 
     let content = std::fs::read_to_string(&project_file)
         .map_err(|e| format!("读取 project 文件失败: {}", e))?;

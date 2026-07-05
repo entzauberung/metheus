@@ -39,6 +39,7 @@ pub(crate) async fn execute_subtask_inner(
             "-p",
             &full_prompt,
         ])
+        .kill_on_drop(true)
         .current_dir(project_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -50,6 +51,15 @@ pub(crate) async fn execute_subtask_inner(
                 e
             ),
         })?;
+
+    // 存储子进程 PID 到 PipelineState，供 stop_execution 快速终止使用
+    {
+        let child_pid = child.id();
+        let mut guard = state.lock().await;
+        if let Some(s) = guard.as_mut() {
+            s.child_pid = child_pid;
+        }
+    }
     // 5. 自动应答：信任确认 + 文件写入确认（异步写入 stdin）
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
@@ -106,17 +116,35 @@ pub(crate) async fn execute_subtask_inner(
                 });
             }
             Ok(None) => {
-                // 进程还在运行 → 检查暂停标志
-                let paused = {
+                // 进程还在运行 → 检查暂停/停止标志
+                let (should_stop, is_failed) = {
                     let guard = state.lock().await;
-                    guard
-                        .as_ref()
-                        .map_or(false, |s| s.status == PipelineStatus::Paused)
+                    guard.as_ref().map_or((false, false), |s| {
+                        if s.status == PipelineStatus::Failed {
+                            (true, true)
+                        } else if s.status == PipelineStatus::Paused {
+                            (true, false)
+                        } else {
+                            (false, false)
+                        }
+                    })
                 };
-                if paused {
-                    // 用户点了暂停 → 强制终止 Claude Code
+                if should_stop {
+                    // 用户点了暂停或停止 → 强制终止 Claude Code
                     let _ = child.start_kill();
                     let _ = child.wait().await;
+                    // 清理 PID
+                    {
+                        let mut guard = state.lock().await;
+                        if let Some(s) = guard.as_mut() {
+                            s.child_pid = None;
+                        }
+                    }
+                    if is_failed {
+                        return Err(project::SubTaskError::ExecutionFailed {
+                            message: "用户停止执行".to_string(),
+                        });
+                    }
                     return Err(project::SubTaskError::UserPaused);
                 }
                 // 检查整体超时

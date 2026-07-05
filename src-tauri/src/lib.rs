@@ -5,7 +5,6 @@
 // (at your option) any later version.
 // ...
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-use std::env;
 use std::fs;
 mod project;
 mod prompts;
@@ -19,14 +18,18 @@ mod test_runner;
 mod commands;
 mod pipeline;
 mod executor;
+mod snapshot;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::pipeline::PipelineState;
 
-///获取项目文件的存储路径
-fn get_project_path(name: &str) -> String {
-    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    format!("{}/.metheus/{}.json", home, name)
+/// 获取项目数据文件的统一存储路径
+///
+/// 返回 `~/.metheus/{project_id}.json`，使用 `dirs::home_dir()` 跨平台获取家目录。
+/// 所有读写 project.json 的模块（lib、git_ops、pipeline）统一调用此函数。
+pub(crate) fn project_data_path(project_id: &str) -> Result<std::path::PathBuf, String> {
+    let home = dirs::home_dir().ok_or("无法获取用户家目录路径".to_string())?;
+    Ok(home.join(".metheus").join(format!("{}.json", project_id)))
 }
 
 /// 校验项目路径：存在性、目录类型、git 仓库
@@ -59,14 +62,14 @@ pub(crate) fn check_project_path(path: &str) -> project::PathValidationResult {
 
 ///保存项目数据到文件
 pub(crate) fn save_project(project: &project::Project) -> Result<(), String> {
-    //1. 确保 .metheus项目存在
-    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let dir = format!("{}/.metheus", home);
-    fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败：{}", e))?;
+    //1. 确保 .metheus 目录存在
+    let path = project_data_path(&project.name)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{}", e))?;
+    }
     //2.序列化为JSON
     let json = serde_json::to_string_pretty(project).map_err(|e| format!("序列化失败: {}", e))?;
     //3.写入文件
-    let path = get_project_path(&project.name);
     fs::write(&path, json).map_err(|e| format!("写入文件失败: {}", e))?;
     Ok(())
 }
@@ -75,7 +78,7 @@ pub(crate) fn save_project(project: &project::Project) -> Result<(), String> {
 // 比如输入 "my_game"，就去 ~/.metheus/my_game.json 里读取，还原成 Project 对象
 pub(crate) fn load_project(name: &str) -> Result<project::Project, String> {
     // 1. 根据名字生成文件路径（例如 "/home/张三/.metheus/my_game.json"）
-    let path = get_project_path(name);
+    let path = project_data_path(name)?;
 
     // 2. 读取整个文件内容 → 得到一个 JSON 字符串
     //    如果文件不存在或无法读取，就返回错误
@@ -101,6 +104,8 @@ pub struct AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     load_env();
+    // 启动时清理上次异常退出遗留的孤儿进程
+    crate::snapshot::cleanup_orphan_processes_at_startup();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
@@ -138,7 +143,9 @@ pub fn run() {
             crate::git_ops::get_current_diff,
             crate::commands::project_ops::validate_project_path,
             crate::commands::project_ops::get_project_files,
-            crate::constitution::get_constitution_summary
+            crate::constitution::get_constitution_summary,
+            crate::snapshot::save_snapshot_event,
+            crate::snapshot::restore_snapshot
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -20,8 +20,15 @@ pub(crate) fn sanitize_json_response(raw: &str) -> String {
     } else {
         text
     };
-    // 第二层: 找到第一个 [ 或 {
-    let start = text.find('[').or_else(|| text.find('{')).unwrap_or(0);
+    // 第二层: 找到第一个 { 或 [（取最早出现的位置）
+    let brace_pos = text.find('{');
+    let bracket_pos = text.find('[');
+    let start = match (brace_pos, bracket_pos) {
+        (Some(b), Some(sq)) => b.min(sq),
+        (Some(b), None) => b,
+        (None, Some(sq)) => sq,
+        (None, None) => 0,
+    };
     // 第三层：用括号计数器找到匹配的闭合位置
     // 使用字节迭代器：{ } [ ] 都是 ASCII 单字节字符，byte_offset 与 start（字节索引）单位一致
     let end = {
@@ -57,7 +64,7 @@ pub(crate) fn sanitize_json_response(raw: &str) -> String {
 /// 第 2 次：把错误发给 AI 修正 → sanitize → 解析
 /// 第 3 次：再次发给 AI 修正（附"最后一次机会"）→ 解析
 /// 三次全失败则返回错误
-pub(crate) async fn parse_json_with_retry<T: serde::de::DeserializeOwned + Default>(
+pub(crate) async fn parse_json_with_retry<T: serde::de::DeserializeOwned>(
     response_text: &str,
 ) -> Result<T, String> {
     // 第一次尝试：直接 sanitize + 解析
@@ -102,22 +109,28 @@ pub(crate) async fn parse_json_with_retry<T: serde::de::DeserializeOwned + Defau
                     let preview: String = cleaned3.chars().take(200).collect();
                     let original_preview: String = response_text.chars().take(200).collect();
                     eprintln!(
-                        "[parse_json_with_retry] 第 3 次解析仍然失败：{}，返回默认值。\
+                        "[parse_json_with_retry] 第 3 次解析仍然失败：{}。\
                          AI 修正后内容（前200字符）：{}；原始响应（前200字符）：{}",
                         final_err, preview, original_preview
                     );
-                    Ok(T::default())
+                    Err(format!(
+                        "JSON 解析失败（3 次重试均失败）：{}。AI 修正后内容：{}...",
+                        final_err, preview
+                    ))
                 }
             }
         }
         Err(e) => {
             let original_preview: String = response_text.chars().take(200).collect();
             eprintln!(
-                "[parse_json_with_retry] AI 修正请求失败（第 3 次）：{}，返回默认值。原始响应（前200字符）：{}",
+                "[parse_json_with_retry] AI 修正请求失败（第 3 次）：{}。原始响应（前200字符）：{}",
                 e,
                 original_preview
             );
-            Ok(T::default())
+            Err(format!(
+                "AI 修正请求在 3 次重试后仍然失败：{}",
+                e
+            ))
         }
     }
 }

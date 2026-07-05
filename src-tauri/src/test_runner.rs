@@ -494,16 +494,8 @@ pub(crate) async fn check_subtask(
         .unwrap_or_else(|e| {
             eprintln!("[check_subtask] AI API 调用失败：{}，返回兜底 JSON", e);
             diagnosis_warnings.push(format!("AI API 调用失败：{}", e));
-            r#"{"passed": false, "issues": ["AI API 调用失败"], "suggestion": ""}"#.to_string()
+            r#"{"passed": false, "issues": ["AI API 调用失败"], "suggestion": "", "warnings": []}"#.to_string()
         });
-    // 兜底：如果 AI 返回空数组 []，自动转换为测试通过
-    let raw_reply = if raw_reply.trim() == "[]" {
-        eprintln!("[check_subtask] AI 返回空数组 []，自动转换为测试通过");
-        diagnosis_warnings.push("AI 返回空数组，自动判定为通过".to_string());
-        r#"{"passed": true, "issues": [], "suggestion": ""}"#.to_string()
-    } else {
-        raw_reply
-    };
     // 解析 JSON 响应（带兜底）
     let test_result: project::TestResult =
         match crate::json_utils::parse_json_with_retry::<project::TestResult>(&raw_reply).await {

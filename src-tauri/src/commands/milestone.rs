@@ -126,41 +126,25 @@ pub(crate) async fn generate_milestones(
             }
         };
 
-    // 步骤 4：清洗并解析 AI 返回的 QAResult JSON
-    let qa_result = {
-        let cleaned = crate::json_utils::sanitize_json_response(&qa_response);
-        // 兜底：AI 有时返回空数组 [] 而非对象，直接走降级
-        if cleaned == "[]" {
-            eprintln!("[generate_milestones] 质检 AI 返回空数组 []，使用兜底不通过结果");
+    // 步骤 4：使用 parse_json_with_retry 解析 AI 返回的 QAResult JSON
+    let qa_result = match crate::json_utils::parse_json_with_retry::<project::QAResult>(&qa_response).await {
+        Ok(mut result) => {
+            result.checked_at = chrono::Utc::now().to_rfc3339();
+            result
+        }
+        Err(e) => {
+            eprintln!(
+                "[generate_milestones] 质检 JSON 解析失败：{}，默认判定为不通过",
+                e
+            );
             project::QAResult {
                 passed: false,
-                reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案".to_string(),
+                reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案"
+                    .to_string(),
                 details: vec![],
                 attention_points: vec![],
                 checked_at: chrono::Utc::now().to_rfc3339(),
-                warnings: vec!["AI 返回空数组 []".to_string()],
-            }
-        } else {
-            match serde_json::from_str::<project::QAResult>(&cleaned) {
-                Ok(mut result) => {
-                    result.checked_at = chrono::Utc::now().to_rfc3339();
-                    result
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[generate_milestones] 质检 JSON 解析失败：{}，默认判定为不通过",
-                        e
-                    );
-                    project::QAResult {
-                        passed: false,
-                        reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案"
-                            .to_string(),
-                        details: vec![],
-                        attention_points: vec![],
-                        checked_at: chrono::Utc::now().to_rfc3339(),
-                        warnings: vec![format!("质检 JSON 解析失败：{}", e)],
-                    }
-                }
+                warnings: vec![format!("质检 JSON 解析失败：{}", e)],
             }
         }
     };
@@ -298,40 +282,22 @@ pub(crate) async fn regenerate_milestones_with_feedback(
             }
         };
 
-    // 步骤 7.4：清洗并解析 AI 返回的 QAResult JSON
-    let qa_result = {
-        let cleaned = crate::json_utils::sanitize_json_response(&qa_response);
-        // 兜底：AI 有时返回空数组 [] 而非对象，直接走降级
-        if cleaned == "[]" {
-            eprintln!(
-                "[regenerate_milestones_with_feedback] 质检 AI 返回空数组 []，使用兜底不通过结果"
-            );
+    // 步骤 7.4：使用 parse_json_with_retry 解析 AI 返回的 QAResult JSON
+    let qa_result = match crate::json_utils::parse_json_with_retry::<project::QAResult>(&qa_response).await {
+        Ok(mut result) => {
+            result.checked_at = chrono::Utc::now().to_rfc3339();
+            result
+        }
+        Err(e) => {
+            eprintln!("[regenerate_milestones_with_feedback] 质检 JSON 解析失败：{}，默认判定为不通过", e);
             project::QAResult {
                 passed: false,
-                reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案".to_string(),
+                reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案"
+                    .to_string(),
                 details: vec![],
                 attention_points: vec![],
                 checked_at: chrono::Utc::now().to_rfc3339(),
-                warnings: vec!["AI 返回空数组 []".to_string()],
-            }
-        } else {
-            match serde_json::from_str::<project::QAResult>(&cleaned) {
-                Ok(mut result) => {
-                    result.checked_at = chrono::Utc::now().to_rfc3339();
-                    result
-                }
-                Err(e) => {
-                    eprintln!("[regenerate_milestones_with_feedback] 质检 JSON 解析失败：{}，默认判定为不通过", e);
-                    project::QAResult {
-                        passed: false,
-                        reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案"
-                            .to_string(),
-                        details: vec![],
-                        attention_points: vec![],
-                        checked_at: chrono::Utc::now().to_rfc3339(),
-                        warnings: vec![format!("质检 JSON 解析失败：{}", e)],
-                    }
-                }
+                warnings: vec![format!("质检 JSON 解析失败：{}", e)],
             }
         }
     };
