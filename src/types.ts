@@ -47,6 +47,7 @@ export interface MidStage {
   id: string;
   title: string;
   version: string;
+  order?: number;
   status: MidStageStatus;
   subtasks: Subtask[];
   domain?: string;

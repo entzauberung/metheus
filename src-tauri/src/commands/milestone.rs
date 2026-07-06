@@ -388,13 +388,14 @@ pub(crate) async fn generate_mid_stages(
         .map_err(|e| format!("解析中阶段 JSON 失败：{}", e))?;
     // 6. 转换成 MidStage 结构体
     let mut mid_stages: Vec<project::MidStage> = Vec::new();
-    for raw in raw_mid_stages {
+    for (i, raw) in raw_mid_stages.iter().enumerate() {
         mid_stages.push(project::MidStage {
             id: uuid::Uuid::new_v4().to_string(),
             version: raw["version"].as_str().unwrap_or("v0.0.0").to_string(),
             title: raw["title"].as_str().unwrap_or("未命名").to_string(),
             description: raw["description"].as_str().unwrap_or("").to_string(),
             tech_focus: raw["tech_focus"].as_str().unwrap_or("").to_string(),
+            order: Some((i + 1) as i32),
             status: project::MidStageStatus::Pending,
             subtasks: vec![],
             test_report: "".to_string(),

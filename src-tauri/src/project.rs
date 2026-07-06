@@ -108,6 +108,7 @@ pub struct MidStage {
     pub id: String,
     pub title: String,
     pub version: String, // 如 "v0.1.1"
+    pub order: Option<i32>,
     pub status: MidStageStatus,
     pub subtasks: Vec<Subtask>,
     pub domain: Option<String>, // 专业模式：域负责人

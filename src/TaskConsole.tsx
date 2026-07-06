@@ -52,6 +52,10 @@ interface TaskConsoleProps {
   // 大阶段生成
   projectStatus: string;
   onGenerateMilestones: () => Promise<void>;
+
+  // 中阶段切换
+  onNextMidStage?: () => void;
+  hasNextMidStage?: boolean;
 }
 
 // ========== 标签页定义 ==========
@@ -267,13 +271,30 @@ function TaskConsole(props: TaskConsoleProps) {
           </div>
         )}
 
-        {/* 大阶段完成提示 */}
+        {/* 中阶段完成提示 */}
         {props.executionStatus?.status === "Completed" && (
-          <div
-            className="completion-prompt"
-            onClick={props.onEnterReviewMode}
-          >
-            ✅ 本大阶段执行完毕，点击此处切换到讨论模式审阅测试报告
+          <div className="completion-prompt">
+            <div className="completion-text">✅ 中阶段执行完成</div>
+            <div className="completion-actions">
+              <button
+                className="btn-exec-action"
+                onClick={() => props.onNextMidStage?.()}
+                disabled={!props.hasNextMidStage}
+              >
+                ▶ 下一个中阶段
+              </button>
+              <button
+                className="btn-exec-action"
+                onClick={props.onEnterReviewMode}
+              >
+                💬 切换到讨论模式审阅
+              </button>
+            </div>
+            {!props.hasNextMidStage && (
+              <div className="completion-hint">
+                ℹ️ 这是当前大阶段的最后一个中阶段，所有中阶段执行完成。
+              </div>
+            )}
           </div>
         )}
 

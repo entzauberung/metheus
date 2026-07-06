@@ -4,7 +4,7 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // ...
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
 import "./App.css";
 import { Project, ViewMode, DiscussionReason, Subtask, PipelineState, QAResult, GeneratedSubtask, TestLog, PathValidationResult } from "./types";
@@ -234,23 +234,9 @@ function App() {
             clearInterval(interval);
           } else if (status.status === "Completed") {
             setIsExecuting(false);
-            handleAddMessage({
-              id: `sys-${Date.now()}`,
-              role: 'system',
-              content: '✅ 本大阶段执行完毕。请审阅测试报告后批准或驳回。',
-              timestamp: Date.now(),
-            });
-            enterDiscussionMode('review');
             clearInterval(interval);
           } else if (status.status === "Failed") {
             setIsExecuting(false);
-            handleAddMessage({
-              id: `sys-${Date.now()}`,
-              role: 'system',
-              content: '❌ 执行遇到错误：' + (status.last_error || '请检查执行日志了解详情。'),
-              timestamp: Date.now(),
-            });
-            enterDiscussionMode('review');
             clearInterval(interval);
           }
         }
@@ -715,6 +701,37 @@ function App() {
     enterDiscussionMode('paused');
   };
 
+  /// 切换到下一个中阶段
+  const handleNextMidStage = useCallback(() => {
+    if (!project || !selectedMilestoneId || !selectedMidStageId) return;
+    const currentMilestone = project.milestones?.find(m => m.id === selectedMilestoneId);
+    if (!currentMilestone) return;
+    const midStages = currentMilestone.mid_stages || [];
+    const sortedMidStages = [...midStages].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    const currentIndex = sortedMidStages.findIndex(ms => ms.id === selectedMidStageId);
+    if (currentIndex >= 0 && currentIndex < sortedMidStages.length - 1) {
+      setSelectedMidStageId(sortedMidStages[currentIndex + 1].id);
+    }
+  }, [project, selectedMilestoneId, selectedMidStageId]);
+
+  /// 切换到下一个中阶段并重置执行状态
+  const handleNextMidStageAndReset = useCallback(() => {
+    handleNextMidStage();
+    setExecutionStatus(null);
+    setIsExecuting(false);
+  }, [handleNextMidStage]);
+
+  /// 计算是否还有下一个中阶段
+  const hasNextMidStage = useMemo(() => {
+    if (!project || !selectedMilestoneId || !selectedMidStageId) return false;
+    const currentMilestone = project.milestones?.find(m => m.id === selectedMilestoneId);
+    if (!currentMilestone) return false;
+    const midStages = currentMilestone.mid_stages || [];
+    const sortedMidStages = [...midStages].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+    const currentIndex = sortedMidStages.findIndex(ms => ms.id === selectedMidStageId);
+    return currentIndex >= 0 && currentIndex < sortedMidStages.length - 1;
+  }, [project, selectedMilestoneId, selectedMidStageId]);
+
   //根据项目状态返回默认对话角色
   const getDefaultRole = (status: string): string => {
     switch (status) {
@@ -931,7 +948,7 @@ function App() {
               onModeChange={handleModeChange}
               modeLocked={project.status !== "Idle"}
             />
-            {project.version_plan && (
+            {project.version_plan && (!project.milestones || project.milestones.length === 0) && (
               <div className="version-plan-panel">
                 <h3>📋 版本方案摘要</h3>
                 <pre className="version-plan-content">{project.version_plan}</pre>
@@ -982,6 +999,8 @@ function App() {
                 onQAIgnore={() => setQaModalData(null)}
                 projectStatus={project.status}
                 onGenerateMilestones={handleGenerateMilestones}
+                onNextMidStage={handleNextMidStageAndReset}
+                hasNextMidStage={hasNextMidStage}
               />
             </div>
           </div>
