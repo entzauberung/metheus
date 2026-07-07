@@ -14,6 +14,7 @@ import TaskConsole from "./TaskConsole";
 import FileTree from "./FileTree";
 import FloatingChatBalloon from "./FloatingChatBalloon";
 import { ExecutionEngineTestPanel } from "./features/dev-tools";
+import { ProjectPathSelector } from "./features/project-path";
 
 const DEFAULT_SIDEBAR_WIDTH = 280;
 const MIN_SIDEBAR_WIDTH = 220;
@@ -40,7 +41,6 @@ const MAX_SIDEBAR_WIDTH = 800;
 function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [projectPath, setProjectPath] = useState<string>("");
-  const [pathSaveStatus, setPathSaveStatus] = useState<string>("");
 
   // === Phase B：视图模式控制 ===
   const [viewMode, setViewMode] = useState<ViewMode>({ phase: 'discussion', reason: 'idle' });
@@ -792,50 +792,12 @@ function App() {
       <main className="main-content">
         {/* === 开发者工具：让你可以手动测试 Tauri 后端的“执行子任务”、“
         检查子任务”、“生成下一步提示词”三个核心命令，并查看结果 === */}
-        <div className="project-path-section">
-          <h3>📁 项目目录</h3>
-          <div className="project-path-row">
-            <input
-              className="project-path-input"
-              type="text"
-              value={projectPath}
-              onChange={(e) => setProjectPath(e.target.value)}
-              placeholder="例如：/home/user/my-project"
-            />
-            <button
-              className="btn-save-path"
-              onClick={async () => {
-                const updated = { ...project, project_path: projectPath };
-                // 验证路径（仅提示，不阻止保存）
-                if (projectPath) {
-                  try {
-                    const validation = await invokeWithTimeout<PathValidationResult>("validate_project_path", { projectPath });
-                    if (!validation.is_valid) {
-                      setPathSaveStatus(`⚠️ ${validation.error_message}（已保存）`);
-                    }
-                  } catch (_) { /* 验证失败不影响保存 */ }
-                }
-                try {
-                  await invokeWithTimeout("persist_project", { projectJson: JSON.stringify(updated) });
-                  setProject(updated);
-                  if (!pathSaveStatus.startsWith("⚠️")) {
-                    setPathSaveStatus("✅ 已保存");
-                  }
-                  setTimeout(() => setPathSaveStatus(""), 5000);
-                } catch (e: any) {
-                  setPathSaveStatus(`❌ 保存失败：${e}`);
-                }
-              }}
-            >
-              保存
-            </button>
-          </div>
-          {pathSaveStatus && (
-            <div className={`path-status ${pathSaveStatus.startsWith("✅") ? "success" : "error"}`}>
-              {pathSaveStatus}
-            </div>
-          )}
-        </div>
+        <ProjectPathSelector
+          project={project}
+          projectPath={projectPath}
+          onProjectChange={setProject}
+          onProjectPathChange={setProjectPath}
+        />
         <ExecutionEngineTestPanel projectPath={projectPath} />
 
         <header className="chat-header">

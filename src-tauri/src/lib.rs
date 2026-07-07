@@ -108,6 +108,7 @@ pub fn run() {
     crate::snapshot::cleanup_orphan_processes_at_startup();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             pipeline_state: Arc::new(Mutex::new(None)),
         })
