@@ -81,6 +81,10 @@ pub(crate) async fn chat_with_role(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64,
+        msg_type: None,
+        approved: None,
+        rejected: None,
+        milestone_id: None,
     };
     Ok(ai_message)
 }

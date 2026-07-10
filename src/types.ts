@@ -99,6 +99,10 @@ export interface ChatMessage {
   id: string;
   role: string;
   content: string;
+  msgType?: string;
+  approved?: boolean;
+  rejected?: boolean;
+  milestoneId?: string;
   timestamp: number;
 }
 
@@ -189,7 +193,7 @@ export interface TestLog {
 }
 
 export type ViewPhase = 'discussion' | 'execution';
-export type DiscussionReason = 'idle' | 'active' | 'review' | 'paused';
+export type DiscussionReason = 'idle' | 'active' | 'review' | 'paused' | 'discuss_summary' | 'view_report';
 
 export interface ViewMode {
   phase: ViewPhase;
@@ -213,4 +217,14 @@ export interface PathValidationResult {
   is_directory: boolean;
   is_git_repo: boolean;
   error_message: string;
+}
+
+// ========== 阶段三新增：分支讨论类型 ==========
+
+export type DiscussionBranchType = 'rollback' | 'redirect';
+
+export interface RollbackCheckpoint {
+  milestoneId: string;
+  midStageId: string;
+  subtaskId: string;
 }

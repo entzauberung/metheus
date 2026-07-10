@@ -7,7 +7,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
 import "./App.css";
-import { Project, ViewMode, DiscussionReason, Subtask, PipelineState, QAResult, GeneratedSubtask, TestLog, PathValidationResult } from "./types";
+import { Project, ViewMode, DiscussionReason, Subtask, PipelineState, QAResult, GeneratedSubtask, TestLog, PathValidationResult, ChatMessage, Milestone, DiscussionBranchType, RollbackCheckpoint } from "./types";
 import ExecutionTree from "./ExecutionTree";
 import ChatRoom from "./ChatRoom";
 import TaskConsole from "./TaskConsole";
@@ -53,6 +53,14 @@ function App() {
   // 测试日志去重：记录已处理过的子任务 ID
   const processedSubtaskIdsRef = useRef<Set<string>>(new Set());
 
+  // 大阶段完成总结去重：记录已发送过总结消息的大阶段 ID
+  const completedMilestonesRef = useRef<Set<string>>(new Set());
+
+  // === 阶段三：分支讨论状态 ===
+  const [discussionBranchType, setDiscussionBranchType] = useState<DiscussionBranchType | null>(null);
+  const [showBranchSelector, setShowBranchSelector] = useState(false);
+  const [rollbackCheckpoint, setRollbackCheckpoint] = useState<RollbackCheckpoint | null>(null);
+
   // === 侧边栏拖拽缩放 ===
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
   const [isDragging, setIsDragging] = useState(false);
@@ -64,11 +72,11 @@ function App() {
     if (viewMode.phase === 'execution') return;
     // 清除上一个未完成的定时器，防止快速连续切换导致时序混乱
     if (animationTimerRef.current) { clearTimeout(animationTimerRef.current); animationTimerRef.current = null; }
-    // 标记 ChatRoom 开始淡出
+    // 立即切换视图，同时启动 ChatRoom 淡出动画（React 18 批处理合并为一次渲染）
+    setViewMode({ phase: 'execution', reason: 'active' });
     setAnimatingComponent('chatroom');
-    // 250ms 后切换状态
+    // 250ms 后清除动画状态
     animationTimerRef.current = setTimeout(() => {
-      setViewMode({ phase: 'execution', reason: 'active' });
       setAnimatingComponent(null);
       animationTimerRef.current = null;
     }, 250);
@@ -79,11 +87,11 @@ function App() {
     if (viewMode.phase === 'discussion' && viewMode.reason === reason) return;
     // 清除上一个定时器
     if (animationTimerRef.current) { clearTimeout(animationTimerRef.current); animationTimerRef.current = null; }
-    // 标记 TaskConsole 开始淡出
+    // 立即切换视图，同时启动 TaskConsole 淡出动画（React 18 批处理合并为一次渲染）
+    setViewMode({ phase: 'discussion', reason });
     setAnimatingComponent('taskconsole');
-    // 250ms 后切换状态
+    // 250ms 后清除动画状态
     animationTimerRef.current = setTimeout(() => {
-      setViewMode({ phase: 'discussion', reason });
       setAnimatingComponent(null);
       animationTimerRef.current = null;
     }, 250);
@@ -154,6 +162,8 @@ function App() {
   const [qaModalData, setQaModalData] = useState<{ milestoneId: string; qaResult: QAResult } | null>(null);
   const [isSubmitting, _setIsSubmitting] = useState(false);
   const [testLogs, setTestLogs] = useState<TestLog[]>([]);
+  // 回退成功后需要自动触发生成执行计划的中阶段 ID（不为 null 时由 useEffect 消费）
+  const [pendingRollbackGenerate, setPendingRollbackGenerate] = useState<string | null>(null);
 
   // === 快照：保存 UI 状态到后端，用于刷新恢复和孤儿进程保护 ===
   const takeSnapshot = () => {
@@ -164,6 +174,10 @@ function App() {
       selected_mid_stage_id: selectedMidStageId ?? null,
       generated_plan_keys: Array.from(generatedPlan.keys()),
       quick_generated_plan_keys: Array.from(quickGeneratedPlan.keys()),
+      discussion_branch_type: discussionBranchType ?? null,
+      checkpoint_milestone_id: rollbackCheckpoint?.milestoneId ?? null,
+      checkpoint_mid_stage_id: rollbackCheckpoint?.midStageId ?? null,
+      checkpoint_subtask_id: rollbackCheckpoint?.subtaskId ?? null,
       saved_at: new Date().toISOString(),
     };
     invokeWithTimeout("save_snapshot_event", {
@@ -235,6 +249,13 @@ function App() {
           } else if (status.status === "Completed") {
             setIsExecuting(false);
             clearInterval(interval);
+            invokeWithTimeout<Project>("get_project", { projectName: project?.name ?? "" })
+              .then((updatedProject) => {
+                setProject(updatedProject);
+              })
+              .catch((err) => {
+                console.error("刷新项目数据失败:", err);
+              });
           } else if (status.status === "Failed") {
             setIsExecuting(false);
             clearInterval(interval);
@@ -248,12 +269,111 @@ function App() {
     return () => clearInterval(interval);
   }, [isExecuting, enterDiscussionMode, handleAddMessage]);
 
+  // 大阶段完成检测：当所有中阶段执行完成后，自动插入总结消息
+  useEffect(() => {
+    if (!project || project.mode === "Quick") return;
+    for (const ms of project.milestones) {
+      if (isMilestoneFullyCompleted(ms) && !completedMilestonesRef.current.has(ms.id)) {
+        // 收集统计数据
+        const midStages = ms.mid_stages || [];
+        const totalCount = midStages.length;
+        const completedCount = midStages.filter(m => m.status === "Completed").length;
+        const failedCount = midStages.filter(m => m.status === "Rejected").length;
+        // 收集 Git tag
+        const tags: string[] = [];
+        for (const mid of midStages) {
+          if (mid.git_tag) tags.push(mid.git_tag);
+        }
+        const tagsLine = tags.length > 0 ? tags.join("、") : "无";
+        // 统计子任务测试通过率
+        let totalSubtasks = 0;
+        let passedSubtasks = 0;
+        for (const mid of midStages) {
+          for (const st of (mid.subtasks || [])) {
+            totalSubtasks++;
+            if (st.test_result?.passed) passedSubtasks++;
+          }
+        }
+        const passRate = totalSubtasks > 0 ? `${Math.round(passedSubtasks / totalSubtasks * 100)}%` : "N/A";
+
+        const markdown = `### 📋 大阶段「${ms.title}」执行完成
+
+| 项目 | 数据 |
+|------|------|
+| 中阶段总数 | ${totalCount} |
+| 已完成 | ${completedCount} |
+| 失败 | ${failedCount} |
+| 子任务测试通过率 | ${passRate} |
+| Git 标签 | ${tagsLine} |
+
+所有中阶段已执行完成，请审阅后决定下一步。`;
+
+        const summaryMsg: ChatMessage = {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: markdown,
+          timestamp: Date.now(),
+          msgType: "milestone_summary",
+          milestoneId: ms.id,
+        };
+        handleAddMessage(summaryMsg);
+        completedMilestonesRef.current = new Set([...completedMilestonesRef.current, ms.id]);
+
+        // 任务 2.5：调用后端 AI 命令生成自然语言总结（第二层消息）
+        invokeWithTimeout<string>('summarize_milestone', {
+          projectName: project.name,
+          milestoneId: ms.id,
+        })
+          .then((aiSummary) => {
+            const aiMsg: ChatMessage = {
+              id: crypto.randomUUID(),
+              role: 'assistant',
+              content: aiSummary,
+              timestamp: Date.now(),
+              msgType: 'milestone_summary',
+              milestoneId: ms.id,
+            };
+            handleAddMessage(aiMsg);
+          })
+          .catch((err) => {
+            console.error('AI 大阶段总结生成失败（第一层统计表格仍可用）:', err);
+          });
+      }
+    }
+  }, [project, handleAddMessage]);
+
   // 完整回调 当 App 组件第一次加载时，自动从后端（Rust）获取当前项目数据，并保存到前端的状态中
   // 页面一打开，自动从后端拉取项目数据，存到状态里，并保存项目路径，只做一次
   useEffect(() => {
     invokeWithTimeout<Project>("get_project", { projectName: "我的游戏" })
       .then((project) => {
+        // 向后兼容：旧项目有 version_plan 但消息列表中没有版本方案消息时，自动插入一条
+        if (project && project.version_plan && project.discussion_threads?.length > 0) {
+          const thread = project.discussion_threads[0];
+          const messages = thread.messages || [];
+          const hasVpMsg = messages.some(m => m.msgType === "version_plan");
+          if (!hasVpMsg) {
+            const compatMsg: ChatMessage = {
+              id: crypto.randomUUID(),
+              role: "assistant",
+              content: project.version_plan,
+              timestamp: Date.now(),
+              msgType: "version_plan",
+            };
+            thread.messages = [...messages, compatMsg];
+          }
+        }
         setProject(project);
+        // 重建已发送总结的大阶段 Set（从消息列表恢复）
+        if (project?.discussion_threads?.[0]?.messages) {
+          const summaryIds = new Set<string>();
+          for (const msg of project.discussion_threads[0].messages) {
+            if (msg.msgType === "milestone_summary" && msg.milestoneId) {
+              summaryIds.add(msg.milestoneId);
+            }
+          }
+          completedMilestonesRef.current = summaryIds;
+        }
         if (project && project.project_path) {
           setProjectPath(project.project_path);
         }
@@ -297,6 +417,19 @@ function App() {
           if (ui.selected_mid_stage_id) {
             setSelectedMidStageId(ui.selected_mid_stage_id);
           }
+          // 恢复分支讨论状态
+          // 注：showBranchSelector 不会从快照恢复（默认 false），因此不会出现弹窗闪烁。
+          // discussionBranchType 恢复后仅用于 ChatRoom 确认按钮的状态判断。
+          if (ui.discussion_branch_type && ui.discussion_branch_type !== 'null') {
+            setDiscussionBranchType(ui.discussion_branch_type as DiscussionBranchType);
+          }
+          if (ui.checkpoint_milestone_id) {
+            setRollbackCheckpoint({
+              milestoneId: ui.checkpoint_milestone_id,
+              midStageId: ui.checkpoint_mid_stage_id ?? '',
+              subtaskId: ui.checkpoint_subtask_id ?? '',
+            });
+          }
         }
       })
       .catch((err) => {
@@ -336,12 +469,42 @@ function App() {
       });
       //更新项目，加上方案
       setProject({ ...project, version_plan: plan as string });
+      // 将版本方案作为消息插入聊天流
+      const versionPlanMsg = {
+        id: crypto.randomUUID(),
+        role: "assistant",
+        content: plan as string,
+        timestamp: Date.now(),
+        msgType: "version_plan",
+      };
+      handleAddMessage(versionPlanMsg);
     } catch (err) {
       console.error("生成方案失败", err);
     } finally {
       setIsGeneratingVersionPlan(false);
     }
   };
+  // 辅助：标记最新版本方案消息的 approved/rejected 字段
+  const markLatestVpMessage = (p: Project, field: "approved" | "rejected"): Project => {
+    const updated = { ...p };
+    if (updated.discussion_threads.length === 0) return updated;
+    const thread = updated.discussion_threads[0];
+    const msgs = [...thread.messages];
+    let latestIdx = -1;
+    let latestTs = 0;
+    for (let i = 0; i < msgs.length; i++) {
+      if (msgs[i].msgType === "version_plan" && msgs[i].timestamp >= latestTs) {
+        latestTs = msgs[i].timestamp;
+        latestIdx = i;
+      }
+    }
+    if (latestIdx >= 0) {
+      msgs[latestIdx] = { ...msgs[latestIdx], [field]: true };
+    }
+    updated.discussion_threads = [{ ...thread, messages: msgs }, ...updated.discussion_threads.slice(1)];
+    return updated;
+  };
+
   //批准版本方案
   const handleApprove = async () => {
     //安全保护
@@ -353,22 +516,43 @@ function App() {
         //再单独传一次方案（其实后端可以从projectJson里取
         versionPlan: project.version_plan,
       });
-      //前端也同步状态"规划中"，并进入执行模式
-      setProject({ ...project, status: "Planning" });
+      //前端也同步状态"规划中"，并标记最新版本方案消息为已批准
+      const toPersist = markLatestVpMessage({ ...project, status: "Planning" as const }, "approved");
+      setProject(toPersist);
+      // 自动触发拆解大阶段
+      handleGenerateMilestones();
       enterExecutionMode();
+      // 持久化
+      invokeWithTimeout("persist_project", { projectJson: JSON.stringify(toPersist) })
+        .catch(err => console.error("持久化批准失败:", err));
     } catch (err) {
       console.error("批准失败：", err);
     }
   };
-  //驳回版本方案（不调用后端，硬盘存储还在，临时放弃）
+  //驳回版本方案（不清空 version_plan，保留在消息列表中）
   const handleReject = () => {
     if (!project) return;
-    //直接把方案清空
-    const updatedProject = { ...project, version_plan: "", status: "Discussing" as const };
-    setProject(updatedProject);
-    invokeWithTimeout("persist_project", { projectJson: JSON.stringify(updatedProject) })
+    // 标记最新版本方案消息为已驳回，状态回到讨论中
+    const toPersist = markLatestVpMessage({ ...project, status: "Discussing" as const }, "rejected");
+    setProject(toPersist);
+    // 插入产品经理自动回复
+    const autoReply: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content: "好的，请告诉我需要修改什么？",
+      timestamp: Date.now(),
+    };
+    handleAddMessage(autoReply);
+    // 持久化
+    invokeWithTimeout("persist_project", { projectJson: JSON.stringify(toPersist) })
       .catch(err => console.error("持久化驳回方案失败:", err));
   }
+
+  // 判断一个大阶段的所有中阶段是否都已执行完成
+  const isMilestoneFullyCompleted = (milestone: Milestone): boolean => {
+    if (!milestone.mid_stages || milestone.mid_stages.length === 0) return false;
+    return milestone.mid_stages.every(m => m.status === "Completed");
+  };
 
   //根据版本方案拆解大阶段
   const handleGenerateMilestones = async () => {
@@ -381,11 +565,13 @@ function App() {
         versionPlan: project.version_plan,
         mode: project.mode,
       });
-      //把Milestones数组合并到项目状态中（触发重新渲染）
-      const updatedProject = { ...project, status: "MilestoneReady" as const, milestones: milestones as any[] };
-      setProject(updatedProject);
+      //把Milestones数组合并到项目状态中（使用函数式更新以避免覆盖并发的状态变更）
+      setProject((prev) => {
+        if (!prev) return prev;
+        return { ...prev, status: "MilestoneReady" as const, milestones: milestones as any[] };
+      });
       try {
-        await invokeWithTimeout("persist_project", { projectJson: JSON.stringify(updatedProject) });
+        await invokeWithTimeout("persist_project", { projectJson: JSON.stringify({ ...project, status: "MilestoneReady" as const, milestones: milestones as any[] }) });
       } catch (saveErr) {
         console.error("保存里程碑失败：", saveErr);
         alert("大阶段已生成，但保存到文件失败，请重试或检查磁盘空间。");
@@ -565,7 +751,7 @@ function App() {
   /// 专业模式：为中阶段生成执行计划
   const handleGeneratePlanForMidStage = async (midStageId: string) => {
     if (!project) return;
-    // 找到对应的 midStage 数据
+    // 找到对应的 midStage 数据 + 所属 milestone
     const mid = project.milestones
       .flatMap((m) => m.mid_stages)
       .find((ms) => ms.id === midStageId);
@@ -573,7 +759,43 @@ function App() {
       console.error("找不到 midStage:", midStageId);
       return;
     }
+    const parentMilestone = project.milestones.find(m =>
+      m.mid_stages.some(ms => ms.id === midStageId)
+    );
+
     setIsGeneratingPlan(true);
+
+    // 阶段四：检测是否为回退后的状态（有已完成 subtask + 有待生成 subtask）
+    const existingSubtasks = mid.subtasks || [];
+    const hasPassedSubtasks = existingSubtasks.some(st => st.status === 'Passed');
+    const hasPendingSubtasks = existingSubtasks.some(st => st.status === 'Pending');
+
+    if (hasPassedSubtasks && hasPendingSubtasks && parentMilestone) {
+      // 回退后状态 → 调用 regenerate_plan_from_checkpoint
+      const firstPending = existingSubtasks.find(st => st.status === 'Pending');
+      try {
+        const result = await invokeWithTimeout<string>('regenerate_plan_from_checkpoint', {
+          projectName: project.name,
+          projectPath: projectPath,
+          milestoneId: parentMilestone.id,
+          midStageId: midStageId,
+          subtaskId: firstPending!.id,
+        });
+        const updatedMidStage = JSON.parse(result);
+        const newSubtasks = updatedMidStage.subtasks as Subtask[];
+        setGeneratedPlan((prev) => {
+          const next = new Map(prev);
+          next.set(midStageId, newSubtasks);
+          return next;
+        });
+      } catch (e) {
+        console.error('从分割点重生成执行计划失败:', e);
+      }
+      setIsGeneratingPlan(false);
+      return;
+    }
+
+    // 原有逻辑：从零开始逐个生成
     const generated: Subtask[] = [];
     let prevTitle = "";
     let prevResult = "";
@@ -613,6 +835,19 @@ function App() {
     });
     setIsGeneratingPlan(false);
   };
+
+  // 回退成功后自动触发生成执行计划（必须在 handleGeneratePlanForMidStage 定义之后）
+  useEffect(() => {
+    if (!pendingRollbackGenerate || !project) {
+      // pendingRollbackGenerate 已设置但 project 为 null（异常情况），重置状态
+      if (pendingRollbackGenerate && !project) {
+        setPendingRollbackGenerate(null);
+      }
+      return;
+    }
+    handleGeneratePlanForMidStage(pendingRollbackGenerate);
+    setPendingRollbackGenerate(null);
+  }, [pendingRollbackGenerate, project, handleGeneratePlanForMidStage]);
 
   /// 专业模式：启动中阶段执行
   const handleStartExecution = async (midStageId: string) => {
@@ -721,6 +956,150 @@ function App() {
     setIsExecuting(false);
   }, [handleNextMidStage]);
 
+  /// 继续到下一个大阶段
+  const handleContinueNextMilestone = useCallback(() => {
+    if (!project || !project.milestones || !selectedMilestoneId) return;
+    const idx = project.milestones.findIndex(m => m.id === selectedMilestoneId);
+    if (idx < 0 || idx >= project.milestones.length - 1) return;
+    const nextMs = project.milestones[idx + 1];
+    setSelectedMilestoneId(nextMs.id);
+    setSelectedMidStageId(nextMs.mid_stages?.[0]?.id ?? null);
+  }, [project, selectedMilestoneId]);
+
+  /// 与产品经理讨论（弹出分支选择弹窗）
+  const handleDiscussWithPM = useCallback(() => {
+    if (!project) return;
+    setShowBranchSelector(true);
+  }, [project]);
+
+  /// 分支选择回调
+  const handleSelectBranch = useCallback((branchType: DiscussionBranchType) => {
+    setDiscussionBranchType(branchType);
+    setShowBranchSelector(false);
+    enterDiscussionMode('discuss_summary');
+    if (branchType === 'redirect') {
+      handleAddMessage({
+        id: `sys-${Date.now()}`,
+        role: 'system',
+        content: '📋 你选择了「后续方向想调整」。请与产品经理讨论新的需求方向，AI 会根据你的反馈重新生成后续大阶段。',
+        timestamp: Date.now(),
+      });
+    }
+  }, [enterDiscussionMode, handleAddMessage]);
+
+  /// 确认 PM 建议回调（分支A/B 统一入口）
+  const handleConfirmPMSuggestion = useCallback(async () => {
+    if (!project) return;
+    const branch = discussionBranchType;
+
+    if (branch === 'rollback') {
+      // 分支A：回退 → 退出讨论模式，让用户在 ExecutionTree 中手动回退
+      setDiscussionBranchType(null);
+      handleAddMessage({
+        id: `sys-${Date.now()}`,
+        role: 'system',
+        content: '已回到执行模式。请使用执行树中的「↩ 回退到此」按钮手动选择要回退的小阶段。',
+        timestamp: Date.now(),
+      });
+      enterExecutionMode();
+    } else if (branch === 'redirect') {
+      // 分支B：重新生成后续大阶段
+      try {
+        const currentThread = project.discussion_threads[0];
+        // 收集用户反馈：取讨论线程中所有用户消息
+        const userMessages = currentThread?.messages
+          ?.filter(m => m.role === 'user')
+          ?.map(m => m.content)
+          ?? [];
+        const feedback = userMessages.join('\n');
+
+        // 构建已完成大阶段摘要
+        const completedSummary = buildCompletedSummary(project);
+
+        // 确定 after_milestone_id（最后一个已完成的大阶段）
+        const lastCompletedMs = [...project.milestones]
+          .reverse()
+          .find(m => m.status === 'Completed' || m.status === 'InProgress');
+        const afterMilestoneId = lastCompletedMs?.id ?? '';
+
+        const result = await invokeWithTimeout<string>('regenerate_milestones_from_point', {
+          projectName: project.name,
+          afterMilestoneId: afterMilestoneId,
+          versionPlan: project.version_plan,
+          mode: project.mode,
+          feedback: feedback,
+          completedSummary: completedSummary,
+        });
+
+        const newProject = JSON.parse(result);
+        setProject(newProject);
+        setDiscussionBranchType(null);
+
+        handleAddMessage({
+          id: `sys-${Date.now()}`,
+          role: 'system',
+          content: '✅ 后续大阶段已重新生成。请查看执行树中的更新。',
+          timestamp: Date.now(),
+        });
+        enterExecutionMode();
+      } catch (err) {
+        console.error('重新生成后续大阶段失败:', err);
+        const errMsg = String(err);
+        // 插入系统消息（含质检详情），不弹出 alert 阻断交互
+        handleAddMessage({
+          id: `sys-${Date.now()}`,
+          role: 'system',
+          content: `### ❌ 质检未通过\n\n${errMsg}\n\n---\n\n请与产品经理继续讨论，修改反馈后重新点击「按照新方案生成后续大阶段」按钮。`,
+          timestamp: Date.now(),
+          msgType: 'qa_failed',
+        });
+        // 自动触发 AI 产品经理引导用户修改反馈
+        invokeWithTimeout('chat_with_role', {
+          message: '用户提交的变更请求未能通过质量检查，请参考上述质检结果，引导用户修改需求并重新提交。',
+          role: '产品经理',
+          threadId: 'thread-init',
+        }).then((reply) => {
+          const replyData = reply as { id: string; role: string; content: string; timestamp: number };
+          handleAddMessage({
+            id: replyData.id,
+            role: replyData.role,
+            content: replyData.content,
+            timestamp: replyData.timestamp,
+          });
+        }).catch(e => console.error('自动引导消息发送失败:', e));
+        // 不重置 discussionBranchType，保持 'redirect' 以便用户修改后重试
+      }
+    }
+  }, [project, discussionBranchType, handleAddMessage, enterExecutionMode]);
+
+  /// 构建已完成大阶段摘要
+  const buildCompletedSummary = useCallback((p: Project): string => {
+    const completed = p.milestones.filter(
+      m => m.status === 'Completed' || m.status === 'InProgress'
+    );
+    if (completed.length === 0) return '（暂无已完成的大阶段）';
+    return completed
+      .map(m => {
+        const midCount = m.mid_stages?.length ?? 0;
+        const completedMidCount = m.mid_stages?.filter(mid => mid.status === 'Completed').length ?? 0;
+        return `${m.title} (${m.version}) — ${completedMidCount}/${midCount} 个中阶段已完成`;
+      })
+      .join('\n');
+  }, []);
+
+  /// 查看详细报告（切换到执行模式）
+  const handleViewDetailedReport = useCallback(() => {
+    if (!project) return;
+    setViewMode({ phase: 'execution', reason: 'view_report' });
+  }, [project]);
+
+  /// 计算是否还有下一个大阶段
+  const hasNextMilestone = useMemo(() => {
+    if (!project || !project.milestones || !selectedMilestoneId) return false;
+    const idx = project.milestones.findIndex(m => m.id === selectedMilestoneId);
+    return idx >= 0 && idx < project.milestones.length - 1;
+  }, [project, selectedMilestoneId]);
+
   /// 计算是否还有下一个中阶段
   const hasNextMidStage = useMemo(() => {
     if (!project || !selectedMilestoneId || !selectedMidStageId) return false;
@@ -782,6 +1161,18 @@ function App() {
           isExecuting={isExecuting}
           isGeneratingPlan={isGeneratingPlan}
           executionStatus={executionStatus}
+          onSubtaskRollbackSuccess={(projectJson: string) => {
+            try {
+              const newProject = JSON.parse(projectJson);
+              setProject(newProject);
+              // 回退成功后自动触发生成执行计划（由 useEffect 消费此状态）
+              if (selectedMidStageId && !isGeneratingPlan && !isExecuting) {
+                setPendingRollbackGenerate(selectedMidStageId);
+              }
+            } catch (e) {
+              console.error('解析回退后的项目数据失败:', e);
+            }
+          }}
         />
         <div
           className={`resize-handle${isDragging ? ' dragging' : ''}`}
@@ -943,21 +1334,21 @@ function App() {
             <ChatRoom
               messages={currentThread.messages || []}
               onAddMessage={handleAddMessage}
-              currentRole={getDefaultRole(project.status)}
+              currentRole={discussionBranchType ? "产品经理" : getDefaultRole(project.status)}
               mode={project.mode}
               onModeChange={handleModeChange}
               modeLocked={project.status !== "Idle"}
+              onApproveVersionPlan={handleApprove}
+              onRejectVersionPlan={handleReject}
+              onContinueNextMilestone={handleContinueNextMilestone}
+              onDiscussWithPM={handleDiscussWithPM}
+              onViewDetailedReport={handleViewDetailedReport}
+              hasNextMilestone={hasNextMilestone}
+              discussionBranchType={discussionBranchType}
+              onConfirmPMSuggestion={handleConfirmPMSuggestion}
+              projectStatus={project.status}
+              hasMilestones={project.milestones.length > 0}
             />
-            {project.version_plan && (!project.milestones || project.milestones.length === 0) && (
-              <div className="version-plan-panel">
-                <h3>📋 版本方案摘要</h3>
-                <pre className="version-plan-content">{project.version_plan}</pre>
-                <div className="version-plan-actions">
-                  <button className="btn-approve" onClick={handleApprove}>✅ 批准</button>
-                  <button className="btn-reject" onClick={handleReject}>❌ 驳回</button>
-                </div>
-              </div>
-            )}
             {project.status === "Planning" && project.version_plan && (
               <div className="generate-plan-area">
                 <button className="btn-generate-plan" onClick={handleGenerateMilestones} disabled={isGeneratingMilestones}>
@@ -1013,6 +1404,37 @@ function App() {
           />
         )}
       </main>
+
+      {/* ===== 阶段三：分支选择弹窗 ===== */}
+      {showBranchSelector && (
+        <div className="branch-selector-overlay" onClick={() => setShowBranchSelector(false)}>
+          <div className="branch-selector" onClick={(e) => e.stopPropagation()}>
+            <h3>🤔 与产品经理讨论什么？</h3>
+            <p>请选择你想讨论的方向，AI 会据此调整后续计划。</p>
+            <div className="branch-options">
+              <div className="branch-option" onClick={() => handleSelectBranch('rollback')}>
+                <span className="branch-option-icon">🔄</span>
+                <div className="branch-option-info">
+                  <div className="branch-option-title">有问题需要回退</div>
+                  <div className="branch-option-desc">回退到某个小阶段重新执行，修正之前的问题</div>
+                </div>
+              </div>
+              <div className="branch-option" onClick={() => handleSelectBranch('redirect')}>
+                <span className="branch-option-icon">🔀</span>
+                <div className="branch-option-info">
+                  <div className="branch-option-title">后续方向想调整</div>
+                  <div className="branch-option-desc">与产品经理讨论后，重新生成后续大阶段</div>
+                </div>
+              </div>
+            </div>
+            <div className="branch-selector-actions">
+              <button className="branch-selector-cancel" onClick={() => setShowBranchSelector(false)}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

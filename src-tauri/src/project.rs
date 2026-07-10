@@ -203,6 +203,18 @@ pub struct Message {
     pub content: String,
     ///时间戳(毫秒)
     pub timestamp: u64,
+    ///消息类型（如 "version_plan"），用于前端区分渲染方式
+    #[serde(default)]
+    pub msg_type: Option<String>,
+    ///版本方案是否已批准
+    #[serde(default)]
+    pub approved: Option<bool>,
+    ///版本方案是否已驳回
+    #[serde(default)]
+    pub rejected: Option<bool>,
+    ///关联的大阶段 ID（仅 msg_type="milestone_summary" 时使用）
+    #[serde(default)]
+    pub milestone_id: Option<String>,
 }
 ///讨论线程
 #[derive(Debug, Clone, Serialize, Deserialize)]

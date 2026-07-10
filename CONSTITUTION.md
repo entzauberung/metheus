@@ -55,12 +55,12 @@
 └──────────────────────┬──────────────────────────────────┘
                        │  IPC (Tauri Bridge)
 ┌──────────────────────▼──────────────────────────────────┐
-│                 Rust 后端 (lib.rs = 入口, 152 行)         │
+│                 Rust 后端 (lib.rs = 入口, 156 行)         │
 │                                                          │
 │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────────────┐ │
 │  │commands/ │ │git_ops   │ │constitution│ │pipeline     │ │
-│  │ chat     │ │ 9 fn     │ │ 7 fn +    │ │ 5 cmd +     │ │
-│  │ plan     │ │          │ │ Validation│ │ PipelineState│ │
+│  │ chat     │ │ 11 fn    │ │ 7 fn +    │ │ 5 cmd +     │ │
+│  │ plan     │ │ (含回退) │ │ Validation│ │ PipelineState│ │
 │  │ milestone│ │          │ │ Result    │ │ + 2 core fn │ │
 │  │ proj_ops │ │          │ │          │ │ (含快速模式)  │ │
 │  └──────────┘ └──────────┘ └──────────┘ └─────────────┘ │
@@ -70,12 +70,12 @@
 │  └──────────┘ └──────────┘ └──────────┘ └─────────────┘ │
 │  ┌──────────┐ ┌──────────┐ ┌──────────────┐ ┌─────────┐ │
 │  │prompts   │ │constants │ │json_utils    │ │snapshot │ │
-│  │10 const  │ │6 const   │ │ 2 fn         │ │ 2 cmd + │ │
+│  │13 const  │ │6 const   │ │ 2 fn         │ │ 2 cmd + │ │
 │  │          │ │          │ │              │ │4辅助fn  │ │
 │  └──────────┘ └──────────┘ └──────────────┘ └─────────┘ │
 │                                                          │
-│  project.rs — 所有数据结构 (struct/enum, 374 行)          │
-│  lib.rs — AppState + run() + generate_handler![34 cmd]  │
+│  project.rs — 所有数据结构 (struct/enum, 386 行)          │
+│  lib.rs — AppState + run() + generate_handler![38 cmd]  │
 └──────────────────────┬──────────────────────────────────┘
                        │
           ┌────────────┼────────────┐
@@ -171,27 +171,27 @@ start_execution(后台 spawn)
 
 ## 5. 模块清单
 
-### `src-tauri/src/lib.rs`（152 行）— 应用入口
+### `src-tauri/src/lib.rs`（156 行）— 应用入口
 | 项目 | 内容 |
 |------|------|
-| **职责** | 模块声明、基础 I/O 函数、AppState 定义、run() 入口、注册全部 34 个 Tauri command |
+| **职责** | 模块声明、基础 I/O 函数、AppState 定义、run() 入口、注册全部 38 个 Tauri command |
 | **依赖** | 所有 13 个子模块（含 snapshot） |
 | **对外接口** | `check_project_path()` (pub(crate)), `save_project()` (pub(crate)), `load_project()` (pub(crate)), `project_data_path()` (pub(crate)), `AppState` (pub), `run()` (pub) |
 | **持久化** | `~/.metheus/{project_name}.json` — 单个 JSON 文件存储完整 Project 结构 |
 | **新增** | `project_data_path()` — 统一路径生成函数(2026-07-05添加) |
 
-### `src-tauri/src/project.rs`（374 行）— 数据模型
+### `src-tauri/src/project.rs`（386 行）— 数据模型
 | 项目 | 内容 |
 |------|------|
 | **职责** | 所有数据结构定义（enum/struct），零业务逻辑 |
 | **关键类型** | `Project`, `Milestone`, `MidStage`(含order字段), `Subtask`, `Message`, `ExecutionResult`, `TestResult`, `DiffSummary`, `QAResult`, `GitTagInfo`, `FileEntry`, `PathValidationResult`, `SubTaskError`, `ConstitutionSummary`, `DiscussionThread` |
 | **同步要求** | 每个 struct/enum 必须与 `src/types.ts` 一一对应 |
 
-### `src-tauri/src/prompts.rs`（130 行）— AI 角色提示词
+### `src-tauri/src/prompts.rs`（245 行）— AI 角色提示词
 | 项目 | 内容 |
 |------|------|
-| **职责** | 10 个 `pub(crate) const` system prompt 字符串常量 |
-| **常量** | `STRATEGY_PROMPT`, `PM_PROMPT`, `DOMAIN_LEAD_PROMPT`, `TECH_PROMPT`, `TEST_PROMPT`, `SELF_CHECK_PROMPT`, `QA_CHECK_PROMPT`, `CONSTITUTION_PART1_PROMPT`, `CONSTITUTION_UPDATE_PROMPT`, `COMPACT_CONSTITUTION_PROMPT` |
+| **职责** | 13 个 `pub(crate) const` system prompt 字符串常量 |
+| **常量** | `STRATEGY_PROMPT`, `PM_PROMPT`, `DOMAIN_LEAD_PROMPT`, `TECH_PROMPT`, `TEST_PROMPT`, `SELF_CHECK_PROMPT`, `QA_CHECK_PROMPT`, `CONSTITUTION_PART1_PROMPT`, `CONSTITUTION_UPDATE_PROMPT`, `COMPACT_CONSTITUTION_PROMPT`, `REGENERATE_MILESTONES_PROMPT`, `REGENERATE_SUBTASKS_PROMPT`, `SUMMARIZE_MILESTONE_PROMPT` |
 
 ### `src-tauri/src/constants.rs`（14 行）— 配置常量
 | 项目 | 内容 |
@@ -211,7 +211,7 @@ start_execution(后台 spawn)
 | `sanitize_json_response` | 从 AI 返回中提取纯净 JSON（处理 ```json 包裹、礼貌前缀、多余文字、括号计数器精准截断） |
 | `parse_json_with_retry` | 带 3 次重试的 JSON 解析（第1次直接解析，第2/3次 AI 自助修正），3 次全败返回 Err(不再返回 T::default()) |
 
-### `src-tauri/src/git_ops.rs`（568 行）— Git 操作
+### `src-tauri/src/git_ops.rs`（752 行）— Git 操作
 | 函数 | 类型 | 说明 |
 |------|------|------|
 | `git_save_node` | cmd | 中阶段 Git 存档（add → commit → tag metheus/vX.Y.Z） |
@@ -219,10 +219,12 @@ start_execution(后台 spawn)
 | `git_save_subtask_inner` | pub(crate) | 小阶段存档内部实现，支持快速/专业模式两种 tag 前缀 |
 | `git_rollback_to_mid_stage` | cmd | 回退到中阶段 tag（stash → reset --hard → 清理后续tag → 更新 project.json） |
 | `git_rollback_to_subtask` | cmd | 回退到小阶段 auto_tag（粒度更细，只回退到特定小阶段） |
+| `rollback_to_subtask_with_reset` | cmd | 回退到小阶段并重置 execution 数据（专用于分支回退场景） |
 | `get_git_tags_summary` | cmd | 列出所有 metheus/* tag（按创建日期倒序） |
 | `get_current_diff` | cmd | 获取当前 git diff（非 git 仓库/无提交时返回空，兼容 worktree） |
 | `compare_version_strings` | pub(crate) | 比较 "v0.1.1" vs "v0.1.3" 返回 -1/0/1 |
 | `save_tag_to_mid_stage` | pub(crate) | 将 tag 名写入 project.json 的 mid_stage.git_tag |
+| `git_stash_and_reset_to_tag` | pub(crate) | stash 当前变更 → reset --hard 到指定 tag（被回退命令复用） |
 
 ### `src-tauri/src/constitution.rs`（713 行）— 宪法管理
 | 项目 | 类型 | 说明 |
@@ -275,7 +277,7 @@ start_execution(后台 spawn)
 | `execute_subtask` | cmd | Tauri 壳包装（前端直接调时传临时空 state） |
 | **自动应答机制** | — | 启动后先写 1\n（信任确认），300ms 后写 20 个 yes\n（文件写入确认） |
 
-### `src-tauri/src/snapshot.rs`（345 行）— 快照与孤儿进程保护（2026-07-05 新增）
+### `src-tauri/src/snapshot.rs`（357 行）— 快照与孤儿进程保护（2026-07-05 新增）
 | 函数 | 类型 | 说明 |
 |------|------|------|
 | `UISnapshot` | pub struct | 前端 UI 状态快照：view_phase/selected_milestone_id/selected_mid_stage_id/generated_plan_keys/quick_generated_plan_keys/saved_at |
@@ -294,21 +296,22 @@ start_execution(后台 spawn)
 |------|------|------|
 | `chat.rs` | `greet`, `send_message`, `chat_with_role` | 对话：测试连接/自由对话/指定角色对话（返回结构化 Message） |
 | `plan.rs` | `generate_version_plan`, `approve_version_plan` | 方案：生成版本方案+宪法第1部分(含自检SELF_CHECK)/批准方案 |
-| `milestone.rs` | `generate_milestones`, `regenerate_milestones_with_feedback`, `generate_mid_stages`, `generate_next_prompt` | 拆解：大阶段(含QA质检)/带反馈重拆/中阶段(含attention_points)/小阶段提示词(含技术栈约束) |
+| `milestone.rs` | `generate_milestones`, `regenerate_milestones_with_feedback`, `regenerate_milestones_from_point`, `generate_mid_stages`, `generate_next_prompt`, `regenerate_plan_from_checkpoint`, `summarize_milestone` | 拆解：大阶段(含QA质检)/带反馈重拆/保留已完成重新生成(含attention_points)/中阶段/小阶段提示词(含技术栈约束)/检查点恢复/大阶段总结 |
 | `project_ops.rs` | `get_project`, `persist_project`, `validate_project_path`, `get_project_files`, `approve_mid_stage`, `reject_mid_stage` | 项目操作：加载/保存/校验/文件树/审批中阶段/驳回中阶段(含自动推进下一阶段) |
 
 ### 前端文件清单
 | 文件 | 职责 |
 |------|------|
-| `src/App.tsx`（1020 行） | **根组件**：所有核心状态、视图模式切换(discussion↔execution带动画)、侧边栏拖拽缩放、执行状态轮询、快照持久化、所有命令回调函数 |
-| `src/ChatRoom.tsx`（159 行） | 聊天组件：发送消息、@角色切换（@策略/@产品/@技术/@测试/@域）、模式选择器 |
-| `src/ExecutionTree.tsx`（740 行） | 执行树：三层嵌套（大阶段→中阶段→小阶段）、版本号编辑、QA质检标记、回退确认弹窗、宪法查看弹窗、快速模式操作区 |
-| `src/TaskConsole.tsx`（688 行） | 执行控制台：执行控制按钮、进度条、4标签页（代码变更/执行日志/宪法更新/Git标签）、测试日志列表、QA驳回弹窗 |
-| `src/FileTree.tsx`（278 行） | 文件树：平铺列表转树状结构、hover/pin 展开、文件类型图标 |
+| `src/App.tsx`（1416 行） | **根组件**：所有核心状态、视图模式切换(discussion↔execution带动画)、侧边栏拖拽缩放、执行状态轮询(2s)、快照持久化、分支讨论(回退/转向)、所有命令回调函数 |
+| `src/ChatRoom.tsx`（262 行） | 聊天组件：发送消息、@角色切换（@策略/@产品/@技术/@测试/@域）、版本方案渲染(milestone_summary/QA失败) |
+| `src/ExecutionTree.tsx`（756 行） | 执行树：三层嵌套（大阶段→中阶段→小阶段）、版本号编辑、QA质检标记、Git tag复制、回退确认弹窗、宪法查看弹窗、快速模式操作区 |
+| `src/TaskConsole.tsx`（688 行） | 执行控制台：执行控制按钮、进度条、4标签页（代码变更/执行日志(终端风格)/宪法摘要/Git标签按版本分组）、测试日志列表、QA驳回弹窗 |
+| `src/FileTree.tsx`（278 行） | 文件树：平铺列表转树状结构、hover/pin 展开、文件类型图标、递归节点渲染 |
 | `src/FloatingChatBalloon.tsx`（74 行） | 悬浮聊天球：执行模式下快捷查看讨论记录的只读浮窗 |
-| `src/utils/invokeWithTimeout.ts`（88 行） | **统一超时包装**：所有 Tauri invoke 的 Promise.race 超时保护，命令→超时秒数映射表 |
-| `src/components/Modal.tsx`（51 行） | 通用弹窗组件 |
-| `src/main.tsx`（9 行） | React DOM 挂载入口 |
+| `src/components/Modal.tsx`（51 行） | 通用弹窗组件（overlay + title + content） |
+| `src/utils/invokeWithTimeout.ts`（88 行） | **统一超时包装**：所有 Tauri invoke 的 Promise.race 超时保护，命令→超时秒数映射表(10s-180s) |
+| `src/main.tsx`（9 行） | React DOM 挂载入口（StrictMode） |
+| `src/types.ts`（230 行） | TypeScript 类型定义：Project/Milestone/MidStage/Subtask/PipelineState/QAResult 等，与 Rust project.rs 一一对应 |
 
 ---
 
@@ -357,6 +360,8 @@ start_execution(后台 spawn)
 | `TestLog` | 测试日志条目：subtask_title/status('passed'|'rejected'|'retried')/reason/files/full_report |
 | `ViewPhase` / `DiscussionReason` / `ViewMode` | 视图模式控制：phase('discussion'|'execution') + reason |
 | `RollbackToSubtaskPayload` | 小阶段回退参数聚合 |
+| `DiscussionBranchType` | 分支讨论类型：'rollback'（回退）｜'redirect'（转向） |
+| `RollbackCheckpoint` | 回退检查点：version/adjustments（分支讨论起点存档） |
 
 ---
 

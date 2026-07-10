@@ -4,7 +4,7 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // ...
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout"
 import { ChatMessage } from "./types"
 interface Props {
@@ -14,8 +14,19 @@ interface Props {
   mode: "Quick" | "Professional";
   onModeChange: (mode: "Quick" | "Professional") => void;
   modeLocked: boolean;
+  onApproveVersionPlan?: () => void;
+  onRejectVersionPlan?: () => void;
+  onContinueNextMilestone?: () => void;
+  onDiscussWithPM?: () => void;
+  onViewDetailedReport?: () => void;
+  hasNextMilestone?: boolean;
+  // === 阶段三：分支讨论 ===
+  discussionBranchType?: 'rollback' | 'redirect' | null;
+  onConfirmPMSuggestion?: () => void;
+  projectStatus?: string;
+  hasMilestones?: boolean;
 }
-function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, modeLocked }: Props) {
+function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, modeLocked, onApproveVersionPlan, onRejectVersionPlan, onContinueNextMilestone, onDiscussWithPM, onViewDetailedReport, hasNextMilestone, discussionBranchType, onConfirmPMSuggestion, projectStatus, hasMilestones }: Props) {
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   // 这是【发送消息】功能。当用户点击发送按钮时执行。
@@ -57,6 +68,13 @@ function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, mod
       targetRole = roleMap[match[1]];
       actualMessage = inputValue.replace(match[0], "").trim();
     }
+    // 分支B：注入上下文信息
+    let contextPrefix = '';
+    if (discussionBranchType === 'redirect') {
+      contextPrefix = `[上下文：当前项目阶段为"${projectStatus || '未开始'}"，已有${hasMilestones ? '若干' : '无'}大阶段。用户选择调整后续方向，请根据用户反馈重新规划后续大阶段。] `;
+    }
+    const finalMessage = contextPrefix + actualMessage;
+
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: "user",
@@ -68,7 +86,7 @@ function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, mod
     setIsLoading(true);
     try {
       const reply = await invokeWithTimeout("chat_with_role", {
-        message: actualMessage,
+        message: finalMessage,
         role: targetRole,
         threadId: "thread-init",
       });
@@ -92,6 +110,13 @@ function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, mod
       setIsLoading(false);
     }
   };
+  // 计算最新的版本方案消息时间戳，用于判定旧方案是否过期
+  const latestVpTimestamp = useMemo(() => {
+    const vpMessages = messages.filter(m => m.msgType === "version_plan");
+    if (vpMessages.length === 0) return 0;
+    return vpMessages.reduce((max, m) => Math.max(max, m.timestamp), 0);
+  }, [messages]);
+
   return (
     <div className="chat-room">
       <div className="chat-messages">
@@ -102,20 +127,99 @@ function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, mod
         {messages.length === 0 ? (
           <p className="empty-tip">开始讨论你的想法吧</p>
         ) : (
-          messages.map((msg) => (
-            // 每条消息用一个 div 包裹，key 是唯一 ID（让 React 高效更新）
-            // className 动态生成，区分用户消息和 AI 消息的样式
-            <div key={msg.id} className={`message message-${msg.role === "user" ? "user" : "ai"}`}>
-              {/* 显示角色：“你”或“AI” */}
-              <div className="message-role">
-                {msg.role === "user" ? "你" : msg.role}
+          messages.map((msg, index) => {
+            // 版本方案消息：特殊渲染
+            if (msg.msgType === "version_plan") {
+              const isExpired = msg.timestamp < latestVpTimestamp;
+              const hasApproved = msg.approved === true;
+              const hasRejected = msg.rejected === true;
+              return (
+                <div key={msg.id} className="message message-ai message-version-plan">
+                  <div className="message-role">
+                    {msg.role === "user" ? "你" : msg.role}
+                  </div>
+                  <div className="message-content">{msg.content}</div>
+                  <div className="vp-actions">
+                    {hasApproved ? (
+                      <span className="vp-status vp-status-approved">✅ 已批准</span>
+                    ) : hasRejected ? (
+                      <span className="vp-status vp-status-rejected">❌ 已驳回</span>
+                    ) : isExpired ? (
+                      <span className="vp-status vp-status-expired">⏳ 已过期</span>
+                    ) : (
+                      <>
+                        <button className="vp-btn-approve" onClick={onApproveVersionPlan}>✅ 批准版本方案</button>
+                        <button className="vp-btn-reject" onClick={onRejectVersionPlan}>❌ 驳回，继续讨论</button>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+            }
+            // 质检失败消息：红色边框特殊渲染
+            if (msg.msgType === "qa_failed") {
+              return (
+                <div key={msg.id} className="message message-system message-qa-failed">
+                  <div className="message-role">
+                    {msg.role === "user" ? "你" : msg.role}
+                  </div>
+                  <div className="message-content">{msg.content}</div>
+                </div>
+              );
+            }
+            // 大阶段总结消息：特殊渲染
+            if (msg.msgType === "milestone_summary") {
+              return (
+                <div key={msg.id} className="message message-ai message-milestone-summary">
+                  <div className="message-role">
+                    {msg.role === "user" ? "你" : msg.role}
+                  </div>
+                  <div className="message-content">{msg.content}</div>
+                  <div className="ms-actions">
+                    {hasNextMilestone ? (
+                      <button className="ms-btn-continue" onClick={onContinueNextMilestone}>▶ 继续下一大阶段</button>
+                    ) : (
+                      <>
+                        <button className="ms-btn-continue ms-btn-disabled" disabled>所有大阶段已完成</button>
+                        <p className="ms-completed-hint">✅ 所有大阶段已执行完成，项目已全部交付。</p>
+                      </>
+                    )}
+                    <button className="ms-btn-discuss" onClick={onDiscussWithPM}>💬 与产品经理讨论</button>
+                    <button className="ms-btn-report" onClick={onViewDetailedReport}>📊 查看详细报告</button>
+                  </div>
+                </div>
+              );
+            }
+            // 普通消息：保持现有渲染逻辑
+            const isLastAiMsg =
+              discussionBranchType != null &&
+              msg.role !== 'user' &&
+              msg.role !== 'system' &&
+              msg.msgType !== 'version_plan' &&
+              msg.msgType !== 'milestone_summary' &&
+              index === messages.length - 1;
+
+            return (
+              <div key={msg.id} className={`message message-${msg.role === "user" ? "user" : "ai"}`}>
+                <div className="message-role">
+                  {msg.role === "user" ? "你" : msg.role}
+                </div>
+                <div className="message-content">{msg.content}</div>
+                {isLastAiMsg && onConfirmPMSuggestion && (
+                  <button
+                    className="btn-confirm-suggestion"
+                    onClick={onConfirmPMSuggestion}
+                  >
+                    {discussionBranchType === 'rollback'
+                      ? '🔄 按照建议回退并继续'
+                      : '🔄 按照新方案生成后续大阶段'}
+                  </button>
+                )}
               </div>
-              {/* 显示消息内容 */}
-              <div className="message-content">{msg.content}</div>
-            </div>
-          ))
+            );
+          })
         )}
-        {/* 如果正在等待 AI 回复，显示 “AI 正在输入...” 的提示 */}
+        {/* 如果正在等待 AI 回复，显示 "AI 正在输入..." 的提示 */}
         {isLoading && <p className="loading-tip">AI 正在输入...</p>}
       </div>
       {/* 模式选择器：仅在未锁定时可切换 */}

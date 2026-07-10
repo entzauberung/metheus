@@ -1700,3 +1700,311 @@
   overflow-y: auto;
   min-height: 0;
 }
+
+/* ===== 版本方案消息特殊样式 ===== */
+
+.message-version-plan {
+  border-left: 3px solid #27ae60;
+  background-color: #f0faf4;
+}
+
+.vp-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.vp-btn-approve {
+  background: #27ae60;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.vp-btn-approve:hover {
+  background: #219a52;
+}
+
+.vp-btn-reject {
+  background: #e74c3c;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.vp-btn-reject:hover {
+  background: #c0392b;
+}
+
+.vp-btn-approve:disabled,
+.vp-btn-reject:disabled {
+  background: #bdc3c7;
+  cursor: not-allowed;
+}
+
+.vp-status {
+  font-size: 13px;
+  font-weight: 600;
+  margin-top: 4px;
+}
+
+.vp-status-approved {
+  color: #27ae60;
+}
+
+.vp-status-rejected {
+  color: #e74c3c;
+}
+
+.vp-status-expired {
+  color: #95a5a6;
+}
+
+/* ===== 大阶段总结消息特殊样式 ===== */
+
+.message-milestone-summary {
+  border-left: 3px solid #3498db;
+  background-color: #f0f7ff;
+}
+
+.ms-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+}
+
+.ms-btn-continue {
+  background: #27ae60;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 18px;
+  font-size: 14px;
+  cursor: pointer;
+  font-weight: 600;
+  transition: background 0.15s;
+}
+
+.ms-btn-continue:hover {
+  background: #219a52;
+}
+
+.ms-btn-discuss {
+  background: #3498db;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.ms-btn-discuss:hover {
+  background: #2980b9;
+}
+
+.ms-btn-report {
+  background: #95a5a6;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 16px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.ms-btn-report:hover {
+  background: #7f8c8d;
+}
+
+.ms-btn-disabled {
+  background: #bdc3c7;
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
+/* ===== 分支选择弹窗样式（阶段三） ===== */
+
+.branch-selector-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.branch-selector {
+  background: #fff;
+  border-radius: 12px;
+  padding: 24px;
+  max-width: 440px;
+  width: 90vw;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.15);
+}
+
+.branch-selector h3 {
+  margin: 0 0 8px 0;
+  font-size: 18px;
+  color: #333;
+}
+
+.branch-selector > p {
+  margin: 0 0 20px 0;
+  color: #666;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.branch-options {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.branch-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  background: #fff;
+}
+
+.branch-option:hover {
+  border-color: #007aff;
+  background: #f0f7ff;
+}
+
+.branch-option-icon {
+  font-size: 28px;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+.branch-option-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.branch-option-title {
+  font-weight: 600;
+  font-size: 15px;
+  color: #333;
+  margin-bottom: 4px;
+}
+
+.branch-option-desc {
+  font-size: 13px;
+  color: #888;
+  line-height: 1.4;
+}
+
+.branch-selector-actions {
+  margin-top: 20px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+.branch-selector-cancel {
+  padding: 8px 16px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  background: #fff;
+  font-size: 14px;
+  cursor: pointer;
+  color: #666;
+  transition: background 0.15s;
+}
+
+.branch-selector-cancel:hover {
+  background: #f5f5f5;
+}
+
+/* ===== 确认建议按钮（ChatRoom 中用） ===== */
+
+.btn-confirm-suggestion {
+  display: block;
+  margin-top: 12px;
+  padding: 8px 16px;
+  background: #007aff;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.btn-confirm-suggestion:hover {
+  background: #005bbf;
+}
+
+.btn-confirm-suggestion:disabled {
+  background: #bdc3c7;
+  cursor: not-allowed;
+}
+
+/* ===== 优化 A：大阶段全部完成提示 ===== */
+
+.ms-completed-hint {
+  margin-top: 8px;
+  font-size: 13px;
+  color: #27ae60;
+  font-weight: 500;
+}
+
+/* ===== 优化 B：回退分割线 ===== */
+
+.rollback-divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.rollback-divider::before,
+.rollback-divider::after {
+  content: '';
+  flex: 1;
+  height: 2px;
+  background: repeating-linear-gradient(
+    90deg,
+    #e74c3c 0px,
+    #e74c3c 6px,
+    transparent 6px,
+    transparent 10px
+  );
+}
+
+.rollback-divider span {
+  font-size: 12px;
+  color: #e74c3c;
+  white-space: nowrap;
+  padding: 0 8px;
+  font-weight: 500;
+}
+
+/* ===== 任务 3.10：质检失败消息 ===== */
+
+.message-qa-failed {
+  border-left: 3px solid #e74c3c !important;
+  background-color: #fef0f0 !important;
+}

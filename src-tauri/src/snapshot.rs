@@ -31,6 +31,18 @@ pub(crate) struct UISnapshot {
     pub generated_plan_keys: Vec<String>,
     /// 快速模式下已生成执行计划的 milestone ID 列表
     pub quick_generated_plan_keys: Vec<String>,
+    /// 分支B讨论类型："rollback" 或 "redirect"，空字符串/"null" 表示未选择
+    #[serde(default)]
+    pub discussion_branch_type: Option<String>,
+    /// 分割点大阶段 ID
+    #[serde(default)]
+    pub checkpoint_milestone_id: Option<String>,
+    /// 分割点中阶段 ID
+    #[serde(default)]
+    pub checkpoint_mid_stage_id: Option<String>,
+    /// 分割点小阶段 ID
+    #[serde(default)]
+    pub checkpoint_subtask_id: Option<String>,
     pub saved_at: String,
 }
 

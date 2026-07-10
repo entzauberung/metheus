@@ -31,6 +31,9 @@ interface Props {
   isExecuting: boolean;
   isGeneratingPlan: boolean;
   executionStatus: PipelineState | null;
+
+  // === 阶段三：小阶段回退成功后刷新项目 ===
+  onSubtaskRollbackSuccess?: (projectJson: string) => void;
 }
 
 function ExecutionTree({
@@ -51,6 +54,7 @@ function ExecutionTree({
   isExecuting,
   isGeneratingPlan,
   executionStatus,
+  onSubtaskRollbackSuccess,
 }: Props) {
   // Phase B: QA 弹窗已移至 App.tsx；onRegenerateMilestones 后续由 TaskConsole 使用
   void onRegenerateMilestones;
@@ -172,12 +176,16 @@ function ExecutionTree({
   const handleSubtaskRollback = async () => {
     if (!subtaskRollbackTarget || !projectId) return;
     try {
-      const result = await invokeWithTimeout('git_rollback_to_subtask', {
+      const result = await invokeWithTimeout('rollback_to_subtask_with_reset', {
         projectPath: projectPath || '',
         projectId: projectId,
         tagName: subtaskRollbackTarget.tagName,
       });
       console.log('小阶段回退成功:', result);
+      // 通知父组件刷新项目状态
+      if (onSubtaskRollbackSuccess && typeof result === 'string') {
+        onSubtaskRollbackSuccess(result);
+      }
       setSubtaskRollbackTarget(null);
     } catch (err) {
       console.error('小阶段回退失败:', err);
@@ -465,22 +473,29 @@ function ExecutionTree({
                               <h4>📋 小阶段</h4>
                               {mid.subtasks.map((st, idx) => {
                                 const isRolledBack = st.status === 'RolledBack';
+                                const prevSt = idx > 0 ? mid.subtasks[idx - 1] : null;
+                                const showDivider = prevSt?.status === 'Passed' && st.status === 'Pending';
                                 return (
-                                  <div
-                                    key={st.id}
-                                    className="subtask-list-item"
-                                    style={{
-                                      display: 'flex',
-                                      alignItems: 'center',
-                                      gap: '8px',
-                                      padding: '4px 0',
-                                      fontSize: '13px',
-                                      color: isRolledBack ? '#999' : '#333',
-                                      textDecoration: isRolledBack ? 'line-through' : 'none',
-                                    }}
-                                  >
-                                    <span>{idx + 1}.</span>
-                                    <span>{st.title}</span>
+                                  <div key={st.id}>
+                                    {showDivider && (
+                                      <div className="rollback-divider">
+                                        <span>↩ 回退分割点 — 从此处开始后续任务</span>
+                                      </div>
+                                    )}
+                                    <div
+                                      className="subtask-list-item"
+                                      style={{
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '8px',
+                                        padding: '4px 0',
+                                        fontSize: '13px',
+                                        color: isRolledBack ? '#999' : '#333',
+                                        textDecoration: isRolledBack ? 'line-through' : 'none',
+                                      }}
+                                    >
+                                      <span>{idx + 1}.</span>
+                                      <span>{st.title}</span>
                                     {/* Tag 展示：已完成且有 auto_tag 的小阶段 */}
                                     {st.status === 'Passed' && st.auto_tag && (
                                       <>
@@ -540,6 +555,7 @@ function ExecutionTree({
                                     {isRolledBack && (
                                       <span style={{ marginLeft: 'auto', color: '#ccc', fontSize: '11px' }}>已回退</span>
                                     )}
+                                  </div>
                                   </div>
                                 );
                               })}

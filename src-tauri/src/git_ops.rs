@@ -566,3 +566,307 @@ pub(crate) fn save_tag_to_mid_stage(
 
     Ok(())
 }
+
+/// 内部函数：暂存未提交变更并执行 git reset --hard 到指定 tag
+///
+/// 1. 检查工作区是否有未提交变更（git status --porcelain）
+/// 2. 如有未提交变更，执行 git stash push 暂存
+/// 3. 执行 git reset --hard 到目标 tag
+/// 4. 如果 reset 失败且之前做了 stash，执行 git stash pop 恢复工作区
+///
+/// 返回 bool 表示是否有未提交变更被 stash（供调用方决定是否提示用户）
+pub(crate) fn git_stash_and_reset_to_tag(
+    project_path: &str,
+    tag_name: &str,
+) -> Result<bool, String> {
+    // 1. 检查工作区状态
+    let status_output = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(project_path)
+        .output()
+        .map_err(|e| format!("git status 失败: {}", e))?;
+    let status = String::from_utf8_lossy(&status_output.stdout);
+    let has_uncommitted = !status.trim().is_empty();
+
+    // 2. 如有未提交变更，先 stash 起来，避免被 reset --hard 永久清除
+    if has_uncommitted {
+        let stash_output = std::process::Command::new("git")
+            .args(["stash", "push", "-m", "metheus_rollback_auto_stash"])
+            .current_dir(project_path)
+            .output()
+            .map_err(|e| format!("git stash 失败: {}", e))?;
+        if !stash_output.status.success() {
+            return Err(format!(
+                "git stash 执行失败:\n{}",
+                String::from_utf8_lossy(&stash_output.stderr)
+            ));
+        }
+    }
+
+    // 3. git reset --hard 到目标 tag
+    let reset_output = std::process::Command::new("git")
+        .args(["reset", "--hard", tag_name])
+        .current_dir(project_path)
+        .output()
+        .map_err(|e| format!("git reset 失败: {}", e))?;
+    if !reset_output.status.success() {
+        // reset 失败，尝试恢复 stash
+        if has_uncommitted {
+            let _ = std::process::Command::new("git")
+                .args(["stash", "pop"])
+                .current_dir(project_path)
+                .output();
+        }
+        return Err(format!(
+            "回退到 {} 失败:\n{}",
+            tag_name,
+            String::from_utf8_lossy(&reset_output.stderr)
+        ));
+    }
+
+    Ok(has_uncommitted)
+}
+
+/// Git 回退到指定小阶段并重置执行数据
+///
+/// 把项目代码回退到指定 subtask auto_tag 对应的版本，并重置该小阶段之后的所有执行数据。
+/// 与 git_rollback_to_subtask 的区别：本命令会彻底重置后续节点的执行状态
+///（status→Pending, execution_result→None, test_result→None, retry_count→0），
+/// 而不是简单地标记为 RolledBack。适用于用户想在某个小阶段重新开始的场景。
+///
+/// 1. 调用 git_stash_and_reset_to_tag 执行 Git 回退（含 stash 保护）
+/// 2. 加载 project.json，定位目标 subtask
+/// 3. 重置目标 subtask 之后的执行数据（同一 mid_stage 内 + 后续 mid_stages + 后续 milestones）
+/// 4. 持久化并返回完整的 Project JSON
+#[tauri::command]
+pub(crate) async fn rollback_to_subtask_with_reset(
+    project_path: String,
+    project_id: String,
+    tag_name: String,
+) -> Result<String, String> {
+    // 1. 执行 Git 回退（含 stash 保护）
+    let _had_stash = git_stash_and_reset_to_tag(&project_path, &tag_name)?;
+
+    // 2. 加载 Project 结构体
+    let mut project = crate::load_project(&project_id)?;
+
+    // 3. 遍历定位目标 subtask
+    let mut target_milestone_idx: Option<usize> = None;
+    let mut target_mid_stage_idx: Option<usize> = None;
+    let mut target_subtask_idx: Option<usize> = None;
+
+    'search: for (mi, milestone) in project.milestones.iter().enumerate() {
+        for (msi, mid_stage) in milestone.mid_stages.iter().enumerate() {
+            for (si, subtask) in mid_stage.subtasks.iter().enumerate() {
+                if let Some(ref auto_tag) = subtask.auto_tag {
+                    if auto_tag == &tag_name {
+                        target_milestone_idx = Some(mi);
+                        target_mid_stage_idx = Some(msi);
+                        target_subtask_idx = Some(si);
+                        break 'search;
+                    }
+                }
+            }
+        }
+    }
+
+    let (t_mi, t_msi, t_si) =
+        match (target_milestone_idx, target_mid_stage_idx, target_subtask_idx) {
+            (Some(mi), Some(msi), Some(si)) => (mi, msi, si),
+            _ => return Err(format!("未找到 tag {} 对应的小阶段", tag_name)),
+        };
+
+    // === 回退后清理后续 git tag（确保 git tag 列表与 Project 结构体状态一致）===
+
+    // 第一步：删除同一中阶段内、目标子任务之后的子任务 auto_tag
+    {
+        let mid_stage = &project.milestones[t_mi].mid_stages[t_msi];
+        for subtask in mid_stage.subtasks.iter().skip(t_si + 1) {
+            if let Some(ref tag) = subtask.auto_tag {
+                let output = std::process::Command::new("git")
+                    .args(["tag", "-d", tag])
+                    .current_dir(&project_path)
+                    .output();
+                match output {
+                    Ok(o) if o.status.success() => {}
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        if !stderr.contains("not found") {
+                            eprintln!("警告: 删除 git tag {} 失败: {}", tag, stderr.trim());
+                        }
+                    }
+                    Err(e) => eprintln!("警告: 执行 git tag -d {} 失败: {}", tag, e),
+                }
+            }
+        }
+    }
+
+    // 第二步：删除同一大阶段内、目标中阶段之后的 mid_stage git_tag 及其所有子任务 auto_tag
+    {
+        let milestone = &project.milestones[t_mi];
+        for mid_stage in milestone.mid_stages.iter().skip(t_msi + 1) {
+            if !mid_stage.git_tag.is_empty() {
+                let output = std::process::Command::new("git")
+                    .args(["tag", "-d", &mid_stage.git_tag])
+                    .current_dir(&project_path)
+                    .output();
+                match output {
+                    Ok(o) if o.status.success() => {}
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        if !stderr.contains("not found") {
+                            eprintln!(
+                                "警告: 删除 git tag {} 失败: {}",
+                                mid_stage.git_tag,
+                                stderr.trim()
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "警告: 执行 git tag -d {} 失败: {}",
+                        mid_stage.git_tag, e
+                    ),
+                }
+            }
+            for subtask in mid_stage.subtasks.iter() {
+                if let Some(ref tag) = subtask.auto_tag {
+                    let output = std::process::Command::new("git")
+                        .args(["tag", "-d", tag])
+                        .current_dir(&project_path)
+                        .output();
+                    match output {
+                        Ok(o) if o.status.success() => {}
+                        Ok(o) => {
+                            let stderr = String::from_utf8_lossy(&o.stderr);
+                            if !stderr.contains("not found") {
+                                eprintln!("警告: 删除 git tag {} 失败: {}", tag, stderr.trim());
+                            }
+                        }
+                        Err(e) => eprintln!("警告: 执行 git tag -d {} 失败: {}", tag, e),
+                    }
+                }
+            }
+        }
+    }
+
+    // 第三步：删除后续大阶段所有 mid_stage git_tag 和所有子任务 auto_tag
+    for milestone in project.milestones.iter().skip(t_mi + 1) {
+        for mid_stage in milestone.mid_stages.iter() {
+            if !mid_stage.git_tag.is_empty() {
+                let output = std::process::Command::new("git")
+                    .args(["tag", "-d", &mid_stage.git_tag])
+                    .current_dir(&project_path)
+                    .output();
+                match output {
+                    Ok(o) if o.status.success() => {}
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        if !stderr.contains("not found") {
+                            eprintln!(
+                                "警告: 删除 git tag {} 失败: {}",
+                                mid_stage.git_tag,
+                                stderr.trim()
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "警告: 执行 git tag -d {} 失败: {}",
+                        mid_stage.git_tag, e
+                    ),
+                }
+            }
+            for subtask in mid_stage.subtasks.iter() {
+                if let Some(ref tag) = subtask.auto_tag {
+                    let output = std::process::Command::new("git")
+                        .args(["tag", "-d", tag])
+                        .current_dir(&project_path)
+                        .output();
+                    match output {
+                        Ok(o) if o.status.success() => {}
+                        Ok(o) => {
+                            let stderr = String::from_utf8_lossy(&o.stderr);
+                            if !stderr.contains("not found") {
+                                eprintln!("警告: 删除 git tag {} 失败: {}", tag, stderr.trim());
+                            }
+                        }
+                        Err(e) => eprintln!("警告: 执行 git tag -d {} 失败: {}", tag, e),
+                    }
+                }
+            }
+        }
+    }
+
+    // 记录是否有任何重置操作发生（用于决定 mid_stage / milestone 状态降级）
+    let mut any_reset = false;
+
+    // 4a. 同一 mid_stage 内，目标 subtask 之后的 subtask → 重置为 Pending
+    {
+        let mid_stage = &mut project.milestones[t_mi].mid_stages[t_msi];
+        for subtask in mid_stage.subtasks.iter_mut().skip(t_si + 1) {
+            subtask.status = project::SubtaskStatus::Pending;
+            subtask.execution_result = None;
+            subtask.test_result = None;
+            subtask.retry_count = 0;
+            any_reset = true;
+        }
+    }
+
+    // 4b. 目标 mid_stage 自身状态降级
+    if any_reset {
+        let mid_stage = &mut project.milestones[t_mi].mid_stages[t_msi];
+        match mid_stage.status {
+            project::MidStageStatus::Completed
+            | project::MidStageStatus::Approved
+            | project::MidStageStatus::RolledBack => {
+                mid_stage.status = project::MidStageStatus::Ready;
+            }
+            _ => { /* 其他状态保持不变 */ }
+        }
+    }
+
+    // 4c. 同一 milestone 内，目标 mid_stage 之后的 mid_stages → 全部重置
+    {
+        let milestone = &mut project.milestones[t_mi];
+        for mid_stage in milestone.mid_stages.iter_mut().skip(t_msi + 1) {
+            mid_stage.status = project::MidStageStatus::Pending;
+            for subtask in mid_stage.subtasks.iter_mut() {
+                subtask.status = project::SubtaskStatus::Pending;
+                subtask.execution_result = None;
+                subtask.test_result = None;
+                subtask.retry_count = 0;
+                any_reset = true;
+            }
+        }
+    }
+
+    // 4d. 目标 milestone 自身状态降级
+    if any_reset {
+        let milestone = &mut project.milestones[t_mi];
+        if milestone.status == project::MilestoneStatus::Completed {
+            milestone.status = project::MilestoneStatus::InProgress;
+        }
+    }
+
+    // 4e. 目标 milestone 之后的 milestones → 全部重置
+    for milestone in project.milestones.iter_mut().skip(t_mi + 1) {
+        milestone.status = project::MilestoneStatus::Pending;
+        for mid_stage in milestone.mid_stages.iter_mut() {
+            mid_stage.status = project::MidStageStatus::Pending;
+            for subtask in mid_stage.subtasks.iter_mut() {
+                subtask.status = project::SubtaskStatus::Pending;
+                subtask.execution_result = None;
+                subtask.test_result = None;
+                subtask.retry_count = 0;
+            }
+        }
+    }
+
+    // 5. 持久化到磁盘
+    crate::save_project(&project)?;
+
+    // 6. 序列化并返回完整的 Project JSON
+    let json_str =
+        serde_json::to_string_pretty(&project).map_err(|e| format!("序列化项目文件失败: {}", e))?;
+
+    Ok(json_str)
+}
