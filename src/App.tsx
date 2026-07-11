@@ -13,6 +13,8 @@ import ChatRoom from "./ChatRoom";
 import TaskConsole from "./TaskConsole";
 import FileTree from "./FileTree";
 import FloatingChatBalloon from "./FloatingChatBalloon";
+import { ExecutionEngineTestPanel } from "./features/dev-tools";
+import { ProjectPathSelector } from "./features/project-path";
 
 const DEFAULT_SIDEBAR_WIDTH = 280;
 const MIN_SIDEBAR_WIDTH = 220;
@@ -39,9 +41,6 @@ const MAX_SIDEBAR_WIDTH = 800;
 function App() {
   const [project, setProject] = useState<Project | null>(null);
   const [projectPath, setProjectPath] = useState<string>("");
-  const [pathSaveStatus, setPathSaveStatus] = useState<string>("");
-  const [testResult, setTestResult] = useState<string>("");
-  const [testLoading, setTestLoading] = useState<string>("");
 
   // === Phase B：视图模式控制 ===
   const [viewMode, setViewMode] = useState<ViewMode>({ phase: 'discussion', reason: 'idle' });
@@ -1184,134 +1183,13 @@ function App() {
       <main className="main-content">
         {/* === 开发者工具：让你可以手动测试 Tauri 后端的“执行子任务”、“
         检查子任务”、“生成下一步提示词”三个核心命令，并查看结果 === */}
-        <div className="project-path-section">
-          <h3>📁 项目目录</h3>
-          <div className="project-path-row">
-            <input
-              className="project-path-input"
-              type="text"
-              value={projectPath}
-              onChange={(e) => setProjectPath(e.target.value)}
-              placeholder="例如：/home/user/my-project"
-            />
-            <button
-              className="btn-save-path"
-              onClick={async () => {
-                const updated = { ...project, project_path: projectPath };
-                // 验证路径（仅提示，不阻止保存）
-                if (projectPath) {
-                  try {
-                    const validation = await invokeWithTimeout<PathValidationResult>("validate_project_path", { projectPath });
-                    if (!validation.is_valid) {
-                      setPathSaveStatus(`⚠️ ${validation.error_message}（已保存）`);
-                    }
-                  } catch (_) { /* 验证失败不影响保存 */ }
-                }
-                try {
-                  await invokeWithTimeout("persist_project", { projectJson: JSON.stringify(updated) });
-                  setProject(updated);
-                  if (!pathSaveStatus.startsWith("⚠️")) {
-                    setPathSaveStatus("✅ 已保存");
-                  }
-                  setTimeout(() => setPathSaveStatus(""), 5000);
-                } catch (e: any) {
-                  setPathSaveStatus(`❌ 保存失败：${e}`);
-                }
-              }}
-            >
-              保存
-            </button>
-          </div>
-          {pathSaveStatus && (
-            <div className={`path-status ${pathSaveStatus.startsWith("✅") ? "success" : "error"}`}>
-              {pathSaveStatus}
-            </div>
-          )}
-        </div>
-        {/* === Phase 2：命令测试面板 === */}
-        <div className="test-panel">
-          <h3>🔧 执行引擎测试</h3>
-          <div className="test-buttons">
-            <button
-              className="test-btn"
-              disabled={testLoading === "execute"}
-              onClick={async () => {
-                setTestLoading("execute");
-                setTestResult("");
-                try {
-                  const res: any = await invokeWithTimeout("execute_subtask", {
-                    projectPath: projectPath || "/tmp/test",
-                    prompt: "创建一个 metheus_test.txt 文件",
-                    subtaskId: "st-test-001",
-                    milestoneId: "ms-test-001",
-                    midStageId: "mid-test-001",
-                  });
-                  setTestResult(JSON.stringify(res, null, 2));
-                } catch (e: any) {
-                  setTestResult(`❌ 错误：${e}`);
-                } finally {
-                  setTestLoading("");
-                }
-              }}
-            >
-              {testLoading === "execute" ? "⏳ 执行中..." : "▶ execute_subtask"}
-            </button>
-            <button
-              className="test-btn"
-              disabled={testLoading === "check"}
-              onClick={async () => {
-                setTestLoading("check");
-                setTestResult("");
-                try {
-                  const res: any = await invokeWithTimeout("check_subtask", {
-                    projectPath: projectPath || "/tmp/test",
-                    subtaskId: "st-test-001",
-                    subtaskGoal: "创建测试文件",
-                    milestoneId: "ms-test-001",
-                    midStageId: "mid-test-001",
-                  });
-                  setTestResult(JSON.stringify(res, null, 2));
-                } catch (e: any) {
-                  setTestResult(`❌ 错误：${e}`);
-                } finally {
-                  setTestLoading("");
-                }
-              }}
-            >
-              {testLoading === "check" ? "⏳ 检查中..." : "🔍 check_subtask"}
-            </button>
-            <button
-              className="test-btn"
-              disabled={testLoading === "prompt"}
-              onClick={async () => {
-                setTestLoading("prompt");
-                setTestResult("");
-                try {
-                  const res: any = await invokeWithTimeout("generate_next_prompt", {
-                    midStageTitle: "数据库设计",
-                    midStageDescription: "设计用户模型",
-                    previousSubtaskTitle: "创建连接配置",
-                    previousSubtaskResult: "通过",
-                    fileChanges: ["config.ts"],
-                    testResult: "通过",
-                    isRetry: false,
-                    retryReason: "",
-                  });
-                  setTestResult(JSON.stringify(res, null, 2));
-                } catch (e: any) {
-                  setTestResult(`❌ 错误：${e}`);
-                } finally {
-                  setTestLoading("");
-                }
-              }}
-            >
-              {testLoading === "prompt" ? "⏳ 生成中..." : "🤖 generate_next_prompt"}
-            </button>
-          </div>
-          <div className={`test-result-box ${!testResult ? "empty" : ""}`}>
-            {testResult || "点击上方按钮测试执行引擎命令，结果将显示在此处。"}
-          </div>
-        </div>
+        <ProjectPathSelector
+          project={project}
+          projectPath={projectPath}
+          onProjectChange={setProject}
+          onProjectPathChange={setProjectPath}
+        />
+        <ExecutionEngineTestPanel projectPath={projectPath} />
 
         <header className="chat-header">
           <h2>弥 · 工作流指挥中心</h2>
