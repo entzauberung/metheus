@@ -8,6 +8,49 @@ use crate::project;
 const MILESTONE_REGEN_SOURCE_CHECK_FAILED: &str = "check_failed";
 const MILESTONE_REGEN_SOURCE_APPROVAL_REJECTED: &str = "approval_rejected";
 
+/// 执行计划自动补救重试次数上限
+const MAX_PLAN_RECOVERY_RETRIES: u32 = 2;
+
+/// 执行计划校验错误分类
+enum PlanValidationError {
+    /// 可自动补救：单个字段缺失/为空但 JSON 主体结构完整
+    Recoverable(String),
+    /// 硬失败：JSON 不可解析、任务列表为空、结构彻底损坏
+    Fatal(String),
+}
+
+/// 分类执行计划生成中的校验错误
+fn classify_plan_error(error: &str) -> PlanValidationError {
+    let msg = error.to_string();
+    // 硬失败 —— JSON 层或结构层
+    if msg.contains("JSON 解析失败")
+        || msg.contains("执行计划为空")
+        || msg.contains("AI 调用失败")
+    {
+        return PlanValidationError::Fatal(msg);
+    }
+    // 检查是否为单字段缺失 —— 搜索 known field names
+    let known_fields = [
+        "allowed_file_paths",
+        "acceptance_criteria",
+        "stop_rules",
+        "execution_prompt",
+        "goal",
+        "title",
+        "context_summary",
+        "new_file_paths",
+        "evidence_files",
+    ];
+    let is_field_error = known_fields.iter().any(|f| msg.contains(f));
+    if is_field_error {
+        PlanValidationError::Recoverable(msg)
+    } else {
+        // 无法识别 —— 保守按致命错误处理
+        PlanValidationError::Fatal(msg)
+    }
+}
+
+
 fn required_string(
     value: &serde_json::Value,
     field: &str,
@@ -128,10 +171,13 @@ async fn generate_milestone_candidates(
         .filter(|feedback| !feedback.is_empty())
         .map_or_else(String::new, |feedback| format!("\n\n=== 重新生成反馈 ===\n{}", feedback));
 
+    // Phase 6: Build Already constitution low-weight reference section
+    let already_section = build_already_context_section(&proj);
+
     let user_message = format!(
         "项目名称：{}\n项目来源：{}\n项目路径：{}\n讨论修订号：{}\n\n\
          === 已批准项目方案 ===\n{}\n\n=== 宪法第 1 部分 ===\n{}\n\n\
-         === 讨论摘要 ===\n{}{}",
+         === 讨论摘要 ===\n{}{}{}",
         proj.name,
         match proj.entry_kind {
             project::ProjectEntryKind::NoProject => "从零开始",
@@ -143,6 +189,7 @@ async fn generate_milestone_candidates(
         if constitution_part1.is_empty() { "（无）" } else { &constitution_part1 },
         discussion_summary,
         feedback_section,
+        already_section,
     );
 
     let system_prompt = format!(
@@ -587,8 +634,10 @@ async fn generate_mid_stage_candidates(
         .map(str::trim)
         .filter(|feedback| !feedback.is_empty())
         .map_or_else(String::new, |feedback| format!("\n\n重新生成反馈：\n{}", feedback));
+    // Phase 6: Already constitution low-weight reference
+    let already_section = build_already_context_section(proj);
     let context = format!(
-        "大阶段：{} ({})\n目标：{}\n范围：{}\n预期输出：{}\n验收标准：{}\n技术栈：{}\n\n项目方案：\n{}{}",
+        "大阶段：{} ({})\n目标：{}\n范围：{}\n预期输出：{}\n验收标准：{}\n技术栈：{}\n\n项目方案：\n{}{}{}",
         milestone.title,
         milestone.version,
         milestone.goal,
@@ -598,6 +647,7 @@ async fn generate_mid_stage_candidates(
         milestone.tech_stack,
         proj.version_plan,
         feedback_section,
+        already_section,
     );
     let reply = crate::api::call_deepseek_api_json(
         crate::prompts::MID_STAGE_GENERATION_PROMPT,
@@ -1047,10 +1097,13 @@ async fn generate_execution_plan_tasks(
         .map(str::trim)
         .filter(|feedback| !feedback.is_empty())
         .map_or_else(String::new, |feedback| format!("\n\n重新生成反馈：\n{}", feedback));
+    // Phase 6: Already constitution low-weight reference
+    let already_section = build_already_context_section(proj);
+
     let context = format!(
         "中阶段：{} ({})\n描述：{}\n技术重点：{}\n\n所属大阶段：{} — {}\n\
          项目方案摘要（仅相关部分）：\n{}\n\n项目路径：{}\n\
-         已有文件（仅作参考，不得无差别注入）：\n（由执行器在运行时按 evidence_files 精确读取）{}",
+         已有文件（仅作参考，不得无差别注入）：\n（由执行器在运行时按 evidence_files 精确读取）{}{}",
         mid_stage.title,
         mid_stage.version,
         mid_stage.description,
@@ -1060,6 +1113,7 @@ async fn generate_execution_plan_tasks(
         proj.version_plan.chars().take(1000).collect::<String>(),
         proj.project_path,
         feedback_section,
+        already_section,
     );
     let reply = crate::api::call_deepseek_api_json(
         crate::prompts::EXECUTION_PLAN_PROMPT,
@@ -1106,6 +1160,149 @@ async fn generate_execution_plan_tasks(
         .collect()
 }
 
+/// 向 AI 发送针对性补救请求，仅补齐缺失字段
+async fn recover_plan_fields(
+    original_reply: &str,
+    field_error: &str,
+    context: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let recovery_prompt = format!(
+        "你之前输出的执行计划 JSON 存在字段问题：{}\n\n\
+         请基于以下上下文，重新输出完整的执行计划 JSON 数组，确保所有必填字段均已补齐。\n\
+         每个小阶段必须包含：order, title, goal, allowed_file_paths, new_file_paths, \
+         evidence_files, context_summary, acceptance_criteria, stop_rules, execution_prompt。\n\
+         allowed_file_paths、acceptance_criteria、stop_rules 均不可为空数组。\n\n\
+         上次输出（供参考）：\n{}\n\n上下文：\n{}",
+        field_error,
+        &original_reply.chars().take(3000).collect::<String>(),
+        context,
+    );
+    let reply = crate::api::call_deepseek_api_json(
+        "你是全栈技术专家。你的任务是修复执行计划 JSON 中的字段缺失问题。输出严格的 JSON 数组，以 [ 开头，以 ] 结尾。不要 markdown 标记，不要解释文字。",
+        &recovery_prompt,
+    )
+    .await
+    .map_err(|error| format!("执行计划字段补救 AI 调用失败：{}", error))?;
+    crate::json_utils::parse_json_with_retry(&reply)
+        .await
+        .map_err(|error| format!("补救后 JSON 解析失败：{}", error))
+}
+
+/// 带自动补救的 plan generation wrapper
+async fn generate_execution_plan_with_recovery(
+    proj: &project::Project,
+    milestone_id: &str,
+    mid_stage_id: &str,
+    regeneration_feedback: Option<&str>,
+    mut autopilot_state: Option<&mut project::AutopilotState>,
+) -> Result<Vec<project::Subtask>, String> {
+    let mut last_error = String::new();
+    let last_reply = String::new();
+
+    // Build context once for recovery use
+    let milestone = proj.milestones.iter()
+        .find(|m| m.id == milestone_id)
+        .ok_or_else(|| "大阶段不存在。".to_string())?;
+    let mid_stage = milestone.mid_stages.iter()
+        .find(|m| m.id == mid_stage_id)
+        .ok_or_else(|| "中阶段不存在。".to_string())?;
+    let context = format!(
+        "中阶段：{} ({})\n描述：{}\n技术重点：{}\n所属大阶段：{} — {}",
+        mid_stage.title, mid_stage.version, mid_stage.description,
+        mid_stage.tech_focus, milestone.title, milestone.goal,
+    );
+
+    for attempt in 0..=MAX_PLAN_RECOVERY_RETRIES {
+        match generate_execution_plan_tasks(proj, milestone_id, mid_stage_id, regeneration_feedback).await {
+            Ok(tasks) => {
+                if attempt > 0 {
+                    if let Some(ref mut ap) = autopilot_state {
+                        ap.recovery_count = ap.recovery_count.saturating_add(attempt);
+                        ap.last_recovery_reason = format!(
+                            "执行计划生成经 {} 次自动补救后成功（原因：{}）",
+                            attempt,
+                            last_error.lines().next().unwrap_or("未知字段错误"),
+                        );
+                        ap.last_recovery_at = chrono::Utc::now().to_rfc3339();
+                    }
+                }
+                return Ok(tasks);
+            }
+            Err(error) => {
+                last_error = error.clone();
+                match classify_plan_error(&error) {
+                    PlanValidationError::Fatal(msg) => {
+                        return Err(msg);
+                    }
+                    PlanValidationError::Recoverable(msg) => {
+                        if attempt >= MAX_PLAN_RECOVERY_RETRIES {
+                            if let Some(ref mut ap) = autopilot_state {
+                                ap.recovery_count = ap.recovery_count.saturating_add(attempt + 1);
+                                ap.last_recovery_reason = format!(
+                                    "执行计划自动补救耗尽（{} 次），最后错误：{}",
+                                    MAX_PLAN_RECOVERY_RETRIES + 1,
+                                    msg.lines().next().unwrap_or("未知"),
+                                );
+                                ap.last_recovery_at = chrono::Utc::now().to_rfc3339();
+                            }
+                            return Err(format!(
+                                "执行计划生成失败，已自动重试 {} 次仍无法补齐字段：{}",
+                                MAX_PLAN_RECOVERY_RETRIES + 1, msg,
+                            ));
+                        }
+                        // Attempt targeted recovery
+                        match recover_plan_fields(&last_reply, &msg, &context).await {
+                            Ok(recovered) => {
+                                let tasks = recovered.iter().enumerate().map(|(index, item)| {
+                                    let entity = format!("第 {} 个小阶段", index + 1);
+                                    let execution_prompt = required_string(item, "execution_prompt", &entity)?;
+                                    Ok::<_, String>(project::Subtask {
+                                        id: uuid::Uuid::new_v4().to_string(),
+                                        title: required_string(item, "title", &entity)?,
+                                        prompt: execution_prompt.clone(),
+                                        status: project::SubtaskStatus::Pending,
+                                        test_report: String::new(),
+                                        execution_result: None,
+                                        test_result: None,
+                                        retry_count: 0,
+                                        auto_tag: None,
+                                        order: (index + 1) as u32,
+                                        goal: required_string(item, "goal", &entity)?,
+                                        allowed_file_paths: required_string_array(item, "allowed_file_paths", &entity)?,
+                                        new_file_paths: string_array(item, "new_file_paths", &entity)?,
+                                        evidence_files: string_array(item, "evidence_files", &entity)?,
+                                        context_summary: required_string(item, "context_summary", &entity)?,
+                                        acceptance_criteria: required_string_array(item, "acceptance_criteria", &entity)?,
+                                        stop_rules: required_string_array(item, "stop_rules", &entity)?,
+                                        execution_prompt,
+                                        confirmed_by_user: None,
+                                        confirmed_at: None,
+                                        confirmation_notes: None,
+                                    })
+                                }).collect::<Result<Vec<_>, _>>()?;
+                                if let Some(ref mut ap) = autopilot_state {
+                                    ap.recovery_count = ap.recovery_count.saturating_add(attempt + 1);
+                                    ap.last_recovery_reason = format!(
+                                        "执行计划经 {} 次自动补救后成功补齐字段",
+                                        attempt + 1,
+                                    );
+                                    ap.last_recovery_at = chrono::Utc::now().to_rfc3339();
+                                }
+                                return Ok(tasks);
+                            }
+                            Err(recovery_error) => {
+                                last_error = recovery_error;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err(format!("执行计划生成失败：{}", last_error))
+}
+
 /// 生成执行计划（V1：动态任务数量，精准上下文注入）
 #[tauri::command]
 pub(crate) async fn generate_execution_plan(
@@ -1125,7 +1322,11 @@ pub(crate) async fn generate_execution_plan(
     }
     let initial_revision = initial.workflow_state.data_revision;
     let initial_plan = initial.version_plan.clone();
-    let subtasks = generate_execution_plan_tasks(&initial, &milestone_id, &mid_stage_id, None).await?;
+    let mut ap_clone = initial.workflow_state.autopilot_state.clone();
+    let subtasks = generate_execution_plan_with_recovery(
+        &initial, &milestone_id, &mid_stage_id, None,
+        ap_clone.as_mut(),
+    ).await?;
     let mut proj = crate::load_project(&project_name)?;
     if proj.workflow_state.current_step != project::WorkflowStep::PlanGeneration
         || proj.workflow_state.data_revision != initial_revision
@@ -1158,6 +1359,17 @@ pub(crate) async fn generate_execution_plan(
     proj.workflow_state.current_step = project::WorkflowStep::PlanCheck;
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+
+    // Merge autopilot recovery info if recovery happened during generation
+    if let (Some(ref ap_recovery), Some(ref mut proj_ap)) =
+        (ap_clone, proj.workflow_state.autopilot_state.as_mut())
+    {
+        if !ap_recovery.last_recovery_reason.is_empty() {
+            proj_ap.recovery_count = ap_recovery.recovery_count;
+            proj_ap.last_recovery_reason = ap_recovery.last_recovery_reason.clone();
+            proj_ap.last_recovery_at = ap_recovery.last_recovery_at.clone();
+        }
+    }
 
     crate::save_and_reload_project(&proj)
 }
@@ -1206,14 +1418,26 @@ pub(crate) async fn regenerate_execution_plan(
     };
     let initial_plan = initial.version_plan.clone();
     let old_regeneration_count = mid_stage.plan_regeneration_count;
-    let subtasks = generate_execution_plan_tasks(
+    let mut ap_clone = initial.workflow_state.autopilot_state.clone();
+    let subtasks = generate_execution_plan_with_recovery(
         &initial,
         &milestone_id,
         &mid_stage_id,
         Some(&effective_feedback),
+        ap_clone.as_mut(),
     ).await?;
 
     let mut latest = crate::load_project(&project_name)?;
+    // Merge recovery info back into autopilot state if recovery happened
+    if let (Some(ref ap_recovery), Some(ref mut latest_ap)) =
+        (ap_clone, latest.workflow_state.autopilot_state.as_mut())
+    {
+        if !ap_recovery.last_recovery_reason.is_empty() {
+            latest_ap.recovery_count = ap_recovery.recovery_count;
+            latest_ap.last_recovery_reason = ap_recovery.last_recovery_reason.clone();
+            latest_ap.last_recovery_at = ap_recovery.last_recovery_at.clone();
+        }
+    }
     if latest.workflow_state.data_revision != expected_data_revision
         || latest.workflow_state.current_step != initial.workflow_state.current_step
         || latest.current_milestone_id != milestone_id
@@ -2132,7 +2356,7 @@ pub(crate) async fn generate_mid_stages(
     }
     let user_message = format!(
         "请根据版本方案，为大阶段「{} - {}」拆解中阶段：\n{}",
-        milestone_title, milestone_description, version_plan
+        milestone_title, milestone_description, version_plan,
     );
     let content = crate::api::call_deepseek_api_inner(
         &system_prompt,
@@ -2584,14 +2808,14 @@ pub(crate) async fn regenerate_plan_from_checkpoint(
             retry_count: 0,
             auto_tag: None,
             order: 0,
-            goal: String::new(),
-            allowed_file_paths: vec![],
-            new_file_paths: vec![],
-            evidence_files: vec![],
-            context_summary: String::new(),
-            acceptance_criteria: vec![],
-            stop_rules: vec![],
-            execution_prompt: String::new(),
+            goal: raw["goal"].as_str().unwrap_or("").to_string(),
+            allowed_file_paths: string_array(&raw, "allowed_file_paths", "再生小阶段").unwrap_or_default(),
+            new_file_paths: string_array(&raw, "new_file_paths", "再生小阶段").unwrap_or_default(),
+            evidence_files: string_array(&raw, "evidence_files", "再生小阶段").unwrap_or_default(),
+            context_summary: raw["context_summary"].as_str().unwrap_or("").to_string(),
+            acceptance_criteria: string_array(&raw, "acceptance_criteria", "再生小阶段").unwrap_or_default(),
+            stop_rules: string_array(&raw, "stop_rules", "再生小阶段").unwrap_or_default(),
+            execution_prompt: raw["execution_prompt"].as_str().unwrap_or("").to_string(),
             confirmed_by_user: None,
             confirmed_at: None,
             confirmation_notes: None,
@@ -2743,4 +2967,83 @@ pub(crate) async fn summarize_milestone(
     .map_err(|e| format!("AI 调用失败: {}", e))?;
 
     Ok(summary)
+}
+
+// ===================================================================
+// Phase 6: Already constitution low-weight context injection
+// ===================================================================
+//
+// NOTE: build_already_context_section is defined below but called from
+// multiple prompt-construction sites earlier in this file.
+
+/// Build an Already constitution context section for AI prompts.
+/// Returns empty string if no Already baseline is available.
+/// The section is labeled as low-weight reference to prevent AI from
+/// treating it as authoritative over user requirements.
+pub(crate) fn build_already_context_section(proj: &project::Project) -> String {
+    let baseline = match &proj.existing_baseline {
+        Some(b) if b.approved && !b.already_constitution_summary.is_empty() => b,
+        _ => return String::new(),
+    };
+
+    // Phase 6: Safe truncation for multi-byte content.
+    // Use char_boundary to avoid cutting in the middle of a UTF-8 sequence.
+    let max_summary_len = 1200usize;
+    let summary = truncate_safe(&baseline.already_constitution_summary, max_summary_len);
+    let evidence = truncate_safe(&baseline.evidence_summary, 600);
+
+    // Prioritize evidence_summary over scanned_files list
+    format!(
+        "\n\n=== 已有项目背景（低权重参考） ===\n\
+         以下信息来自已有项目的自动分析，仅作为低权重参考。\n\
+         当与用户当前需求和方案冲突时，以用户当前需求为准。\n\n\
+         已有项目摘要：{}\n\
+         证据摘要：{}\n\
+         技术栈：{}\n\
+         已完成能力：{}\n\
+         待完成能力：{}\n\
+         风险：{}\n\
+         （以上信息权重低于用户需求和当前方案，仅供参考，不得覆盖用户决策。）",
+        summary,
+        evidence,
+        truncate_safe(&baseline.tech_stack, 300),
+        baseline.completed_capabilities.iter()
+            .take(5)
+            .map(|c| format!("- {}", truncate_safe(c, 120)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        baseline.pending_capabilities.iter()
+            .take(3)
+            .map(|c| format!("- {}", truncate_safe(c, 120)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        baseline.risks.iter()
+            .take(5)
+            .map(|r| format!("- {}", truncate_safe(r, 150)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Phase 6: Safe UTF-8 truncation at character boundary.
+/// Prevents cutting multi-byte characters (e.g., Chinese) in the middle.
+fn truncate_safe(text: &str, max_chars: usize) -> &str {
+    if text.len() <= max_chars {
+        return text;
+    }
+    let mut end = max_chars;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 {
+        return "";
+    }
+    let truncated = &text[..end];
+    // Add ellipsis only if we actually truncated and there's room
+    if end + 3 <= max_chars + 3 && truncated.len() < text.len() {
+        // Return truncated with "…" — caller handles formatting
+        truncated
+    } else {
+        truncated
+    }
 }

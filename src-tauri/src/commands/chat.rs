@@ -117,6 +117,45 @@ pub(crate) async fn chat_with_role(
         c.push_str(&format!("[工作流步骤: {:?}]\n", proj.workflow_state.current_step));
         c.push_str(&format!("[讨论范围: {:?}]\n", proj.workflow_state.discussion_scope));
 
+        // Phase 6: PauseAdjustment — inject focused context about current stage
+        if proj.workflow_state.discussion_scope == project::DiscussionScope::PauseAdjustment {
+            c.push_str("\n--- 暂停调整上下文（聚焦当前阶段）---\n");
+            // Current milestone info
+            if !proj.current_milestone_id.is_empty() {
+                if let Some(ms) = proj.milestones.iter().find(|m| m.id == proj.current_milestone_id) {
+                    c.push_str(&format!("当前大阶段: {} — {}\n", ms.title, ms.goal));
+                    c.push_str(&format!("大阶段状态: {:?}\n", ms.status));
+                }
+            }
+            // Current mid-stage info
+            if !proj.current_mid_stage_id.is_empty() {
+                if let Some(ms) = proj.milestones.iter().find(|m| m.id == proj.current_milestone_id) {
+                    if let Some(mid) = ms.mid_stages.iter().find(|m| m.id == proj.current_mid_stage_id) {
+                        c.push_str(&format!("当前中阶段: {} ({})\n", mid.title, mid.version));
+                        c.push_str(&format!("中阶段状态: {:?}, 子任务数: {}\n", mid.status, mid.subtasks.len()));
+                        // Subtask status summary
+                        let pending = mid.subtasks.iter().filter(|s| s.status == project::SubtaskStatus::Pending).count();
+                        let passed = mid.subtasks.iter().filter(|s| s.status == project::SubtaskStatus::Passed).count();
+                        let awaiting = mid.subtasks.iter().filter(|s| s.status == project::SubtaskStatus::AwaitingConfirmation).count();
+                        c.push_str(&format!("子任务进度: {} 待执行, {} 待确认, {} 已通过\n", pending, awaiting, passed));
+                    }
+                }
+            }
+            // Autopilot state
+            if let Some(ref ap) = proj.workflow_state.autopilot_state {
+                c.push_str(&format!("自动驾驶状态: {:?}, 最近动作: {}\n", ap.run_status, ap.last_action));
+                if !ap.last_recovery_reason.is_empty() {
+                    c.push_str(&format!("最近补救: {}\n", ap.last_recovery_reason));
+                }
+            }
+            // Recent execution history (last 3 entries)
+            let recent: Vec<_> = proj.execution_history.iter().rev().take(3).collect();
+            for entry in recent.iter().rev() {
+                c.push_str(&format!("执行记录: [{}] {}\n", entry.level, entry.text.chars().take(200).collect::<String>()));
+            }
+            c.push_str("--- 暂停调整上下文结束 ---\n\n");
+        }
+
         // Existing baseline summary
         if let Some(ref baseline) = proj.existing_baseline {
             if baseline.approved {

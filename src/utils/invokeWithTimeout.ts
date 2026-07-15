@@ -92,8 +92,13 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   transition_workflow: 15,
   migrate_project_workflow: 15,
   toggle_autopilot: 15,
+  autopilot_mark_error: 15,
   autopilot_pause: 120,  // 可能涉及 In Stop kill 子进程
   autopilot_next_step: 15,
+  resume_autopilot: 15,
+  enter_autopilot_discussion: 15,
+  resume_autopilot_after_discussion: 15,
+  exit_autopilot_keep_state: 15,
   start_preflight_check: 15,
   return_to_discussion: 15,
   resume_plan_approval: 15,

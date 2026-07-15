@@ -1,4 +1,4 @@
-import { ArrowRight, BadgeCheck, Boxes, Pause, RefreshCw, SearchCheck, WandSparkles } from "lucide-react";
+import { ArrowRight, BadgeCheck, Boxes, RefreshCw, SearchCheck, WandSparkles } from "lucide-react";
 import { Project } from "../types";
 import { ActionButton } from "../components/ActionButton";
 import { ConsoleFeedback, ConsoleStepShell } from "../components/ConsoleStepShell";
@@ -14,6 +14,7 @@ interface Props {
   regenerationModalOpen: boolean; setRegenerationModalOpen: (open: boolean) => void;
   onGenerate: () => void; onCheck: () => void; onApprove: () => void;
   onSelect: (id: string) => void; onContinue: () => void;
+  onEnterNextStep: () => void;  // Phase 4: dedicated enter-execution/plan-generation action
   onRegenerate: (source: "check_failed" | "approval_rejected") => void;
   autopilotActive?: boolean;
   autopilotRunning?: boolean;
@@ -26,14 +27,7 @@ export function MidStagePlanningStep(props: Props) {
   const autopilotRunning = props.autopilotRunning === true;
   const autopilotActive = props.autopilotActive === true;
 
-  const autopilotBanner = autopilotRunning ? (
-    <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-      <FeedbackBanner type="info" message={`自动驾驶运行中：${props.project.workflow_state.autopilot_state?.last_action || "自动推进中..."}`} />
-      {props.onAutopilotPause && (
-        <ActionButton icon={<Pause size={16} />} variant="secondary" onClick={props.onAutopilotPause}>暂停自动驾驶</ActionButton>
-      )}
-    </div>
-  ) : autopilotActive ? (
+  const autopilotBanner = (autopilotActive && !autopilotRunning) ? (
     <FeedbackBanner type="info" message="自动驾驶暂停中。" />
   ) : null;
   const draft = props.project.mid_stage_draft;
@@ -51,7 +45,7 @@ export function MidStagePlanningStep(props: Props) {
     <ConsoleStepShell icon={<Boxes />} title="中阶段规划" description={milestone?.title || "当前大阶段"}
       status={props.busy ? "progress" : "pending"} statusLabel={props.busy ? "生成中" : "待生成"}
       feedback={props.feedback} busy={props.busy}
-      actions={autopilotRunning ? undefined : <WorkflowActionBar><ActionButton icon={<WandSparkles size={16} />} loading={props.busy} loadingLabel="生成中" onClick={props.onGenerate}>生成中阶段草稿</ActionButton></WorkflowActionBar>}>
+      actions={autopilotActive ? undefined : <WorkflowActionBar><ActionButton icon={<WandSparkles size={16} />} loading={props.busy} loadingLabel="生成中" onClick={props.onGenerate}>生成中阶段草稿</ActionButton></WorkflowActionBar>}>
       {autopilotBanner}
       <p className="console-step-summary">当前大阶段已选定，可以编译垂直切片。</p>
     </ConsoleStepShell>
@@ -62,7 +56,7 @@ export function MidStagePlanningStep(props: Props) {
     return <ConsoleStepShell icon={<SearchCheck />} title="中阶段质量检查" description={`${candidates.length} 个候选中阶段`}
       status={failed ? "failure" : "pending"} statusLabel={failed ? "检查失败" : "待检查"}
       feedback={props.feedback} busy={props.busy}
-      actions={autopilotRunning ? undefined : <WorkflowActionBar>
+      actions={autopilotActive ? undefined : <WorkflowActionBar>
         <ActionButton icon={<SearchCheck size={16} />} loading={props.busy} disabled={candidates.length === 0} onClick={props.onCheck}>运行检查</ActionButton>
         <ActionButton icon={<RefreshCw size={16} />} variant="danger" loading={props.busy} onClick={() => props.onRegenerate("check_failed")}>重新生成</ActionButton>
       </WorkflowActionBar>}>
@@ -76,7 +70,7 @@ export function MidStagePlanningStep(props: Props) {
   if (step === "MidStageApproval") return (
     <ConsoleStepShell icon={<BadgeCheck />} title="批准中阶段" description="质量检查已通过" status="success" statusLabel="待批准"
       feedback={props.feedback} busy={props.busy}
-      actions={autopilotRunning ? undefined : <WorkflowActionBar>
+      actions={autopilotActive ? undefined : <WorkflowActionBar>
         <ActionButton icon={<BadgeCheck size={16} />} loading={props.busy} onClick={props.onApprove}>批准中阶段</ActionButton>
         <ActionButton icon={<RefreshCw size={16} />} variant="danger" onClick={() => props.setRegenerationModalOpen(true)}>驳回并重新生成</ActionButton>
       </WorkflowActionBar>}>
@@ -100,19 +94,24 @@ export function MidStagePlanningStep(props: Props) {
   const hasCompletedMidStages = formal.some(m => m.status === "Completed");
   const pendingMidStages = formal.filter(m => m.status !== "Completed");
 
-  // Build contextual action label and description based on selected mid-stage state
-  let actionLabel = "开始生成执行计划";
+  // Phase 4: Build contextual action based on selected mid-stage state.
+  // Selection (onSelect) is separate from entering the next step (onEnterNextStep / onContinue).
   let stepDescription = "选择正式中阶段后生成执行计划";
+  let nextLabel: string | null = null;
+  let nextDisabled = false;
   if (selectedMid) {
     if (selectedIsCompleted) {
-      actionLabel = "同步当前中阶段状态";
-      stepDescription = "该中阶段已完成。选择一个未完成的中阶段继续，或同步项目状态。";
+      stepDescription = "该中阶段已完成。请选择其他未完成的中阶段。";
+      nextDisabled = true;
     } else if (selectedMid.plan_approved_at && (selectedMid.plan_revision ?? 0) > 0) {
-      actionLabel = "进入执行";
+      nextLabel = "进入执行阶段";
       stepDescription = "该中阶段执行计划已批准，可以进入执行。";
     } else if (selectedMid.subtasks?.some(s => s.status === "Executing" || s.status === "AwaitingConfirmation" || s.status === "Passed")) {
-      actionLabel = "回到执行";
+      nextLabel = "回到执行阶段";
       stepDescription = "该中阶段已有执行记录，将回到执行步骤。";
+    } else {
+      nextLabel = "生成执行计划";
+      stepDescription = "已选择中阶段，可以生成执行计划。";
     }
   }
 
@@ -120,8 +119,11 @@ export function MidStagePlanningStep(props: Props) {
     status={props.project.current_mid_stage_id ? (selectedIsCompleted ? "success" : "success") : "pending"}
     statusLabel={props.project.current_mid_stage_id ? (selectedIsCompleted ? "已完成" : "已选择") : "待选择"}
     feedback={props.feedback} busy={props.busy}
-    actions={(props.project.current_mid_stage_id && !autopilotRunning) ? <WorkflowActionBar>
-      <ActionButton icon={<ArrowRight size={16} />} onClick={props.onSelect.bind(null, props.project.current_mid_stage_id)}>{actionLabel}</ActionButton>
+    actions={(props.project.current_mid_stage_id && !autopilotActive) ? <WorkflowActionBar>
+      {!selectedIsCompleted && nextLabel && (
+        <ActionButton icon={<ArrowRight size={16} />} disabled={nextDisabled}
+          onClick={props.onEnterNextStep}>{nextLabel}</ActionButton>
+      )}
     </WorkflowActionBar> : undefined}>
     {autopilotBanner}
     {formal.length > 0 ? (

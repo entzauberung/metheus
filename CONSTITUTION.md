@@ -58,12 +58,20 @@
 - **不在 MVP 阶段引入 WebSocket**，前端通过 Tauri IPC `invoke()` 调用后端
 - **`project.rs` 只定义数据结构**，业务逻辑分散在各功能模块中
 - **Rust 端 `project.rs` 与前端 `types.ts` 的数据结构必须保持一一对应**
-- **统一工作流状态是业务页面和按钮权限的唯一判断依据**。旧的 Project.status、viewMode 和 isExecuting 只能作为兼容或纯视觉状态。
+- **统一工作流状态是业务页面和按钮权限的唯一判断依据**。旧的 Project.status、viewMode 和 isExecuting 只能作为兼容或纯视觉状态。`workflow_state` 是唯一业务状态入口，任何组件不得绕过它直接读取 `Project.status` 或 `isExecuting` 做业务裁决。
 - **所有业务事实必须由后端确认并持久化**。前端不得通过临时对象或完整项目覆盖完成关键业务变更。
 - **禁止前端通过 persist_project 任意提交完整项目对象完成关键业务状态变更**。每个审批、检查、生成、执行和回退动作必须调用对应的后端业务接口。
+- **Already 宪法低权重全局记忆规则（2026-07-15 固化）**：
+  1. Already 宪法（`ALREADY_CONSTITUTION.md`）独立于工作 `CONSTITUTION.md`，两者不混合。
+  2. Already 宪法摘要以"已有信息"段落注入工作宪法第一部分，标记为低权重参考。
+  3. 所有 AI 生成命令（大阶段、中阶段、执行计划、质量检查）的提示词统一注入 Already 摘要，但必须标注"低权重，仅在无冲突时参考"。
+  4. Already 证据摘要（`evidence_summary`）比纯文件清单（`scanned_files`）权重更高；提示词中优先使用摘要。
+  5. Already 宪法中可能包含多字节/中文内容时，截断必须使用安全边界（`char_boundary`），禁止在非 UTF-8 边界切断。
+  6. 用户新需求与 Already 已有能力冲突时，以用户新需求为准，Already 仅为上下文参考。
 - **所有关键推进必须由用户明确点击**。当前阶段不做自动推进（禁止自动拆大阶段、自动进入 Console、自动开始执行、自动回退后重生成、自动进入下一大阶段）。
 - **自动驾驶（autopilot）语义（2026-07-15 固化）**：autopilot 只在大阶段边界（`MilestoneReview`）停下由人做 A/B/C；大阶段内部的中阶段生成/检查/批准、执行计划生成/检查/批准、执行、确认全部自动代点；只保留暂停键；执行中暂停等同 In Stop 回退到最近已完成小阶段；autopilot 自动选择下一个未完成大阶段，用户不手选；autopilot 永不自动做 A/B/C 决策。
 - **稳定性原则（2026-07-15 固化）**：不再保留任何"执行前重新生成提示词 / 固定管线自动重拆"的路径；执行端只执行用户或 autopilot 已确认的既定计划（`execution_prompt`），杜绝 AI 歧义。
+- **AI 结构化输出波动恢复原则（2026-07-15 固化）**：AI 结构化输出（执行计划生成/重生成）的单字段缺失（`allowed_file_paths`、`acceptance_criteria`、`stop_rules`、`execution_prompt` 等为空或缺失但 JSON 主体结构完整）属于可恢复错误；autopilot 必须优先在后端自动补救（将校验错误反馈给 AI 重补缺失字段），不得第一时间中断用户进入 `ErrorStopped`；JSON 整体不可解析或任务列表为空属于硬失败，不走自动补救；只有连续自动补救失败（达到 `MAX_PLAN_RECOVERY_RETRIES=2` 上限）才进入 `ErrorStopped`；手动模式保留原样（由用户自行点击重试）。
 - **本轮真实可体验闭环目标**：No Project 和 Half Project 都能走到正式执行；三项检查无法绕过；In Stop 和 ED Stop 都能真实体验；回退有影响预览；大阶段 A、B、C 都能完整走通；任意关键状态刷新后可以恢复。
 - **V1 人工治理模式**：批准计划不等于自动执行计划。每个小阶段必须经历"用户点击执行 → 自动验证 → 用户确认结果"后才允许写 Git 稳定标签。`PlanApproval` 是方案审批页面，不代表方案已经批准。Console 链式步骤必须由用户逐级点击推进，禁止自动连续执行下一个小阶段。
 - **DeepSeek v4 Flash 任务边界**：当前所有 DeepSeek 对话、检查、方案、大阶段、中阶段和执行计划编译统一使用 `deepseek-v4-flash`，暂不做模型分化。所有模型任务必须有明确边界——单一目标、允许文件范围、上下文证据、验收标准、禁止扩展范围、信息不足时停止规则。返回的阶段、计划、检查结果必须经过结构化解析和本地字段校验；缺字段、范围越界、任务空白、检查失败均不得进入下一步。
@@ -574,6 +582,44 @@ cd ~/metheus && npm run build
 | 5 | 标签与版本号归一化展示 | ✅ 已完成 |
 | 6 | Already 项目宪法（AI 读文件、隔离低权重全局记忆） | ✅ 已完成 |
 | 7 | 最终校验与宪法同步 | ✅ 已完成 |
+
+### Phase: 自动驾驶 P0 稳定性修复（2026-07-15 启动，2026-07-15 七阶段施工完成）
+
+**本轮范围**：七阶段严格顺序施工，修复自动驾驶"点了不动"及稳定性问题。执行工具：DeepCode（deepseek v4 pro）。全部阶段完成。
+
+| 阶段 | 施工内容 | 状态 |
+|------|----------|------|
+| 1 | 固化宪法：workflow_state 唯一业务状态、Already 低权重规则、类型一致性 | ✅ 已完成 |
+| 2 | autopilot 驱动稳定性：动作完成断言、合法/异常停顿区分、刷新恢复协调、手动按钮锁定 | ✅ 已完成 |
+| 3 | 进度条主显示层：双源进度（autopilot_next_step + Project 兜底）、统一暂停入口 | ✅ 已完成 |
+| 4 | 语义清理：拆分选择/进入执行命令、中阶段完成不提示生成计划、步骤事实不一致时后端纠正 | ✅ 已完成 |
+| 5 | 执行同步收紧：启动恢复壳层防闪回、恢复优先级（内存 > 磁盘 > 本地）、handleChatComplete 防旧状态覆盖 | ✅ 已完成 |
+| 6 | Already 宪法低权重全局记忆：AI 提示词注入低权重摘要、中文安全截断、证据摘要优先于文件清单 | ✅ 已完成 |
+| 7 | 最终一致性核对：命令注册全覆盖、超时配置完整、状态字面量一致、宪法同步 | ✅ 已完成 |
+
+### Phase: 自动驾驶 P0 第二阶段稳定性修复（2026-07-15 启动）
+
+**本轮范围**：七阶段严格顺序施工，修复 autopilot_next_step 阶段推进错位、暂停/讨论/恢复上下文丢失、刷新恢复顺序、按钮语义不一致等问题。执行工具：DeepCode（deepseek v4 pro）。前一阶段未通过构建时禁止进入后一阶段。
+
+| 阶段 | 施工内容 | 状态 |
+|------|----------|------|
+| 1 | 统一 autopilot 入口与主显示层：移除按钮对 current_milestone_id 的依赖、去重 autopilotBanner | ✅ 已完成 |
+| 2 | 修正 autopilot_next_step Execution 分支推进算法：只扫描当前中阶段 | ✅ 已完成 |
+| 3 | 修复暂停→讨论→恢复三段链路：pause_reason 修正、恢复步骤上下文计算 | ✅ 已完成 |
+| 4 | 错误分级与重试策略：autopilot_mark_error 上下文增强、错误分类 | ✅ 已完成 |
+| 5 | 强化刷新恢复与重启恢复顺序：get_project → execution_status → autopilot 校正 | ✅ 已完成 |
+| 6 | autopilot 按钮语义彻底分离：手动按钮与 autopilot 按钮不共存 | ✅ 已完成 |
+| 7 | 最终一致性核对：命令注册、超时配置、类型对齐、宪法同步 | ✅ 已完成 | |
+
+### autopilot 驱动架构（2026-07-15 固化，2026-07-15 五阶段施工完成）
+
+- **后端 `autopilot_next_step`**（`src-tauri/src/commands/workflow.rs`）：只读顾问，返回下一步应执行的原子命令名与参数，不执行任何写操作。包含 Phase 3 进度字段（`completed_subtasks`、`total_subtasks`、`current_mid_stage_index`、`total_mid_stages`、`current_action`）。Phase 4 修复了 Execution 分支在无 pending/awaiting 时的边界推进判断。Phase 5 增加了卡在 Executing 状态的子任务恢复。
+- **后端 `autopilot_mark_error`**（`src-tauri/src/commands/workflow.rs`）：持久化错误状态为 `ErrorStopped`，确保刷新后不丢失。Phase 2 新增。
+- **前端驱动循环 `runAutopilotCycle`**（`src/App.tsx`）：调用 `autopilot_next_step` → 执行返回的命令 → 应用完整 Project → 延时 1s → 取下一步。由 `useEffect` 监听 `autopilot_active` 启动，由 `autopilotDrivingRef` 防重入。
+- **前端进度条 `AutopilotProgressBar`**（`src/App.tsx`）：Phase 3 新增，显示目标大阶段完成百分比、当前中阶段序号、当前动作。包含暂停按钮和错误消息展示。
+- **停止条件**：大阶段边界（`MilestoneReview`）、暂停（`Paused`）、出错（`ErrorStopped`）、等待审阅（`WaitingMilestoneReview`）、未知命令。
+- **安全性**：所有错误被 try/catch 包裹，失败调用 `autopilot_mark_error` 持久化错误状态，绝不冒泡导致 React 崩溃。
+- **僵尸状态修复**（`src-tauri/src/pipeline.rs`）：`execute_current_subtask` 执行失败时恢复子任务状态从 `Executing` 到 `Pending`；`autopilot_next_step` 检测到卡在 `Executing` 的子任务时自动重置为 `Pending` 并重试。
 
 ### 执行持久化规则（2026-07-14 固化）
 
