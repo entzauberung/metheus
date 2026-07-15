@@ -12,23 +12,29 @@ pub(crate) async fn execute_subtask_inner(
 ) -> Result<project::ExecutionResult, project::SubTaskError> {
     // 1. 执行前记录文件列表
     let before_files = crate::test_runner::get_tracked_files(project_path);
-    // 2. 拼接完整 prompt
+    // 2. 拼接完整 prompt（V1：精确执行已批准任务，信息不足时停止）
     let full_prompt = format!(
-        "{}\n\n=== 重要约束 ===\n请直接执行，不要询问确认。所有决策由你自行判断。完成后不要输出总结，直接结束",
+        "{}\n\n=== V1 执行约束 ===\n\
+        1. 只执行上述任务，不得自行扩展文件范围或改变架构。\n\
+        2. 信息不足或发现范围外问题时，必须停止并说明阻塞原因，不得自行猜测或扩展。\n\
+        3. 完成后不要输出总结，直接结束。",
         prompt
     );
     // 3. 确定模型名（从环境变量读取，带白名单校验和降级兜底）
-    let model_env =
-        std::env::var("METHEUS_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
-    const VALID_MODELS: &[&str] = &["deepseek-v4-pro", "deepseek-v4-flash"];
+    let model_env = match std::env::var("METHEUS_MODEL") {
+        Ok(model) => model,
+        Err(_) => crate::constants::DEEPSEEK_WORKFLOW_MODEL.to_string(),
+    };
+    const VALID_MODELS: &[&str] = &[crate::constants::DEEPSEEK_WORKFLOW_MODEL];
     let model_name: String = if VALID_MODELS.contains(&model_env.as_str()) {
         model_env
     } else {
         eprintln!(
-            "[execute_subtask] 警告：配置的模型名 \"{}\" 不在白名单中，降级为默认值 \"deepseek-v4-flash\"",
-            model_env
+            "[execute_subtask] 警告：配置的模型名 \"{}\" 不在当前白名单中，使用统一默认模型 \"{}\"",
+            model_env,
+            crate::constants::DEEPSEEK_WORKFLOW_MODEL,
         );
-        "deepseek-v4-flash".to_string()
+        crate::constants::DEEPSEEK_WORKFLOW_MODEL.to_string()
     };
     // 4. 用 tokio::process::Command 启动 Claude Code（非阻塞）
     let mut child = tokio::process::Command::new("claude")
@@ -192,4 +198,3 @@ pub(crate) async fn execute_subtask(
             project::SubTaskError::Timeout => "执行超时".to_string(),
         })
 }
-

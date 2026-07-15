@@ -24,25 +24,12 @@ const SNAPSHOT_VERSION: u32 = 1;
 /// 前端 UI 状态快照，由前端序列化后传给后端保存
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct UISnapshot {
+    /// 仅用于恢复视觉布局，不参与业务阶段裁决。
     pub view_phase: String,
-    pub selected_milestone_id: Option<String>,
-    pub selected_mid_stage_id: Option<String>,
-    /// 专业模式下已生成执行计划的 mid_stage ID 列表
-    pub generated_plan_keys: Vec<String>,
-    /// 快速模式下已生成执行计划的 milestone ID 列表
-    pub quick_generated_plan_keys: Vec<String>,
-    /// 分支B讨论类型："rollback" 或 "redirect"，空字符串/"null" 表示未选择
     #[serde(default)]
-    pub discussion_branch_type: Option<String>,
-    /// 分割点大阶段 ID
+    pub sidebar_width: Option<u32>,
     #[serde(default)]
-    pub checkpoint_milestone_id: Option<String>,
-    /// 分割点中阶段 ID
-    #[serde(default)]
-    pub checkpoint_mid_stage_id: Option<String>,
-    /// 分割点小阶段 ID
-    #[serde(default)]
-    pub checkpoint_subtask_id: Option<String>,
+    pub active_tab: Option<String>,
     pub saved_at: String,
 }
 

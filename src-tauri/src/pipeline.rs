@@ -1,12 +1,7 @@
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use crate::project;
 use crate::AppState;
-use crate::check_project_path;
 
-/// 快速模式 Git tag 前缀，避免与专业模式的 metheus/auto/ 冲突
-const QUICK_TAG_PREFIX: &str = "metheus/q/";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PipelineStatus {
@@ -26,6 +21,20 @@ pub struct SubtaskStatusItem {
     pub retry_count: u32,
 }
 
+/// 执行日志条目
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    /// ISO 8601 时间戳
+    pub timestamp: String,
+    /// 日志级别：info / success / error / pause
+    pub level: String,
+    /// 日志文本
+    pub text: String,
+}
+
+/// 日志历史上限
+const MAX_LOG_HISTORY: usize = 200;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineState {
     pub mid_stage_id: String,
@@ -38,125 +47,73 @@ pub struct PipelineState {
     /// 当前正在运行的子进程 PID，用于 stop_execution 快速终止
     #[serde(default)]
     pub child_pid: Option<u32>,
+    // === V1 人工执行字段 ===
+    /// 项目名称
+    #[serde(default)]
+    pub project_name: String,
+    /// 大阶段 ID
+    #[serde(default)]
+    pub milestone_id: String,
+    /// 计划修订号（验证计划未被修改）
+    #[serde(default)]
+    pub plan_revision: u64,
+    /// 当前执行的小阶段 ID
+    #[serde(default)]
+    pub current_subtask_id: String,
+    /// 等待用户确认执行结果
+    #[serde(default)]
+    pub awaiting_confirmation: bool,
+    /// 累积日志历史（最新条目在末尾）
+    #[serde(default)]
+    pub log_history: Vec<LogEntry>,
 }
 
+/// 追加日志条目到 PipelineState，同时更新 current_log 并限制历史上限
+fn append_log(state: &mut PipelineState, level: &str, text: String) {
+    let entry = LogEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        level: level.to_string(),
+        text: text.clone(),
+    };
+    state.log_history.push(entry);
+    // 保持最近 MAX_LOG_HISTORY 条
+    if state.log_history.len() > MAX_LOG_HISTORY {
+        let excess = state.log_history.len() - MAX_LOG_HISTORY;
+        state.log_history.drain(0..excess);
+    }
+    state.current_log = text;
+}
 
-/// 启动后台流水线执行一组子任务
-#[tauri::command]
-pub(crate) async fn start_execution(
-    state: tauri::State<'_, AppState>,
-    project_id: String,
-    project_path: String,
-    stage_identifier: String,
-    is_quick_mode: bool,
-    mid_stage_title: String,
-    mid_stage_description: String,
-    subtasks_json: String,
-) -> Result<(), String> {
-    // 前置校验：项目路径有效性
-    let path_check = check_project_path(&project_path);
-    if !path_check.is_valid {
-        return Err(format!(
-            "项目目录无效，无法启动执行：{}",
-            path_check.error_message
-        ));
-    }
-    // 自动初始化 git 仓库（路径有效但不是 git 仓库时）
-    if !path_check.is_git_repo {
-        let init = std::process::Command::new("git")
-            .args(["init"])
-            .current_dir(&project_path)
-            .output()
-            .map_err(|e| format!("{}：git 命令不可用 — {}", crate::constants::GIT_INIT_FAILED, e))?;
-        if !init.status.success() {
-            let stderr = String::from_utf8_lossy(&init.stderr);
-            let truncated: String = stderr.chars().take(200).collect();
-            return Err(format!("{}：{}", crate::constants::GIT_INIT_FAILED, truncated));
-        }
-        std::process::Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(&project_path)
-            .output()
-            .map_err(|e| format!("git add 失败：{}", e))?;
-        std::process::Command::new("git")
-            .args(["commit", "--allow-empty", "-m", crate::constants::GIT_AUTO_INIT_COMMIT_MSG])
-            .current_dir(&project_path)
-            .output()
-            .map_err(|e| format!("git commit 失败：{}", e))?;
-    }
-    // 解析子任务列表：把 subtasks_json 转成 Rust 结构体 Vec<Subtask>
-    let subtasks: Vec<project::Subtask> =
-        serde_json::from_str(&subtasks_json).map_err(|e| format!("解析小阶段列表失败：{}", e))?;
-    if subtasks.is_empty() {
-        return Err("子任务列表为空，请先生成执行计划".to_string());
-    }
-    let pipeline_state = state.pipeline_state.clone();
-    // 初始化状态 在全局共享状态中创建一个 PipelineState，
-    // 记录当前阶段 ID、总任务数、每个子任务的状态（等待/执行中/成功/失败）、当前日志等
-    {
-        let mut guard = pipeline_state.lock().await;
-        *guard = Some(PipelineState {
-            mid_stage_id: stage_identifier.clone(),
-            status: PipelineStatus::Running,
-            current_subtask_index: 0,
-            total_subtasks: subtasks.len(),
-            subtask_statuses: subtasks
-                .iter()
-                .map(|s| SubtaskStatusItem {
-                    subtask_id: s.id.clone(),
-                    title: s.title.clone(),
-                    status: "waiting".to_string(),
-                    test_result: None,
-                    retry_count: 0,
-                })
-                .collect(),
-            current_log: "🚀 流水线已启动".to_string(),
-            last_error: None,
-            child_pid: None,
-        });
-    }
-    // 启动后台任务：
-    // 用 tokio::spawn 启动一个异步任务，根据模式调用不同的流水线执行函数
-    let stage_id = stage_identifier.clone();
-    let project_id_clone = project_id.clone();
-    tokio::spawn(async move {
-        let result = if is_quick_mode {
-            execute_quick_pipeline(
-                project_id_clone,
-                stage_id,
-                project_path,
-                subtasks,
-                mid_stage_title,
-                mid_stage_description,
-                pipeline_state.clone(),
-            )
-            .await
-        } else {
-            execute_mid_stage_pipeline(
-                project_id_clone,
-                stage_id,
-                project_path,
-                subtasks,
-                mid_stage_title,
-                mid_stage_description,
-                pipeline_state.clone(),
-            )
-            .await
+/// 写入持久化执行历史到 Project 磁盘文件
+fn write_execution_history(
+    project_name: &str,
+    level: &str,
+    event_type: project::ExecutionEventType,
+    text: String,
+    milestone_id: Option<&str>,
+    mid_stage_id: Option<&str>,
+    subtask_id: Option<&str>,
+) {
+    if let Ok(mut proj) = crate::load_project(project_name) {
+        let entry = project::ExecutionHistoryEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            level: level.to_string(),
+            event_type,
+            text,
+            milestone_id: milestone_id.map(|s| s.to_string()),
+            mid_stage_id: mid_stage_id.map(|s| s.to_string()),
+            subtask_id: subtask_id.map(|s| s.to_string()),
         };
-        if let Err(e) = result {
-            let mut guard = pipeline_state.lock().await;
-            // 捕获失败：如果后台任务执行失败，会将全局状态中的流水线标记为 Failed，并记录错误日志
-            if let Some(s) = guard.as_mut() {
-                s.status = PipelineStatus::Failed;
-                s.last_error = Some(e.clone());
-                s.current_log = format!("❌ 流水线失败: {}", e);
-            }
+        proj.execution_history.push(entry);
+        // 限制历史上限
+        if proj.execution_history.len() > project::MAX_EXECUTION_HISTORY {
+            let excess = proj.execution_history.len() - project::MAX_EXECUTION_HISTORY;
+            proj.execution_history.drain(0..excess);
         }
-    });
-    // 不等待结果直接返回：
-    // 函数立即返回 Ok(())，后台任务继续运行。这样前端调用后不会卡住
-    Ok(())
+        let _ = crate::save_project(&proj);
+    }
 }
+
 
 #[tauri::command]
 pub(crate) async fn get_execution_status(
@@ -166,915 +123,1217 @@ pub(crate) async fn get_execution_status(
     Ok(guard.clone())
 }
 
-/// 暂停流水线执行
+
+// ===================================================================
+// V1 人工执行命令：单小阶段执行 → 人工确认
+// ===================================================================
+
+/// V1 执行当前小阶段（从磁盘读取已批准计划，一次只执行一个）
 #[tauri::command]
-pub(crate) async fn pause_execution(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let mut guard = state.pipeline_state.lock().await;
-    match guard.as_mut() {
-        Some(s) if s.status == PipelineStatus::Running => {
+pub(crate) async fn execute_current_subtask(
+    state: tauri::State<'_, AppState>,
+    project_name: String,
+) -> Result<PipelineState, String> {
+    let proj = crate::load_project(&project_name)?;
+    let project_path = proj.project_path.clone();
+
+    let milestone_id = &proj.current_milestone_id;
+    let mid_stage_id = &proj.current_mid_stage_id;
+    if milestone_id.is_empty() || mid_stage_id.is_empty() {
+        return Err("请先选择大阶段和中阶段。".to_string());
+    }
+
+    let ms = proj.milestones.iter().find(|m| m.id == *milestone_id).ok_or("大阶段不存在。")?;
+    let mid = ms.mid_stages.iter().find(|m| m.id == *mid_stage_id).ok_or("中阶段不存在。")?;
+
+    // Verify plan is approved
+    if mid.plan_approved_at.is_none() || mid.plan_revision == 0 {
+        return Err("执行计划尚未批准，请先在 Console 中批准执行计划。".to_string());
+    }
+
+    // Verify Git workspace is ready
+    let ws = get_execution_workspace_status_inner(&project_path)?;
+    if !ws.ready {
+        return Err(ws.status_message);
+    }
+
+    // Find the next pending subtask
+    let next_idx = mid.subtasks.iter().position(|st| {
+        st.status == project::SubtaskStatus::Pending
+    }).ok_or("没有待执行的小阶段。所有小阶段已执行完成。".to_string())?;
+
+    let subtask = &mid.subtasks[next_idx];
+    let subtask_id = subtask.id.clone();
+    let subtask_title = subtask.title.clone();
+    let approved_prompt = if subtask.execution_prompt.is_empty() {
+        subtask.prompt.clone()
+    } else {
+        subtask.execution_prompt.clone()
+    };
+
+    let total = mid.subtasks.len();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Write execution history: user clicked execute
+    write_execution_history(
+        &project_name, "info", project::ExecutionEventType::UserExecute,
+        format!("👆 用户点击执行 ({}/{})：{}", next_idx + 1, total, subtask_title),
+        Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
+    );
+
+    // === 阶段一关键修复：执行前先持久化 "Executing" 到磁盘 ===
+    // 这样刷新后前端能从磁盘 Project 中知道当前正在执行，
+    // 而不是错误地显示"点击执行"。
+    {
+        let mut proj = crate::load_project(&project_name)?;
+        let ms = proj.milestones.iter_mut().find(|m| m.id == *milestone_id).ok_or("大阶段不存在。")?;
+        let mid = ms.mid_stages.iter_mut().find(|m| m.id == *mid_stage_id).ok_or("中阶段不存在。")?;
+        if let Some(st) = mid.subtasks.get_mut(next_idx) {
+            st.status = project::SubtaskStatus::Executing;
+        }
+        proj.execution_session = Some(project::ExecutionSession {
+            active: true,
+            milestone_id: milestone_id.clone(),
+            mid_stage_id: mid_stage_id.clone(),
+            subtask_id: subtask_id.clone(),
+            subtask_title: subtask_title.clone(),
+            status: "executing".to_string(),
+            started_at: now.clone(),
+            state_entered_at: now.clone(),
+            plan_revision: mid.plan_revision,
+            subtask_index: next_idx,
+            total_subtasks: total,
+        });
+        crate::save_project(&proj)?;
+    }
+
+    // Write execution history: execution started
+    write_execution_history(
+        &project_name, "info", project::ExecutionEventType::SubtaskExecuting,
+        format!("▶ 开始执行 ({}/{})：{}", next_idx + 1, total, subtask_title),
+        Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
+    );
+
+    // Initialize pipeline state (V1: single subtask context)
+    let pipeline_state = state.pipeline_state.clone();
+    {
+        let mut guard = pipeline_state.lock().await;
+        *guard = Some(PipelineState {
+            mid_stage_id: mid_stage_id.clone(),
+            status: PipelineStatus::Running,
+            current_subtask_index: next_idx,
+            total_subtasks: total,
+            subtask_statuses: mid.subtasks.iter().map(|s| SubtaskStatusItem {
+                subtask_id: s.id.clone(),
+                title: s.title.clone(),
+                status: if s.id == subtask_id { "executing".to_string() } else { "waiting".to_string() },
+                test_result: None,
+                retry_count: 0,
+            }).collect(),
+            current_log: format!("▶ 执行中 ({}/{})：{}", next_idx + 1, total, subtask_title),
+            last_error: None,
+            child_pid: None,
+            project_name: project_name.clone(),
+            milestone_id: milestone_id.clone(),
+            plan_revision: mid.plan_revision,
+            current_subtask_id: subtask_id.clone(),
+            awaiting_confirmation: false,
+            log_history: vec![LogEntry {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                level: "info".to_string(),
+                text: format!("▶ 执行中 ({}/{})：{}", next_idx + 1, total, subtask_title),
+            }],
+        });
+    }
+
+    // Execute the approved prompt
+    let exec_result = crate::executor::execute_subtask_inner(
+        &project_path,
+        &approved_prompt,
+        &subtask_id,
+        pipeline_state.clone(),
+    ).await.map_err(|e| match e {
+        project::SubTaskError::UserPaused => "用户暂停".to_string(),
+        project::SubTaskError::ExecutionFailed { message } => message,
+        project::SubTaskError::Timeout => "执行超时".to_string(),
+    })?;
+
+    // Write execution history: executor complete
+    write_execution_history(
+        &project_name, "info", project::ExecutionEventType::ExecutorComplete,
+        format!("✅ 执行完成 ({}/{})：{}", next_idx + 1, total, subtask_title),
+        Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
+    );
+
+    // Run test
+    let test = crate::test_runner::check_subtask(
+        &project_path,
+        &approved_prompt,
+        &subtask_id,
+        &subtask_title,
+        mid_stage_id,
+    ).await.unwrap_or(project::TestResult {
+        passed: false,
+        issues: vec!["测试服务不可用".to_string()],
+        suggestion: "请手动检查".to_string(),
+        warnings: vec![],
+    });
+
+    // Write execution history: test complete
+    write_execution_history(
+        &project_name,
+        if test.passed { "success" } else { "error" },
+        project::ExecutionEventType::TestComplete,
+        if test.passed {
+            format!("🔍 测试通过 ({}/{})：{}", next_idx + 1, total, subtask_title)
+        } else {
+            format!("🔍 测试未通过 ({}/{})：{} — {}", next_idx + 1, total, subtask_title, test.suggestion)
+        },
+        Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
+    );
+
+    // Write results back to disk (with execution session update)
+    let mut proj = crate::load_project(&project_name)?;
+    let ms = proj.milestones.iter_mut().find(|m| m.id == *milestone_id).ok_or("大阶段不存在。")?;
+    let mid = ms.mid_stages.iter_mut().find(|m| m.id == *mid_stage_id).ok_or("中阶段不存在。")?;
+    if let Some(st) = mid.subtasks.get_mut(next_idx) {
+        st.execution_result = Some(exec_result.clone());
+        st.test_result = Some(test.clone());
+        st.status = project::SubtaskStatus::AwaitingConfirmation;
+    }
+    // Update execution session to awaiting_confirmation
+    let now_await = chrono::Utc::now().to_rfc3339();
+    proj.execution_session = Some(project::ExecutionSession {
+        active: true,
+        milestone_id: milestone_id.clone(),
+        mid_stage_id: mid_stage_id.clone(),
+        subtask_id: subtask_id.clone(),
+        subtask_title: subtask_title.clone(),
+        status: "awaiting_confirmation".to_string(),
+        started_at: proj.execution_session.as_ref().map(|s| s.started_at.clone()).unwrap_or_else(|| now_await.clone()),
+        state_entered_at: now_await.clone(),
+        plan_revision: mid.plan_revision,
+        subtask_index: next_idx,
+        total_subtasks: total,
+    });
+    crate::save_project(&proj)?;
+
+    // Write execution history: awaiting confirmation
+    write_execution_history(
+        &project_name, "info", project::ExecutionEventType::AwaitingConfirmation,
+        format!("⏳ 待确认 ({}/{})：{}", next_idx + 1, total, subtask_title),
+        Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
+    );
+
+    // Update pipeline state to awaiting confirmation
+    let result_state;
+    {
+        let mut guard = pipeline_state.lock().await;
+        if let Some(s) = guard.as_mut() {
             s.status = PipelineStatus::Paused;
-            s.current_log = "⏸ 已暂停".to_string();
-            Ok(())
+            append_log(s, "info", format!("⏳ 待确认 ({}/{})：{}", next_idx + 1, total, subtask_title));
+            s.awaiting_confirmation = true;
+            if let Some(stat) = s.subtask_statuses.get_mut(next_idx) {
+                stat.status = "testing".to_string();
+                stat.test_result = Some(test);
+            }
+            result_state = s.clone();
+        } else {
+            return Err("流水线状态丢失".to_string());
         }
-        _ => Err("当前没有正在执行的流水线".to_string()),
     }
+
+    Ok(result_state)
 }
 
-
-/// 恢复流水线执行
+/// V1 确认小阶段执行结果（用户点击"确认通过"）
 #[tauri::command]
-pub(crate) async fn resume_execution(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    let mut guard = state.pipeline_state.lock().await;
-    match guard.as_mut() {
-        Some(s) if s.status == PipelineStatus::Paused => {
-            s.status = PipelineStatus::Running;
-            s.current_log = "▶ 已恢复".to_string();
-            Ok(())
-        }
-        _ => Err("当前没有已暂停的流水线".to_string()),
+pub(crate) async fn confirm_subtask_result(
+    state: tauri::State<'_, AppState>,
+    project_name: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
+    let project_path = proj.project_path.clone();
+
+    let milestone_id = proj.current_milestone_id.clone();
+    let mid_stage_id = proj.current_mid_stage_id.clone();
+    if milestone_id.is_empty() || mid_stage_id.is_empty() {
+        return Err("请先选择大阶段和中阶段。".to_string());
     }
+
+    // 在获取可变借用前，收集当前大阶段其他中阶段的完成状态
+    let other_mid_stages_all_completed = {
+        let ms_for_check = proj.milestones.iter().find(|m| m.id == milestone_id);
+        ms_for_check.map(|ms| {
+            ms.mid_stages.iter()
+                .filter(|m| m.id != mid_stage_id)
+                .all(|m| m.status == project::MidStageStatus::Completed)
+        }).unwrap_or(false)
+    };
+
+    let ms = proj.milestones.iter_mut().find(|m| m.id == milestone_id).ok_or("大阶段不存在。")?;
+    let mid = ms.mid_stages.iter_mut().find(|m| m.id == mid_stage_id).ok_or("中阶段不存在。")?;
+
+    // Verify Git workspace is still available before tagging
+    let ws = get_execution_workspace_status_inner(&project_path)?;
+    if !ws.ready {
+        return Err(format!("Git 工作区不可用，无法标记确认：{}", ws.status_message));
+    }
+
+    // Collect subtask data before mutation
+    let subtask_id = {
+        let st = mid.subtasks.iter()
+            .find(|s| s.status == project::SubtaskStatus::AwaitingConfirmation)
+            .ok_or("没有待确认的小阶段。".to_string())?;
+        st.id.clone()
+    };
+    let subtask_idx = mid.subtasks.iter().position(|s| s.id == subtask_id).unwrap_or(0);
+    let subtask_title = mid.subtasks[subtask_idx].title.clone();
+    let mid_version = mid.version.clone();
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Create git tag first (before mutating status)
+    let tag_result = crate::git_ops::git_save_subtask(
+        project_path.clone(),
+        (subtask_idx + 1) as u32,
+        mid_version.clone(),
+        subtask_title.clone(),
+    ).await;
+
+    match tag_result {
+        Ok(tag_name) => {
+            let st = &mut mid.subtasks[subtask_idx];
+            st.status = project::SubtaskStatus::Passed;
+            st.confirmed_by_user = Some(true);
+            st.confirmed_at = Some(now.clone());
+            st.auto_tag = Some(tag_name);
+        }
+        Err(e) => {
+            return Err(format!("Git 标签创建失败：{}。任务未标记为通过。", e));
+        }
+    }
+
+    // === 记录代码变更历史（在标记 Passed 后立即捕获 diff） ===
+    {
+        let diff_text = capture_diff_snapshot(&project_path);
+        if !diff_text.is_empty() {
+            let files = extract_changed_files(&diff_text);
+            let max_diff_len = 8000usize;
+            let (truncated_diff, was_truncated) = if diff_text.len() > max_diff_len {
+                (diff_text.chars().take(max_diff_len).collect::<String>() + "\n…（diff 已截断）", true)
+            } else {
+                (diff_text, false)
+            };
+            proj.change_history.push(project::ChangeHistoryEntry {
+                subtask_id: subtask_id.clone(),
+                subtask_title: subtask_title.clone(),
+                recorded_at: now.clone(),
+                files_changed: files,
+                diff_text: truncated_diff,
+                diff_truncated: was_truncated,
+            });
+            // 限制历史上限
+            const MAX_CHANGE_HISTORY: usize = 60;
+            if proj.change_history.len() > MAX_CHANGE_HISTORY {
+                let excess = proj.change_history.len() - MAX_CHANGE_HISTORY;
+                proj.change_history.drain(0..excess);
+            }
+        }
+    }
+
+    // === 中阶段完成检测与工作流推进 ===
+    // 检查当前中阶段是否所有小阶段均已通过
+    let all_subtasks_passed = mid.subtasks.iter().all(|s| s.status == project::SubtaskStatus::Passed);
+
+    if all_subtasks_passed {
+        // 标记中阶段完成
+        mid.status = project::MidStageStatus::Completed;
+        mid.completed_at = Some(now.clone());
+
+        // Write execution history: mid_stage complete
+        write_execution_history(
+            &project_name, "success", project::ExecutionEventType::MidStageComplete,
+            format!("✅ 中阶段完成：{} (v{})", mid.title, mid.version),
+            Some(&milestone_id), Some(&mid_stage_id), None,
+        );
+
+        // 使用预先收集的状态：当前大阶段其他中阶段是否均已完成
+        let all_mid_stages_done = other_mid_stages_all_completed;
+
+        if all_mid_stages_done {
+            // 大阶段全部中阶段完成 → 进入大阶段审阅
+            proj.workflow_state.current_step = project::WorkflowStep::MilestoneReview;
+            proj.workflow_state.review_node_id = milestone_id.clone();
+
+            // Autopilot awareness: signal milestone review boundary
+            if proj.workflow_state.autopilot_active {
+                if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
+                    ap.run_status = project::AutopilotRunStatus::WaitingMilestoneReview;
+                    ap.last_action = format!("到达大阶段边界：{}，等待人工 A/B/C", ms.title);
+                    ap.last_action_at = now.clone();
+                }
+            }
+
+            write_execution_history(
+                &project_name, "success", project::ExecutionEventType::AdvanceMilestoneReview,
+                format!("📋 推进到大阶段审阅：{}", ms.title),
+                Some(&milestone_id), None, None,
+            );
+        } else {
+            // 大阶段仍有未完成中阶段 → 进入中阶段选择
+            proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
+            proj.current_mid_stage_id = String::new();
+            write_execution_history(
+                &project_name, "success", project::ExecutionEventType::AdvanceNextMidStage,
+                "➡ 推进到下一中阶段选择".to_string(),
+                Some(&milestone_id), None, None,
+            );
+        }
+
+        proj.workflow_state.data_revision += 1;
+        proj.workflow_state.last_transition_at = now.clone();
+    }
+
+    // 提取中阶段节点标签所需数据（在 save_project 释放可变借用前克隆）
+    let mid_version_for_node_tag = mid.version.clone();
+    let mid_title_for_node_tag = mid.title.clone();
+    let mid_stage_id_for_node_tag = mid_stage_id.clone();
+
+    // Update constitution part 2 + record change history entry
+    if !project_path.is_empty() {
+        let constitution_path = std::path::Path::new(&project_path).join("CONSTITUTION.md");
+        if constitution_path.exists() {
+            if let Ok(diff_output) = std::process::Command::new("git")
+                .args(["diff", "HEAD~1"])
+                .current_dir(&project_path)
+                .output()
+            {
+                let diff_str = String::from_utf8_lossy(&diff_output.stdout).to_string();
+                let diff_summary = crate::diff::extract_diff_summary(&diff_str);
+                let old_constitution = std::fs::read_to_string(&constitution_path).unwrap_or_default();
+                let diff_summary_for_history = diff_summary.clone();
+                if let Ok(updated) = crate::constitution::update_constitution(old_constitution.clone(), diff_summary).await {
+                    let _ = std::fs::write(&constitution_path, &updated);
+                    // 仅在宪法实际变更时记录历史
+                    if updated != old_constitution {
+                        let part2 = extract_constitution_part2(&updated);
+                        let token_est = crate::constitution::estimate_tokens(&part2);
+                        let summary = build_constitution_change_summary(&diff_summary_for_history);
+                        proj.constitution_change_history.push(project::ConstitutionChangeEntry {
+                            timestamp: now.clone(),
+                            subtask_id: subtask_id.clone(),
+                            subtask_title: subtask_title.clone(),
+                            change_summary: summary,
+                            token_estimate: token_est,
+                        });
+                        const MAX_CONSTITUTION_HISTORY: usize = 50;
+                        if proj.constitution_change_history.len() > MAX_CONSTITUTION_HISTORY {
+                            let excess = proj.constitution_change_history.len() - MAX_CONSTITUTION_HISTORY;
+                            proj.constitution_change_history.drain(0..excess);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Write execution history: user confirmed
+    write_execution_history(
+        &project_name, "success", project::ExecutionEventType::UserConfirm,
+        format!("✅ 用户确认通过：{}", subtask_title),
+        Some(&milestone_id), Some(&mid_stage_id), Some(&subtask_id),
+    );
+
+    // Clear execution session before saving (小阶段已确认)
+    proj.execution_session = None;
+
+    crate::save_project(&proj)?;
+
+    // === 中阶段节点 Git 标签（项目状态已持久化，标签为补充元数据） ===
+    if all_subtasks_passed {
+        match crate::git_ops::git_save_node(
+            project_path.clone(),
+            mid_version_for_node_tag,
+            mid_title_for_node_tag,
+        ).await {
+            Ok(node_tag) => {
+                // 更新中阶段的 git_tag 字段
+                if let Err(e) = crate::git_ops::save_tag_to_mid_stage(
+                    &project_name,
+                    &mid_stage_id_for_node_tag,
+                    &node_tag,
+                ) {
+                    eprintln!("[execution] 中阶段 git_tag 写入失败（项目状态已推进）：{}", e);
+                }
+            }
+            Err(e) => {
+                eprintln!("[execution] 中阶段节点标签创建失败（项目状态已推进）：{}", e);
+            }
+        }
+    }
+
+    // Clear pipeline state
+    {
+        let mut guard = state.pipeline_state.lock().await;
+        if let Some(s) = guard.as_mut() {
+            s.status = PipelineStatus::Idle;
+            s.awaiting_confirmation = false;
+            append_log(s, "success", format!("✅ 已确认: {}", subtask_title));
+        }
+    }
+
+    Ok(proj)
 }
 
-
-/// 停止流水线执行
+/// V1 驳回小阶段执行结果（用户点击"发现问题"）
 #[tauri::command]
-pub(crate) async fn stop_execution(state: tauri::State<'_, AppState>) -> Result<(), String> {
+pub(crate) async fn reject_subtask_result(
+    state: tauri::State<'_, AppState>,
+    project_name: String,
+    reason: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
+
+    let milestone_id = &proj.current_milestone_id;
+    let mid_stage_id = &proj.current_mid_stage_id;
+
+    let ms = proj.milestones.iter_mut().find(|m| m.id == *milestone_id).ok_or("大阶段不存在。")?;
+    let mid = ms.mid_stages.iter_mut().find(|m| m.id == *mid_stage_id).ok_or("中阶段不存在。")?;
+
+    let subtask_idx = mid.subtasks.iter()
+        .position(|s| s.status == project::SubtaskStatus::AwaitingConfirmation)
+        .ok_or("没有待确认的小阶段。".to_string())?;
+
+    // Capture data before mutation
+    let subtask_id = mid.subtasks[subtask_idx].id.clone();
+    let subtask_title = mid.subtasks[subtask_idx].title.clone();
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let st = &mut mid.subtasks[subtask_idx];
+    st.status = project::SubtaskStatus::Rejected;
+    st.confirmed_by_user = Some(false);
+    st.confirmed_at = Some(now.clone());
+    st.confirmation_notes = Some(reason.clone());
+
+    // Write execution history: user rejected
+    write_execution_history(
+        &project_name, "error", project::ExecutionEventType::UserReject,
+        format!("❌ 用户驳回：{} — {}", subtask_title, reason),
+        Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
+    );
+
+    // Clear execution session
+    proj.execution_session = None;
+
+    crate::save_project(&proj)?;
+
+    // Clear pipeline state
+    {
+        let mut guard = state.pipeline_state.lock().await;
+        if let Some(s) = guard.as_mut() {
+            s.status = PipelineStatus::Idle;
+            s.awaiting_confirmation = false;
+            append_log(s, "error", format!("❌ 已驳回: {}", reason));
+        }
+    }
+
+    Ok(proj)
+}
+
+// ===================================================================
+// V1 执行工作区探测与准备
+// ===================================================================
+
+/// 探测项目路径的 Git 工作区是否满足执行前置条件（只读）
+#[tauri::command]
+pub(crate) async fn get_execution_workspace_status(
+    project_name: String,
+) -> Result<project::ExecutionWorkspaceStatus, String> {
+    let proj = crate::load_project(&project_name)?;
+    let path = &proj.project_path;
+
+    if path.is_empty() {
+        return Ok(project::ExecutionWorkspaceStatus {
+            path_exists: false,
+            is_directory: false,
+            is_git_repo: false,
+            has_commits: false,
+            git_user_available: false,
+            git_email_available: false,
+            ready: false,
+            status_message: "项目路径未设置。".to_string(),
+        });
+    }
+
+    let path_std = std::path::Path::new(path);
+    let path_exists = path_std.exists();
+    let is_directory = path_std.is_dir();
+
+    if !path_exists {
+        return Ok(project::ExecutionWorkspaceStatus {
+            path_exists: false,
+            is_directory: false,
+            is_git_repo: false,
+            has_commits: false,
+            git_user_available: false,
+            git_email_available: false,
+            ready: false,
+            status_message: format!("项目路径 {} 不存在。", path),
+        });
+    }
+    if !is_directory {
+        return Ok(project::ExecutionWorkspaceStatus {
+            path_exists: true,
+            is_directory: false,
+            is_git_repo: false,
+            has_commits: false,
+            git_user_available: false,
+            git_email_available: false,
+            ready: false,
+            status_message: format!("项目路径 {} 不是目录。", path),
+        });
+    }
+
+    let git_path = path_std.join(".git");
+    let is_git_repo = git_path.exists();
+
+    let has_commits = if is_git_repo {
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(path)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let git_user_available = std::process::Command::new("git")
+        .args(["config", "user.name"])
+        .current_dir(path)
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout).trim().len() > 0
+        })
+        .unwrap_or(false);
+
+    let git_email_available = std::process::Command::new("git")
+        .args(["config", "user.email"])
+        .current_dir(path)
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout).trim().len() > 0
+        })
+        .unwrap_or(false);
+
+    let ready = is_git_repo && has_commits && git_user_available && git_email_available;
+
+    let status_message = if ready {
+        "Git 工作区已就绪，可以执行小阶段。".to_string()
+    } else {
+        let mut missing = Vec::new();
+        if !is_git_repo { missing.push("Git 仓库未初始化"); }
+        if is_git_repo && !has_commits { missing.push("尚无首次提交"); }
+        if !git_user_available { missing.push("Git user.name 未配置"); }
+        if !git_email_available { missing.push("Git user.email 未配置"); }
+        format!("Git 工作区未就绪：{}。", missing.join("、"))
+    };
+
+    Ok(project::ExecutionWorkspaceStatus {
+        path_exists,
+        is_directory,
+        is_git_repo,
+        has_commits,
+        git_user_available,
+        git_email_available,
+        ready,
+        status_message,
+    })
+}
+
+/// 准备执行工作区：初始化 Git 仓库、创建首次提交（仅在 Execution 步骤可调用）
+#[tauri::command]
+pub(crate) async fn prepare_execution_workspace(
+    project_name: String,
+) -> Result<project::ExecutionWorkspaceStatus, String> {
+    let proj = crate::load_project(&project_name)?;
+
+    if proj.workflow_state.current_step != project::WorkflowStep::Execution {
+        return Err(format!(
+            "当前步骤为 {:?}，只有 Execution 步骤可以准备执行工作区",
+            proj.workflow_state.current_step
+        ));
+    }
+
+    // Write execution history: user requested workspace preparation
+    write_execution_history(
+        &project_name, "info", project::ExecutionEventType::WorkspacePrepare,
+        "🔧 用户点击准备执行环境".to_string(),
+        None, None, None,
+    );
+
+    let path = &proj.project_path;
+    if path.is_empty() {
+        return Err("项目路径未设置。".to_string());
+    }
+
+    let path_std = std::path::Path::new(path);
+    if !path_std.exists() {
+        return Err(format!("项目路径 {} 不存在。", path));
+    }
+    if !path_std.is_dir() {
+        return Err(format!("项目路径 {} 不是目录。", path));
+    }
+
+    let git_path = path_std.join(".git");
+
+    // Init git repo if needed
+    if !git_path.exists() {
+        let init = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .output()
+            .map_err(|e| format!("git init 失败：{}", e))?;
+        if !init.status.success() {
+            let stderr = String::from_utf8_lossy(&init.stderr);
+            return Err(format!("git init 失败：{}", stderr.chars().take(200).collect::<String>()));
+        }
+    }
+
+    // Check git identity
+    let user_name = std::process::Command::new("git")
+        .args(["config", "user.name"])
+        .current_dir(path)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    let user_email = std::process::Command::new("git")
+        .args(["config", "user.email"])
+        .current_dir(path)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    if user_name.is_empty() || user_email.is_empty() {
+        write_execution_history(
+            &project_name, "error", project::ExecutionEventType::WorkspacePrepareFailed,
+            format!("Git 身份未配置（user.name={:?}, user.email={:?}）", user_name, user_email),
+            None, None, None,
+        );
+        return Err(format!(
+            "Git 身份未配置（user.name={:?}, user.email={:?}）。请在项目目录下执行 git config user.name 和 git config user.email。",
+            user_name, user_email
+        ));
+    }
+
+    // Create initial commit if no commits exist
+    let has_commits = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !has_commits {
+        std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(path)
+            .output()
+            .map_err(|e| format!("git add 失败：{}", e))?;
+        let commit = std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "初始提交（由 Metheus 自动创建）"])
+            .current_dir(path)
+            .output()
+            .map_err(|e| format!("git commit 失败：{}", e))?;
+        if !commit.status.success() {
+            let stderr = String::from_utf8_lossy(&commit.stderr);
+            if !stderr.contains("nothing to commit") {
+                return Err(format!("git commit 失败：{}", stderr.chars().take(200).collect::<String>()));
+            }
+        }
+    }
+
+    // Write execution history: workspace ready
+    write_execution_history(
+        &project_name, "success", project::ExecutionEventType::WorkspaceReady,
+        "Git 工作区已就绪，可以执行小阶段。".to_string(),
+        None, None, None,
+    );
+
+    // Re-probe and return status
+    get_execution_workspace_status_inner(path)
+}
+
+/// Internal helper: probe workspace status from path
+fn get_execution_workspace_status_inner(path: &str) -> Result<project::ExecutionWorkspaceStatus, String> {
+    let path_std = std::path::Path::new(path);
+    let path_exists = path_std.exists();
+    let is_directory = path_std.is_dir();
+
+    if !path_exists || !is_directory {
+        return Ok(project::ExecutionWorkspaceStatus {
+            path_exists,
+            is_directory,
+            is_git_repo: false,
+            has_commits: false,
+            git_user_available: false,
+            git_email_available: false,
+            ready: false,
+            status_message: if !path_exists {
+                format!("项目路径 {} 不存在。", path)
+            } else {
+                format!("项目路径 {} 不是目录。", path)
+            },
+        });
+    }
+
+    let git_path = path_std.join(".git");
+    let is_git_repo = git_path.exists();
+
+    let has_commits = if is_git_repo {
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(path)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let git_user_available = std::process::Command::new("git")
+        .args(["config", "user.name"])
+        .current_dir(path)
+        .output()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false);
+
+    let git_email_available = std::process::Command::new("git")
+        .args(["config", "user.email"])
+        .current_dir(path)
+        .output()
+        .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false);
+
+    let ready = is_git_repo && has_commits && git_user_available && git_email_available;
+
+    let status_message = if ready {
+        "Git 工作区已就绪，可以执行小阶段。".to_string()
+    } else {
+        let mut missing = Vec::new();
+        if !is_git_repo { missing.push("Git 仓库未初始化"); }
+        if is_git_repo && !has_commits { missing.push("尚无首次提交"); }
+        if !git_user_available { missing.push("Git user.name 未配置"); }
+        if !git_email_available { missing.push("Git user.email 未配置"); }
+        format!("Git 工作区未就绪：{}。", missing.join("、"))
+    };
+
+    Ok(project::ExecutionWorkspaceStatus {
+        path_exists,
+        is_directory,
+        is_git_repo,
+        has_commits,
+        git_user_available,
+        git_email_available,
+        ready,
+        status_message,
+    })
+}
+
+// ===================================================================
+// V1 暂停与回退命令
+// ===================================================================
+
+/// V1 In Stop：立即终止当前子进程，回到上一个稳定检查点
+#[tauri::command]
+pub(crate) async fn request_in_stop(
+    state: tauri::State<'_, AppState>,
+    project_name: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
+
+    // Kill child process
     let child_pid = {
         let mut guard = state.pipeline_state.lock().await;
-        match guard.as_mut() {
-            Some(s) => {
-                s.status = PipelineStatus::Failed;
-                s.last_error = Some("用户手动停止".to_string());
-                s.current_log = "⏹ 已停止".to_string();
-                let pid = s.child_pid.take();
-                s.child_pid = None;
-                pid
-            }
-            None => {
-                // 没有活跃执行，幂等返回成功
-                return Ok(());
-            }
+        if let Some(s) = guard.as_mut() {
+            s.status = PipelineStatus::Failed;
+            append_log(s, "pause", "⏹ In Stop：立即暂停".to_string());
+            let pid = s.child_pid.take();
+            s.child_pid = None;
+            pid
+        } else {
+            None
         }
     };
 
-    // 尝试通过 PID 立即终止子进程（轮询循环也会检测到 Failed 状态作为安全网）
     if let Some(pid) = child_pid {
-        let pid_str = pid.to_string();
-        // Unix: 发送 SIGKILL；Windows: TerminateProcess
         #[cfg(unix)]
-        {
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid_str])
-                .output();
-        }
+        { let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).output(); }
         #[cfg(not(unix))]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/PID", &pid_str])
-                .output();
+        { let _ = std::process::Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output(); }
+    }
+
+    // Find last passed (stable) subtask
+    let last_passed = find_last_passed_subtask(&proj);
+    let current_attempt = find_current_subtask(&proj);
+
+    // Revert code to last stable tag if available
+    if let Some(ref last) = last_passed {
+        if let Some(ref tag) = last.auto_tag {
+            let _ = crate::git_ops::git_stash_and_reset_to_tag(&proj.project_path, tag);
         }
     }
 
-    Ok(())
+    // Save PauseContext
+    let now = chrono::Utc::now().to_rfc3339();
+    proj.pause_context = Some(project::PauseContext {
+        pause_type: "in_stop".to_string(),
+        current_subtask_id: current_attempt.as_ref().map(|s| s.id.clone()).unwrap_or_default(),
+        last_passed_subtask_id: last_passed.as_ref().map(|s| s.id.clone()).unwrap_or_default(),
+        stable_tag: last_passed.as_ref().and_then(|s| s.auto_tag.clone()).unwrap_or_default(),
+        paused_at: now.clone(),
+        discussion_start_revision: proj.discussion_revision,
+        pending_action: String::new(),
+    });
+
+    // Write execution history: user requested In Stop
+    write_execution_history(
+        &project_name, "pause", project::ExecutionEventType::UserInStop,
+        "⏹ 用户请求立即暂停 (In Stop)".to_string(),
+        current_attempt.as_ref().and_then(|_| {
+            proj.milestones.iter().find(|m| m.id == proj.current_milestone_id).map(|m| m.id.as_str())
+        }),
+        Some(&proj.current_mid_stage_id),
+        current_attempt.as_ref().map(|s| s.id.as_str()),
+    );
+
+    // Clear execution session (execution is being aborted)
+    proj.execution_session = None;
+
+    proj.workflow_state.current_step = project::WorkflowStep::PauseDecision;
+    proj.workflow_state.data_revision += 1;
+    proj.workflow_state.last_transition_at = now;
+
+    crate::save_project(&proj)?;
+    Ok(proj)
 }
 
+/// V1 ED Stop：当前任务完成后暂停（标记请求，执行器完成后检查）
+#[tauri::command]
+pub(crate) async fn request_ed_stop(
+    state: tauri::State<'_, AppState>,
+    project_name: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
 
-/// 这个函数就是一条自动流水线：
-/// 逐个执行子任务，每个子任务最多重试 3 次，期间可以暂停/恢复，并实时更新进度面板。
-/// 1. 初始化（准备空账本）
-///   ↓
-/// 2. 循环每个子任务（洗菜 → 切菜 → 炒菜）
-///   ├─ 2.1 更新状态：开始做这道菜
-///   ├─ 2.2 内层重试循环（最多 3 次）
-///   │    ├─ 暂停检查（如果老板喊停，就等待恢复）
-///   │    ├─ 生成提示词（告诉厨师下一步做什么）
-///   │    ├─ 执行子任务（厨师做菜）
-///   │    ├─ 运行测试（质检员尝菜）
-///   │    ├─ 如果通过 → 记录成功，跳出重试循环
-///   │    └─ 如果失败 → 重试次数+1，继续重试
-///   └─ 2.3 更新状态：这道菜完成
-///   ↓
-/// 3. 全部子任务完成 → 更新最终状态为"完成"
-/// 按顺序执行一组子任务（subtasks），每个子任务可能重试最多 3 次，全部通过后标记中阶段完成；
-/// 过程中实时更新全局状态（进度、日志、测试结果），并支持暂停/恢复。
-pub(crate) async fn execute_mid_stage_pipeline(
-    project_id: String,
-    mid_stage_id: String,
-    project_path: String,
-    mut subtasks: Vec<project::Subtask>,
-    mid_stage_title: String,
-    mid_stage_description: String,
-    state: Arc<Mutex<Option<PipelineState>>>,
-) -> Result<(), String> {
-    // 初始化变量
-    let mut previous_result = String::new();
-    let mut previous_title = String::new();
-    let mut file_changes: Vec<String> = vec![];
-    let mut last_test_result = String::new();
-    let mut mid_stage_version = String::new();
-
-    // 提前从 project 文件中提取 mid_stage_version（避免只在函数末尾获取）
+    // Set ED Stop flag in pipeline state
     {
-        if let Ok(project_file) = crate::project_data_path(&project_id) {
-            if let Ok(content) = std::fs::read_to_string(&project_file) {
-                if let Ok(project) = serde_json::from_str::<project::Project>(&content) {
-                    for milestone in &project.milestones {
-                        for mid_stage in &milestone.mid_stages {
-                            if mid_stage.id == mid_stage_id {
-                                mid_stage_version = mid_stage.version.clone();
-                                break;
-                            }
-                        }
-                        if !mid_stage_version.is_empty() {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for i in 0..subtasks.len() {
-        let subtask_title = subtasks[i].title.clone();
-        let subtask_id = subtasks[i].id.clone();
-        let mut retry_count = 0u32;
-        let max_retries = 3u32;
-        // 更新状态
-        // 标记当前子任务为 "executing"，更新 current_log
-        {
-            let mut guard = state.lock().await;
-            if let Some(s) = guard.as_mut() {
-                s.current_subtask_index = i;
-                if i > 0 {
-                    s.subtask_statuses[i - 1].status = "passed".to_string();
-                }
-                s.subtask_statuses[i].status = "executing".to_string();
-                s.current_log =
-                    format!("▶ 执行中 ({}/{})：{}", i + 1, subtasks.len(), subtask_title);
-            }
-        }
-        while retry_count < max_retries {
-            // 暂停检查
-            // 如果全局状态变成 Paused，就循环等待直到恢复
-            {
-                let guard = state.lock().await;
-                if let Some(s) = guard.as_ref() {
-                    if s.status == PipelineStatus::Paused {
-                        drop(guard);
-                        loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            let guard2 = state.lock().await;
-                            if let Some(s2) = guard2.as_ref() {
-                                if s2.status != PipelineStatus::Paused {
-                                    // 恢复后立即检查：如果被标记为 Failed，直接终止流水线
-                                    if s2.status == PipelineStatus::Failed {
-                                        return Err("流水线已被取消".to_string());
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // 生成 prompt：根据上一步结果、文件变更、测试结果等，调用 generate_next_prompt 得到下一步的标题和指令
-            let generated = crate::commands::milestone::generate_next_prompt(
-                mid_stage_title.clone(),
-                mid_stage_description.clone(),
-                previous_title.clone(),
-                previous_result.clone(),
-                file_changes.clone(),
-                last_test_result.clone(),
-                retry_count > 0,
-                if retry_count > 0 {
-                    last_test_result.clone()
-                } else {
-                    String::new()
-                },
-            )
-            .await?;
-            // 更新日志
-            {
-                let mut guard = state.lock().await;
-                if let Some(s) = guard.as_mut() {
-                    s.current_log = format!("⚙️ {}", generated.title);
-                }
-            }
-            // 执行子任务（可被暂停中断）
-            let exec_result = match crate::executor::execute_subtask_inner(
-                &project_path,
-                &generated.prompt,
-                &subtask_id,
-                state.clone(),
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(project::SubTaskError::UserPaused) => {
-                    // 用户暂停：Claude Code 已被 kill，进入等待恢复循环
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        let guard = state.lock().await;
-                        if let Some(s) = guard.as_ref() {
-                            if s.status != PipelineStatus::Paused {
-                                // 已恢复（或已取消）
-                                if s.status == PipelineStatus::Failed {
-                                    return Err("流水线已被取消".to_string());
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    // 恢复后重新执行当前子任务（不增加 retry_count）
-                    continue;
-                }
-                Err(e) => {
-                    let msg = match e {
-                        project::SubTaskError::ExecutionFailed { message } => message,
-                        project::SubTaskError::Timeout => "执行超时".to_string(),
-                        _ => format!("{:?}", e),
-                    };
-                    return Err(format!("Claude Code 执行失败：{}", msg));
-                }
-            };
-            subtasks[i].execution_result = Some(exec_result.clone());
-            file_changes = exec_result.file_changes.clone();
-            // 记录执行结果到日志
-            {
-                let mut guard = state.lock().await;
-                if let Some(s) = guard.as_mut() {
-                    if exec_result.success {
-                        s.current_log = format!(
-                            "✅ 完成: {} (变更 {} 个文件)",
-                            subtask_title,
-                            file_changes.len()
-                        );
-                    } else {
-                        s.current_log = format!(
-                            "❌ 失败: {} — {}",
-                            subtask_title,
-                            exec_result.error_log.chars().take(100).collect::<String>()
-                        );
-                    }
-                }
-            }
-            // Claude Code 进程失败 -> 不进入重试循环，直接中止
-            if !exec_result.success {
-                return Err(format!("Claude Code 执行失败：{}", exec_result.error_log));
-            }
-            // 运行测试
-            // 调用 check_subtask，得到 test.passed
-            {
-                let mut guard = state.lock().await;
-                if let Some(s) = guard.as_mut() {
-                    s.subtask_statuses[i].status = "testing".to_string();
-                    s.current_log = format!("🔍 测试: {}", subtask_title);
-                }
-            }
-            // 检查
-            let test = match crate::test_runner::check_subtask(
-                &project_path,
-                &generated.prompt,
-                &subtask_id,
-                &subtask_title,
-                &mid_stage_id,
-            )
-            .await
-            {
-                Ok(t) => t,
-                Err(err) => project::TestResult {
-                    passed: false,
-                    issues: vec![format!("测试服务不可用: {}", err)],
-                    suggestion: "请手动检查".to_string(),
-                    warnings: vec![],
-                },
-            };
-            last_test_result = if test.passed {
-                "通过".to_string()
-            } else if test.issues.is_empty() {
-                "不通过（测试工程师未提供具体问题）".to_string()
-            } else {
-                let issues_text = test
-                    .issues
-                    .iter()
-                    .map(|issue| format!("- {}", issue))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let full = format!("不通过。具体问题：\n{}", issues_text);
-                // 防止 retry_reason 过长，截断到 1000 字符
-                if full.chars().count() > 1000 {
-                    format!("{}…（已截断）", full.chars().take(1000).collect::<String>())
-                } else {
-                    full
-                }
-            };
-            if test.passed {
-                {
-                    let mut guard = state.lock().await;
-                    if let Some(s) = guard.as_mut() {
-                        s.subtask_statuses[i].status = "passed".to_string();
-                        s.subtask_statuses[i].test_result = Some(test.clone());
-                        s.current_log = format!("✅ 通过: {}", subtask_title);
-                    }
-                }
-                previous_result = "通过".to_string();
-                previous_title = subtask_title.clone();
-                subtasks[i].test_result = Some(test);
-                subtasks[i].retry_count = retry_count;
-
-                // === 宪法更新链 ===
-                let mut constitution_updated = false;
-                let mut old_constitution = String::new();
-                // 步骤 1：获取 git diff
-                match std::process::Command::new("git")
-                    .args(["diff", "HEAD"])
-                    .current_dir(&project_path)
-                    .output()
-                {
-                    Ok(output) => {
-                        let diff_stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                        // 步骤 2：提取变更摘要
-                        let diff_summary = crate::diff::extract_diff_summary(&diff_stdout);
-                        // 步骤 3：检查是否有实际变更
-                        if diff_summary.new_files.is_empty()
-                            && diff_summary.modified_files.is_empty()
-                            && diff_summary.deleted_files.is_empty()
-                            && diff_summary.new_functions.is_empty()
-                            && diff_summary.modified_functions.is_empty()
-                            && diff_summary.deleted_functions.is_empty()
-                            && diff_summary.changed_dependencies.is_empty()
-                        {
-                            eprintln!("[constitution] 宪法更新跳过（无变更）");
-                        } else {
-                            // 步骤 4：读取当前 CONSTITUTION.md
-                            let constitution_path =
-                                std::path::Path::new(&project_path).join("CONSTITUTION.md");
-                            let constitution_content =
-                                std::fs::read_to_string(&constitution_path).unwrap_or_default();
-                            old_constitution = constitution_content.clone();
-                            // 步骤 5：调用 update_constitution
-                            match crate::constitution::update_constitution(constitution_content.clone(), diff_summary)
-                                .await
-                            {
-                                Ok(updated_content) => {
-                                    // 步骤 6：写回 CONSTITUTION.md
-                                    if let Err(e) =
-                                        std::fs::write(&constitution_path, &updated_content)
-                                    {
-                                        eprintln!(
-                                            "[constitution] 写入 CONSTITUTION.md 失败：{}",
-                                            e
-                                        );
-                                    } else {
-                                        constitution_updated = true;
-                                        // 步骤 6b：检查是否需要剪枝
-                                        // 提取第 2 部分，超过阈值则触发 compact_constitution
-                                        if let Some(part2_start) =
-                                            updated_content.find("## 第 2 部分")
-                                        {
-                                            let part2 = &updated_content[part2_start..];
-                                            if crate::constitution::estimate_tokens(part2) > crate::constants::COMPACTION_TRIGGER_TOKENS {
-                                                match crate::constitution::compact_constitution(updated_content.clone())
-                                                    .await
-                                                {
-                                                    Ok(compacted) => {
-                                                        if let Err(e) = std::fs::write(
-                                                            &constitution_path,
-                                                            &compacted,
-                                                        ) {
-                                                            eprintln!(
-                                                                "[constitution] 写入剪枝后宪法失败：{}",
-                                                                e
-                                                            );
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!(
-                                                            "[constitution] 宪法剪枝失败，保留膨胀版本：{}",
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[constitution] 宪法更新失败：{}", e);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[constitution] git diff 失败，跳过宪法更新：{}", e);
-                    }
-                }
-
-                // === git_save_subtask ===
-                match crate::git_ops::git_save_subtask(
-                    project_path.clone(),
-                    (i + 1) as u32,
-                    mid_stage_version.clone(),
-                    subtask_title.clone(),
-                )
-                .await
-                {
-                    Ok(tag_name) => {
-                        subtasks[i].auto_tag = Some(tag_name);
-                    }
-                    Err(e) => {
-                        eprintln!("[constitution] git_save_subtask 失败：{}", e);
-                        // 如果宪法在此次流水线中被更新过，回退宪法到更新前的内容
-                        if constitution_updated {
-                            let constitution_path =
-                                std::path::Path::new(&project_path).join("CONSTITUTION.md");
-                            if let Err(e2) = std::fs::write(&constitution_path, &old_constitution) {
-                                eprintln!(
-                                    "[constitution] 宪法回退写入也失败，宪法可能处于不一致状态：{}",
-                                    e2
-                                );
-                            } else {
-                                eprintln!(
-                                    "[constitution] git_save_subtask 失败，宪法已回退到更新前状态"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                break;
-            } else {
-                retry_count += 1;
-                subtasks[i].retry_count = retry_count;
-                {
-                    let mut guard = state.lock().await;
-                    if let Some(s) = guard.as_mut() {
-                        s.subtask_statuses[i].status = "retrying".to_string();
-                        s.subtask_statuses[i].retry_count = retry_count;
-                        s.current_log =
-                            format!("🔄 重试 {}/{}: {}", retry_count, max_retries, subtask_title);
-                    }
-                }
-                if retry_count >= max_retries {
-                    return Err(format!(
-                        "小阶段「{}」重试 {} 次仍未通过",
-                        subtask_title, max_retries
-                    ));
-                }
-            }
-        }
-    }
-    // 全部完成
-    // 更新状态为 "passed"，记录测试结果，break 出 while 循环
-    {
-        let mut guard = state.lock().await;
+        let mut guard = state.pipeline_state.lock().await;
         if let Some(s) = guard.as_mut() {
-            s.status = PipelineStatus::Completed;
-            if let Some(last) = s.subtask_statuses.last_mut() {
-                last.status = "passed".to_string();
-            }
-            s.current_log = "✅ 所有小阶段执行完成！".to_string();
+            append_log(s, "pause", "⏸ ED Stop：当前任务完成后将暂停".to_string());
         }
     }
-    // 写回 project 文件
-    // 流水线跑完后，找到项目文件里对应的那个"中阶段"（MidStage），
-    // 把每个子任务的执行结果、测试结果、重试次数填进去，
-    // 然后把中阶段状态改成 "completed"，最后保存文件
-    if let Ok(project_file) = crate::project_data_path(&project_id) {
-        if let Ok(content) = std::fs::read_to_string(&project_file) {
-            if let Ok(mut project) = serde_json::from_str::<project::Project>(&content) {
-                // 找到对应的 MidStage，更新结果
-                for milestone in &mut project.milestones {
-                    for mid_stage in &mut milestone.mid_stages {
-                        if mid_stage.id == mid_stage_id {
-                            mid_stage_version = mid_stage.version.clone();
-                            for (i, subtask) in mid_stage.subtasks.iter_mut().enumerate() {
-                                if i < subtasks.len() {
-                                    subtask.execution_result = subtasks[i].execution_result.clone();
-                                    subtask.test_result = subtasks[i].test_result.clone();
-                                    subtask.retry_count = subtasks[i].retry_count;
-                                    subtask.auto_tag = subtasks[i].auto_tag.clone();
-                                }
-                            }
-                            mid_stage.status = project::MidStageStatus::Completed;
-                            break;
-                        }
-                    }
-                }
-                // 保存
-                if let Ok(json) = serde_json::to_string_pretty(&project) {
-                    let _ = std::fs::write(&project_file, json);
-                }
-            }
-        }
-    }
-    // === 全部小阶段完成，自动 Git 存档 ===
-    let tag_name = format!("metheus/{}", mid_stage_version);
-    crate::git_ops::git_save_node(
-        project_path.to_string(),
-        mid_stage_version.clone(),
-        mid_stage_title.to_string(),
-    )
-    .await?;
-    crate::git_ops::save_tag_to_mid_stage(&project_id, &mid_stage_id, &tag_name)?;
-    Ok(())
+
+    // Write execution history
+    write_execution_history(
+        &project_name, "pause", project::ExecutionEventType::UserEdStop,
+        "⏸ 用户请求完成后暂停 (ED Stop)".to_string(),
+        Some(&proj.current_milestone_id), Some(&proj.current_mid_stage_id), None,
+    );
+
+    // Save pending action in PauseContext
+    let now = chrono::Utc::now().to_rfc3339();
+    let current = find_current_subtask(&proj);
+    proj.pause_context = Some(project::PauseContext {
+        pause_type: "ed_stop".to_string(),
+        current_subtask_id: current.as_ref().map(|s| s.id.clone()).unwrap_or_default(),
+        last_passed_subtask_id: String::new(),
+        stable_tag: String::new(),
+        paused_at: now.clone(),
+        discussion_start_revision: proj.discussion_revision,
+        pending_action: "ed_stop_requested".to_string(),
+    });
+
+    proj.workflow_state.pause_reason = project::PauseReason::EDStop;
+
+    crate::save_project(&proj)?;
+    Ok(proj)
 }
 
-/// 快速模式流水线：直接执行大阶段的子任务（跳过中阶段）
-///
-/// 与专业模式 `execute_mid_stage_pipeline` 的区别：
-/// 1. 使用大阶段 version 而非中阶段 version 打 tag
-/// 2. Git tag 使用 `metheus/q/` 前缀，避免与专业模式冲突
-/// 3. 完成后将结果写回 milestone.subtasks 而非 mid_stage.subtasks
-pub(crate) async fn execute_quick_pipeline(
-    project_id: String,
-    milestone_version: String,
-    project_path: String,
-    mut subtasks: Vec<project::Subtask>,
-    milestone_title: String,
-    milestone_description: String,
-    state: Arc<Mutex<Option<PipelineState>>>,
-) -> Result<(), String> {
-    let mut previous_result = String::new();
-    let mut previous_title = String::new();
-    let mut file_changes: Vec<String> = vec![];
-    let mut last_test_result = String::new();
+/// V1 暂停决策：继续 / 调整 / 回退
+#[tauri::command]
+pub(crate) async fn resolve_pause_decision(
+    project_name: String,
+    action: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
 
-    for i in 0..subtasks.len() {
-        let subtask_title = subtasks[i].title.clone();
-        let subtask_id = subtasks[i].id.clone();
-        let mut retry_count = 0u32;
-        let max_retries = 3u32;
+    if proj.workflow_state.current_step != project::WorkflowStep::PauseDecision {
+        return Err(format!("当前步骤 {:?} 不是 PauseDecision", proj.workflow_state.current_step));
+    }
 
-        // 标记当前子任务为 "executing"
-        {
-            let mut guard = state.lock().await;
-            if let Some(s) = guard.as_mut() {
-                s.current_subtask_index = i;
-                if i > 0 {
-                    s.subtask_statuses[i - 1].status = "passed".to_string();
-                }
-                s.subtask_statuses[i].status = "executing".to_string();
-                s.current_log =
-                    format!("▶ 执行中 ({}/{})：{}", i + 1, subtasks.len(), subtask_title);
+    match action.as_str() {
+        "continue" => {
+            // Go back to Execution step
+            proj.workflow_state.current_step = project::WorkflowStep::Execution;
+            proj.workflow_state.pause_reason = project::PauseReason::None;
+            proj.pause_context = None;
+            write_execution_history(
+                &project_name, "info", project::ExecutionEventType::UserContinue,
+                "▶ 用户选择继续执行".to_string(), None, None, None,
+            );
+        }
+        "adjust" => {
+            // Enter Discussion with PauseAdjustment scope
+            proj.workflow_state.current_step = project::WorkflowStep::Discussion;
+            proj.workflow_state.discussion_scope = project::DiscussionScope::PauseAdjustment;
+            // Keep pause_context for reference
+            write_execution_history(
+                &project_name, "info", project::ExecutionEventType::UserAdjust,
+                "🔧 用户选择调整后续方案".to_string(), None, None, None,
+            );
+        }
+        "rollback" => {
+            // Enter RollbackPreview
+            proj.workflow_state.current_step = project::WorkflowStep::RollbackPreview;
+            write_execution_history(
+                &project_name, "pause", project::ExecutionEventType::UserRollback,
+                "↩ 用户选择回退到更早稳定点".to_string(), None, None, None,
+            );
+        }
+        _ => return Err(format!("未知暂停动作：{}", action)),
+    }
+
+    proj.workflow_state.data_revision += 1;
+    proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+
+    crate::save_project(&proj)?;
+    Ok(proj)
+}
+
+/// V1 预览回退影响范围
+#[tauri::command]
+pub(crate) async fn preview_rollback_impact(
+    project_name: String,
+    checkpoint_subtask_id: String,
+) -> Result<project::RollbackImpact, String> {
+    let proj = crate::load_project(&project_name)?;
+
+    // Collect all subtasks across all mid-stages
+    let mut all_subtasks: Vec<(&str, &str, &project::Subtask)> = Vec::new();
+    for ms in &proj.milestones {
+        for mid in &ms.mid_stages {
+            for st in &mid.subtasks {
+                all_subtasks.push((ms.id.as_str(), mid.id.as_str(), st));
             }
         }
+    }
 
-        while retry_count < max_retries {
-            // 暂停检查
-            {
-                let guard = state.lock().await;
-                if let Some(s) = guard.as_ref() {
-                    if s.status == PipelineStatus::Paused {
-                        drop(guard);
-                        loop {
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                            let guard2 = state.lock().await;
-                            if let Some(s2) = guard2.as_ref() {
-                                if s2.status != PipelineStatus::Paused {
-                                    if s2.status == PipelineStatus::Failed {
-                                        return Err("流水线已被取消".to_string());
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    // Find checkpoint position
+    let cp_idx = all_subtasks.iter()
+        .position(|(_, _, st)| st.id == checkpoint_subtask_id)
+        .ok_or("未找到检查点小阶段".to_string())?;
 
-            // 生成 prompt
-            let generated = crate::commands::milestone::generate_next_prompt(
-                milestone_title.clone(),
-                milestone_description.clone(),
-                previous_title.clone(),
-                previous_result.clone(),
-                file_changes.clone(),
-                last_test_result.clone(),
-                retry_count > 0,
-                if retry_count > 0 {
-                    last_test_result.clone()
-                } else {
-                    String::new()
-                },
-            )
-            .await?;
+    let retained: Vec<String> = all_subtasks[..=cp_idx].iter()
+        .map(|(_, _, st)| st.title.clone()).collect();
+    let discarded: Vec<String> = all_subtasks[cp_idx + 1..].iter()
+        .map(|(_, _, st)| st.title.clone()).collect();
+    let deleted_tags: Vec<String> = all_subtasks[cp_idx + 1..].iter()
+        .filter_map(|(_, _, st)| st.auto_tag.clone()).collect();
 
-            // 更新日志
-            {
-                let mut guard = state.lock().await;
-                if let Some(s) = guard.as_mut() {
-                    s.current_log = format!("⚙️ {}", generated.title);
-                }
-            }
+    let target_tag = all_subtasks[cp_idx].2.auto_tag.clone()
+        .unwrap_or_else(|| "无标签（代码将回退到该检查点的 Git 提交）".to_string());
 
-            // 执行子任务
-            let exec_result = match crate::executor::execute_subtask_inner(
-                &project_path,
-                &generated.prompt,
-                &subtask_id,
-                state.clone(),
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(project::SubTaskError::UserPaused) => {
-                    loop {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        let guard = state.lock().await;
-                        if let Some(s) = guard.as_ref() {
-                            if s.status != PipelineStatus::Paused {
-                                if s.status == PipelineStatus::Failed {
-                                    return Err("流水线已被取消".to_string());
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    continue;
-                }
-                Err(e) => {
-                    let msg = match e {
-                        project::SubTaskError::ExecutionFailed { message } => message,
-                        project::SubTaskError::Timeout => "执行超时".to_string(),
-                        _ => format!("{:?}", e),
-                    };
-                    return Err(format!("Claude Code 执行失败：{}", msg));
-                }
-            };
-            subtasks[i].execution_result = Some(exec_result.clone());
-            file_changes = exec_result.file_changes.clone();
+    Ok(project::RollbackImpact {
+        target_checkpoint: format!("{} (tag: {})", all_subtasks[cp_idx].2.title, target_tag),
+        retained_nodes: retained,
+        discarded_nodes: discarded,
+        deleted_tags,
+        regeneration_scope: format!("从「{}」之后重新生成执行计划", all_subtasks[cp_idx].2.title),
+        includes_code_rollback: true,
+    })
+}
 
-            // 记录执行结果
-            {
-                let mut guard = state.lock().await;
-                if let Some(s) = guard.as_mut() {
-                    if exec_result.success {
-                        s.current_log = format!(
-                            "✅ 完成: {} (变更 {} 个文件)",
-                            subtask_title,
-                            file_changes.len()
-                        );
-                    } else {
-                        s.current_log = format!(
-                            "❌ 失败: {} — {}",
-                            subtask_title,
-                            exec_result.error_log.chars().take(100).collect::<String>()
-                        );
-                    }
-                }
-            }
+/// V1 确认回退：执行 Git 回退并更新项目数据
+#[tauri::command]
+pub(crate) async fn confirm_rollback(
+    project_name: String,
+    checkpoint_subtask_id: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
+    let project_path = proj.project_path.clone();
 
-            if !exec_result.success {
-                return Err(format!("Claude Code 执行失败：{}", exec_result.error_log));
-            }
+    // Find checkpoint subtask and its tag
+    let mut checkpoint_tag: Option<String> = None;
+    let mut checkpoint_idx: Option<(usize, String, String)> = None; // (subtask_idx, mid_stage_id, milestone_id)
 
-            // 运行测试
-            {
-                let mut guard = state.lock().await;
-                if let Some(s) = guard.as_mut() {
-                    s.subtask_statuses[i].status = "testing".to_string();
-                    s.current_log = format!("🔍 测试: {}", subtask_title);
-                }
-            }
-
-            let test = match crate::test_runner::check_subtask(
-                &project_path,
-                &generated.prompt,
-                &subtask_id,
-                &subtask_title,
-                &milestone_version,
-            )
-            .await
-            {
-                Ok(t) => t,
-                Err(err) => project::TestResult {
-                    passed: false,
-                    issues: vec![format!("测试服务不可用: {}", err)],
-                    suggestion: "请手动检查".to_string(),
-                    warnings: vec![],
-                },
-            };
-
-            last_test_result = if test.passed {
-                "通过".to_string()
-            } else if test.issues.is_empty() {
-                "不通过（测试工程师未提供具体问题）".to_string()
-            } else {
-                let issues_text = test
-                    .issues
-                    .iter()
-                    .map(|issue| format!("- {}", issue))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let full = format!("不通过。具体问题：\n{}", issues_text);
-                if full.chars().count() > 1000 {
-                    format!("{}…（已截断）", full.chars().take(1000).collect::<String>())
-                } else {
-                    full
-                }
-            };
-
-            if test.passed {
-                {
-                    let mut guard = state.lock().await;
-                    if let Some(s) = guard.as_mut() {
-                        s.subtask_statuses[i].status = "passed".to_string();
-                        s.subtask_statuses[i].test_result = Some(test.clone());
-                        s.current_log = format!("✅ 通过: {}", subtask_title);
-                    }
-                }
-                previous_result = "通过".to_string();
-                previous_title = subtask_title.clone();
-                subtasks[i].test_result = Some(test);
-                subtasks[i].retry_count = retry_count;
-
-                // === 宪法更新链（与专业模式相同） ===
-                let mut constitution_updated = false;
-                let mut old_constitution = String::new();
-                match std::process::Command::new("git")
-                    .args(["diff", "HEAD"])
-                    .current_dir(&project_path)
-                    .output()
-                {
-                    Ok(output) => {
-                        let diff_stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                        let diff_summary = crate::diff::extract_diff_summary(&diff_stdout);
-                        if diff_summary.new_files.is_empty()
-                            && diff_summary.modified_files.is_empty()
-                            && diff_summary.deleted_files.is_empty()
-                            && diff_summary.new_functions.is_empty()
-                            && diff_summary.modified_functions.is_empty()
-                            && diff_summary.deleted_functions.is_empty()
-                            && diff_summary.changed_dependencies.is_empty()
-                        {
-                            eprintln!("[constitution] 宪法更新跳过（无变更）");
-                        } else {
-                            let constitution_path =
-                                std::path::Path::new(&project_path).join("CONSTITUTION.md");
-                            let constitution_content =
-                                std::fs::read_to_string(&constitution_path).unwrap_or_default();
-                            old_constitution = constitution_content.clone();
-                            match crate::constitution::update_constitution(
-                                constitution_content.clone(),
-                                diff_summary,
-                            )
-                            .await
-                            {
-                                Ok(updated_content) => {
-                                    if let Err(e) =
-                                        std::fs::write(&constitution_path, &updated_content)
-                                    {
-                                        eprintln!("[constitution] 写入 CONSTITUTION.md 失败：{}", e);
-                                    } else {
-                                        constitution_updated = true;
-                                        if let Some(part2_start) =
-                                            updated_content.find("## 第 2 部分")
-                                        {
-                                            let part2 = &updated_content[part2_start..];
-                                            if crate::constitution::estimate_tokens(part2)
-                                                > crate::constants::COMPACTION_TRIGGER_TOKENS
-                                            {
-                                                match crate::constitution::compact_constitution(
-                                                    updated_content.clone(),
-                                                )
-                                                .await
-                                                {
-                                                    Ok(compacted) => {
-                                                        if let Err(e) = std::fs::write(
-                                                            &constitution_path,
-                                                            &compacted,
-                                                        ) {
-                                                            eprintln!(
-                                                                "[constitution] 写入剪枝后宪法失败：{}",
-                                                                e
-                                                            );
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        eprintln!(
-                                                            "[constitution] 宪法剪枝失败，保留膨胀版本：{}",
-                                                            e
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[constitution] 宪法更新失败：{}", e);
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[constitution] git diff 失败，跳过宪法更新：{}", e);
-                    }
-                }
-
-                // === git_save_subtask（快速模式 tag 前缀） ===
-                match crate::git_ops::git_save_subtask_inner(
-                    project_path.clone(),
-                    (i + 1) as u32,
-                    milestone_version.clone(),
-                    subtask_title.clone(),
-                    true, // is_quick_mode
-                )
-                .await
-                {
-                    Ok(tag_name) => {
-                        subtasks[i].auto_tag = Some(tag_name);
-                    }
-                    Err(e) => {
-                        eprintln!("[constitution] git_save_subtask 失败：{}", e);
-                        if constitution_updated {
-                            let constitution_path =
-                                std::path::Path::new(&project_path).join("CONSTITUTION.md");
-                            if let Err(e2) = std::fs::write(&constitution_path, &old_constitution) {
-                                eprintln!(
-                                    "[constitution] 宪法回退写入也失败，宪法可能处于不一致状态：{}",
-                                    e2
-                                );
-                            } else {
-                                eprintln!(
-                                    "[constitution] git_save_subtask 失败，宪法已回退到更新前状态"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                break;
-            } else {
-                retry_count += 1;
-                subtasks[i].retry_count = retry_count;
-                {
-                    let mut guard = state.lock().await;
-                    if let Some(s) = guard.as_mut() {
-                        s.subtask_statuses[i].status = "retrying".to_string();
-                        s.subtask_statuses[i].retry_count = retry_count;
-                        s.current_log = format!(
-                            "🔄 重试 {}/{}: {}",
-                            retry_count, max_retries, subtask_title
-                        );
-                    }
-                }
-                if retry_count >= max_retries {
-                    return Err(format!(
-                        "小阶段「{}」重试 {} 次仍未通过",
-                        subtask_title, max_retries
-                    ));
+    for ms in &proj.milestones {
+        for mid in &ms.mid_stages {
+            for (idx, st) in mid.subtasks.iter().enumerate() {
+                if st.id == checkpoint_subtask_id {
+                    checkpoint_tag = st.auto_tag.clone();
+                    checkpoint_idx = Some((idx, mid.id.clone(), ms.id.clone()));
+                    break;
                 }
             }
         }
     }
 
-    // 全部完成
-    {
-        let mut guard = state.lock().await;
-        if let Some(s) = guard.as_mut() {
-            s.status = PipelineStatus::Completed;
-            if let Some(last) = s.subtask_statuses.last_mut() {
-                last.status = "passed".to_string();
-            }
-            s.current_log = "✅ 所有小阶段执行完成！".to_string();
-        }
+    let (cp_idx, mid_stage_id, milestone_id) =
+        checkpoint_idx.ok_or("未找到检查点小阶段".to_string())?;
+
+    // Execute git rollback
+    if let Some(ref tag) = checkpoint_tag {
+        crate::git_ops::git_stash_and_reset_to_tag(&project_path, tag)
+            .map_err(|e| format!("Git 回退失败：{}", e))?;
     }
 
-    // 写回 project 文件：更新 milestone.subtasks
-    if let Ok(project_file) = crate::project_data_path(&project_id) {
-        if let Ok(content) = std::fs::read_to_string(&project_file) {
-            if let Ok(mut project) = serde_json::from_str::<project::Project>(&content) {
-                for milestone in &mut project.milestones {
-                    if milestone.version == milestone_version {
-                        for (i, subtask) in milestone.subtasks.iter_mut().enumerate() {
-                            if i < subtasks.len() {
-                                subtask.execution_result = subtasks[i].execution_result.clone();
-                                subtask.test_result = subtasks[i].test_result.clone();
-                                subtask.retry_count = subtasks[i].retry_count;
-                                subtask.auto_tag = subtasks[i].auto_tag.clone();
-                            }
-                        }
-                        milestone.status = project::MilestoneStatus::Completed;
-                        break;
+    // Update project data: discard subtasks after checkpoint, clear their tags
+    for ms in &mut proj.milestones {
+        for mid in &mut ms.mid_stages {
+            for (idx, st) in mid.subtasks.iter_mut().enumerate() {
+                if mid.id == mid_stage_id && ms.id == milestone_id {
+                    if idx > cp_idx {
+                        st.status = project::SubtaskStatus::RolledBack;
+                        st.auto_tag = None;
+                        st.execution_result = None;
+                        st.test_result = None;
                     }
                 }
-                if let Ok(json) = serde_json::to_string_pretty(&project) {
-                    let _ = std::fs::write(&project_file, json);
+            }
+        }
+    }
+
+    // Clear mid-stage tags for rolled-back mid-stages
+    for ms in &mut proj.milestones {
+        for mid in &mut ms.mid_stages {
+            if mid.id == mid_stage_id && ms.id == milestone_id {
+                // Keep the mid_stage but clear its completion markers
+                if mid.subtasks.iter().all(|s| s.status == project::SubtaskStatus::RolledBack
+                    || s.status == project::SubtaskStatus::Pending) {
+                    mid.status = project::MidStageStatus::Pending;
+                    mid.git_tag.clear();
+                    mid.completed_at = None;
                 }
             }
         }
     }
 
-    // === 全部小阶段完成，自动 Git 存档（快速模式节点 tag） ===
-    let _tag_name = format!("{}{}", QUICK_TAG_PREFIX, milestone_version);
-    crate::git_ops::git_save_node(
-        project_path.to_string(),
-        format!("q/{}", milestone_version),
-        milestone_title.to_string(),
-    )
-    .await?;
+    proj.workflow_state.current_step = project::WorkflowStep::PlanGeneration;
+    proj.workflow_state.pause_reason = project::PauseReason::None;
+    proj.pause_context = None;
+    proj.execution_session = None;
+    proj.workflow_state.data_revision += 1;
+    proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
-    Ok(())
+    crate::save_project(&proj)?;
+    Ok(proj)
+}
+
+// === 辅助函数 ===
+
+/// 捕获最近一次提交的 diff（git diff HEAD~1），失败时静默返回空字符串
+fn capture_diff_snapshot(project_path: &str) -> String {
+    std::process::Command::new("git")
+        .args(["diff", "HEAD~1"])
+        .current_dir(project_path)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default()
+}
+
+/// 从 diff 文本中提取变更文件列表（仅文件名，去重）
+fn extract_changed_files(diff_text: &str) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for line in diff_text.lines() {
+        if line.starts_with("diff --git ") {
+            // 格式: diff --git a/path b/path
+            if let Some(b_path) = line.split(" b/").nth(1) {
+                let clean = b_path.trim();
+                if !files.contains(&clean.to_string()) {
+                    files.push(clean.to_string());
+                }
+            }
+        }
+    }
+    files
+}
+
+/// 从宪法文本中提取第二部分内容（从 "## 第 2 部分" 开始到文末）
+fn extract_constitution_part2(constitution: &str) -> String {
+    if let Some(pos) = constitution.find("## 第 2 部分") {
+        constitution[pos..].to_string()
+    } else {
+        // Fallback: try "## Part 2" or "## 2."
+        if let Some(pos) = constitution.find("## Part 2") {
+            constitution[pos..].to_string()
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// 从 DiffSummary 构建宪法变更摘要描述
+fn build_constitution_change_summary(diff: &crate::project::DiffSummary) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !diff.new_files.is_empty() {
+        parts.push(format!("新增文件：{}", diff.new_files.join("、")));
+    }
+    if !diff.modified_files.is_empty() {
+        parts.push(format!("修改文件：{}", diff.modified_files.join("、")));
+    }
+    if !diff.new_functions.is_empty() {
+        parts.push(format!("新增函数：{}", diff.new_functions.join("、")));
+    }
+    if !diff.modified_functions.is_empty() {
+        parts.push(format!("修改函数：{}", diff.modified_functions.join("、")));
+    }
+    if !diff.changed_dependencies.is_empty() {
+        parts.push(format!("依赖变更：{}", diff.changed_dependencies.join("、")));
+    }
+    if parts.is_empty() {
+        "无结构性变更".to_string()
+    } else {
+        parts.join("；")
+    }
+}
+
+pub(crate) fn find_last_passed_subtask(proj: &project::Project) -> Option<project::Subtask> {
+    let mut last: Option<project::Subtask> = None;
+    for ms in &proj.milestones {
+        for mid in &ms.mid_stages {
+            for st in &mid.subtasks {
+                if st.status == project::SubtaskStatus::Passed {
+                    last = Some(st.clone());
+                }
+            }
+        }
+    }
+    last
+}
+
+fn find_current_subtask(proj: &project::Project) -> Option<project::Subtask> {
+    for ms in &proj.milestones {
+        for mid in &ms.mid_stages {
+            for st in &mid.subtasks {
+                if st.status == project::SubtaskStatus::Executing
+                    || st.status == project::SubtaskStatus::AwaitingConfirmation {
+                    return Some(st.clone());
+                }
+            }
+        }
+    }
+    // Fallback: find first Pending
+    for ms in &proj.milestones {
+        for mid in &ms.mid_stages {
+            for st in &mid.subtasks {
+                if st.status == project::SubtaskStatus::Pending {
+                    return Some(st.clone());
+                }
+            }
+        }
+    }
+    None
 }

@@ -13,16 +13,8 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
 
   // 方案生成类 — 大模型计算密集，给充裕时间
   generate_version_plan: 180,
-  generate_milestones: 180,
-  regenerate_milestones_with_feedback: 180,
-  generate_mid_stages: 180,
-  generate_next_prompt: 120,
 
   // 执行控制类 — 后端轻量操作
-  start_execution: 30,
-  pause_execution: 15,
-  resume_execution: 15,
-  stop_execution: 15,
   approve_version_plan: 30,
 
   // 测试/检查类 — 涉及文件读写和子进程调用
@@ -33,23 +25,119 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   get_execution_status: 10,
 
   // 持久化类 — 文件 I/O
-  persist_project: 15,
 
   // 数据获取类
   get_project: 10,
   get_project_files: 15,
   get_current_diff: 10,
+  get_change_history: 10,
   get_git_tags_summary: 10,
   read_constitution: 10,
+  get_constitution_change_history: 10,
   validate_project_path: 10,
 
   // Git 操作类
-  git_rollback_to_mid_stage: 60,
-  git_rollback_to_subtask: 60,
+
+  // 宪法管理（AI 调用 + 文件 I/O）
+  update_constitution: 120,
+
+  // 快照持久化
+  save_snapshot_event: 15,
+  restore_snapshot: 15,
+
+  // 旧兼容命令（仍注册，仅用于旧数据迁移）
+  approve_mid_stage: 15,
+  reject_mid_stage: 15,
+
+  // V1 新增命令 - 项目入口
+  initialize_project_entry: 30,
+  scan_existing_project: 60,
+  generate_existing_baseline: 120,
+  approve_existing_baseline: 15,
+
+  // V1 新增命令 - 三项检查
+  run_preflight_check: 120,
+
+  // V1 新增命令 - 执行计划
+  generate_execution_plan: 180,
+  check_stage_plan: 150,
+  approve_stage_plan: 15,
+
+  // V1 Console 规划闭环 - AI 命令必须长于后端 120 秒 HTTP 超时
+  generate_milestone_draft: 150,
+  regenerate_milestone_draft: 150,
+  check_milestone_draft: 150,
+  approve_milestone_draft: 15,
+  select_milestone: 15,
+  generate_mid_stage_draft: 150,
+  regenerate_mid_stage_draft: 150,
+  check_mid_stage_draft: 150,
+  approve_mid_stage_draft: 15,
+  select_mid_stage: 15,
+  regenerate_execution_plan: 180,
+
+  // V1 新增命令 - 执行控制（autopilot 也需要这些）
+  execute_current_subtask: 720,
+  confirm_subtask_result: 30,
+  reject_subtask_result: 15,
+  get_execution_workspace_status: 15,
+  prepare_execution_workspace: 60,
+  request_in_stop: 30,
+  request_ed_stop: 15,
+  resolve_pause_decision: 15,
+  preview_rollback_impact: 15,
+  confirm_rollback: 30,
+
+  // V1 新增命令 - 工作流
+  transition_workflow: 15,
+  migrate_project_workflow: 15,
+  toggle_autopilot: 15,
+  autopilot_pause: 120,  // 可能涉及 In Stop kill 子进程
+  autopilot_next_step: 15,
+  start_preflight_check: 15,
+  return_to_discussion: 15,
+  resume_plan_approval: 15,
+  restart_discussion_from_approved: 15,
+  restart_checks: 15,
+
+  // V1 新增命令 - 暂停决策
+  suggest_rollback_checkpoint: 120,
+  approve_milestone_outcome: 15,
+
+  // V1 新增命令 - 大阶段审阅与未来规划
+  enter_milestone_review: 15,
+  approve_future_milestones: 15,
+  generate_future_milestone_draft: 150,
+  summarize_milestone: 120,
+
+  // V1 新增命令 - 宪法
+  get_constitution_summary: 15,
+  compact_constitution: 60,
+
+  // V1 新增命令 - 方案和控制台
+  reject_version_plan: 15,
+  enter_console: 15,
+  analyze_existing_project: 180,
 };
 
 /// 未显式配置的命令超时秒数
 const DEFAULT_TIMEOUT_SECS = 30;
+
+export class InvokeTimeoutError extends Error {
+  readonly command: string;
+  readonly timeoutMs: number;
+
+  constructor(command: string, timeoutMs: number) {
+    super(`请求等待超时（${command}，超过 ${timeoutMs / 1000} 秒）`);
+    this.name = "InvokeTimeoutError";
+    this.command = command;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+export function isInvokeTimeoutError(error: unknown): error is InvokeTimeoutError {
+  return error instanceof InvokeTimeoutError;
+}
 
 /**
  * 带超时的 invoke 包装器。
@@ -76,13 +164,20 @@ export async function invokeWithTimeout<T>(
     );
   }
 
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const timeoutPromise = new Promise<never>((_, reject) => {
-    setTimeout(() => {
-      reject(new Error(`请求超时（${cmd}，超过 ${timeout / 1000} 秒），请检查网络或重试`));
+    timer = setTimeout(() => {
+      reject(new InvokeTimeoutError(cmd, timeout));
     }, timeout);
   });
 
-  return Promise.race([invoke<T>(cmd, args), timeoutPromise]);
+  try {
+    return await Promise.race([invoke<T>(cmd, args), timeoutPromise]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 export { INVOKE_TIMEOUT_MAP, DEFAULT_TIMEOUT_SECS };

@@ -1,51 +1,87 @@
-// src/components/Modal.tsx
+// src/components/Modal.tsx — 统一弹窗组件（基于 @radix-ui/react-dialog）
 import React from 'react';
+import * as Dialog from '@radix-ui/react-dialog';
+import { X } from 'lucide-react';
+
+interface ModalAction {
+  label: string;
+  onClick: () => void;
+  variant?: 'primary' | 'secondary' | 'danger';
+  disabled?: boolean;
+}
 
 interface ModalProps {
   isOpen: boolean;
   onClose: () => void;
   title: string;
   children: React.ReactNode;
+  description?: string;
+  showCloseButton?: boolean;
+  isDanger?: boolean;
+  actions?: ModalAction[];
+  /** 提交期间锁定关闭（禁止 Esc、遮罩点击、关闭按钮关闭） */
+  lockClose?: boolean;
+  /** 是否正在提交（操作按钮显示加载态） */
+  isSubmitting?: boolean;
 }
 
-export function Modal({ isOpen, onClose, title, children }: ModalProps) {
-  if (!isOpen) return null;
+export function Modal({
+  isOpen,
+  onClose,
+  title,
+  children,
+  description,
+  showCloseButton = true,
+  isDanger = false,
+  actions,
+  lockClose = false,
+  isSubmitting = false,
+}: ModalProps) {
+  const handleClose = lockClose ? () => {} : onClose;
 
   return (
-    <div
-      onClick={onClose}
-      style={{
-        position: 'fixed',
-        inset: 0,
-        background: 'rgba(0,0,0,0.4)',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        zIndex: 1000,
-      }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          background: '#fff',
-          borderRadius: '8px',
-          minWidth: '360px',
-          maxWidth: '480px',
-          boxShadow: '0 4px 24px rgba(0,0,0,0.2)',
-        }}
-      >
-        <div
-          style={{
-            padding: '12px 16px',
-            borderBottom: '1px solid #eee',
-            fontWeight: 600,
-            fontSize: '16px',
-          }}
+    <Dialog.Root open={isOpen} onOpenChange={(open) => { if (!open && !lockClose) onClose(); }}>
+      <Dialog.Portal>
+        <Dialog.Overlay className="modal-overlay" />
+        <Dialog.Content
+          className="modal-content"
+          onEscapeKeyDown={handleClose}
+          onInteractOutside={handleClose}
         >
-          {title}
-        </div>
-        {children}
-      </div>
-    </div>
+          <Dialog.Title className={`modal-title ${isDanger ? 'modal-title-danger' : ''}`}>
+            {title}
+          </Dialog.Title>
+          {description && (
+            <Dialog.Description className="modal-description">
+              {description}
+            </Dialog.Description>
+          )}
+          {showCloseButton && !lockClose && (
+            <Dialog.Close asChild>
+              <button className="modal-close-btn" aria-label="关闭">
+                <X size={16} />
+              </button>
+            </Dialog.Close>
+          )}
+          <div className="modal-body-scrollable">
+            {children}
+          </div>
+          {actions && actions.length > 0 && (
+            <div className="modal-actions">
+              {actions.map((action, idx) => (
+                <button
+                  key={idx}
+                  className={`modal-action-btn modal-action-${action.variant || 'secondary'}`}
+                  onClick={action.onClick}
+                  disabled={action.disabled || (isSubmitting && action.variant !== 'secondary')}
+                >
+                  {action.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   );
 }

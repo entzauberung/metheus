@@ -60,7 +60,7 @@ pub(crate) fn check_project_path(path: &str) -> project::PathValidationResult {
     }
 }
 
-///保存项目数据到文件
+///保存项目数据到文件（原子写入：先写临时文件，再替换正式文件）
 pub(crate) fn save_project(project: &project::Project) -> Result<(), String> {
     //1. 确保 .metheus 目录存在
     let path = project_data_path(&project.name)?;
@@ -69,8 +69,15 @@ pub(crate) fn save_project(project: &project::Project) -> Result<(), String> {
     }
     //2.序列化为JSON
     let json = serde_json::to_string_pretty(project).map_err(|e| format!("序列化失败: {}", e))?;
-    //3.写入文件
-    fs::write(&path, json).map_err(|e| format!("写入文件失败: {}", e))?;
+    //3. 写入同目录临时文件
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, &json).map_err(|e| format!("写入临时文件失败: {}", e))?;
+    //4. 替换正式文件（原子 rename）
+    fs::rename(&tmp_path, &path).map_err(|e| {
+        // 清理临时文件
+        let _ = fs::remove_file(&tmp_path);
+        format!("替换项目文件失败: {}", e)
+    })?;
     Ok(())
 }
 
@@ -90,6 +97,16 @@ pub(crate) fn load_project(name: &str) -> Result<project::Project, String> {
 
     // 4. 成功时，把 Project 对象装进 Ok 信封返回
     Ok(project)
+}
+
+/// Persist a project and return the exact value that can be read back from disk.
+pub(crate) fn save_and_reload_project(
+    project: &project::Project,
+) -> Result<project::Project, String> {
+    let project_name = project.name.clone();
+    save_project(project)?;
+    load_project(&project_name)
+        .map_err(|error| format!("项目已保存，但重新读取磁盘最终状态失败：{}", error))
 }
 
 fn load_env() {
@@ -118,36 +135,71 @@ pub fn run() {
             crate::commands::chat::chat_with_role,
             crate::commands::plan::generate_version_plan,
             crate::commands::plan::approve_version_plan,
-            crate::commands::project_ops::persist_project,
-            crate::commands::milestone::generate_milestones,
-            crate::commands::milestone::regenerate_milestones_with_feedback,
-            crate::commands::milestone::regenerate_milestones_from_point,
-            crate::commands::milestone::generate_mid_stages,
+            crate::commands::plan::reject_version_plan,
+            crate::commands::plan::enter_console,
+            crate::commands::milestone::generate_milestone_draft,
+            crate::commands::milestone::regenerate_milestone_draft,
+            crate::commands::milestone::check_milestone_draft,
+            crate::commands::milestone::approve_milestone_draft,
+            crate::commands::milestone::select_milestone,
+            crate::commands::milestone::generate_mid_stage_draft,
+            crate::commands::milestone::regenerate_mid_stage_draft,
+            crate::commands::milestone::check_mid_stage_draft,
+            crate::commands::milestone::approve_mid_stage_draft,
+            crate::commands::milestone::select_mid_stage,
+            crate::commands::milestone::generate_execution_plan,
+            crate::commands::milestone::regenerate_execution_plan,
+            crate::commands::milestone::check_stage_plan,
+            crate::commands::milestone::approve_stage_plan,
+            crate::commands::milestone::enter_milestone_review,
+            crate::commands::milestone::approve_milestone_outcome,
+            crate::commands::milestone::suggest_rollback_checkpoint,
+            crate::commands::milestone::generate_future_milestone_draft,
+            crate::commands::milestone::approve_future_milestones,
             crate::executor::execute_subtask,
             crate::test_runner::check_subtask,
-            crate::commands::milestone::generate_next_prompt,
-            crate::commands::milestone::regenerate_plan_from_checkpoint,
             crate::commands::milestone::summarize_milestone,
-            crate::pipeline::start_execution,
+            crate::pipeline::execute_current_subtask,
+            crate::pipeline::confirm_subtask_result,
+            crate::pipeline::reject_subtask_result,
+            crate::pipeline::get_execution_workspace_status,
+            crate::pipeline::prepare_execution_workspace,
             crate::pipeline::get_execution_status,
-            crate::pipeline::pause_execution,
-            crate::pipeline::resume_execution,
-            crate::pipeline::stop_execution,
+            crate::pipeline::request_in_stop,
+            crate::pipeline::request_ed_stop,
+            crate::pipeline::resolve_pause_decision,
+            crate::pipeline::preview_rollback_impact,
+            crate::pipeline::confirm_rollback,
             crate::commands::project_ops::approve_mid_stage,
             crate::commands::project_ops::reject_mid_stage,
             crate::git_ops::git_save_node,
             crate::git_ops::git_save_subtask,
-            crate::git_ops::git_rollback_to_mid_stage,
-            crate::git_ops::git_rollback_to_subtask,
-            crate::git_ops::rollback_to_subtask_with_reset,
             crate::constitution::update_constitution,
             crate::constitution::compact_constitution,
             crate::constitution::read_constitution,
             crate::git_ops::get_git_tags_summary,
             crate::git_ops::get_current_diff,
+            crate::git_ops::get_change_history,
+            crate::commands::project_analysis::analyze_existing_project,
+            crate::commands::project_analysis::scan_existing_project,
+            crate::commands::project_analysis::generate_existing_baseline,
+            crate::commands::project_analysis::approve_existing_baseline,
+            crate::commands::checks::run_preflight_check,
+            crate::commands::workflow::transition_workflow,
+            crate::commands::workflow::migrate_project_workflow,
+            crate::commands::workflow::toggle_autopilot,
+            crate::commands::workflow::autopilot_pause,
+            crate::commands::workflow::autopilot_next_step,
+            crate::commands::workflow::start_preflight_check,
+            crate::commands::workflow::return_to_discussion,
+            crate::commands::workflow::resume_plan_approval,
+            crate::commands::workflow::restart_discussion_from_approved,
+            crate::commands::workflow::restart_checks,
+            crate::commands::project_ops::initialize_project_entry,
             crate::commands::project_ops::validate_project_path,
             crate::commands::project_ops::get_project_files,
             crate::constitution::get_constitution_summary,
+            crate::constitution::get_constitution_change_history,
             crate::snapshot::save_snapshot_event,
             crate::snapshot::restore_snapshot
         ])

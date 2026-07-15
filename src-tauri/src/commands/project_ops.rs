@@ -89,27 +89,132 @@ pub(crate) async fn get_project_files(project_path: String) -> Result<Vec<projec
     Ok(entries)
 }
 
+/// 项目入口结果
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct ProjectEntryResult {
+    pub project: project::Project,
+    pub is_recovery: bool,
+    pub message: String,
+}
+
 /// 从硬盘加载项目数据（Tauri 命令）
+/// 项目不存在时返回明确错误，不再返回默认空项目。
 #[tauri::command]
 pub(crate) async fn get_project(project_name: String) -> Result<project::Project, String> {
     let name = if project_name.is_empty() {
-        "我的游戏".to_string()
+        return Err("未指定项目名称".to_string());
     } else {
         project_name
     };
-    match crate::load_project(&name) {
-        Ok(project) => Ok(project),
-        Err(_) => {
-            // 文件不存在时返回默认空项目，不报错
-            Ok(project::Project::new(&name))
+    crate::load_project(&name)
+}
+
+/// 初始化项目入口（Before 页面调用）
+/// 创建新项目或安全恢复同名同路径项目。
+#[tauri::command]
+pub(crate) async fn initialize_project_entry(
+    project_name: String,
+    project_path: String,
+    entry_kind: String,
+) -> Result<project::Project, String> {
+    if project_name.trim().is_empty() {
+        return Err("项目名称不能为空".to_string());
+    }
+    if project_path.trim().is_empty() {
+        return Err("项目路径不能为空".to_string());
+    }
+
+    let kind = match entry_kind.as_str() {
+        "NoProject" => project::ProjectEntryKind::NoProject,
+        "HalfProject" => project::ProjectEntryKind::HalfProject,
+        _ => return Err(format!("未知的项目来源类型：{}", entry_kind)),
+    };
+
+    let path = std::path::Path::new(&project_path);
+
+    // === 先检查同名项目是否已存在（冲突检测在目录操作之前） ===
+    let project_data_path = crate::project_data_path(&project_name)?;
+    if project_data_path.exists() {
+        if let Ok(existing) = crate::load_project(&project_name) {
+            if existing.project_path == project_path && !existing.project_path.is_empty() {
+                // Same name + same path = recovery — don't recreate or reset
+                return Ok(existing);
+            } else if !existing.project_path.is_empty() {
+                return Err(format!(
+                    "项目名称「{}」已被使用（路径：{}），请修改项目名称",
+                    project_name, existing.project_path
+                ));
+            }
         }
     }
+
+    // NoProject: validate path and optionally create directory
+    if kind == project::ProjectEntryKind::NoProject {
+        if path.exists() {
+            // Path exists but is a regular file — reject
+            if !path.is_dir() {
+                return Err(format!(
+                    "路径「{}」已存在但是一个普通文件，不是目录。请选择目录路径。",
+                    project_path
+                ));
+            }
+            // Path exists, is a directory — check if non-empty
+            let is_empty = std::fs::read_dir(path)
+                .map(|mut rd| rd.next().is_none())
+                .unwrap_or(false);
+            if !is_empty {
+                return Err(format!(
+                    "目录「{}」非空，无法作为 No Project 使用。请选择空目录或使用 Half Project 改造已有项目。",
+                    project_path
+                ));
+            }
+        } else {
+            // Path doesn't exist — create it
+            std::fs::create_dir_all(path)
+                .map_err(|e| format!("创建项目目录失败：{}", e))?;
+            // Verify the created directory is writable
+            if !path.is_dir() {
+                return Err(format!(
+                    "目录「{}」创建后不可用，请检查权限或选择其他路径。",
+                    project_path
+                ));
+            }
+        }
+    }
+
+    let mut project = if kind == project::ProjectEntryKind::HalfProject {
+        project::Project::new_half(&project_name, &project_path)
+    } else {
+        let mut p = project::Project::new(&project_name);
+        p.project_path = project_path.to_string();
+        p
+    };
+
+    // Set workflow state based on entry kind
+    match kind {
+        project::ProjectEntryKind::NoProject => {
+            project.workflow_state.top_level_phase = project::TopLevelPhase::FirstDiscussion;
+            project.workflow_state.current_step = project::WorkflowStep::Discussion;
+        }
+        project::ProjectEntryKind::HalfProject => {
+            // HalfProject 初始阶段必须为 Before（尚未进入讨论）
+            project.workflow_state.top_level_phase = project::TopLevelPhase::Before;
+            project.workflow_state.current_step = project::WorkflowStep::ExistingAnalysis;
+        }
+    }
+
+    // Persist
+    crate::save_project(&project)?;
+
+    Ok(project)
 }
 
 /// 3.3 执行引擎流水线
 /// 根据传入的中阶段信息和子任务列表，启动一个后台任务，逐个执行这些子任务，并实时更新执行状态（运行中、成功、失败等）
 /// 启动后台流水线执行一组子任务，立即返回成功，执行进度保存在全局状态中，前端可查询。
 #[tauri::command]
+#[allow(dead_code)]
 pub(crate) async fn persist_project(project_json: String) -> Result<String, String> {
     //前端发来的 JSON 字符串转成 Project 对象
     let project: project::Project =

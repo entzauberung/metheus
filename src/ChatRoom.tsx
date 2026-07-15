@@ -6,27 +6,21 @@
 // ...
 import { useState, useMemo } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout"
-import { ChatMessage } from "./types"
+import { ChatMessage, Project } from "./types"
 interface Props {
   messages: ChatMessage[];
   onAddMessage: (msg: ChatMessage) => void;
+  projectName?: string;
   currentRole: string;
-  mode: "Quick" | "Professional";
-  onModeChange: (mode: "Quick" | "Professional") => void;
-  modeLocked: boolean;
-  onApproveVersionPlan?: () => void;
-  onRejectVersionPlan?: () => void;
-  onContinueNextMilestone?: () => void;
-  onDiscussWithPM?: () => void;
+  threadId: string;
   onViewDetailedReport?: () => void;
-  hasNextMilestone?: boolean;
-  // === 阶段三：分支讨论 ===
-  discussionBranchType?: 'rollback' | 'redirect' | null;
-  onConfirmPMSuggestion?: () => void;
-  projectStatus?: string;
-  hasMilestones?: boolean;
+  // === V1：项目状态更新回调（替代乐观插入） ===
+  onProjectUpdated?: (project: Project) => void;
+  // === V1：方案已批准时隐藏聊天输入 ===
+  hideInput?: boolean;
+  hideInputReason?: string;
 }
-function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, modeLocked, onApproveVersionPlan, onRejectVersionPlan, onContinueNextMilestone, onDiscussWithPM, onViewDetailedReport, hasNextMilestone, discussionBranchType, onConfirmPMSuggestion, projectStatus, hasMilestones }: Props) {
+function ChatRoom({ messages, onAddMessage, projectName, currentRole, threadId, onViewDetailedReport, onProjectUpdated, hideInput, hideInputReason }: Props) {
   const [inputValue, setInputValue] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   // 这是【发送消息】功能。当用户点击发送按钮时执行。
@@ -68,41 +62,28 @@ function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, mod
       targetRole = roleMap[match[1]];
       actualMessage = inputValue.replace(match[0], "").trim();
     }
-    // 分支B：注入上下文信息
-    let contextPrefix = '';
-    if (discussionBranchType === 'redirect') {
-      contextPrefix = `[上下文：当前项目阶段为"${projectStatus || '未开始'}"，已有${hasMilestones ? '若干' : '无'}大阶段。用户选择调整后续方向，请根据用户反馈重新规划后续大阶段。] `;
-    }
-    const finalMessage = contextPrefix + actualMessage;
-
-    const userMessage: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content: actualMessage,
-      timestamp: Date.now(),
-    };
-    onAddMessage(userMessage);
+    // 不再乐观插入用户消息 — 后端 chat_with_role 负责持久化所有消息
+    // 前端通过 onProjectUpdated 接收后端返回的完整 Project（含已持久化的消息列表）
+    // 即使 AI 失败，后端也返回含用户消息+失败提示的完整 Project
     setInputValue("");
     setIsLoading(true);
     try {
-      const reply = await invokeWithTimeout("chat_with_role", {
-        message: finalMessage,
+      const updatedProject = await invokeWithTimeout<Project>("chat_with_role", {
+        projectName: projectName || "default",
+        message: actualMessage,
         role: targetRole,
-        threadId: "thread-init",
+        threadId: threadId,
       });
-      const replyData = reply as { id: string; role: string; content: string; timestamp: number };
-      const aiMessage: ChatMessage = {
-        id: replyData.id,
-        role: replyData.role,
-        content: replyData.content,
-        timestamp: replyData.timestamp,
-      };
-      onAddMessage(aiMessage);
+      // 将完整 Project 传回 App 以替换本地状态（用户消息已持久化，AI 回复或失败提示也在其中）
+      if (onProjectUpdated && updatedProject) {
+        onProjectUpdated(updatedProject);
+      }
     } catch (error) {
+      // 仅在后端完全无法保存用户消息时才走到这里（网络断开等极端情况）
       const errorMessage: ChatMessage = {
         id: crypto.randomUUID(),
-        role: "ai",
-        content: `❌ 出错啦：${error}`,
+        role: "system",
+        content: `❌ 消息发送失败：${error}`,
         timestamp: Date.now(),
       };
       onAddMessage(errorMessage);
@@ -112,7 +93,7 @@ function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, mod
   };
   // 计算最新的版本方案消息时间戳，用于判定旧方案是否过期
   const latestVpTimestamp = useMemo(() => {
-    const vpMessages = messages.filter(m => m.msgType === "version_plan");
+    const vpMessages = messages.filter(m => m.msg_type === "version_plan");
     if (vpMessages.length === 0) return 0;
     return vpMessages.reduce((max, m) => Math.max(max, m.timestamp), 0);
   }, [messages]);
@@ -127,9 +108,9 @@ function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, mod
         {messages.length === 0 ? (
           <p className="empty-tip">开始讨论你的想法吧</p>
         ) : (
-          messages.map((msg, index) => {
+          messages.map((msg) => {
             // 版本方案消息：特殊渲染
-            if (msg.msgType === "version_plan") {
+            if (msg.msg_type === "version_plan") {
               const isExpired = msg.timestamp < latestVpTimestamp;
               const hasApproved = msg.approved === true;
               const hasRejected = msg.rejected === true;
@@ -147,17 +128,16 @@ function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, mod
                     ) : isExpired ? (
                       <span className="vp-status vp-status-expired">⏳ 已过期</span>
                     ) : (
-                      <>
-                        <button className="vp-btn-approve" onClick={onApproveVersionPlan}>✅ 批准版本方案</button>
-                        <button className="vp-btn-reject" onClick={onRejectVersionPlan}>❌ 驳回，继续讨论</button>
-                      </>
+                      <span className="vp-status" style={{ background: "#fff8c5", color: "#664d03" }}>
+                        📝 历史草稿（请在方案审批页面操作）
+                      </span>
                     )}
                   </div>
                 </div>
               );
             }
             // 质检失败消息：红色边框特殊渲染
-            if (msg.msgType === "qa_failed") {
+            if (msg.msg_type === "qa_failed") {
               return (
                 <div key={msg.id} className="message message-system message-qa-failed">
                   <div className="message-role">
@@ -168,7 +148,7 @@ function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, mod
               );
             }
             // 大阶段总结消息：特殊渲染
-            if (msg.msgType === "milestone_summary") {
+            if (msg.msg_type === "milestone_summary") {
               return (
                 <div key={msg.id} className="message message-ai message-milestone-summary">
                   <div className="message-role">
@@ -176,45 +156,18 @@ function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, mod
                   </div>
                   <div className="message-content">{msg.content}</div>
                   <div className="ms-actions">
-                    {hasNextMilestone ? (
-                      <button className="ms-btn-continue" onClick={onContinueNextMilestone}>▶ 继续下一大阶段</button>
-                    ) : (
-                      <>
-                        <button className="ms-btn-continue ms-btn-disabled" disabled>所有大阶段已完成</button>
-                        <p className="ms-completed-hint">✅ 所有大阶段已执行完成，项目已全部交付。</p>
-                      </>
-                    )}
-                    <button className="ms-btn-discuss" onClick={onDiscussWithPM}>💬 与产品经理讨论</button>
                     <button className="ms-btn-report" onClick={onViewDetailedReport}>📊 查看详细报告</button>
                   </div>
                 </div>
               );
             }
             // 普通消息：保持现有渲染逻辑
-            const isLastAiMsg =
-              discussionBranchType != null &&
-              msg.role !== 'user' &&
-              msg.role !== 'system' &&
-              msg.msgType !== 'version_plan' &&
-              msg.msgType !== 'milestone_summary' &&
-              index === messages.length - 1;
-
             return (
               <div key={msg.id} className={`message message-${msg.role === "user" ? "user" : "ai"}`}>
                 <div className="message-role">
                   {msg.role === "user" ? "你" : msg.role}
                 </div>
                 <div className="message-content">{msg.content}</div>
-                {isLastAiMsg && onConfirmPMSuggestion && (
-                  <button
-                    className="btn-confirm-suggestion"
-                    onClick={onConfirmPMSuggestion}
-                  >
-                    {discussionBranchType === 'rollback'
-                      ? '🔄 按照建议回退并继续'
-                      : '🔄 按照新方案生成后续大阶段'}
-                  </button>
-                )}
               </div>
             );
           })
@@ -222,41 +175,37 @@ function ChatRoom({ messages, onAddMessage, currentRole, mode, onModeChange, mod
         {/* 如果正在等待 AI 回复，显示 "AI 正在输入..." 的提示 */}
         {isLoading && <p className="loading-tip">AI 正在输入...</p>}
       </div>
-      {/* 模式选择器：仅在未锁定时可切换 */}
-      <div className="mode-selector">
-        <span className="mode-label">项目模式：</span>
-        <button
-          className={`mode-btn ${mode === "Quick" ? "mode-active" : ""}`}
-          onClick={() => onModeChange("Quick")}
-          disabled={modeLocked}
-        >
-          快速
-        </button>
-        <button
-          className={`mode-btn ${mode === "Professional" ? "mode-active" : ""}`}
-          onClick={() => onModeChange("Professional")}
-          disabled={modeLocked}
-        >
-          专业
-        </button>
-        {modeLocked && <span className="mode-locked-hint">🔒 项目已开始，项目已锁定</span>}
-      </div>
-      {/* 底部输入区域：文本输入框和发送按钮 */}
-      <footer className="input-area">
-        <input
-          className="chat-input"
-          type="text"
-          placeholder="输入你的想法..."
-          value={inputValue}
-          onChange={(e) => setInputValue(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") handleSend();
-          }}
-        />
-        <button className="send-button" onClick={handleSend}>
-          发送
-        </button>
-      </footer>
+      {/* 底部输入区域：方案已批准时隐藏 */}
+      {hideInput ? (
+        <footer className="input-area" style={{
+          padding: "12px 16px",
+          textAlign: "center",
+          color: "#656d76",
+          fontSize: "13px",
+          background: "#f6f8fa",
+          borderTop: "1px solid #d0d7de",
+        }}>
+          <p style={{ margin: 0 }}>
+            {hideInputReason || "方案已批准，聊天输入已锁定。请使用方案审批页面的操作按钮。"}
+          </p>
+        </footer>
+      ) : (
+        <footer className="input-area">
+          <input
+            className="chat-input"
+            type="text"
+            placeholder="输入你的想法..."
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") handleSend();
+            }}
+          />
+          <button className="send-button" onClick={handleSend}>
+            发送
+          </button>
+        </footer>
+      )}
     </div>
   );
 }

@@ -4,19 +4,43 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // ...
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
 import "./App.css";
-import { Project, ViewMode, DiscussionReason, Subtask, PipelineState, QAResult, GeneratedSubtask, TestLog, PathValidationResult, ChatMessage, Milestone, DiscussionBranchType, RollbackCheckpoint } from "./types";
+import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus } from "./types";
+import { ProjectEntry } from "./ProjectEntry";
+import { ExistingBaselinePanel } from "./ExistingBaselinePanel";
+import { PreflightPanel } from "./PreflightPanel";
+import { PlanApprovalPanel } from "./PlanApprovalPanel";
+import { DecisionStepHeader } from "./components/DecisionStepHeader";
+import { FeedbackBanner } from "./components/FeedbackBanner";
+import { ActionButton } from "./components/ActionButton";
+import { Modal } from "./components/Modal";
+import { ConsoleStepShell } from "./components/ConsoleStepShell";
+import { WorkflowActionBar } from "./components/WorkflowActionBar";
+import { Check, GitBranch, ListTodo, Pause, Play, RotateCcw, Search, Square, WandSparkles, X } from "lucide-react";
 import ExecutionTree from "./ExecutionTree";
 import ChatRoom from "./ChatRoom";
 import TaskConsole from "./TaskConsole";
+import { ConsoleWorkflowPanel } from "./ConsoleWorkflowPanel";
+import { PauseDecisionPanel } from "./PauseDecisionPanel";
+import { RollbackImpactDialog } from "./RollbackImpactDialog";
+import { MilestoneReviewPanel } from "./MilestoneReviewPanel";
 import FileTree from "./FileTree";
 import FloatingChatBalloon from "./FloatingChatBalloon";
 
 const DEFAULT_SIDEBAR_WIDTH = 280;
 const MIN_SIDEBAR_WIDTH = 220;
 const MAX_SIDEBAR_WIDTH = 800;
+
+const WORKFLOW_STEPS = new Set<WorkflowStep>([
+  "WaitingEntry", "ExistingAnalysis", "BaselineApproval", "Discussion", "ThreeChecks",
+  "PlanApproval", "MilestoneGeneration", "MilestoneCheck", "MilestoneApproval",
+  "MilestoneSelection", "MidStageGeneration", "MidStageCheck", "MidStageApproval",
+  "MidStageSelection", "PlanGeneration", "PlanCheck", "PlanApproving", "Execution",
+  "PauseDecision", "RollbackPreview", "BranchDiscussion", "FuturePlanApproval",
+  "MilestoneReview", "Completed",
+]);
 
 // ============================================================
 // App.tsx — 「弥」的前端总指挥
@@ -38,16 +62,13 @@ const MAX_SIDEBAR_WIDTH = 800;
 
 function App() {
   const [project, setProject] = useState<Project | null>(null);
+  const projectRef = useRef<Project | null>(null);
   const [projectPath, setProjectPath] = useState<string>("");
-  const [pathSaveStatus, setPathSaveStatus] = useState<string>("");
-  const [testResult, setTestResult] = useState<string>("");
-  const [testLoading, setTestLoading] = useState<string>("");
 
   // === Phase B：视图模式控制 ===
   const [viewMode, setViewMode] = useState<ViewMode>({ phase: 'discussion', reason: 'idle' });
 
-  // Phase D: 动画控制
-  const [animatingComponent, setAnimatingComponent] = useState<'chatroom' | 'taskconsole' | null>(null);
+  // Phase D: 动画控制（保留用于视觉过渡，不决定业务阶段）
   const animationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // 测试日志去重：记录已处理过的子任务 ID
@@ -56,48 +77,52 @@ function App() {
   // 大阶段完成总结去重：记录已发送过总结消息的大阶段 ID
   const completedMilestonesRef = useRef<Set<string>>(new Set());
 
-  // === 阶段三：分支讨论状态 ===
-  const [discussionBranchType, setDiscussionBranchType] = useState<DiscussionBranchType | null>(null);
-  const [showBranchSelector, setShowBranchSelector] = useState(false);
-  const [rollbackCheckpoint, setRollbackCheckpoint] = useState<RollbackCheckpoint | null>(null);
-
   // === 侧边栏拖拽缩放 ===
   const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
   const [isDragging, setIsDragging] = useState(false);
   const dragStartX = useRef(0);
   const dragStartWidth = useRef(0);
 
-  const enterExecutionMode = useCallback(() => {
-    // 如果已经在执行模式，不重复触发
-    if (viewMode.phase === 'execution') return;
-    // 清除上一个未完成的定时器，防止快速连续切换导致时序混乱
-    if (animationTimerRef.current) { clearTimeout(animationTimerRef.current); animationTimerRef.current = null; }
-    // 立即切换视图，同时启动 ChatRoom 淡出动画（React 18 批处理合并为一次渲染）
-    setViewMode({ phase: 'execution', reason: 'active' });
-    setAnimatingComponent('chatroom');
-    // 250ms 后清除动画状态
-    animationTimerRef.current = setTimeout(() => {
-      setAnimatingComponent(null);
-      animationTimerRef.current = null;
-    }, 250);
-  }, [viewMode.phase]);
-
   const enterDiscussionMode = useCallback((reason: DiscussionReason) => {
-    // 如果已经在讨论模式且 reason 相同，不重复触发
+    // 仅保留视觉过渡职责，不再决定业务阶段
     if (viewMode.phase === 'discussion' && viewMode.reason === reason) return;
-    // 清除上一个定时器
     if (animationTimerRef.current) { clearTimeout(animationTimerRef.current); animationTimerRef.current = null; }
-    // 立即切换视图，同时启动 TaskConsole 淡出动画（React 18 批处理合并为一次渲染）
     setViewMode({ phase: 'discussion', reason });
-    setAnimatingComponent('taskconsole');
-    // 250ms 后清除动画状态
     animationTimerRef.current = setTimeout(() => {
-      setAnimatingComponent(null);
       animationTimerRef.current = null;
     }, 250);
   }, [viewMode.phase, viewMode.reason]);
 
-  // handleAddMessage 必须在轮询 useEffect 之前定义（依赖数组引用）
+  // 后端持久化后的完整 Project 是唯一事实；异步旧结果不得覆盖较新修订。
+  const handleChatComplete = useCallback((updatedProject: Project) => {
+    const current = projectRef.current;
+    if (!updatedProject.workflow_state || !WORKFLOW_STEPS.has(updatedProject.workflow_state.current_step)) {
+      console.error("拒绝应用缺少合法工作流状态的 Project", updatedProject);
+      return false;
+    }
+    if (current) {
+      if (updatedProject.name !== current.name) {
+        console.warn("拒绝应用其他项目的异步结果", updatedProject.name);
+        return false;
+      }
+      if (updatedProject.project_path !== current.project_path) {
+        console.warn("拒绝应用项目路径不一致的异步结果", updatedProject.project_path);
+        return false;
+      }
+      if (updatedProject.workflow_state.data_revision < current.workflow_state.data_revision) {
+        console.warn("拒绝应用较旧的 Project 修订", updatedProject.workflow_state.data_revision);
+        return false;
+      }
+    }
+
+    projectRef.current = updatedProject;
+    setProject(() => updatedProject);
+    setProjectPath(updatedProject.project_path);
+    return true;
+  }, []);
+
+  // handleAddMessage: 添加系统消息等不需要后端持久化的非对话消息
+  // 系统消息不递增 discussion_revision（只有用户需求消息才递增，且由后端 chat_with_role 控制）
   const handleAddMessage = useCallback((msg: any) => {
     setProject((prev) => {
       if (!prev) return null;
@@ -148,36 +173,234 @@ function App() {
     };
   }, [isDragging, handleResizeMouseMove, handleResizeMouseUp]);
 
-  // === Phase B：从 ExecutionTree 提升的 9 个状态 ===
-  const [selectedMilestoneId, setSelectedMilestoneId] = useState<string | null>(null);
-  const [selectedMidStageId, setSelectedMidStageId] = useState<string | null>(null);
-  const [generatedPlan, setGeneratedPlan] = useState<Map<string, Subtask[]>>(new Map());
-  const [quickGeneratedPlan, setQuickGeneratedPlan] = useState<Map<string, Subtask[]>>(new Map());
   const [isExecuting, setIsExecuting] = useState(false);
-  const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
-  const [isGeneratingVersionPlan, setIsGeneratingVersionPlan] = useState(false);
-  const [isGeneratingMilestones, setIsGeneratingMilestones] = useState(false);
+  const [feedbackMsg, setFeedbackMsg] = useState<{ type: "error" | "success" | "warning" | "info"; message: string } | null>(null);
   const [executionStatus, setExecutionStatus] = useState<PipelineState | null>(null);
   const [_autoAdvance, _setAutoAdvance] = useState(false);
-  const [qaModalData, setQaModalData] = useState<{ milestoneId: string; qaResult: QAResult } | null>(null);
-  const [isSubmitting, _setIsSubmitting] = useState(false);
+  // === 决策层统一提交锁（同一时间只能执行一个关键动作） ===
+  const [decisionAction, setDecisionAction] = useState<string | null>(null);
+  const isDecisionSubmitting = decisionAction !== null;
+
   const [testLogs, setTestLogs] = useState<TestLog[]>([]);
-  // 回退成功后需要自动触发生成执行计划的中阶段 ID（不为 null 时由 useEffect 消费）
-  const [pendingRollbackGenerate, setPendingRollbackGenerate] = useState<string | null>(null);
+  // === 执行工作区状态（供 V1ExecutionPanel 和 TaskConsole 共用） ===
+  const [workspaceStatus, setWorkspaceStatus] = useState<ExecutionWorkspaceStatus | null>(null);
+
+  useEffect(() => {
+    projectRef.current = project;
+  }, [project]);
+  // V1: 回退后手动触发生成（不再自动触发）
+
+  // === 阶段一关键修复：启动时从磁盘 Project 恢复执行状态 ===
+  // 解决刷新后执行状态丢失的问题。
+  useEffect(() => {
+    if (!project) return;
+    const session = project.execution_session;
+    if (!session || !session.active) {
+      // No active session — clear any stale execution state
+      setExecutionStatus(null);
+      setIsExecuting(false);
+      return;
+    }
+
+    // Recover based on disk session status
+    if (session.status === "executing") {
+      // Was executing when page was closed/refreshed.
+      // Check if backend memory still has the pipeline running.
+      invokeWithTimeout<PipelineState | null>("get_execution_status")
+        .then((memStatus) => {
+          if (memStatus && memStatus.status === "Running") {
+            // Backend still running — restore and poll
+            setExecutionStatus(memStatus);
+            setIsExecuting(true);
+          } else if (memStatus && memStatus.awaiting_confirmation) {
+            // Already finished while we were away
+            setExecutionStatus(memStatus);
+            setIsExecuting(false);
+            // Reload project to get latest disk state
+            invokeWithTimeout<Project>("get_project", { projectName: project.name })
+              .then((p) => handleChatComplete(p))
+              .catch(() => {});
+          } else {
+            // Memory state lost but disk says executing.
+            // Show the executing state from disk data so user isn't confused.
+            setExecutionStatus({
+              mid_stage_id: session.mid_stage_id,
+              status: "Running",
+              current_subtask_index: session.subtask_index,
+              total_subtasks: session.total_subtasks,
+              subtask_statuses: [],
+              current_log: `▶ 执行中 (${session.subtask_index + 1}/${session.total_subtasks})：${session.subtask_title}`,
+              last_error: undefined,
+              child_pid: undefined,
+              project_name: project.name,
+              milestone_id: session.milestone_id,
+              plan_revision: session.plan_revision,
+              current_subtask_id: session.subtask_id,
+              awaiting_confirmation: false,
+              log_history: [],
+            });
+            setIsExecuting(true);
+            // Poll in case backend recovers
+          }
+        })
+        .catch(() => {
+          // Can't reach backend — show disk-based state
+          setExecutionStatus({
+            mid_stage_id: session.mid_stage_id,
+            status: "Running",
+            current_subtask_index: session.subtask_index,
+            total_subtasks: session.total_subtasks,
+            subtask_statuses: [],
+            current_log: "⏳ 执行状态恢复中…请稍候或刷新页面。",
+            last_error: undefined,
+            child_pid: undefined,
+            project_name: project.name,
+            milestone_id: session.milestone_id,
+            plan_revision: session.plan_revision,
+            current_subtask_id: session.subtask_id,
+            awaiting_confirmation: false,
+            log_history: [],
+          });
+          setIsExecuting(true);
+        });
+    } else if (session.status === "awaiting_confirmation") {
+      // Was waiting for confirmation — restore that state directly
+      setExecutionStatus({
+        mid_stage_id: session.mid_stage_id,
+        status: "Paused",
+        current_subtask_index: session.subtask_index,
+        total_subtasks: session.total_subtasks,
+        subtask_statuses: [],
+        current_log: `⏳ 待确认 (${session.subtask_index + 1}/${session.total_subtasks})：${session.subtask_title}`,
+        last_error: undefined,
+        child_pid: undefined,
+        project_name: project.name,
+        milestone_id: session.milestone_id,
+        plan_revision: session.plan_revision,
+        current_subtask_id: session.subtask_id,
+        awaiting_confirmation: true,
+        log_history: [],
+      });
+      setIsExecuting(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.name, project?.execution_session?.active, project?.execution_session?.status, project?.execution_session?.subtask_id]);
+
+  // Fetch workspace status when entering Execution
+  useEffect(() => {
+    if (!project || project.workflow_state.current_step !== "Execution") return;
+    invokeWithTimeout<ExecutionWorkspaceStatus>("get_execution_workspace_status", { projectName: project.name })
+      .then(setWorkspaceStatus)
+      .catch(() => setWorkspaceStatus(null));
+  }, [project?.name, project?.workflow_state.current_step, project?.workflow_state.data_revision]);
+
+  // === 自动驾驶驱动循环 — 使用 autopilot_next_step 逐步推进 ===
+  // 覆盖范围：大阶段内部所有步骤（中阶段规划、执行计划、执行、确认）
+  // 停止条件：大阶段边界（MilestoneReview）、出错、暂停
+  const autopilotLoopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autopilotActiveRef = useRef(false);
+
+  const runAutopilotCycle = useCallback(async (proj: Project) => {
+    if (!proj.workflow_state.autopilot_active) return;
+    if (proj.workflow_state.top_level_phase !== "Console") return;
+
+    const autopilotState = proj.workflow_state.autopilot_state;
+    // Check if autopilot is paused, at boundary, or errored
+    if (autopilotState) {
+      if (autopilotState.run_status === "Paused") return;
+      if (autopilotState.run_status === "WaitingMilestoneReview") return;
+      if (autopilotState.run_status === "ErrorStopped") return;
+    }
+
+    try {
+      const next = await invokeWithTimeout<{
+        command: string;
+        args: Record<string, unknown>;
+        description: string;
+        at_milestone_boundary: boolean;
+        is_error: boolean;
+        error_message: string;
+      }>("autopilot_next_step", { projectName: proj.name });
+
+      // Stop conditions
+      if (next.at_milestone_boundary) {
+        // Sync project to get updated autopilot state
+        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+        handleChatComplete(latest);
+        return;
+      }
+
+      if (next.is_error) {
+        // Sync and stop
+        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+        handleChatComplete(latest);
+        return;
+      }
+
+      if (!next.command) {
+        // No action to take — stop
+        return;
+      }
+
+      // Execute the suggested command
+      const updated = await invokeWithTimeout<Project>(next.command, {
+        ...next.args,
+        projectName: proj.name,
+      });
+      handleChatComplete(updated);
+
+      // Schedule next cycle (1 second delay to let UI update)
+      if (autopilotActiveRef.current && updated.workflow_state.autopilot_active) {
+        autopilotLoopRef.current = setTimeout(() => {
+          runAutopilotCycle(updated);
+        }, 1000);
+      }
+    } catch (error) {
+      console.warn("[autopilot] Cycle error:", error);
+      // Don't crash — sync and stop
+      try {
+        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+        handleChatComplete(latest);
+      } catch (_) {}
+    }
+  }, []);
+
+  // Start/stop autopilot loop when autopilot_active changes
+  useEffect(() => {
+    if (!project) return;
+    const active = project.workflow_state.autopilot_active === true;
+    autopilotActiveRef.current = active;
+
+    // Clear any pending loop
+    if (autopilotLoopRef.current) {
+      clearTimeout(autopilotLoopRef.current);
+      autopilotLoopRef.current = null;
+    }
+
+    if (!active) return;
+    if (project.workflow_state.top_level_phase !== "Console") return;
+
+    // Check if should start
+    const apState = project.workflow_state.autopilot_state;
+    if (apState) {
+      if (apState.run_status === "Paused") return;
+      if (apState.run_status === "WaitingMilestoneReview") return;
+      if (apState.run_status === "ErrorStopped") return;
+    }
+
+    // Start the drive loop
+    autopilotLoopRef.current = setTimeout(() => {
+      runAutopilotCycle(project);
+    }, 500);
+  }, [project?.workflow_state?.autopilot_active, project?.workflow_state?.autopilot_state?.run_status, project?.workflow_state?.top_level_phase]);
 
   // === 快照：保存 UI 状态到后端，用于刷新恢复和孤儿进程保护 ===
   const takeSnapshot = () => {
     if (!project) return;
     const snapshotUi = {
       view_phase: viewMode.phase,
-      selected_milestone_id: selectedMilestoneId ?? null,
-      selected_mid_stage_id: selectedMidStageId ?? null,
-      generated_plan_keys: Array.from(generatedPlan.keys()),
-      quick_generated_plan_keys: Array.from(quickGeneratedPlan.keys()),
-      discussion_branch_type: discussionBranchType ?? null,
-      checkpoint_milestone_id: rollbackCheckpoint?.milestoneId ?? null,
-      checkpoint_mid_stage_id: rollbackCheckpoint?.midStageId ?? null,
-      checkpoint_subtask_id: rollbackCheckpoint?.subtaskId ?? null,
+      sidebar_width: sidebarWidth,
+      active_tab: null,
       saved_at: new Date().toISOString(),
     };
     invokeWithTimeout("save_snapshot_event", {
@@ -192,22 +415,37 @@ function App() {
     takeSnapshot();
     // takeSnapshot 通过闭包读取最新 state，不放入 deps 以避免循环
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project, viewMode.phase, selectedMilestoneId, selectedMidStageId, generatedPlan, quickGeneratedPlan]);
+  }, [project, viewMode.phase, sidebarWidth]);
 
-  // Phase B: 执行状态轮询 + 自动阶段切换
+  // === 阶段一关键修复：执行状态轮询 ===
+  // 覆盖 V1 恢复场景（刷新时后端仍在执行）和旧流水线场景。
+  // 轮询条件：isExecuting 为真（由恢复 effect 或旧流水线设置）。
+  // 轮询内部额外检查当前工作流步骤，非 Execution 时停止。
   useEffect(() => {
     if (!isExecuting) return;
 
     const interval = setInterval(async () => {
       try {
+        // 若工作流步骤已离开 Execution，停止轮询
+        const current = projectRef.current;
+        if (current && current.workflow_state.current_step !== "Execution") {
+          setIsExecuting(false);
+          return;
+        }
+
         const status = await invokeWithTimeout<PipelineState | null>("get_execution_status");
+        if (!status) {
+          // No memory state — if we're polling from recovery, the backend may have exited.
+          // Keep polling for a bit; the recovery effect handles the fallback.
+          return;
+        }
         setExecutionStatus(status);
 
         // 执行中定期刷新快照，确保 running_pid（孤儿进程保护用）保持最新
         takeSnapshot();
 
         // 从执行状态中提取测试日志（去重）
-        if (status && status.subtask_statuses) {
+        if (status.subtask_statuses) {
           const newLogs: TestLog[] = [];
           for (const item of status.subtask_statuses) {
             if (processedSubtaskIdsRef.current.has(item.subtask_id)) continue;
@@ -235,31 +473,47 @@ function App() {
           }
         }
 
-        if (status) {
-          if (status.status === "Paused") {
-            setIsExecuting(false);
-            handleAddMessage({
-              id: `sys-${Date.now()}`,
-              role: 'system',
-              content: '⏸️ 执行已暂停。讨论修改方向后，点击恢复执行继续。',
-              timestamp: Date.now(),
-            });
-            enterDiscussionMode('paused');
-            clearInterval(interval);
-          } else if (status.status === "Completed") {
-            setIsExecuting(false);
-            clearInterval(interval);
-            invokeWithTimeout<Project>("get_project", { projectName: project?.name ?? "" })
+        // V1: awaiting_confirmation — stop polling, let V1ExecutionPanel handle it
+        if (status.awaiting_confirmation) {
+          setIsExecuting(false);
+          // Refresh project to get latest disk state
+          if (project) {
+            invokeWithTimeout<Project>("get_project", { projectName: project.name })
               .then((updatedProject) => {
-                setProject(updatedProject);
+                handleChatComplete(updatedProject);
               })
               .catch((err) => {
                 console.error("刷新项目数据失败:", err);
               });
-          } else if (status.status === "Failed") {
-            setIsExecuting(false);
-            clearInterval(interval);
           }
+          clearInterval(interval);
+          return;
+        }
+
+        if (status.status === "Paused") {
+          // Old pipeline pause — switch to discussion
+          setIsExecuting(false);
+          handleAddMessage({
+            id: `sys-${Date.now()}`,
+            role: 'system',
+            content: '⏸️ 执行已暂停。讨论修改方向后，点击恢复执行继续。',
+            timestamp: Date.now(),
+          });
+          enterDiscussionMode('paused');
+          clearInterval(interval);
+        } else if (status.status === "Completed") {
+          setIsExecuting(false);
+          clearInterval(interval);
+          invokeWithTimeout<Project>("get_project", { projectName: project?.name ?? "" })
+            .then((updatedProject) => {
+              handleChatComplete(updatedProject);
+            })
+            .catch((err) => {
+              console.error("刷新项目数据失败:", err);
+            });
+        } else if (status.status === "Failed") {
+          setIsExecuting(false);
+          clearInterval(interval);
         }
       } catch (e) {
         console.error("轮询状态失败:", e);
@@ -267,7 +521,7 @@ function App() {
     }, 2000);
 
     return () => clearInterval(interval);
-  }, [isExecuting, enterDiscussionMode, handleAddMessage]);
+  }, [isExecuting, project, enterDiscussionMode, handleAddMessage, handleChatComplete, takeSnapshot]);
 
   // 大阶段完成检测：当所有中阶段执行完成后，自动插入总结消息
   useEffect(() => {
@@ -313,8 +567,8 @@ function App() {
           role: "assistant",
           content: markdown,
           timestamp: Date.now(),
-          msgType: "milestone_summary",
-          milestoneId: ms.id,
+          msg_type: "milestone_summary",
+          milestone_id: ms.id,
         };
         handleAddMessage(summaryMsg);
         completedMilestonesRef.current = new Set([...completedMilestonesRef.current, ms.id]);
@@ -322,7 +576,7 @@ function App() {
         // 任务 2.5：调用后端 AI 命令生成自然语言总结（第二层消息）
         invokeWithTimeout<string>('summarize_milestone', {
           projectName: project.name,
-          milestoneId: ms.id,
+          milestone_id: ms.id,
         })
           .then((aiSummary) => {
             const aiMsg: ChatMessage = {
@@ -330,8 +584,8 @@ function App() {
               role: 'assistant',
               content: aiSummary,
               timestamp: Date.now(),
-              msgType: 'milestone_summary',
-              milestoneId: ms.id,
+              msg_type: 'milestone_summary',
+              milestone_id: ms.id,
             };
             handleAddMessage(aiMsg);
           })
@@ -342,34 +596,41 @@ function App() {
     }
   }, [project, handleAddMessage]);
 
-  // 完整回调 当 App 组件第一次加载时，自动从后端（Rust）获取当前项目数据，并保存到前端的状态中
-  // 页面一打开，自动从后端拉取项目数据，存到状态里，并保存项目路径，只做一次
+  // 启动恢复逻辑：从存储的项目名称恢复，没有则进入 Before 页面
   useEffect(() => {
-    invokeWithTimeout<Project>("get_project", { projectName: "我的游戏" })
+    const storedName = localStorage.getItem("metheus_last_project");
+    if (!storedName) {
+      // 没有存储的项目，停留在 Before 页面
+      return;
+    }
+
+    invokeWithTimeout<Project>("get_project", { projectName: storedName })
       .then((project) => {
-        // 向后兼容：旧项目有 version_plan 但消息列表中没有版本方案消息时，自动插入一条
-        if (project && project.version_plan && project.discussion_threads?.length > 0) {
-          const thread = project.discussion_threads[0];
-          const messages = thread.messages || [];
-          const hasVpMsg = messages.some(m => m.msgType === "version_plan");
-          if (!hasVpMsg) {
-            const compatMsg: ChatMessage = {
-              id: crypto.randomUUID(),
-              role: "assistant",
-              content: project.version_plan,
-              timestamp: Date.now(),
-              msgType: "version_plan",
-            };
-            thread.messages = [...messages, compatMsg];
-          }
+        // 检查项目是否有效且处于正确的阶段
+        if (!project || !project.name) {
+          setProject(null);
+          return;
         }
+
         setProject(project);
-        // 重建已发送总结的大阶段 Set（从消息列表恢复）
+        // 检查是否需要迁移旧项目（workflow_state 仍为 WaitingEntry/Before）
+        const needsMigration = project.workflow_state.current_step === "WaitingEntry"
+          && project.workflow_state.top_level_phase === "Before";
+        if (needsMigration) {
+          invokeWithTimeout<Project>("migrate_project_workflow", {
+            projectName: project.name,
+          }).then((migrated) => {
+            handleChatComplete(migrated);
+          }).catch((err) => {
+            console.error("迁移旧项目工作流失败:", err);
+          });
+        }
+        // 重建已发送总结的大阶段 Set
         if (project?.discussion_threads?.[0]?.messages) {
           const summaryIds = new Set<string>();
           for (const msg of project.discussion_threads[0].messages) {
-            if (msg.msgType === "milestone_summary" && msg.milestoneId) {
-              summaryIds.add(msg.milestoneId);
+            if (msg.msg_type === "milestone_summary" && msg.milestone_id) {
+              summaryIds.add(msg.milestone_id);
             }
           }
           completedMilestonesRef.current = summaryIds;
@@ -377,176 +638,221 @@ function App() {
         if (project && project.project_path) {
           setProjectPath(project.project_path);
         }
-        // 从持久化数据恢复执行计划到内存 Map，使刷新后「开始执行」按钮仍可见
-        if (project && project.milestones) {
-          setQuickGeneratedPlan((prev) => {
-            const next = new Map(prev);
-            for (const ms of project.milestones) {
-              if (ms.subtasks && ms.subtasks.length > 0) {
-                next.set(ms.id, ms.subtasks);
-              }
-            }
-            return next;
-          });
-          setGeneratedPlan((prev) => {
-            const next = new Map(prev);
-            for (const ms of project.milestones) {
-              for (const mid of ms.mid_stages) {
-                if (mid.subtasks && mid.subtasks.length > 0) {
-                  next.set(mid.id, mid.subtasks);
-                }
-              }
-            }
-            return next;
-          });
-        }
-        // 恢复 UI 状态快照（视图模式、选中阶段等）
         return invokeWithTimeout<any>("restore_snapshot", { projectId: project.name });
       })
       .then((snapshot) => {
         if (snapshot && snapshot.ui) {
           const ui = snapshot.ui;
-          // 恢复视图模式（跳过动画，直接设置）
           if (ui.view_phase === 'execution') {
             setViewMode({ phase: 'execution', reason: 'active' });
           }
-          // 恢复选中状态
-          if (ui.selected_milestone_id) {
-            setSelectedMilestoneId(ui.selected_milestone_id);
+          if (typeof ui.sidebar_width === "number") {
+            setSidebarWidth(Math.max(MIN_SIDEBAR_WIDTH, Math.min(MAX_SIDEBAR_WIDTH, ui.sidebar_width)));
           }
-          if (ui.selected_mid_stage_id) {
-            setSelectedMidStageId(ui.selected_mid_stage_id);
-          }
-          // 恢复分支讨论状态
-          // 注：showBranchSelector 不会从快照恢复（默认 false），因此不会出现弹窗闪烁。
-          // discussionBranchType 恢复后仅用于 ChatRoom 确认按钮的状态判断。
-          if (ui.discussion_branch_type && ui.discussion_branch_type !== 'null') {
-            setDiscussionBranchType(ui.discussion_branch_type as DiscussionBranchType);
-          }
-          if (ui.checkpoint_milestone_id) {
-            setRollbackCheckpoint({
-              milestoneId: ui.checkpoint_milestone_id,
-              midStageId: ui.checkpoint_mid_stage_id ?? '',
-              subtaskId: ui.checkpoint_subtask_id ?? '',
-            });
-          }
+        }
+        // 恢复后进入默认讨论模式
+        if (project) {
+          enterDiscussionMode('idle');
         }
       })
       .catch((err) => {
         console.error("获取项目失败:", err);
         setProject(null);
+        localStorage.removeItem("metheus_last_project");
       });
-    enterDiscussionMode('idle');
   }, []);
 
-  const handleSelectMilestone = (id: string) => {
-    // 点击已选中大阶段 → 幂等保持（不取消选中）
-    if (selectedMilestoneId === id) return;
-    setSelectedMilestoneId(id);
-    // 自动选中该大阶段的第一个中阶段（专业模式）
-    if (project) {
-      const ms = project.milestones.find(m => m.id === id);
-      if (ms && ms.mid_stages.length > 0) {
-        setSelectedMidStageId(ms.mid_stages[0].id);
-      }
-    }
-  };
-  //生成版本方案
-  const handleGeneratePlan = async () => {
-    //无项目数据则返回
-    if (!project) return;
-    if (isGeneratingVersionPlan) return; // 防止重复提交
-    const currentThread = project.discussion_threads[0];
-    if (!currentThread) {
-      console.error("没有可用的讨论线程");
-      return;
-    }
-    setIsGeneratingVersionPlan(true);
-    try {
-      const plan = await invokeWithTimeout("generate_version_plan", {
-        messages: currentThread.messages,
-        projectPath: project.project_path,
-      });
-      //更新项目，加上方案
-      setProject({ ...project, version_plan: plan as string });
-      // 将版本方案作为消息插入聊天流
-      const versionPlanMsg = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: plan as string,
-        timestamp: Date.now(),
-        msgType: "version_plan",
-      };
-      handleAddMessage(versionPlanMsg);
-    } catch (err) {
-      console.error("生成方案失败", err);
-    } finally {
-      setIsGeneratingVersionPlan(false);
-    }
-  };
-  // 辅助：标记最新版本方案消息的 approved/rejected 字段
-  const markLatestVpMessage = (p: Project, field: "approved" | "rejected"): Project => {
-    const updated = { ...p };
-    if (updated.discussion_threads.length === 0) return updated;
-    const thread = updated.discussion_threads[0];
-    const msgs = [...thread.messages];
-    let latestIdx = -1;
-    let latestTs = 0;
-    for (let i = 0; i < msgs.length; i++) {
-      if (msgs[i].msgType === "version_plan" && msgs[i].timestamp >= latestTs) {
-        latestTs = msgs[i].timestamp;
-        latestIdx = i;
-      }
-    }
-    if (latestIdx >= 0) {
-      msgs[latestIdx] = { ...msgs[latestIdx], [field]: true };
-    }
-    updated.discussion_threads = [{ ...thread, messages: msgs }, ...updated.discussion_threads.slice(1)];
-    return updated;
+  // 项目创建后的处理：使用后端返回的完整 Project（已含正确的 workflow_state）
+  const handleProjectCreated = useCallback((project: Project) => {
+    projectRef.current = project;
+    setProject(project);
+    setProjectPath(project.project_path);
+    localStorage.setItem("metheus_last_project", project.name);
+    // 不额外调用 enterDiscussionMode — workflow_state 已经由后端设置为 Discussion
+  }, []);
+
+  const handleSelectMilestone = async (id: string) => {
+    if (!project || project.current_milestone_id === id) return;
+    const updated = await invokeWithTimeout<Project>("select_milestone", {
+      projectName: project.name,
+      milestoneId: id,
+    });
+    handleChatComplete(updated);
   };
 
-  //批准版本方案
-  const handleApprove = async () => {
-    //安全保护
-    if (!project) return;
+  const handleSelectMidStage = async (id: string) => {
+    if (!project || project.current_mid_stage_id === id) return;
+    const updated = await invokeWithTimeout<Project>("select_mid_stage", {
+      projectName: project.name,
+      midStageId: id,
+    });
+    handleChatComplete(updated);
+  };
+  // 生成版本方案（V1: 后端校验三项检查 → 返回完整 Project → PlanApproval 步骤）
+  const handleGeneratePlan = async () => {
+    if (!project || isDecisionSubmitting) return;
+    setDecisionAction("generate_plan");
     try {
-      await invokeWithTimeout("approve_version_plan", {
-        //把项目转成 JSON 字符串传到后端
-        projectJson: JSON.stringify(project),
-        //再单独传一次方案（其实后端可以从projectJson里取
-        versionPlan: project.version_plan,
+      const updatedProject = await invokeWithTimeout<Project>("generate_version_plan", {
+        projectName: project.name,
+        expectedDiscussionRevision: project.discussion_revision,
+        expectedDataRevision: project.workflow_state.data_revision,
       });
-      //前端也同步状态"规划中"，并标记最新版本方案消息为已批准
-      const toPersist = markLatestVpMessage({ ...project, status: "Planning" as const }, "approved");
-      setProject(toPersist);
-      // 自动触发拆解大阶段
-      handleGenerateMilestones();
-      enterExecutionMode();
-      // 持久化
-      invokeWithTimeout("persist_project", { projectJson: JSON.stringify(toPersist) })
-        .catch(err => console.error("持久化批准失败:", err));
+      handleChatComplete(updatedProject);
     } catch (err) {
-      console.error("批准失败：", err);
+      console.error("生成方案失败", err);
+      setFeedbackMsg({ type: "error", message: "生成方案失败：" + String(err) });
+    } finally {
+      setDecisionAction(null);
     }
   };
-  //驳回版本方案（不清空 version_plan，保留在消息列表中）
-  const handleReject = () => {
-    if (!project) return;
-    // 标记最新版本方案消息为已驳回，状态回到讨论中
-    const toPersist = markLatestVpMessage({ ...project, status: "Discussing" as const }, "rejected");
-    setProject(toPersist);
-    // 插入产品经理自动回复
-    const autoReply: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: "assistant",
-      content: "好的，请告诉我需要修改什么？",
-      timestamp: Date.now(),
-    };
-    handleAddMessage(autoReply);
-    // 持久化
-    invokeWithTimeout("persist_project", { projectJson: JSON.stringify(toPersist) })
-      .catch(err => console.error("持久化驳回方案失败:", err));
-  }
+  // 批准方案（传入 draft_id 和 generation_revision）
+  const handleApproveWithDraft = useCallback(async (draftId: string, generationRevision: number) => {
+    if (!project || isDecisionSubmitting) return;
+    setDecisionAction("approve_plan");
+    try {
+      const updated = await invokeWithTimeout<Project>("approve_version_plan", {
+        projectName: project.name,
+        draftId: draftId,
+        generationRevision: generationRevision,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "success", message: "项目方案已批准。宪法第一部分已写入项目目录。" });
+    } catch (err) {
+      console.error("批准失败:", err);
+      setFeedbackMsg({ type: "error", message: "批准失败：" + String(err) });
+    } finally {
+      setDecisionAction(null);
+    }
+  }, [project, isDecisionSubmitting]);
+
+  // 驳回方案（传入 draft_id 和反馈）
+  const handleRejectWithDraft = useCallback(async (draftId: string, feedback: string) => {
+    if (!project || isDecisionSubmitting) return;
+    setDecisionAction("reject_plan");
+    try {
+      const updated = await invokeWithTimeout<Project>("reject_version_plan", {
+        projectName: project.name,
+        draftId: draftId,
+        feedback: feedback,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "info", message: "方案已驳回，已返回讨论模式。" });
+    } catch (err) {
+      console.error("驳回失败:", err);
+      setFeedbackMsg({ type: "error", message: "驳回失败：" + String(err) });
+    } finally {
+      setDecisionAction(null);
+    }
+  }, [project, isDecisionSubmitting]);
+
+  // 从 ThreeChecks 或 PlanApproval 返回 Discussion
+  const handleReturnToDiscussion = useCallback(async () => {
+    if (!project || isDecisionSubmitting) return;
+    const currentStep = project.workflow_state.current_step;
+    if (currentStep !== "ThreeChecks" && currentStep !== "PlanApproval") return;
+    setDecisionAction("return_to_discussion");
+    try {
+      const updated = await invokeWithTimeout<Project>("return_to_discussion", {
+        projectName: project.name,
+        sourceStep: currentStep,
+        reason: "用户返回继续讨论",
+      });
+      handleChatComplete(updated);
+    } catch (err) {
+      console.error("返回讨论失败:", err);
+      setFeedbackMsg({ type: "error", message: "返回讨论失败：" + String(err) });
+    } finally {
+      setDecisionAction(null);
+    }
+  }, [project, isDecisionSubmitting]);
+
+  // 从 Discussion 恢复方案审批
+  const handleResumePlanApproval = useCallback(async () => {
+    if (!project || isDecisionSubmitting) return;
+    setDecisionAction("resume_plan_approval");
+    try {
+      const updated = await invokeWithTimeout<Project>("resume_plan_approval", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+    } catch (err) {
+      console.error("恢复方案审批失败:", err);
+      setFeedbackMsg({ type: "error", message: "恢复方案审批失败：" + String(err) });
+    } finally {
+      setDecisionAction(null);
+    }
+  }, [project, isDecisionSubmitting]);
+
+  // 重新讨论已批准方案
+  const handleReDiscussApprovedPlan = useCallback(async () => {
+    if (!project || isDecisionSubmitting) return;
+    setDecisionAction("rediscuss_approved");
+    try {
+      const updated = await invokeWithTimeout<Project>("restart_discussion_from_approved", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "info", message: "已返回讨论模式，旧方案已保留在历史记录中。" });
+    } catch (err) {
+      console.error("重新讨论失败:", err);
+      setFeedbackMsg({ type: "error", message: "重新讨论失败：" + String(err) });
+    } finally {
+      setDecisionAction(null);
+    }
+  }, [project, isDecisionSubmitting]);
+
+  // 从 Discussion 进入三项检查
+  const handleStartChecks = useCallback(async () => {
+    if (!project || isDecisionSubmitting) return;
+    setDecisionAction("start_checks");
+    try {
+      const updated = await invokeWithTimeout<Project>("start_preflight_check", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+    } catch (err) {
+      console.error("进入检查模式失败:", err);
+      setFeedbackMsg({ type: "error", message: "进入检查模式失败：" + String(err) });
+    } finally {
+      setDecisionAction(null);
+    }
+  }, [project, isDecisionSubmitting]);
+
+  // 从 ThreeChecks 重新开始全部检查
+  const handleRestartChecks = useCallback(async () => {
+    if (!project || isDecisionSubmitting) return;
+    setDecisionAction("restart_checks");
+    try {
+      const updated = await invokeWithTimeout<Project>("restart_checks", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "info", message: "检查结果已重置，请从第一项重新开始。" });
+    } catch (err) {
+      console.error("重新开始检查失败:", err);
+      setFeedbackMsg({ type: "error", message: "重新开始检查失败：" + String(err) });
+    } finally {
+      setDecisionAction(null);
+    }
+  }, [project, isDecisionSubmitting]);
+
+  // 从 PlanApproval 进入 Console
+  const handleEnterConsole = useCallback(async () => {
+    if (!project || isDecisionSubmitting) return;
+    setDecisionAction("enter_console");
+    try {
+      const updatedProject = await invokeWithTimeout<Project>("enter_console", {
+        projectName: project.name,
+      });
+      handleChatComplete(updatedProject);
+    } catch (err) {
+      console.error("进入控制台失败:", err);
+      setFeedbackMsg({ type: "error", message: "进入控制台失败：" + String(err) });
+    } finally {
+      setDecisionAction(null);
+    }
+  }, [project, isDecisionSubmitting]);
 
   // 判断一个大阶段的所有中阶段是否都已执行完成
   const isMilestoneFullyCompleted = (milestone: Milestone): boolean => {
@@ -554,538 +860,190 @@ function App() {
     return milestone.mid_stages.every(m => m.status === "Completed");
   };
 
-  //根据版本方案拆解大阶段
-  const handleGenerateMilestones = async () => {
-    if (!project) return;
-    if (isGeneratingMilestones) return; // 防止重复提交
-    setIsGeneratingMilestones(true);
-    //调用后端命令，传入版本方案和模式，等待返回Milestones数组
-    try {
-      const milestones = await invokeWithTimeout("generate_milestones", {
-        versionPlan: project.version_plan,
-        mode: project.mode,
-      });
-      //把Milestones数组合并到项目状态中（使用函数式更新以避免覆盖并发的状态变更）
-      setProject((prev) => {
-        if (!prev) return prev;
-        return { ...prev, status: "MilestoneReady" as const, milestones: milestones as any[] };
-      });
-      try {
-        await invokeWithTimeout("persist_project", { projectJson: JSON.stringify({ ...project, status: "MilestoneReady" as const, milestones: milestones as any[] }) });
-      } catch (saveErr) {
-        console.error("保存里程碑失败：", saveErr);
-        alert("大阶段已生成，但保存到文件失败，请重试或检查磁盘空间。");
-      }
-      enterExecutionMode();
-    } catch (err) {
-      console.error("拆解大阶段失败：", err);
-    } finally {
-      setIsGeneratingMilestones(false);
-    }
-  };
-
-  //切换项目的工作模式（快速/专业）
-  const handleModeChange = async (mode: "Quick" | "Professional") => {
-    if (!project) return;
-    const updatedProject = { ...project, mode };
-    setProject(updatedProject);
-    //保存到文件
-    try {
-      await invokeWithTimeout("persist_project", { projectJson: JSON.stringify(updatedProject) });
-    } catch (e) {
-      console.error("保存模式切换失败：", e);
-      alert("模式已切换，但保存到文件失败，请重试。");
-    }
-  };
-
-  // 编辑大阶段版本号
-  const handleVersionEdit = (id: string, newVersion: string) => {
-    if (!project) return;
-    const updatedMilestones = project.milestones.map(ms =>
-      ms.id === id ? { ...ms, version: newVersion } : ms
-    );
-    const updatedProject = { ...project, milestones: updatedMilestones };
-    setProject(updatedProject);
-    invokeWithTimeout("persist_project", { projectJson: JSON.stringify(updatedProject) })
-      .catch(err => console.error("持久化版本编辑失败:", err));
-  };
-
-  //点拆解中阶段，调后端拆解子阶段，更新到项目状态中
-  const handleGenerateMidStages = async (milestoneId: string) => {
-    if (!project) return;
-    const milestone = project.milestones.find(ms => ms.id === milestoneId);
-    if (!milestone) return;
-    try {
-      const midStages = await invokeWithTimeout("generate_mid_stages", {
-        milestoneId: milestoneId,
-        milestoneTitle: milestone.title,
-        milestoneDescription: milestone.description,
-        versionPlan: project.version_plan,
-        mode: project.mode,
-        attentionPoints: milestone.qa_result?.attention_points ?? [],
-      });
-      const updatedMilestones = project.milestones.map(ms =>
-        ms.id === milestoneId ? { ...ms, mid_stages: midStages as any[] } : ms
-      );
-      const updatedProject = { ...project, milestones: updatedMilestones };
-      setProject(updatedProject);
-      try {
-        await invokeWithTimeout("persist_project", { projectJson: JSON.stringify(updatedProject) });
-      } catch (saveErr) {
-        console.error("保存中阶段失败：", saveErr);
-        alert("中阶段已生成，但保存到文件失败，请重试。");
-      }
-    } catch (err) {
-      console.error("拆解中阶段失败：", err);
-    }
-  }
-
-  //当质检驳回后，用户选择「采纳意见，重新拆解」时调用
-  const handleRegenerateMilestones = async (feedback: string) => {
+  // === V1 暂停：In Stop ===
+  const handleInStop = async () => {
     if (!project) return;
     try {
-      const newMilestones = await invokeWithTimeout("regenerate_milestones_with_feedback", {
-        versionPlan: project.version_plan,
-        mode: project.mode,
-        feedback: feedback,
-      });
-      const updatedProject = { ...project, status: "MilestoneReady" as const, milestones: newMilestones as any[] };
-      setProject(updatedProject);
-      try {
-        await invokeWithTimeout("persist_project", { projectJson: JSON.stringify(updatedProject) });
-      } catch (saveErr) {
-        console.error("持久化重新拆解失败:", saveErr);
-      }
-    } catch (err) {
-      console.error("重新拆解失败：", err);
-      alert("重新拆解失败：" + err);
-    }
-  };
-
-  // === Phase B: 从 ExecutionTree 提升的函数 ===
-
-  /// 快速模式：为大阶段生成执行计划（跳过中阶段）
-  const handleGenerateQuickPlan = async (milestone: any) => {
-    setIsGeneratingPlan(true);
-    const generated: Subtask[] = [];
-    let prevTitle = "";
-    let prevResult = "";
-
-    for (let i = 0; i < 3; i++) {
-      try {
-        const next = await invokeWithTimeout<GeneratedSubtask>("generate_next_prompt", {
-          midStageTitle: milestone.title,
-          midStageDescription: milestone.description || "",
-          previousSubtaskTitle: prevTitle,
-          previousSubtaskResult: prevResult,
-          fileChanges: [],
-          testResult: "",
-          isRetry: false,
-          retryReason: "",
-        });
-        generated.push({
-          id: `${milestone.id}-st-${i + 1}`,
-          title: next.title,
-          prompt: next.prompt,
-          status: "Pending" as const,
-          test_report: "",
-          retry_count: 0,
-        });
-        prevTitle = next.title;
-        prevResult = "通过";
-      } catch (e) {
-        console.error("快速模式生成子任务失败:", e);
-        break;
-      }
-    }
-
-    setQuickGeneratedPlan((prev) => {
-      const next = new Map(prev);
-      next.set(milestone.id, generated);
-      return next;
-    });
-    setIsGeneratingPlan(false);
-  };
-
-  /// 快速模式：开始执行大阶段的子任务
-  const handleStartQuickExecution = async (milestone: any) => {
-    if (!projectPath) {
-      alert("请先在主界面设置项目目录");
-      return;
-    }
-    // 验证路径有效性
-    try {
-      const validation = await invokeWithTimeout<PathValidationResult>("validate_project_path", { projectPath });
-      if (!validation.is_valid) {
-        alert(`项目目录无效：${validation.error_message}`);
-        return;
-      }
-    } catch (e) {
-      console.error("路径验证失败:", e);
-      // 继续执行 — 后端也会做校验
-    }
-    const plan = quickGeneratedPlan.get(milestone.id);
-    if (!plan || plan.length === 0) {
-      alert("请先生成执行计划");
-      return;
-    }
-    try {
-      await invokeWithTimeout("start_execution", {
-        projectId: project?.name ?? "",
-        projectPath: projectPath,
-        stageIdentifier: milestone.version,
-        isQuickMode: true,
-        midStageTitle: milestone.title,
-        midStageDescription: milestone.description,
-        subtasksJson: JSON.stringify(plan),
-      });
-      setIsExecuting(true);
-      enterExecutionMode();
-    } catch (e) {
-      console.error("快速模式启动执行失败:", e);
-    }
-  };
-
-  // === Phase C: TaskConsole 专用的执行控制回调 ===
-
-  /// 专业模式：为中阶段生成执行计划
-  const handleGeneratePlanForMidStage = async (midStageId: string) => {
-    if (!project) return;
-    // 找到对应的 midStage 数据 + 所属 milestone
-    const mid = project.milestones
-      .flatMap((m) => m.mid_stages)
-      .find((ms) => ms.id === midStageId);
-    if (!mid) {
-      console.error("找不到 midStage:", midStageId);
-      return;
-    }
-    const parentMilestone = project.milestones.find(m =>
-      m.mid_stages.some(ms => ms.id === midStageId)
-    );
-
-    setIsGeneratingPlan(true);
-
-    // 阶段四：检测是否为回退后的状态（有已完成 subtask + 有待生成 subtask）
-    const existingSubtasks = mid.subtasks || [];
-    const hasPassedSubtasks = existingSubtasks.some(st => st.status === 'Passed');
-    const hasPendingSubtasks = existingSubtasks.some(st => st.status === 'Pending');
-
-    if (hasPassedSubtasks && hasPendingSubtasks && parentMilestone) {
-      // 回退后状态 → 调用 regenerate_plan_from_checkpoint
-      const firstPending = existingSubtasks.find(st => st.status === 'Pending');
-      try {
-        const result = await invokeWithTimeout<string>('regenerate_plan_from_checkpoint', {
-          projectName: project.name,
-          projectPath: projectPath,
-          milestoneId: parentMilestone.id,
-          midStageId: midStageId,
-          subtaskId: firstPending!.id,
-        });
-        const updatedMidStage = JSON.parse(result);
-        const newSubtasks = updatedMidStage.subtasks as Subtask[];
-        setGeneratedPlan((prev) => {
-          const next = new Map(prev);
-          next.set(midStageId, newSubtasks);
-          return next;
-        });
-      } catch (e) {
-        console.error('从分割点重生成执行计划失败:', e);
-      }
-      setIsGeneratingPlan(false);
-      return;
-    }
-
-    // 原有逻辑：从零开始逐个生成
-    const generated: Subtask[] = [];
-    let prevTitle = "";
-    let prevResult = "";
-
-    for (let i = 0; i < 3; i++) {
-      try {
-        const next = await invokeWithTimeout<GeneratedSubtask>("generate_next_prompt", {
-          midStageTitle: mid.title,
-          midStageDescription: mid.description || "",
-          previousSubtaskTitle: prevTitle,
-          previousSubtaskResult: prevResult,
-          fileChanges: [],
-          testResult: "",
-          isRetry: false,
-          retryReason: "",
-        });
-        generated.push({
-          id: `${midStageId}-st-${i + 1}`,
-          title: next.title,
-          prompt: next.prompt,
-          status: "Pending" as const,
-          test_report: "",
-          retry_count: 0,
-        });
-        prevTitle = next.title;
-        prevResult = "通过";
-      } catch (e) {
-        console.error("生成子任务失败:", e);
-        break;
-      }
-    }
-
-    setGeneratedPlan((prev) => {
-      const next = new Map(prev);
-      next.set(midStageId, generated);
-      return next;
-    });
-    setIsGeneratingPlan(false);
-  };
-
-  // 回退成功后自动触发生成执行计划（必须在 handleGeneratePlanForMidStage 定义之后）
-  useEffect(() => {
-    if (!pendingRollbackGenerate || !project) {
-      // pendingRollbackGenerate 已设置但 project 为 null（异常情况），重置状态
-      if (pendingRollbackGenerate && !project) {
-        setPendingRollbackGenerate(null);
-      }
-      return;
-    }
-    handleGeneratePlanForMidStage(pendingRollbackGenerate);
-    setPendingRollbackGenerate(null);
-  }, [pendingRollbackGenerate, project, handleGeneratePlanForMidStage]);
-
-  /// 专业模式：启动中阶段执行
-  const handleStartExecution = async (midStageId: string) => {
-    if (!projectPath) {
-      alert("请先在主界面设置项目目录");
-      return;
-    }
-    // 验证路径有效性
-    try {
-      const validation = await invokeWithTimeout<PathValidationResult>("validate_project_path", { projectPath });
-      if (!validation.is_valid) {
-        alert(`项目目录无效：${validation.error_message}`);
-        return;
-      }
-    } catch (e) {
-      console.error("路径验证失败:", e);
-      // 继续执行 — 后端也会做校验
-    }
-    const plan = generatedPlan.get(midStageId);
-    if (!plan || plan.length === 0) {
-      alert("请先生成执行计划");
-      return;
-    }
-    const mid = project?.milestones
-      .flatMap((m) => m.mid_stages)
-      .find((ms) => ms.id === midStageId);
-    try {
-      await invokeWithTimeout("start_execution", {
-        projectId: project?.name ?? "",
-        projectPath: projectPath,
-        stageIdentifier: midStageId,
-        isQuickMode: false,
-        midStageTitle: mid?.title ?? midStageId,
-        midStageDescription: mid?.description ?? "",
-        subtasksJson: JSON.stringify(plan),
-      });
-      setIsExecuting(true);
-      enterExecutionMode();
-    } catch (e) {
-      console.error("启动执行失败:", e);
-    }
-  };
-
-  /// 暂停执行
-  const handlePause = async () => {
-    try {
-      await invokeWithTimeout("pause_execution");
+      const updated = await invokeWithTimeout<Project>("request_in_stop", { projectName: project.name });
+      handleChatComplete(updated);
       setIsExecuting(false);
-      handleAddMessage({
-        id: Date.now().toString(),
-        role: 'system',
-        content: '⏸️ 执行已暂停。讨论修改方向后，点击恢复执行。',
-        timestamp: Date.now(),
-      });
-      enterDiscussionMode('paused');
-    } catch (e) {
-      console.error("暂停失败:", e);
+      setExecutionStatus(null);
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "暂停失败：" + String(err) });
     }
   };
 
-  /// 恢复执行
-  const handleResume = async () => {
-    try {
-      await invokeWithTimeout("resume_execution");
-      setIsExecuting(true);
-      enterExecutionMode();
-    } catch (e) {
-      console.error("恢复失败:", e);
-    }
-  };
-
-  /// 停止执行
-  const handleStop = async () => {
-    try {
-      await invokeWithTimeout("stop_execution");
-    } catch (e) {
-      console.error("停止执行失败:", e);
-    }
-    setIsExecuting(false);
-    handleAddMessage({
-      id: Date.now().toString(),
-      role: 'system',
-      content: '⏹️ 执行已被用户停止。可重新生成执行计划或返回讨论。',
-      timestamp: Date.now(),
-    });
-    enterDiscussionMode('paused');
-  };
-
-  /// 切换到下一个中阶段
-  const handleNextMidStage = useCallback(() => {
-    if (!project || !selectedMilestoneId || !selectedMidStageId) return;
-    const currentMilestone = project.milestones?.find(m => m.id === selectedMilestoneId);
-    if (!currentMilestone) return;
-    const midStages = currentMilestone.mid_stages || [];
-    const sortedMidStages = [...midStages].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-    const currentIndex = sortedMidStages.findIndex(ms => ms.id === selectedMidStageId);
-    if (currentIndex >= 0 && currentIndex < sortedMidStages.length - 1) {
-      setSelectedMidStageId(sortedMidStages[currentIndex + 1].id);
-    }
-  }, [project, selectedMilestoneId, selectedMidStageId]);
-
-  /// 切换到下一个中阶段并重置执行状态
-  const handleNextMidStageAndReset = useCallback(() => {
-    handleNextMidStage();
-    setExecutionStatus(null);
-    setIsExecuting(false);
-  }, [handleNextMidStage]);
-
-  /// 继续到下一个大阶段
-  const handleContinueNextMilestone = useCallback(() => {
-    if (!project || !project.milestones || !selectedMilestoneId) return;
-    const idx = project.milestones.findIndex(m => m.id === selectedMilestoneId);
-    if (idx < 0 || idx >= project.milestones.length - 1) return;
-    const nextMs = project.milestones[idx + 1];
-    setSelectedMilestoneId(nextMs.id);
-    setSelectedMidStageId(nextMs.mid_stages?.[0]?.id ?? null);
-  }, [project, selectedMilestoneId]);
-
-  /// 与产品经理讨论（弹出分支选择弹窗）
-  const handleDiscussWithPM = useCallback(() => {
+  // === V1 暂停：ED Stop ===
+  const handleEdStop = async () => {
     if (!project) return;
-    setShowBranchSelector(true);
-  }, [project]);
-
-  /// 分支选择回调
-  const handleSelectBranch = useCallback((branchType: DiscussionBranchType) => {
-    setDiscussionBranchType(branchType);
-    setShowBranchSelector(false);
-    enterDiscussionMode('discuss_summary');
-    if (branchType === 'redirect') {
-      handleAddMessage({
-        id: `sys-${Date.now()}`,
-        role: 'system',
-        content: '📋 你选择了「后续方向想调整」。请与产品经理讨论新的需求方向，AI 会根据你的反馈重新生成后续大阶段。',
-        timestamp: Date.now(),
-      });
+    try {
+      const updated = await invokeWithTimeout<Project>("request_ed_stop", { projectName: project.name });
+      handleChatComplete(updated);
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "ED Stop 请求失败：" + String(err) });
     }
-  }, [enterDiscussionMode, handleAddMessage]);
+  };
 
-  /// 确认 PM 建议回调（分支A/B 统一入口）
-  const handleConfirmPMSuggestion = useCallback(async () => {
+  // === V1 暂停决策：继续/调整/回退 ===
+  const handleResolvePause = async (action: string) => {
     if (!project) return;
-    const branch = discussionBranchType;
-
-    if (branch === 'rollback') {
-      // 分支A：回退 → 退出讨论模式，让用户在 ExecutionTree 中手动回退
-      setDiscussionBranchType(null);
-      handleAddMessage({
-        id: `sys-${Date.now()}`,
-        role: 'system',
-        content: '已回到执行模式。请使用执行树中的「↩ 回退到此」按钮手动选择要回退的小阶段。',
-        timestamp: Date.now(),
+    try {
+      const updated = await invokeWithTimeout<Project>("resolve_pause_decision", {
+        projectName: project.name,
+        action,
       });
-      enterExecutionMode();
-    } else if (branch === 'redirect') {
-      // 分支B：重新生成后续大阶段
-      try {
-        const currentThread = project.discussion_threads[0];
-        // 收集用户反馈：取讨论线程中所有用户消息
-        const userMessages = currentThread?.messages
-          ?.filter(m => m.role === 'user')
-          ?.map(m => m.content)
-          ?? [];
-        const feedback = userMessages.join('\n');
-
-        // 构建已完成大阶段摘要
-        const completedSummary = buildCompletedSummary(project);
-
-        // 确定 after_milestone_id（最后一个已完成的大阶段）
-        const lastCompletedMs = [...project.milestones]
-          .reverse()
-          .find(m => m.status === 'Completed' || m.status === 'InProgress');
-        const afterMilestoneId = lastCompletedMs?.id ?? '';
-
-        const result = await invokeWithTimeout<string>('regenerate_milestones_from_point', {
-          projectName: project.name,
-          afterMilestoneId: afterMilestoneId,
-          versionPlan: project.version_plan,
-          mode: project.mode,
-          feedback: feedback,
-          completedSummary: completedSummary,
-        });
-
-        const newProject = JSON.parse(result);
-        setProject(newProject);
-        setDiscussionBranchType(null);
-
-        handleAddMessage({
-          id: `sys-${Date.now()}`,
-          role: 'system',
-          content: '✅ 后续大阶段已重新生成。请查看执行树中的更新。',
-          timestamp: Date.now(),
-        });
-        enterExecutionMode();
-      } catch (err) {
-        console.error('重新生成后续大阶段失败:', err);
-        const errMsg = String(err);
-        // 插入系统消息（含质检详情），不弹出 alert 阻断交互
-        handleAddMessage({
-          id: `sys-${Date.now()}`,
-          role: 'system',
-          content: `### ❌ 质检未通过\n\n${errMsg}\n\n---\n\n请与产品经理继续讨论，修改反馈后重新点击「按照新方案生成后续大阶段」按钮。`,
-          timestamp: Date.now(),
-          msgType: 'qa_failed',
-        });
-        // 自动触发 AI 产品经理引导用户修改反馈
-        invokeWithTimeout('chat_with_role', {
-          message: '用户提交的变更请求未能通过质量检查，请参考上述质检结果，引导用户修改需求并重新提交。',
-          role: '产品经理',
-          threadId: 'thread-init',
-        }).then((reply) => {
-          const replyData = reply as { id: string; role: string; content: string; timestamp: number };
-          handleAddMessage({
-            id: replyData.id,
-            role: replyData.role,
-            content: replyData.content,
-            timestamp: replyData.timestamp,
-          });
-        }).catch(e => console.error('自动引导消息发送失败:', e));
-        // 不重置 discussionBranchType，保持 'redirect' 以便用户修改后重试
+      handleChatComplete(updated);
+      if (action === "continue") {
+        setFeedbackMsg({ type: "info", message: "已恢复执行模式，可继续执行下一个小阶段。" });
       }
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "决策失败：" + String(err) });
     }
-  }, [project, discussionBranchType, handleAddMessage, enterExecutionMode]);
+  };
 
-  /// 构建已完成大阶段摘要
-  const buildCompletedSummary = useCallback((p: Project): string => {
-    const completed = p.milestones.filter(
-      m => m.status === 'Completed' || m.status === 'InProgress'
-    );
-    if (completed.length === 0) return '（暂无已完成的大阶段）';
-    return completed
-      .map(m => {
-        const midCount = m.mid_stages?.length ?? 0;
-        const completedMidCount = m.mid_stages?.filter(mid => mid.status === 'Completed').length ?? 0;
-        return `${m.title} (${m.version}) — ${completedMidCount}/${midCount} 个中阶段已完成`;
-      })
-      .join('\n');
-  }, []);
+  // === V1 回退预览 ===
+  const handlePreviewRollback = async (checkpointSubtaskId: string): Promise<RollbackImpact | null> => {
+    if (!project) return null;
+    try {
+      const impact = await invokeWithTimeout<RollbackImpact>("preview_rollback_impact", {
+        projectName: project.name,
+        checkpointSubtaskId,
+      });
+      return impact ?? null;
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "预览失败：" + String(err) });
+      return null;
+    }
+  };
+
+  // === V1 确认回退 ===
+  const handleConfirmRollback = async (checkpointSubtaskId: string) => {
+    if (!project) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("confirm_rollback", {
+        projectName: project.name,
+        checkpointSubtaskId,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "success", message: "回退已完成。请重新生成执行计划。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "回退失败：" + String(err) });
+    }
+  };
+
+  // V1: 回退后不自动触发生成。pendingRollbackGenerate 已移除。
+
+  // === V1 人工执行：执行当前小阶段 ===
+  const handleExecuteCurrentSubtask = async () => {
+    if (!project) return;
+    try {
+      const status = await invokeWithTimeout<PipelineState>("execute_current_subtask", {
+        projectName: project.name,
+      });
+      setExecutionStatus(status);
+      if (status.awaiting_confirmation) {
+        // Refresh project to get updated subtask status
+        const updated = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
+        handleChatComplete(updated);
+      }
+    } catch (err) {
+      console.error("执行失败:", err);
+      setFeedbackMsg({ type: "error", message: "执行失败：" + String(err) });
+    }
+  };
+
+  // === V1 人工执行：确认通过 ===
+  const handleConfirmSubtask = async () => {
+    if (!project) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("confirm_subtask_result", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+      setExecutionStatus(null);
+      setFeedbackMsg({ type: "success", message: "小阶段已确认通过，Git 标签已创建。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "确认失败：" + String(err) });
+    }
+  };
+
+  // === V1 人工执行：驳回 ===
+  const handleRejectSubtask = async (reason: string) => {
+    if (!project) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("reject_subtask_result", {
+        projectName: project.name,
+        reason,
+      });
+      handleChatComplete(updated);
+      setExecutionStatus(null);
+      setFeedbackMsg({ type: "warning", message: "小阶段已驳回：" + reason });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "驳回失败：" + String(err) });
+    }
+  };
+
+  // === V1 手动同步项目状态（不依赖浏览器 reload） ===
+  const handleSyncProject = async () => {
+    if (!project) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
+      handleChatComplete(updated);
+      // Also refresh pipeline state if available
+      const pipelineStatus = await invokeWithTimeout<PipelineState | null>("get_execution_status");
+      if (pipelineStatus) {
+        setExecutionStatus(pipelineStatus);
+        if (pipelineStatus.awaiting_confirmation) {
+          setIsExecuting(false);
+        }
+      }
+      setFeedbackMsg({ type: "info", message: "项目状态已同步。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "同步项目状态失败：" + String(err) });
+    }
+  };
+
+  // === V1 A/B/C 大阶段审阅 ===
+  // V1: enter_milestone_review is called via invokeWithTimeout directly when needed
+
+  const handleApproveMilestoneOutcome = async (branch: string) => {
+    if (!project) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("approve_milestone_outcome", {
+        projectName: project.name,
+        branch,
+      });
+      handleChatComplete(updated);
+      if (branch === "A") {
+        setFeedbackMsg({ type: "success", message: "大阶段已批准。" });
+      }
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "决策失败：" + String(err) });
+    }
+  };
+
+  const handleSuggestRollback = async () => {
+    if (!project) return;
+    try {
+      const suggestion = await invokeWithTimeout<string>("suggest_rollback_checkpoint", { projectName: project.name });
+      handleAddMessage({ id: `sys-${Date.now()}`, role: "assistant", content: suggestion, timestamp: Date.now() });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "建议生成失败：" + String(err) });
+    }
+  };
+
+  const handleGenerateFutureMilestones = async () => {
+    if (!project) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("generate_future_milestone_draft", { projectName: project.name });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "success", message: "未来大阶段草稿已生成，请在 Console 中检查和批准。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "生成失败：" + String(err) });
+    }
+  };
+
+  // approve_future_milestones is called via ConsoleWorkflowPanel when step === FuturePlanApproval
 
   /// 查看详细报告（切换到执行模式）
   const handleViewDetailedReport = useCallback(() => {
@@ -1093,349 +1051,546 @@ function App() {
     setViewMode({ phase: 'execution', reason: 'view_report' });
   }, [project]);
 
-  /// 计算是否还有下一个大阶段
-  const hasNextMilestone = useMemo(() => {
-    if (!project || !project.milestones || !selectedMilestoneId) return false;
-    const idx = project.milestones.findIndex(m => m.id === selectedMilestoneId);
-    return idx >= 0 && idx < project.milestones.length - 1;
-  }, [project, selectedMilestoneId]);
-
-  /// 计算是否还有下一个中阶段
-  const hasNextMidStage = useMemo(() => {
-    if (!project || !selectedMilestoneId || !selectedMidStageId) return false;
-    const currentMilestone = project.milestones?.find(m => m.id === selectedMilestoneId);
-    if (!currentMilestone) return false;
-    const midStages = currentMilestone.mid_stages || [];
-    const sortedMidStages = [...midStages].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-    const currentIndex = sortedMidStages.findIndex(ms => ms.id === selectedMidStageId);
-    return currentIndex >= 0 && currentIndex < sortedMidStages.length - 1;
-  }, [project, selectedMilestoneId, selectedMidStageId]);
-
-  //根据项目状态返回默认对话角色
-  const getDefaultRole = (status: string): string => {
-    switch (status) {
-      case "Idle":
-      case "Discussing":
+  // 根据工作流步骤返回默认对话角色（不再依赖 project.status）
+  const getDefaultRole = (step: string): string => {
+    switch (step) {
+      case "Discussion":
         return "策略产品经理";
-      case "Planning":
-        return "产品经理";
-      case "MilestoneReady":
-        return "域负责人";
-      case "Executing":
-        return "全栈技术顾问";
-      case "Paused":
-        return "策略产品经理"
       default:
         return "策略产品经理";
     }
   };
 
   if (!project) {
-    return <div className="loading">加载中...</div>;
+    return <ProjectEntry onProjectCreated={handleProjectCreated} />;
   }
 
   const currentThread = project.discussion_threads[0];
   if (!currentThread) {
-    return <div className="loading">没有可用的讨论线程，请检查项目数据...</div>;
+    return <ProjectEntry onProjectCreated={handleProjectCreated} />;
+  }
+
+  // Determine which main panel to show based on workflow_state
+  const phase = project.workflow_state.top_level_phase;
+  const step = project.workflow_state.current_step;
+
+  // Before phase: show ExistingBaselinePanel for Half Project analysis
+  if (phase === "Before" && (step === "ExistingAnalysis" || step === "BaselineApproval")) {
+    return <ExistingBaselinePanel
+      projectName={project.name}
+      projectPath={project.project_path}
+      onBaselineApproved={(updated) => {
+        handleChatComplete(updated);
+        setProjectPath(updated.project_path);
+      }}
+      onReject={() => {
+        localStorage.removeItem("metheus_last_project");
+        setProject(null);
+      }}
+    />;
   }
 
   return (
     <div className="app-layout">
-      <aside className="sidebar" style={{ width: sidebarWidth + 'px' }}>
-        <ExecutionTree
-          milestones={project.milestones}
-          onSelectMilestone={handleSelectMilestone}
-          onVersionEdit={handleVersionEdit}
-          onGenerateMidStages={handleGenerateMidStages}
-          onRegenerateMilestones={handleRegenerateMilestones}
-          projectPath={projectPath}
-          projectId={project.name}
-          // Phase B: 从 App.tsx 传入的提升状态
-          selectedMilestoneId={selectedMilestoneId}
-          selectedMidStageId={selectedMidStageId}
-          onSelectMidStage={setSelectedMidStageId}
-          quickGeneratedPlan={quickGeneratedPlan}
-          generatedPlan={generatedPlan}
-          onGenerateQuickPlan={handleGenerateQuickPlan}
-          onStartQuickExecution={handleStartQuickExecution}
-          isExecuting={isExecuting}
-          isGeneratingPlan={isGeneratingPlan}
-          executionStatus={executionStatus}
-          onSubtaskRollbackSuccess={(projectJson: string) => {
-            try {
-              const newProject = JSON.parse(projectJson);
-              setProject(newProject);
-              // 回退成功后自动触发生成执行计划（由 useEffect 消费此状态）
-              if (selectedMidStageId && !isGeneratingPlan && !isExecuting) {
-                setPendingRollbackGenerate(selectedMidStageId);
-              }
-            } catch (e) {
-              console.error('解析回退后的项目数据失败:', e);
-            }
-          }}
-        />
-        <div
-          className={`resize-handle${isDragging ? ' dragging' : ''}`}
-          onMouseDown={handleResizeMouseDown}
-          onDoubleClick={() => setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)}
-        />
-      </aside>
+      {project.milestones.length > 0 && (
+        <aside className="sidebar" style={{ width: sidebarWidth + 'px' }}>
+          <ExecutionTree
+            project={project}
+            onSelectMilestone={handleSelectMilestone}
+            projectPath={projectPath}
+            onSelectMidStage={handleSelectMidStage}
+          />
+          <div
+            className={`resize-handle${isDragging ? ' dragging' : ''}`}
+            onMouseDown={handleResizeMouseDown}
+            onDoubleClick={() => setSidebarWidth(DEFAULT_SIDEBAR_WIDTH)}
+          />
+        </aside>
+      )}
 
       <main className="main-content">
-        {/* === 开发者工具：让你可以手动测试 Tauri 后端的“执行子任务”、“
-        检查子任务”、“生成下一步提示词”三个核心命令，并查看结果 === */}
-        <div className="project-path-section">
-          <h3>📁 项目目录</h3>
-          <div className="project-path-row">
-            <input
-              className="project-path-input"
-              type="text"
-              value={projectPath}
-              onChange={(e) => setProjectPath(e.target.value)}
-              placeholder="例如：/home/user/my-project"
-            />
-            <button
-              className="btn-save-path"
-              onClick={async () => {
-                const updated = { ...project, project_path: projectPath };
-                // 验证路径（仅提示，不阻止保存）
-                if (projectPath) {
-                  try {
-                    const validation = await invokeWithTimeout<PathValidationResult>("validate_project_path", { projectPath });
-                    if (!validation.is_valid) {
-                      setPathSaveStatus(`⚠️ ${validation.error_message}（已保存）`);
-                    }
-                  } catch (_) { /* 验证失败不影响保存 */ }
-                }
-                try {
-                  await invokeWithTimeout("persist_project", { projectJson: JSON.stringify(updated) });
-                  setProject(updated);
-                  if (!pathSaveStatus.startsWith("⚠️")) {
-                    setPathSaveStatus("✅ 已保存");
-                  }
-                  setTimeout(() => setPathSaveStatus(""), 5000);
-                } catch (e: any) {
-                  setPathSaveStatus(`❌ 保存失败：${e}`);
-                }
-              }}
-            >
-              保存
-            </button>
-          </div>
-          {pathSaveStatus && (
-            <div className={`path-status ${pathSaveStatus.startsWith("✅") ? "success" : "error"}`}>
-              {pathSaveStatus}
-            </div>
-          )}
-        </div>
-        {/* === Phase 2：命令测试面板 === */}
-        <div className="test-panel">
-          <h3>🔧 执行引擎测试</h3>
-          <div className="test-buttons">
-            <button
-              className="test-btn"
-              disabled={testLoading === "execute"}
-              onClick={async () => {
-                setTestLoading("execute");
-                setTestResult("");
-                try {
-                  const res: any = await invokeWithTimeout("execute_subtask", {
-                    projectPath: projectPath || "/tmp/test",
-                    prompt: "创建一个 metheus_test.txt 文件",
-                    subtaskId: "st-test-001",
-                    milestoneId: "ms-test-001",
-                    midStageId: "mid-test-001",
-                  });
-                  setTestResult(JSON.stringify(res, null, 2));
-                } catch (e: any) {
-                  setTestResult(`❌ 错误：${e}`);
-                } finally {
-                  setTestLoading("");
-                }
-              }}
-            >
-              {testLoading === "execute" ? "⏳ 执行中..." : "▶ execute_subtask"}
-            </button>
-            <button
-              className="test-btn"
-              disabled={testLoading === "check"}
-              onClick={async () => {
-                setTestLoading("check");
-                setTestResult("");
-                try {
-                  const res: any = await invokeWithTimeout("check_subtask", {
-                    projectPath: projectPath || "/tmp/test",
-                    subtaskId: "st-test-001",
-                    subtaskGoal: "创建测试文件",
-                    milestoneId: "ms-test-001",
-                    midStageId: "mid-test-001",
-                  });
-                  setTestResult(JSON.stringify(res, null, 2));
-                } catch (e: any) {
-                  setTestResult(`❌ 错误：${e}`);
-                } finally {
-                  setTestLoading("");
-                }
-              }}
-            >
-              {testLoading === "check" ? "⏳ 检查中..." : "🔍 check_subtask"}
-            </button>
-            <button
-              className="test-btn"
-              disabled={testLoading === "prompt"}
-              onClick={async () => {
-                setTestLoading("prompt");
-                setTestResult("");
-                try {
-                  const res: any = await invokeWithTimeout("generate_next_prompt", {
-                    midStageTitle: "数据库设计",
-                    midStageDescription: "设计用户模型",
-                    previousSubtaskTitle: "创建连接配置",
-                    previousSubtaskResult: "通过",
-                    fileChanges: ["config.ts"],
-                    testResult: "通过",
-                    isRetry: false,
-                    retryReason: "",
-                  });
-                  setTestResult(JSON.stringify(res, null, 2));
-                } catch (e: any) {
-                  setTestResult(`❌ 错误：${e}`);
-                } finally {
-                  setTestLoading("");
-                }
-              }}
-            >
-              {testLoading === "prompt" ? "⏳ 生成中..." : "🤖 generate_next_prompt"}
-            </button>
-          </div>
-          <div className={`test-result-box ${!testResult ? "empty" : ""}`}>
-            {testResult || "点击上方按钮测试执行引擎命令，结果将显示在此处。"}
-          </div>
-        </div>
 
-        <header className="chat-header">
-          <h2>弥 · 工作流指挥中心</h2>
-          <h4>Metheus 带来你的灵感，输出你的创意！</h4>
-        </header>
-
-        {/* ===== Phase D: 讨论模式（带动画过渡） ===== */}
-        {(viewMode.phase === 'discussion' || animatingComponent === 'chatroom') && (
-          <div className={`transition-wrapper${animatingComponent === 'chatroom' ? ' animate-fade-out-right' : ''
-            }${animatingComponent === 'taskconsole' ? ' animate-fade-in-right' : ''
-            }`}>
-            {/* 生成版本方案按钮 */}
-            {(project.status === "Idle" || project.status === "Discussing") && !project.version_plan && (
-              <div className="generate-plan-area">
-                <button className="btn-generate-plan" onClick={handleGeneratePlan} disabled={isGeneratingVersionPlan}>
-                  📝 {isGeneratingVersionPlan ? "生成中..." : "生成版本方案"}
-                </button>
-              </div>
+        {/* ===== Phase-dependent main content ===== */}
+        {(phase === "FirstDiscussion" || phase === "Before") && (
+          <div className="transition-wrapper">
+            {/* 决策层步骤导航 */}
+            {step !== "WaitingEntry" && (
+              <DecisionStepHeader currentStep={step} />
             )}
-            <ChatRoom
-              messages={currentThread.messages || []}
-              onAddMessage={handleAddMessage}
-              currentRole={discussionBranchType ? "产品经理" : getDefaultRole(project.status)}
-              mode={project.mode}
-              onModeChange={handleModeChange}
-              modeLocked={project.status !== "Idle"}
-              onApproveVersionPlan={handleApprove}
-              onRejectVersionPlan={handleReject}
-              onContinueNextMilestone={handleContinueNextMilestone}
-              onDiscussWithPM={handleDiscussWithPM}
-              onViewDetailedReport={handleViewDetailedReport}
-              hasNextMilestone={hasNextMilestone}
-              discussionBranchType={discussionBranchType}
-              onConfirmPMSuggestion={handleConfirmPMSuggestion}
-              projectStatus={project.status}
-              hasMilestones={project.milestones.length > 0}
-            />
-            {project.status === "Planning" && project.version_plan && (
-              <div className="generate-plan-area">
-                <button className="btn-generate-plan" onClick={handleGenerateMilestones} disabled={isGeneratingMilestones}>
-                  📊 {isGeneratingMilestones ? "拆解中..." : "根据版本方案拆解大阶段"}
-                </button>
-              </div>
-            )}
-          </div>
-        )}
 
-        {/* ===== Phase D: 执行模式（带动画过渡） ===== */}
-        {(viewMode.phase === 'execution' || animatingComponent === 'taskconsole') && (
-          <div className={`execution-layout${animatingComponent === 'taskconsole' ? ' animate-fade-out-left' : ''
-            }${animatingComponent === 'chatroom' ? ' animate-fade-in-left' : ''
-            }`}>
-            <FileTree
-              projectPath={projectPath}
-            />
-            <div className="execution-main">
-              <TaskConsole
-                projectPath={projectPath}
-                projectId={project.name}
-                isExecuting={isExecuting}
-                isGeneratingPlan={isGeneratingPlan}
-                executionStatus={executionStatus}
-                generatedPlan={generatedPlan}
-                selectedMidStageId={selectedMidStageId}
-                qaModalData={qaModalData}
-                isSubmitting={isSubmitting}
-                testLogs={testLogs}
-                onGeneratePlan={handleGeneratePlanForMidStage}
-                onStartExecution={handleStartExecution}
-                onPause={handlePause}
-                onResume={handleResume}
-                onStop={handleStop}
-                onRegenerateMilestones={handleRegenerateMilestones}
-                onEnterReviewMode={() => enterDiscussionMode('review')}
-                onDismissQA={() => setQaModalData(null)}
-                onQAIgnore={() => setQaModalData(null)}
-                projectStatus={project.status}
-                onGenerateMilestones={handleGenerateMilestones}
-                onNextMidStage={handleNextMidStageAndReset}
-                hasNextMidStage={hasNextMidStage}
+            {/* 决策层错误/成功反馈（替代浏览器 alert） */}
+            {feedbackMsg && (
+              <FeedbackBanner
+                type={feedbackMsg.type}
+                message={feedbackMsg.message}
+                onRetry={() => setFeedbackMsg(null)}
+                style={{ margin: "8px 16px" }}
               />
+            )}
+
+            {/* ThreeChecks step: render PreflightPanel */}
+            {step === "ThreeChecks" && (
+              <PreflightPanel
+                projectName={project.name}
+                preflightResults={project.preflight_results}
+                discussionRevision={project.discussion_revision}
+                dataRevision={project.workflow_state.data_revision}
+                onProjectUpdated={handleChatComplete}
+                onReturnToDiscussion={handleReturnToDiscussion}
+                onAllPassed={handleGeneratePlan}
+                onRestartChecks={handleRestartChecks}
+                isSubmitting={isDecisionSubmitting}
+              />
+            )}
+
+            {/* PlanApproval step: render PlanApprovalPanel (根据 draft_status 分发视图) */}
+            {step === "PlanApproval" && (
+              <PlanApprovalPanel
+                project={project}
+                onReturnToDiscussion={handleReturnToDiscussion}
+                onApprove={handleApproveWithDraft}
+                onReject={handleRejectWithDraft}
+                onEnterConsole={handleEnterConsole}
+                onReDiscuss={handleReDiscussApprovedPlan}
+                isSubmitting={isDecisionSubmitting}
+              />
+            )}
+
+            {/* Discussion step: show action buttons + ChatRoom */}
+            {step === "Discussion" && (
+              <>
+                {/* 在讨论中，如果没有方案，提供生成方案和进入检查的入口 */}
+                {!project.version_plan && (
+                  <div className="discussion-actions" style={{
+                    display: "flex", gap: "12px", justifyContent: "center",
+                    padding: "12px", marginBottom: "12px", flexWrap: "wrap",
+                  }}>
+                    {/* 存在待审批草稿时，提供"继续审阅草稿"入口 */}
+                    {project.plan_draft?.draft_status === "Pending" && (
+                      <button
+                        className="btn-start-checks"
+                        onClick={handleResumePlanApproval}
+                        style={{
+                          padding: "8px 20px",
+                          fontSize: "14px",
+                          background: "#1a7f37",
+                          color: "#fff",
+                          border: "none",
+                          borderRadius: "6px",
+                          cursor: "pointer",
+                        }}
+                      >
+                        📝 继续审阅当前草稿
+                      </button>
+                    )}
+                    <button
+                      className="btn-start-checks"
+                      onClick={handleStartChecks}
+                      style={{
+                        padding: "8px 20px",
+                        fontSize: "14px",
+                        background: "#0969da",
+                        color: "#fff",
+                        border: "none",
+                        borderRadius: "6px",
+                        cursor: "pointer",
+                      }}
+                    >
+                      📋 进行三项检查
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* ChatRoom visible only during Discussion step (not during ThreeChecks or PlanApproval) */}
+            {step === "Discussion" && (
+              <ChatRoom
+                messages={currentThread.messages || []}
+                onAddMessage={handleAddMessage}
+                projectName={project.name}
+                currentRole={getDefaultRole(step)}
+                threadId={currentThread.id}
+                onViewDetailedReport={handleViewDetailedReport}
+                onProjectUpdated={handleChatComplete}
+              />
+            )}
+          </div>
+        )}
+
+        {(phase === "Console") && (
+          <div className="execution-layout">
+            <FileTree projectPath={projectPath} />
+            <div className="execution-main">
+              {/* V1 Console 规划闭环：大阶段 → 中阶段 → 执行计划 */}
+              {(step === "MilestoneGeneration" || step === "MilestoneCheck" ||
+                step === "MilestoneApproval" || step === "MilestoneSelection" ||
+                step === "MidStageGeneration" || step === "MidStageCheck" ||
+                step === "MidStageApproval" || step === "MidStageSelection" ||
+                step === "PlanGeneration" || step === "PlanCheck" || step === "PlanApproving") && (
+                <ConsoleWorkflowPanel
+                  project={project}
+                  onProjectUpdated={handleChatComplete}
+                />
+              )}
+              {/* V1 执行阶段 UI — 仅在 Execution 步骤渲染 */}
+              {step === "Execution" && (
+                <>
+                  <V1ExecutionPanel
+                    project={project}
+                    executionStatus={executionStatus}
+                    workspaceStatus={workspaceStatus}
+                    onWorkspaceStatusChange={setWorkspaceStatus}
+                    onExecute={handleExecuteCurrentSubtask}
+                    onConfirm={handleConfirmSubtask}
+                    onReject={handleRejectSubtask}
+                    onInStop={handleInStop}
+                    onEdStop={handleEdStop}
+                    onSyncProject={handleSyncProject}
+                  />
+                  <TaskConsole
+                    projectPath={projectPath}
+                    projectName={project.name}
+                    executionStatus={executionStatus}
+                    testLogs={testLogs}
+                    workspaceReady={workspaceStatus?.ready === true}
+                    executionHistory={project.execution_history}
+                  />
+                </>
+              )}
+              {/* V1 暂停决策 */}
+              {step === "PauseDecision" && (
+                <PauseDecisionPanel
+                  pauseType={project.pause_context?.pause_type === "ed_stop" ? "ed_stop" : "in_stop"}
+                  onContinue={() => handleResolvePause("continue")}
+                  onAdjustOnly={() => handleResolvePause("adjust")}
+                  onRollback={() => handleResolvePause("rollback")}
+                />
+              )}
+              {/* V1 回退预览 */}
+              {step === "RollbackPreview" && (
+                <RollbackImpactDialog
+                  project={project}
+                  onPreview={handlePreviewRollback}
+                  onConfirm={handleConfirmRollback}
+                />
+              )}
+              {/* V1 大阶段审阅 A/B/C */}
+              {step === "MilestoneReview" && (
+                <MilestoneReviewPanel
+                  milestoneTitle={project.milestones.find(m => m.id === project.current_milestone_id)?.title ?? "?"}
+                  onContinue={() => handleApproveMilestoneOutcome("A")}
+                  onFixPast={() => handleApproveMilestoneOutcome("B")}
+                  onAdjustFuture={() => handleApproveMilestoneOutcome("C")}
+                />
+              )}
+              {/* V1 分支讨论 (B/C) */}
+              {step === "BranchDiscussion" && (
+                <BranchDiscussionPanel
+                  project={project}
+                  onSuggestRollback={handleSuggestRollback}
+                  onGenerateFuture={handleGenerateFutureMilestones}
+                  onChatComplete={handleChatComplete}
+                  onAddMessage={handleAddMessage}
+                />
+              )}
+              {/* V1 未来计划审批 (C) */}
+              {step === "FuturePlanApproval" && (
+                <ConsoleWorkflowPanel
+                  project={project}
+                  onProjectUpdated={handleChatComplete}
+                />
+              )}
+              {/* 未识别步骤只显示错误，不回退到旧业务控制台。 */}
+              {step !== "MilestoneGeneration" && step !== "MilestoneCheck" &&
+                step !== "MilestoneApproval" && step !== "MilestoneSelection" &&
+                step !== "MidStageGeneration" && step !== "MidStageCheck" &&
+                step !== "MidStageApproval" && step !== "MidStageSelection" &&
+                step !== "PlanGeneration" && step !== "PlanCheck" &&
+                step !== "PlanApproving" && step !== "Execution" &&
+                step !== "PauseDecision" && step !== "RollbackPreview" &&
+                step !== "MilestoneReview" && step !== "BranchDiscussion" &&
+                step !== "FuturePlanApproval" && (
+                <div className="unsupported-console-step">
+                  <h2>不支持的 Console 步骤</h2>
+                  <p>当前步骤：{step}。请同步项目状态后重试。</p>
+                  <button onClick={() => invokeWithTimeout<Project>("get_project", { projectName: project.name }).then(handleChatComplete)}>
+                    同步项目状态
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         )}
 
-        {/* ===== 阶段二悬浮球 ===== */}
-        {(viewMode.phase === 'execution' || animatingComponent === 'taskconsole') && (
-          <FloatingChatBalloon
-            messages={currentThread.messages || []}
-          />
+        {phase === "Completed" && (
+          <div className="completed-view" style={{ padding: "40px", textAlign: "center" }}>
+            <h2>✅ 项目已完成</h2>
+            <p style={{ color: "#656d76" }}>所有大阶段已执行完毕。</p>
+          </div>
+        )}
+
+        {/* ===== Floating chat balloon in console mode ===== */}
+        {phase === "Console" && (
+          <FloatingChatBalloon messages={currentThread.messages || []} />
         )}
       </main>
 
-      {/* ===== 阶段三：分支选择弹窗 ===== */}
-      {showBranchSelector && (
-        <div className="branch-selector-overlay" onClick={() => setShowBranchSelector(false)}>
-          <div className="branch-selector" onClick={(e) => e.stopPropagation()}>
-            <h3>🤔 与产品经理讨论什么？</h3>
-            <p>请选择你想讨论的方向，AI 会据此调整后续计划。</p>
-            <div className="branch-options">
-              <div className="branch-option" onClick={() => handleSelectBranch('rollback')}>
-                <span className="branch-option-icon">🔄</span>
-                <div className="branch-option-info">
-                  <div className="branch-option-title">有问题需要回退</div>
-                  <div className="branch-option-desc">回退到某个小阶段重新执行，修正之前的问题</div>
+    </div>
+  );
+}
+
+// ============================================================
+// V1 执行面板：单小阶段执行 + 人工确认
+// ============================================================
+function V1ExecutionPanel({
+  project, executionStatus, workspaceStatus, onWorkspaceStatusChange, onExecute, onConfirm, onReject, onInStop, onEdStop, onSyncProject,
+}: {
+  project: Project; executionStatus: PipelineState | null;
+  workspaceStatus: ExecutionWorkspaceStatus | null;
+  onWorkspaceStatusChange: (status: ExecutionWorkspaceStatus) => void;
+  onExecute: () => Promise<void>; onConfirm: () => Promise<void>;
+  onReject: (reason: string) => Promise<void>;
+  onInStop: () => Promise<void>; onEdStop: () => Promise<void>;
+  onSyncProject: () => Promise<void>;
+}) {
+  const [rejectReason, setRejectReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [showReject, setShowReject] = useState(false);
+
+  const ms = project.milestones.find(m => m.id === project.current_milestone_id);
+  const mid = ms?.mid_stages.find(m => m.id === project.current_mid_stage_id);
+  const planApproved = mid?.plan_approved_at != null && (mid?.plan_revision ?? 0) > 0;
+
+  // Find next pending subtask or one awaiting confirmation
+  const pendingSubtasks = mid?.subtasks.filter(s => s.status === "Pending") ?? [];
+  const nextSubtask = pendingSubtasks[0] ?? null;
+  const awaitingSubtask = mid?.subtasks.find(s => s.status === "AwaitingConfirmation") ?? null;
+
+  const isAwaiting = executionStatus?.awaiting_confirmation === true || awaitingSubtask != null;
+  const isExecuting = executionStatus?.status === "Running";
+
+  const handlePrepareWorkspace = async () => {
+    if (!project || busy) return;
+    setBusy(true);
+    try {
+      const status = await invokeWithTimeout<ExecutionWorkspaceStatus>("prepare_execution_workspace", { projectName: project.name });
+      onWorkspaceStatusChange(status);
+    } catch (err) {
+      console.error("准备执行工作区失败:", err);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleConfirm = async () => {
+    setBusy(true);
+    await onConfirm();
+    setBusy(false);
+  };
+
+  const handleReject = async () => {
+    if (!rejectReason.trim()) return;
+    setBusy(true);
+    await onReject(rejectReason.trim());
+    setRejectReason("");
+    setShowReject(false);
+    setBusy(false);
+  };
+
+  const workspaceReady = workspaceStatus?.ready === true;
+
+  return (
+    <div className="v1-execution-panel" style={{ padding: "24px" }}>
+      <h2 className="execution-panel-title"><ListTodo size={20} />执行</h2>
+
+      {/* Workspace status banner */}
+      {planApproved && workspaceStatus && !workspaceReady && (
+        <FeedbackBanner type="warning" message={workspaceStatus.status_message} />
+      )}
+
+      {/* Workspace preparation */}
+      {planApproved && !workspaceReady && (
+        <div style={{ marginBottom: "20px" }}>
+          <ActionButton icon={<GitBranch size={16} />} loading={busy} loadingLabel="准备中"
+            onClick={handlePrepareWorkspace}>准备执行环境</ActionButton>
+          <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
+            执行小阶段前需要初始化 Git 仓库并创建首次提交。
+          </p>
+        </div>
+      )}
+
+      {/* Awaiting confirmation */}
+      {isAwaiting && awaitingSubtask && (
+        <div style={{ marginBottom: "20px" }}>
+          <div style={{ padding: "14px", background: "#ddf4ff", borderRadius: "8px", border: "1px solid #0969da", marginBottom: "16px" }}>
+            <strong>待确认：{awaitingSubtask.title}</strong>
+            <div style={{ fontSize: "13px", color: "#656d76", marginTop: "8px" }}>
+              <div>目标：{awaitingSubtask.goal || awaitingSubtask.title}</div>
+              {awaitingSubtask.execution_result && (
+                <>
+                  <div style={{ marginTop: "4px" }}>变更文件：{awaitingSubtask.execution_result.file_changes?.join(", ") || "无"}</div>
+                  <div style={{ marginTop: "4px", maxHeight: "150px", overflowY: "auto", background: "#f6f8fa", padding: "8px", borderRadius: "4px", fontFamily: "monospace", fontSize: "11px" }}>
+                    {awaitingSubtask.execution_result.output?.slice(-1000)}
+                  </div>
+                </>
+              )}
+              {awaitingSubtask.test_result && (
+                <div style={{ marginTop: "4px", color: awaitingSubtask.test_result.passed ? "#1a7f37" : "#cf222e" }}>
+                  测试：{awaitingSubtask.test_result.passed ? "通过" : "未通过"}
+                  {awaitingSubtask.test_result.suggestion && ` — ${awaitingSubtask.test_result.suggestion}`}
                 </div>
-              </div>
-              <div className="branch-option" onClick={() => handleSelectBranch('redirect')}>
-                <span className="branch-option-icon">🔀</span>
-                <div className="branch-option-info">
-                  <div className="branch-option-title">后续方向想调整</div>
-                  <div className="branch-option-desc">与产品经理讨论后，重新生成后续大阶段</div>
-                </div>
-              </div>
+              )}
+              <div style={{ marginTop: "4px" }}>验收标准：{awaitingSubtask.acceptance_criteria?.join("；") || "（无）"}</div>
             </div>
-            <div className="branch-selector-actions">
-              <button className="branch-selector-cancel" onClick={() => setShowBranchSelector(false)}>
-                取消
-              </button>
+          </div>
+          <WorkflowActionBar>
+            <ActionButton icon={<Check size={16} />} loading={busy} loadingLabel="确认中" onClick={handleConfirm}>确认通过</ActionButton>
+            <ActionButton icon={<X size={16} />} variant="danger" disabled={busy} onClick={() => setShowReject(true)}>发现问题</ActionButton>
+          </WorkflowActionBar>
+          <Modal isOpen={showReject} onClose={() => setShowReject(false)} title="驳回执行结果"
+            description="请记录需要修正的问题。" isDanger lockClose={busy} isSubmitting={busy}
+            actions={[
+              { label: "取消", onClick: () => setShowReject(false), variant: "secondary", disabled: busy },
+              { label: busy ? "提交中..." : "确认驳回", onClick: handleReject, variant: "danger", disabled: busy || !rejectReason.trim() },
+            ]}>
+            <textarea className="console-feedback-input" value={rejectReason} onChange={e => setRejectReason(e.target.value)} placeholder="请说明发现的问题" disabled={busy} />
+          </Modal>
+        </div>
+      )}
+
+      {/* Next pending subtask — only when workspace is ready */}
+      {!isAwaiting && planApproved && workspaceReady && nextSubtask && (
+        <div style={{ marginBottom: "20px" }}>
+          <div style={subtaskCardStyle}>
+            <strong>下一个任务：{nextSubtask.title}</strong>
+            <div style={{ fontSize: "13px", color: "#656d76", marginTop: "4px" }}>
+              目标：{nextSubtask.goal || nextSubtask.title}
+            </div>
+            <div style={{ fontSize: "12px", color: "#656d76", marginTop: "2px" }}>
+              允许修改：{nextSubtask.allowed_file_paths?.join(", ") || "—"} |
+              允许新建：{nextSubtask.new_file_paths?.join(", ") || "—"}
+            </div>
+            <div style={{ fontSize: "12px", color: "#656d76", marginTop: "2px" }}>
+              验收标准：{nextSubtask.acceptance_criteria?.join("；") || "（无）"}
+            </div>
+          </div>
+          <ActionButton icon={<Play size={16} />} loading={busy || isExecuting} loadingLabel={isExecuting ? "执行中" : "启动中"}
+            onClick={async () => { setBusy(true); await onExecute(); setBusy(false); }}>执行当前小阶段</ActionButton>
+          <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
+            一次只执行一个已批准小阶段。执行完成后需要人工确认结果。
+          </p>
+        </div>
+      )}
+
+      {/* Pause controls — only visible when execution is actively running */}
+      {isExecuting && !isAwaiting && (
+        <div style={{
+          marginBottom: "20px", padding: "16px",
+          background: "#fff8f0", borderRadius: "8px", border: "1px solid #e6a23c",
+        }}>
+          <div style={{ fontWeight: 600, fontSize: "14px", marginBottom: "12px", color: "#9a6700" }}>
+            ⏸ 暂停执行
+          </div>
+          <div style={{ display: "flex", gap: "16px", flexWrap: "wrap" }}>
+            <div style={{ flex: 1, minWidth: "180px" }}>
+              <ActionButton
+                icon={<Square size={16} />}
+                variant="danger"
+                disabled={busy}
+                onClick={async () => { setBusy(true); await onInStop(); setBusy(false); }}
+                fullWidth
+              >
+                立即暂停 (In Stop)
+              </ActionButton>
+              <p style={{ color: "#656d76", fontSize: "12px", marginTop: "4px" }}>
+                立即终止当前任务，回到上一个稳定检查点。未完成的任务不保留部分结果。
+              </p>
+            </div>
+            <div style={{ flex: 1, minWidth: "180px" }}>
+              <ActionButton
+                icon={<Pause size={16} />}
+                variant="secondary"
+                disabled={busy}
+                onClick={async () => { setBusy(true); await onEdStop(); setBusy(false); }}
+                fullWidth
+              >
+                完成后暂停 (ED Stop)
+              </ActionButton>
+              <p style={{ color: "#656d76", fontSize: "12px", marginTop: "4px" }}>
+                当前任务执行完成并确认后再暂停，已完成的任务得到保留。
+              </p>
             </div>
           </div>
         </div>
       )}
+
+      {/* All done — workflow should have auto-advanced; this is a safety net */}
+      {!isAwaiting && planApproved && workspaceReady && !nextSubtask && (
+        <div style={{ marginBottom: "20px" }}>
+          <FeedbackBanner type="success" message="当前中阶段所有小阶段已执行完成。" />
+          <p style={{ color: "#656d76", fontSize: "13px", marginTop: "12px" }}>
+            如果页面未自动跳转，请手动同步项目状态。
+          </p>
+          <ActionButton
+            icon={<RotateCcw size={16} />}
+            variant="secondary"
+            onClick={onSyncProject}
+          >
+            同步项目状态
+          </ActionButton>
+        </div>
+      )}
+
+      {/* Execution log */}
+      {executionStatus && (
+        <div style={{ marginTop: "20px", padding: "10px", background: "#f6f8fa", borderRadius: "6px", fontSize: "12px", fontFamily: "monospace", color: "#656d76" }}>
+          {executionStatus.current_log}
+        </div>
+      )}
     </div>
+  );
+}
+
+const subtaskCardStyle: React.CSSProperties = {
+  padding: "14px", background: "#f6f8fa", borderRadius: "8px",
+  border: "1px solid #d0d7de", marginBottom: "12px",
+};
+
+// ============================================================
+// V1 分支讨论面板 (B/C 分支)
+// ============================================================
+function BranchDiscussionPanel({
+  project, onSuggestRollback, onGenerateFuture, onChatComplete, onAddMessage,
+}: {
+  project: Project;
+  onSuggestRollback: () => Promise<void>;
+  onGenerateFuture: () => Promise<void>;
+  onChatComplete: (p: Project) => void;
+  onAddMessage: (msg: ChatMessage) => void;
+}) {
+  const scope = project.workflow_state.discussion_scope;
+  const isFixPast = scope === "FixPast";
+
+  return (
+    <ConsoleStepShell icon={isFixPast ? <RotateCcw /> : <GitBranch />}
+      title={isFixPast ? "B 分支：修正过去" : "C 分支：调整未来"}
+      description={isFixPast ? "分析执行证据并建议稳定回退点" : "保留已完成大阶段并调整后续"}
+      status="pending" statusLabel="讨论中"
+      actions={<WorkflowActionBar>{isFixPast ? (
+        <ActionButton icon={<Search size={16} />} variant="danger" onClick={onSuggestRollback}>诊断并建议回退点</ActionButton>
+      ) : (
+        <ActionButton icon={<WandSparkles size={16} />} onClick={onGenerateFuture}>生成后续大阶段草稿</ActionButton>
+      )}</WorkflowActionBar>}>
+      <ChatRoom
+        messages={project.discussion_threads[0]?.messages || []}
+        onAddMessage={onAddMessage}
+        projectName={project.name}
+        currentRole="产品经理"
+        threadId={project.discussion_threads[0]?.id || "thread-init"}
+        onProjectUpdated={onChatComplete}
+      />
+    </ConsoleStepShell>
   );
 }
 

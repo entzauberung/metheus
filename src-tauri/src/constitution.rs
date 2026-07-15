@@ -699,6 +699,42 @@ pub(crate) async fn get_constitution_summary(
     })
 }
 
+/// 获取宪法第二部分变更历史与当前 token 预测
+#[tauri::command]
+pub(crate) async fn get_constitution_change_history(
+    project_name: String,
+    project_path: String,
+) -> Result<project::ConstitutionChangeHistory, String> {
+    let proj = crate::load_project(&project_name)?;
+    let entries = proj.constitution_change_history.clone();
+
+    // 读取当前宪法并估算 Part 2 token
+    let constitution_path = std::path::Path::new(&project_path).join("CONSTITUTION.md");
+    let current_token_estimate = if constitution_path.exists() {
+        let content = std::fs::read_to_string(&constitution_path).unwrap_or_default();
+        // 提取 Part 2
+        let part2 = if let Some(pos) = content.find("## 第 2 部分") {
+            content[pos..].to_string()
+        } else if let Some(pos) = content.find("## Part 2") {
+            content[pos..].to_string()
+        } else {
+            String::new()
+        };
+        estimate_tokens(&part2)
+    } else {
+        0.0
+    };
+
+    let compaction_threshold = crate::constants::COMPACTION_TRIGGER_TOKENS as f64;
+
+    Ok(project::ConstitutionChangeHistory {
+        entries,
+        current_token_estimate,
+        compaction_threshold,
+        needs_compaction: current_token_estimate > compaction_threshold,
+    })
+}
+
 /// 宪法更新校验结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ValidationResult {
@@ -710,4 +746,102 @@ pub enum ValidationResult {
     StructureDamaged(String),
     /// 返回内容为空或过短，携带原因描述
     Empty(String),
+}
+
+/// 安全写入宪法第二部分（已有项目基线）。
+///
+/// - 如果宪法文件不存在，创建新的，包含第一和第二部分的占位结构
+/// - 如果宪法存在且已有「## 第 1 部分」，第一部分逐字保留
+/// - 第二部分替换或追加 Metheus 管理的基线内容
+/// - 无法安全解析宪法结构时返回错误
+pub(crate) fn write_constitution_part2(
+    project_path: &str,
+    baseline: &crate::project::ExistingProjectBaseline,
+) -> Result<(), String> {
+    use std::fs;
+    use std::path::Path;
+
+    let constitution_path = Path::new(project_path).join("CONSTITUTION.md");
+    let part2_content = format!(
+        "### 已有项目基线\n\
+         **项目摘要**：{}\n\n\
+         **技术栈**：{}\n\n\
+         **已完成能力**：\n{}\n\n\
+         **待处理能力**：\n{}\n\n\
+         **风险**：\n{}\n\n\
+         **不确定项**：\n{}\n\n\
+         **证据来源**：扫描 {} 个文件，{}\n",
+        baseline.project_summary,
+        baseline.tech_stack,
+        baseline.completed_capabilities.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"),
+        baseline.pending_capabilities.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"),
+        baseline.risks.iter().map(|r| format!("- {}", r)).collect::<Vec<_>>().join("\n"),
+        baseline.uncertainties.iter().map(|u| format!("- {}", u)).collect::<Vec<_>>().join("\n"),
+        baseline.scanned_files.len(),
+        baseline.evidence_summary,
+    );
+
+    let new_content = if constitution_path.exists() {
+        let existing = fs::read_to_string(&constitution_path)
+            .map_err(|e| format!("读取已有 CONSTITUTION.md 失败：{}", e))?;
+
+        if existing.contains("## 第 1 部分") {
+            // 安全分区：找到「## 第 2 部分」位置
+            if let Some(part2_pos) = existing.find("## 第 2 部分") {
+                // 保留第一部分，替换第二部分
+                let part1 = &existing[..part2_pos];
+                format!("{}{}\n\n{}\n", part1.trim_end(), "\n\n## 第 2 部分：项目当前状态", part2_content)
+            } else {
+                // 有第一部分但没有第二部分 — 追加
+                format!("{}\n\n## 第 2 部分：项目当前状态\n\n{}\n", existing.trim_end(), part2_content)
+            }
+        } else if existing.contains("## 第 2 部分") {
+            // 只有第二部分（异常），整体替换第二部分
+            if let Some(part2_pos) = existing.find("## 第 2 部分") {
+                let before = &existing[..part2_pos];
+                format!("{}{}\n\n{}\n", before.trim_end(), "\n\n## 第 2 部分：项目当前状态", part2_content)
+            } else {
+                format!("{}\n\n## 第 2 部分：项目当前状态\n\n{}\n", existing.trim_end(), part2_content)
+            }
+        } else {
+            // 没有标准分区 — 在已有内容末尾安全追加
+            format!("{}\n\n---\n\n## 第 2 部分：项目当前状态\n\n{}\n", existing.trim_end(), part2_content)
+        }
+    } else {
+        // 宪法文件不存在 — 创建新的，包含第一和第二部分的占位
+        format!(
+            "## 第 1 部分：项目长期规则\n（在方案批准时写入）\n\n---\n\n## 第 2 部分：项目当前状态\n\n{}\n",
+            part2_content
+        )
+    };
+
+    fs::write(&constitution_path, &new_content)
+        .map_err(|e| format!("写入 CONSTITUTION.md 失败：{}", e))?;
+
+    Ok(())
+}
+
+/// 读取 Already 项目宪法作为低权重背景参考
+/// 返回格式化的参考文本，或空字符串（如果 Already 宪法不存在）
+#[allow(dead_code)]
+pub(crate) fn read_already_constitution_reference(project_path: &str) -> String {
+    use std::path::Path;
+    let already_path = Path::new(project_path).join("ALREADY_CONSTITUTION.md");
+    if !already_path.exists() {
+        return String::new();
+    }
+    match std::fs::read_to_string(&already_path) {
+        Ok(content) => {
+            // 截断到合理长度（低权重参考，不宜过长）
+            let truncated: String = content.chars().take(2000).collect();
+            format!(
+                "## 低权重背景参考（仅作了解，不得覆盖当前决策）\n\
+                 > 以下内容来自对已有项目文件的自动分析，权重低于工作宪法和当前讨论。\n\
+                 > 如果与当前讨论或工作宪法冲突，以工作宪法和当前讨论为准。\n\n{}\n\n\
+                 ---\n（Already 宪法参考结束）\n",
+                truncated
+            )
+        }
+        Err(_) => String::new(),
+    }
 }

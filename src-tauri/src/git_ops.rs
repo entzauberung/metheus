@@ -137,6 +137,7 @@ pub(crate) async fn git_save_subtask_inner(
 /// 1. 检查工作区是否有未提交变更 → 有则 stash
 /// 2. git reset --hard 到目标 tag → 代码回退
 /// 3. 遍历 project.json → 回退点之后的节点标记为 RolledBack
+#[allow(dead_code)]
 #[tauri::command]
 pub(crate) async fn git_rollback_to_mid_stage(
     project_path: String,
@@ -277,6 +278,7 @@ pub(crate) async fn git_rollback_to_mid_stage(
 /// 1. 检查工作区是否有未提交变更 → 有则 stash
 /// 2. git reset --hard 到目标 tag → 代码回退
 /// 3. 遍历 project.json → 回退点之后的 subtasks 和 mid_stages 标记为 RolledBack
+#[allow(dead_code)]
 #[tauri::command]
 pub(crate) async fn git_rollback_to_subtask(
     project_path: String,
@@ -404,57 +406,53 @@ pub(crate) async fn git_rollback_to_subtask(
 /// 解析为 GitTagInfo 列表返回。非 git 仓库或无匹配 tag 时返回空数组。
 #[tauri::command]
 pub(crate) async fn get_git_tags_summary(
-    project_path: String,
-) -> Result<Vec<project::GitTagInfo>, String> {
-    let output = std::process::Command::new("git")
-        .args([
-            "tag",
-            "-l",
-            "metheus/*",
-            "--sort=-creatordate",
-            "--format=%(refname:short)|%(creatordate:short)|%(subject)",
-        ])
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| format!("git tag 命令执行失败: {}", e))?;
+    project_name: String,
+) -> Result<project::GitTagTree, String> {
+    let proj = crate::load_project(&project_name)?;
 
-    if !output.status.success() {
-        // 非 git 仓库或无权限等情况，返回空数组
-        return Ok(vec![]);
-    }
+    let milestones: Vec<project::MilestoneTagNode> = proj.milestones.iter().map(|ms| {
+        let mid_stages: Vec<project::MidStageTagNode> = ms.mid_stages.iter().map(|mid| {
+            let subtasks: Vec<project::SubtaskTagNode> = mid.subtasks.iter().enumerate().map(|(idx, st)| {
+                project::SubtaskTagNode {
+                    subtask_id: st.id.clone(),
+                    subtask_title: st.title.clone(),
+                    subtask_index: (idx + 1) as u32,
+                    subtask_tag: st.auto_tag.clone().unwrap_or_default(),
+                    subtask_status: format!("{:?}", st.status),
+                }
+            }).collect();
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut tags: Vec<project::GitTagInfo> = Vec::new();
+            project::MidStageTagNode {
+                mid_stage_id: mid.id.clone(),
+                mid_stage_title: mid.title.clone(),
+                mid_stage_version: mid.version.clone(),
+                mid_stage_tag: mid.git_tag.clone(),
+                mid_stage_status: format!("{:?}", mid.status),
+                subtasks,
+            }
+        }).collect();
 
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+        project::MilestoneTagNode {
+            milestone_id: ms.id.clone(),
+            milestone_title: ms.title.clone(),
+            milestone_version: ms.version.clone(),
+            milestone_status: format!("{:?}", ms.status),
+            mid_stages,
         }
-        let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() < 3 {
-            // 脏数据保护：跳过不满足 3 段的行
-            continue;
-        }
-        tags.push(project::GitTagInfo {
-            name: parts[0].to_string(),
-            date: parts[1].to_string(),
-            subject: parts[2].to_string(),
-        });
-    }
+    }).collect();
 
-    Ok(tags)
+    Ok(project::GitTagTree { milestones })
 }
 
 /// 获取当前工作区的 git diff
 ///
 /// 执行 git diff 获取未暂存的变更。非 git 仓库或工作区干净时返回空字符串。
+/// 对预期状态（非 Git 仓库、无提交、HEAD 不存在）静默返回空，不打印错误日志。
 #[tauri::command]
 pub(crate) async fn get_current_diff(project_path: String) -> Result<String, String> {
     // 1. 检查 .git 是否存在（目录或文件，兼容 worktree）
     let git_path = std::path::Path::new(&project_path).join(".git");
     if !git_path.exists() {
-        eprintln!("[get_current_diff] 不是 git 仓库，返回空");
         return Ok(String::new());
     }
 
@@ -477,27 +475,33 @@ pub(crate) async fn get_current_diff(project_path: String) -> Result<String, Str
     let stderr_str = String::from_utf8_lossy(&output.stderr);
     let stderr_lower = stderr_str.to_lowercase();
 
-    if stderr_lower.contains("not a git repository") {
-        eprintln!("[get_current_diff] 不是 git 仓库");
-        return Ok(String::new());
-    }
-
-    if stderr_lower.contains("does not have any commits")
+    // Expected states: not a git repo, no commits, HEAD missing → silent empty
+    if stderr_lower.contains("not a git repository")
+        || stderr_lower.contains("does not have any commits")
         || stderr_lower.contains("ambiguous argument")
         || stderr_lower.contains("unknown revision")
     {
-        eprintln!("[get_current_diff] 仓库尚无提交");
         return Ok(String::new());
     }
 
-    // 5. 未知错误 → 截断日志 + 返回空
+    // 5. 真正的异常 → 保留日志
     let truncated: String = stderr_str.chars().take(200).collect();
     eprintln!("[get_current_diff] 未知 git 错误: {}", truncated);
     Ok(String::new())
 }
 
+/// 获取项目的代码变更历史（按确认时间排列）
+#[tauri::command]
+pub(crate) async fn get_change_history(
+    project_name: String,
+) -> Result<Vec<project::ChangeHistoryEntry>, String> {
+    let proj = crate::load_project(&project_name)?;
+    Ok(proj.change_history.clone())
+}
+
 /// 比较两个版本号字符串（eg: "v0.1.1"  "v0.1.3"）
 /// 返回 -1：a < b，0：a == b，1：a > b
+#[allow(dead_code)]
 pub(crate) fn compare_version_strings(a: &str, b: &str) -> i32 {
     let parts_a: Vec<u32> = a
         .strip_prefix('v')
@@ -638,6 +642,7 @@ pub(crate) fn git_stash_and_reset_to_tag(
 /// 2. 加载 project.json，定位目标 subtask
 /// 3. 重置目标 subtask 之后的执行数据（同一 mid_stage 内 + 后续 mid_stages + 后续 milestones）
 /// 4. 持久化并返回完整的 Project JSON
+#[allow(dead_code)]
 #[tauri::command]
 pub(crate) async fn rollback_to_subtask_with_reset(
     project_path: String,

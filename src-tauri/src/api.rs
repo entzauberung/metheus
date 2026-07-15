@@ -1,5 +1,9 @@
 use std::env;
-use crate::constants::DEEPSEEK_API_TIMEOUT_SECS;
+use crate::constants::{
+    DEEPSEEK_API_TIMEOUT_SECS,
+    DEEPSEEK_API_URL,
+    DEEPSEEK_WORKFLOW_MODEL,
+};
 
 pub(crate) async fn call_deepseek_api(system_prompt: &str, user_message: &str) -> Result<String, String> {
     call_deepseek_api_inner(system_prompt, user_message, false, 0.1).await
@@ -17,18 +21,6 @@ pub(crate) async fn call_deepseek_api_inner(
     force_json: bool,
     temperature: f64,
 ) -> Result<String, String> {
-    let api_key = env::var("API_KEY").map_err(|_| "API_KEY 环境变量未设置".to_string())?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(DEEPSEEK_API_TIMEOUT_SECS))
-        .build()
-        .unwrap_or_else(|e| {
-            eprintln!(
-                "[call_deepseek_api_inner] 构造带超时的 HTTP 客户端失败：{}，降级使用无超时客户端",
-                e
-            );
-            reqwest::Client::new()
-        });
-
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if !system_prompt.is_empty() {
         messages.push(serde_json::json!({
@@ -41,8 +33,22 @@ pub(crate) async fn call_deepseek_api_inner(
         "content": user_message
     }));
 
+    call_deepseek_api_messages(messages, force_json, temperature).await
+}
+
+pub(crate) async fn call_deepseek_api_messages(
+    messages: Vec<serde_json::Value>,
+    force_json: bool,
+    temperature: f64,
+) -> Result<String, String> {
+    let api_key = env::var("API_KEY").map_err(|_| "API_KEY 环境变量未设置".to_string())?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(DEEPSEEK_API_TIMEOUT_SECS))
+        .build()
+        .map_err(|error| format!("构造 DeepSeek HTTP 客户端失败：{}", error))?;
+
     let mut body = serde_json::json!({
-        "model": "deepseek-v4-flash",
+        "model": DEEPSEEK_WORKFLOW_MODEL,
         "messages": messages,
         "temperature": temperature,
     });
@@ -52,7 +58,7 @@ pub(crate) async fn call_deepseek_api_inner(
     }
 
     let response = client
-        .post("https://api.deepseek.com/v1/chat/completions")
+        .post(DEEPSEEK_API_URL)
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&body)
@@ -69,14 +75,27 @@ pub(crate) async fn call_deepseek_api_inner(
             }
         })?;
 
+    let status = response.status();
+    if !status.is_success() {
+        let error_body = response.text().await
+            .map_err(|error| format!("DeepSeek API 返回 HTTP {}，且错误正文读取失败：{}", status, error))?;
+        return Err(format!("DeepSeek API 返回 HTTP {}：{}", status, error_body));
+    }
+
     let response_data: serde_json::Value = response
         .json()
         .await
         .map_err(|e| format!("解析响应失败: {}", e))?;
 
-    let reply = response_data["choices"][0]["message"]["content"]
-        .as_str()
-        .ok_or("AI回复异常".to_string())?
+    let reply = response_data
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|content| !content.trim().is_empty())
+        .ok_or_else(|| "DeepSeek API 响应缺少有效 choices[0].message.content".to_string())?
         .to_string();
 
     Ok(reply)
