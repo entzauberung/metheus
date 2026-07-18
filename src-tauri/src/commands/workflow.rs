@@ -188,12 +188,6 @@ pub(crate) async fn migrate_project_workflow(
                 last_action: "从旧版本迁移恢复".to_string(),
                 last_action_at: chrono::Utc::now().to_rfc3339(),
                 error_message: String::new(),
-                last_recovery_reason: String::new(),
-                recovery_count: 0,
-                last_recovery_at: String::new(),
-                pause_step: String::new(),
-                pause_milestone_id: String::new(),
-                pause_mid_stage_id: String::new(),
             });
         } else {
             // 所有大阶段已完成 — 关闭 autopilot
@@ -653,12 +647,6 @@ pub(crate) async fn toggle_autopilot(
             last_action: format!("自动驾驶已激活，目标大阶段：{}", target.title),
             last_action_at: now,
             error_message: String::new(),
-            last_recovery_reason: String::new(),
-            recovery_count: 0,
-            last_recovery_at: String::new(),
-            pause_step: String::new(),
-            pause_milestone_id: String::new(),
-            pause_mid_stage_id: String::new(),
         });
     } else {
         proj.workflow_state.autopilot_active = false;
@@ -668,50 +656,6 @@ pub(crate) async fn toggle_autopilot(
 
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
-
-    crate::save_and_reload_project(&proj)
-}
-
-/// 自动驾驶标记错误：持久化错误状态，前端停止驱动循环后刷新不丢失
-#[tauri::command]
-pub(crate) async fn autopilot_mark_error(
-    project_name: String,
-    message: String,
-) -> Result<project::Project, String> {
-    let mut proj = crate::load_project(&project_name)?;
-
-    if !proj.workflow_state.autopilot_active {
-        return Err("自动驾驶未激活。".to_string());
-    }
-
-    let now = chrono::Utc::now().to_rfc3339();
-    // Phase 7 (2026-07-15): Preserve existing recovery context and pause context
-    // when marking error, instead of resetting them.
-    let existing_ap = proj.workflow_state.autopilot_state.take();
-    let (recovery_reason, recovery_count, recovery_at, pause_step, pause_ms, pause_mid) =
-        if let Some(ref ap) = existing_ap {
-            (ap.last_recovery_reason.clone(), ap.recovery_count,
-             ap.last_recovery_at.clone(), ap.pause_step.clone(),
-             ap.pause_milestone_id.clone(), ap.pause_mid_stage_id.clone())
-        } else {
-            (String::new(), 0, String::new(), String::new(), String::new(), String::new())
-        };
-    proj.workflow_state.autopilot_state = Some(project::AutopilotState {
-        active: true,
-        target_milestone_id: proj.workflow_state.autopilot_target_milestone_id.clone(),
-        run_status: project::AutopilotRunStatus::ErrorStopped,
-        last_action: format!("因错误停止：{}", message),
-        last_action_at: now.clone(),
-        error_message: message,
-        last_recovery_reason: recovery_reason,
-        recovery_count,
-        last_recovery_at: recovery_at,
-        pause_step,
-        pause_milestone_id: pause_ms,
-        pause_mid_stage_id: pause_mid,
-    });
-    proj.workflow_state.data_revision += 1;
-    proj.workflow_state.last_transition_at = now;
 
     crate::save_and_reload_project(&proj)
 }
@@ -732,11 +676,6 @@ pub(crate) async fn autopilot_pause(
         && proj.execution_session.as_ref().map(|s| s.status == "executing").unwrap_or(false);
 
     let now = chrono::Utc::now().to_rfc3339();
-
-    // Phase 7 (2026-07-15): Store pause context for accurate resume
-    let pause_step = format!("{:?}", proj.workflow_state.current_step);
-    let pause_ms_id = proj.current_milestone_id.clone();
-    let pause_mid_id = proj.current_mid_stage_id.clone();
 
     if is_executing {
         // In Stop: kill child process, rollback to last completed subtask
@@ -771,14 +710,11 @@ pub(crate) async fn autopilot_pause(
         // Clear execution session
         proj.execution_session = None;
 
-        // Set autopilot to paused with In Stop context
+        // Set autopilot to paused
         if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
             ap.run_status = project::AutopilotRunStatus::Paused;
             ap.last_action = "执行中暂停（In Stop），已回退到最近完成小阶段".to_string();
             ap.last_action_at = now.clone();
-            ap.pause_step = pause_step;
-            ap.pause_milestone_id = pause_ms_id;
-            ap.pause_mid_stage_id = pause_mid_id;
         }
     } else {
         // Not executing: just set autopilot to paused
@@ -786,174 +722,12 @@ pub(crate) async fn autopilot_pause(
             ap.run_status = project::AutopilotRunStatus::Paused;
             ap.last_action = "自动驾驶已暂停".to_string();
             ap.last_action_at = now.clone();
-            ap.pause_step = pause_step;
-            ap.pause_milestone_id = pause_ms_id;
-            ap.pause_mid_stage_id = pause_mid_id;
         }
     }
 
-    // Phase 7 (2026-07-15): Set pause_reason based on whether we were executing
-    proj.workflow_state.current_step = project::WorkflowStep::PauseDecision;
-    proj.workflow_state.pause_reason = if is_executing {
-        project::PauseReason::InStop
-    } else {
-        project::PauseReason::None
-    };
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = now;
 
-    crate::save_and_reload_project(&proj)
-}
-
-/// 从 Paused 状态恢复自动驾驶（保留原目标大阶段和当前进度）
-#[tauri::command]
-pub(crate) async fn resume_autopilot(
-    project_name: String,
-) -> Result<project::Project, String> {
-    let mut proj = crate::load_project(&project_name)?;
-    if !proj.workflow_state.autopilot_active {
-        return Err("自动驾驶未激活。".to_string());
-    }
-    if proj.workflow_state.autopilot_state.is_none() {
-        return Err("自动驾驶状态不存在。".to_string());
-    }
-    let run_status = proj.workflow_state.autopilot_state.as_ref().unwrap().run_status.clone();
-    if run_status != project::AutopilotRunStatus::Paused {
-        return Err(format!("自动驾驶当前状态为 {:?}，只有 Paused 状态才能恢复。", run_status));
-    }
-    let now = chrono::Utc::now().to_rfc3339();
-    // Phase 4: verify target milestone still valid
-    let target_id = proj.workflow_state.autopilot_target_milestone_id.clone();
-    if target_id.is_empty() {
-        return Err("自动驾驶目标大阶段为空，请重新激活自动驾驶。".to_string());
-    }
-    let target_completed = proj.milestones.iter()
-        .find(|m| m.id == target_id)
-        .map(|m| m.status == project::MilestoneStatus::Completed)
-        .unwrap_or(true); // not found → treat as completed
-    if target_completed {
-        // Auto-select next incomplete milestone
-        if let Some(next_ms) = proj.milestones.iter()
-            .find(|m| m.status != project::MilestoneStatus::Completed)
-        {
-            let next_id = next_ms.id.clone();
-            proj.workflow_state.autopilot_target_milestone_id = next_id.clone();
-            if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
-                ap.target_milestone_id = next_id.clone();
-                ap.run_status = project::AutopilotRunStatus::Running;
-                ap.last_action = format!("目标大阶段已完成，自动切换到：{}", next_ms.title);
-                ap.last_action_at = now.clone();
-            }
-        } else {
-            return Err("所有大阶段已完成，无法恢复自动驾驶。".to_string());
-        }
-    } else {
-        if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
-            ap.run_status = project::AutopilotRunStatus::Running;
-            ap.last_action = "自动驾驶已恢复".to_string();
-            ap.last_action_at = now.clone();
-        }
-    }
-    proj.workflow_state.data_revision += 1;
-    proj.workflow_state.last_transition_at = now;
-    crate::save_and_reload_project(&proj)
-}
-
-/// 从 autopilot 暂停进入阶段中讨论（PauseAdjustment）
-#[tauri::command]
-pub(crate) async fn enter_autopilot_discussion(
-    project_name: String,
-) -> Result<project::Project, String> {
-    let mut proj = crate::load_project(&project_name)?;
-    if !proj.workflow_state.autopilot_active {
-        return Err("自动驾驶未激活。".to_string());
-    }
-    let autopilot = proj.workflow_state.autopilot_state.as_ref()
-        .ok_or("自动驾驶状态不存在。".to_string())?;
-    if autopilot.run_status != project::AutopilotRunStatus::Paused {
-        return Err(format!("自动驾驶当前状态为 {:?}，只有 Paused 状态才能进入讨论。", autopilot.run_status));
-    }
-    let now = chrono::Utc::now().to_rfc3339();
-    proj.workflow_state.current_step = project::WorkflowStep::Discussion;
-    proj.workflow_state.discussion_scope = project::DiscussionScope::PauseAdjustment;
-    proj.workflow_state.data_revision += 1;
-    proj.workflow_state.last_transition_at = now.clone();
-    if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
-        ap.last_action = "从自动驾驶暂停进入阶段讨论".to_string();
-        ap.last_action_at = now;
-    }
-    crate::save_and_reload_project(&proj)
-}
-
-/// 讨论后恢复自动驾驶（PauseAdjustment → Running）
-#[tauri::command]
-pub(crate) async fn resume_autopilot_after_discussion(
-    project_name: String,
-) -> Result<project::Project, String> {
-    let mut proj = crate::load_project(&project_name)?;
-    if !proj.workflow_state.autopilot_active {
-        return Err("自动驾驶未激活。".to_string());
-    }
-    if proj.workflow_state.current_step != project::WorkflowStep::Discussion {
-        return Err("当前不在讨论步骤，无法恢复自动驾驶。".to_string());
-    }
-    if proj.workflow_state.discussion_scope != project::DiscussionScope::PauseAdjustment {
-        return Err("当前讨论范围不是暂停调整，无法恢复自动驾驶。".to_string());
-    }
-    // Verify target milestone still valid
-    let target_ms_id = proj.workflow_state.autopilot_target_milestone_id.clone();
-    if target_ms_id.is_empty() {
-        return Err("自动驾驶目标大阶段为空，请重新激活自动驾驶。".to_string());
-    }
-    let target_exists = proj.milestones.iter().any(|m| m.id == target_ms_id && m.status != project::MilestoneStatus::Completed);
-    let now = chrono::Utc::now().to_rfc3339();
-    if !target_exists {
-        // Auto-select next incomplete milestone
-        if let Some(next_ms) = proj.milestones.iter()
-            .find(|m| m.status != project::MilestoneStatus::Completed)
-        {
-            proj.workflow_state.autopilot_target_milestone_id = next_ms.id.clone();
-            if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
-                ap.target_milestone_id = next_ms.id.clone();
-                ap.last_action = format!("目标大阶段已完成，自动切换到：{}", next_ms.title);
-                ap.last_action_at = now.clone();
-            }
-        } else {
-            return Err("所有大阶段已完成，无法恢复自动驾驶。".to_string());
-        }
-    }
-    // Phase 7 (2026-07-15): Compute correct resume step from pause context
-    // instead of always resetting to MilestoneSelection.
-    let resume_step = compute_resume_step(&proj);
-    proj.workflow_state.current_step = resume_step;
-    // Reset discussion_scope to FirstDiscussion since we're out of pause context
-    proj.workflow_state.discussion_scope = project::DiscussionScope::FirstDiscussion;
-    proj.workflow_state.pause_reason = project::PauseReason::None;
-    proj.workflow_state.data_revision += 1;
-    proj.workflow_state.last_transition_at = now.clone();
-    if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
-        ap.run_status = project::AutopilotRunStatus::Running;
-        ap.last_action = "讨论后恢复自动驾驶".to_string();
-        ap.last_action_at = now;
-    }
-    crate::save_and_reload_project(&proj)
-}
-
-/// 退出自动驾驶但保留当前阶段事实（不清空计划/阶段）
-#[tauri::command]
-pub(crate) async fn exit_autopilot_keep_state(
-    project_name: String,
-) -> Result<project::Project, String> {
-    let mut proj = crate::load_project(&project_name)?;
-    if !proj.workflow_state.autopilot_active {
-        return Err("自动驾驶未激活。".to_string());
-    }
-    let now = chrono::Utc::now().to_rfc3339();
-    proj.workflow_state.autopilot_active = false;
-    proj.workflow_state.autopilot_target_milestone_id = String::new();
-    proj.workflow_state.autopilot_state = None;
-    proj.workflow_state.data_revision += 1;
-    proj.workflow_state.last_transition_at = now;
     crate::save_and_reload_project(&proj)
 }
 
@@ -972,123 +746,6 @@ pub struct AutopilotNextStep {
     pub is_error: bool,
     /// 错误/暂停说明
     pub error_message: String,
-    // === Phase 3: 进度字段 ===
-    /// 目标大阶段内已完成小阶段数
-    pub completed_subtasks: u64,
-    /// 目标大阶段内总小阶段数
-    pub total_subtasks: u64,
-    /// 当前中阶段序号（1-based，0 表示尚未确定）
-    pub current_mid_stage_index: u64,
-    /// 目标大阶段内总中阶段数
-    pub total_mid_stages: u64,
-    /// 当前动作人类可读文本
-    pub current_action: String,
-}
-
-/// 计算自动驾驶进度（在目标大阶段范围内统计）
-fn compute_autopilot_progress(proj: &project::Project) -> (u64, u64, u64, u64, String) {
-    let target_ms = proj.milestones.iter()
-        .find(|m| m.id == proj.workflow_state.autopilot_target_milestone_id);
-
-    let (completed_subtasks, total_subtasks) = target_ms.map(|ms| {
-        let completed = ms.mid_stages.iter()
-            .flat_map(|mid| mid.subtasks.iter())
-            .filter(|st| st.status == project::SubtaskStatus::Passed)
-            .count() as u64;
-        let total = ms.mid_stages.iter()
-            .flat_map(|mid| mid.subtasks.iter())
-            .count() as u64;
-        (completed, total)
-    }).unwrap_or((0, 0));
-
-    let (current_mid_stage_index, total_mid_stages) = target_ms.map(|ms| {
-        let total = ms.mid_stages.len() as u64;
-        // 找当前选中的中阶段序号
-        let current = if !proj.current_mid_stage_id.is_empty() {
-            ms.mid_stages.iter()
-                .position(|m| m.id == proj.current_mid_stage_id)
-                .map(|i| i as u64 + 1)
-                .unwrap_or(0)
-        } else {
-            // 找第一个未完成中阶段
-            ms.mid_stages.iter()
-                .position(|m| m.status != project::MidStageStatus::Completed)
-                .map(|i| i as u64 + 1)
-                .unwrap_or(total)
-        };
-        (current, total)
-    }).unwrap_or((0, 0));
-
-    let current_action = if let Some(ms) = target_ms {
-        let mid_title = ms.mid_stages.iter()
-            .find(|m| m.id == proj.current_mid_stage_id)
-            .map(|m| m.title.as_str())
-            .unwrap_or("—");
-        format!("大阶段「{}」→ 中阶段「{}」", ms.title, mid_title)
-    } else {
-        String::new()
-    };
-
-    (completed_subtasks, total_subtasks, current_mid_stage_index, total_mid_stages, current_action)
-}
-
-/// 创建带进度字段的 AutopilotNextStep
-fn autopilot_step(
-    proj: &project::Project,
-    command: String,
-    args: serde_json::Value,
-    description: String,
-    at_milestone_boundary: bool,
-    is_error: bool,
-    error_message: String,
-) -> AutopilotNextStep {
-    let (completed_subtasks, total_subtasks, current_mid_stage_index, total_mid_stages, current_action) =
-        compute_autopilot_progress(proj);
-    AutopilotNextStep {
-        command,
-        args,
-        description,
-        at_milestone_boundary,
-        is_error,
-        error_message,
-        completed_subtasks,
-        total_subtasks,
-        current_mid_stage_index,
-        total_mid_stages,
-        current_action,
-    }
-}
-
-/// Phase 7 (2026-07-15): Compute the correct workflow step to resume to after
-/// autopilot discussion, based on current project state (milestone/mid-stage selection).
-fn compute_resume_step(proj: &project::Project) -> project::WorkflowStep {
-    // If we have a current mid-stage with an approved plan, go to Execution
-    if !proj.current_mid_stage_id.is_empty() {
-        if let Some(ms) = proj.milestones.iter().find(|m| m.id == proj.current_milestone_id) {
-            if let Some(mid) = ms.mid_stages.iter().find(|m| m.id == proj.current_mid_stage_id) {
-                let has_plan = mid.plan_approved_at.is_some() && mid.plan_revision > 0;
-                let has_execution_facts = mid.subtasks.iter().any(|st| {
-                    matches!(st.status,
-                        project::SubtaskStatus::Executing
-                        | project::SubtaskStatus::AwaitingConfirmation
-                        | project::SubtaskStatus::Passed)
-                });
-                if has_plan || has_execution_facts {
-                    return project::WorkflowStep::Execution;
-                }
-                // Has mid-stage selected but no plan yet → PlanGeneration
-                return project::WorkflowStep::PlanGeneration;
-            }
-        }
-    }
-
-    // If we have a current milestone but no mid-stage → MidStageSelection
-    if !proj.current_milestone_id.is_empty() {
-        return project::WorkflowStep::MidStageSelection;
-    }
-
-    // Fallback: MilestoneSelection
-    project::WorkflowStep::MilestoneSelection
 }
 
 #[tauri::command]
@@ -1097,32 +754,49 @@ pub(crate) async fn autopilot_next_step(
 ) -> Result<AutopilotNextStep, String> {
     let proj = crate::load_project(&project_name)?;
 
-    // Helper: build a step response with progress fields filled in
-    let step_resp = |cmd: &str, args: serde_json::Value, desc: &str, boundary: bool, err: bool, err_msg: &str| {
-        autopilot_step(&proj, cmd.to_string(), args, desc.to_string(), boundary, err, err_msg.to_string())
-    };
-    let noop = |desc: &str, boundary: bool, err: bool, err_msg: &str| {
-        step_resp("", serde_json::json!({}), desc, boundary, err, err_msg)
-    };
-
     if !proj.workflow_state.autopilot_active {
-        return Ok(noop("自动驾驶未激活", false, true, "自动驾驶未激活"));
+        return Ok(AutopilotNextStep {
+            command: String::new(),
+            args: serde_json::json!({}),
+            description: "自动驾驶未激活".to_string(),
+            at_milestone_boundary: false,
+            is_error: true,
+            error_message: "自动驾驶未激活".to_string(),
+        });
     }
 
     // Check if autopilot is paused or errored
     if let Some(ref ap) = proj.workflow_state.autopilot_state {
         match ap.run_status {
             project::AutopilotRunStatus::Paused => {
-                return Ok(noop("自动驾驶已暂停，等待手动操作", false, false, ""));
+                return Ok(AutopilotNextStep {
+                    command: String::new(),
+                    args: serde_json::json!({}),
+                    description: "自动驾驶已暂停，等待手动操作".to_string(),
+                    at_milestone_boundary: false,
+                    is_error: false,
+                    error_message: String::new(),
+                });
             }
             project::AutopilotRunStatus::ErrorStopped => {
-                return Ok(noop(
-                    &format!("自动驾驶因错误停止：{}", ap.error_message),
-                    false, true, &ap.error_message,
-                ));
+                return Ok(AutopilotNextStep {
+                    command: String::new(),
+                    args: serde_json::json!({}),
+                    description: format!("自动驾驶因错误停止：{}", ap.error_message),
+                    at_milestone_boundary: false,
+                    is_error: true,
+                    error_message: ap.error_message.clone(),
+                });
             }
             project::AutopilotRunStatus::WaitingMilestoneReview => {
-                return Ok(noop("到达大阶段边界，等待人工 A/B/C 决策", true, false, ""));
+                return Ok(AutopilotNextStep {
+                    command: String::new(),
+                    args: serde_json::json!({}),
+                    description: "到达大阶段边界，等待人工 A/B/C 决策".to_string(),
+                    at_milestone_boundary: true,
+                    is_error: false,
+                    error_message: String::new(),
+                });
             }
             _ => {} // Running — continue
         }
@@ -1132,282 +806,247 @@ pub(crate) async fn autopilot_next_step(
     let target_ms_id = &proj.workflow_state.autopilot_target_milestone_id;
 
     // Ensure target milestone exists
-    let target_ms = match proj.milestones.iter().find(|m| m.id == *target_ms_id) {
+    let target_ms = proj.milestones.iter().find(|m| m.id == *target_ms_id);
+    if target_ms.is_none() {
+        return Ok(AutopilotNextStep {
+            command: String::new(),
+            args: serde_json::json!({}),
+            description: "目标大阶段不存在".to_string(),
+            at_milestone_boundary: false,
+            is_error: true,
+            error_message: "目标大阶段不存在".to_string(),
+        });
+    }
+    let target_ms = match target_ms {
         Some(ms) => ms,
-        None => return Ok(noop("目标大阶段不存在", false, true, "目标大阶段不存在")),
+        None => return Ok(AutopilotNextStep {
+            command: String::new(),
+            args: serde_json::json!({}),
+            description: "目标大阶段不存在".to_string(),
+            at_milestone_boundary: false,
+            is_error: true,
+            error_message: "目标大阶段不存在".to_string(),
+        }),
     };
-
-    // Phase 7 (2026-07-15): If target milestone is already completed, auto-switch
-    // to next incomplete milestone. Prevents autopilot from pointing at a completed target.
-    if target_ms.status == project::MilestoneStatus::Completed {
-        if let Some(next_ms) = proj.milestones.iter()
-            .find(|m| m.status != project::MilestoneStatus::Completed)
-        {
-            let next_id = next_ms.id.clone();
-            // Persist the redirect in a side-load to avoid blocking the advisor
-            if let Ok(mut fix_proj) = crate::load_project(&project_name) {
-                fix_proj.workflow_state.autopilot_target_milestone_id = next_id.clone();
-                if let Some(ref mut ap) = fix_proj.workflow_state.autopilot_state {
-                    ap.target_milestone_id = next_id.clone();
-                    ap.last_action = format!("目标大阶段已完成，自动切换到：{}", next_ms.title);
-                    ap.last_action_at = chrono::Utc::now().to_rfc3339();
-                }
-                let _ = crate::save_project(&fix_proj);
-            }
-            return Ok(autopilot_step(
-                &proj,
-                "select_milestone".to_string(),
-                serde_json::json!({ "projectName": project_name, "milestoneId": next_id }),
-                format!("目标大阶段已完成，自动切换到：{}", next_ms.title),
-                false, false, "".to_string(),
-            ));
-        } else {
-            return Ok(noop("所有大阶段已完成", true, false, ""));
-        }
-    }
-
-    // Phase 4.4: MidStageSelection consistency cleanup — fix AwaitingConfirmation
-    // residuals when mid-stage is already Completed, or mark mid-stage Completed
-    // when all subtasks passed but mid-stage status is stale.
-    if matches!(step, project::WorkflowStep::MidStageSelection) && !proj.current_mid_stage_id.is_empty() {
-        if let Some(mid) = target_ms.mid_stages.iter()
-            .find(|m| m.id == proj.current_mid_stage_id)
-        {
-            let all_passed = mid.subtasks.iter().all(|st| st.status == project::SubtaskStatus::Passed);
-            let has_awaiting = mid.subtasks.iter().any(|st| st.status == project::SubtaskStatus::AwaitingConfirmation);
-            let needs_fix = (mid.status == project::MidStageStatus::Completed && has_awaiting)
-                || (all_passed && mid.status != project::MidStageStatus::Completed);
-            if needs_fix {
-                let _ = crate::load_project(&project_name).map(|mut fix_proj| {
-                    if let Some(ms) = fix_proj.milestones.iter_mut().find(|m| m.id == *target_ms_id) {
-                        if let Some(mid_mut) = ms.mid_stages.iter_mut()
-                            .find(|m| m.id == fix_proj.current_mid_stage_id)
-                        {
-                            if mid_mut.subtasks.iter().all(|st| st.status == project::SubtaskStatus::Passed)
-                                && mid_mut.status != project::MidStageStatus::Completed
-                            {
-                                mid_mut.status = project::MidStageStatus::Completed;
-                                mid_mut.completed_at = Some(chrono::Utc::now().to_rfc3339());
-                            }
-                            for st in &mut mid_mut.subtasks {
-                                if st.status == project::SubtaskStatus::AwaitingConfirmation
-                                    && mid_mut.status == project::MidStageStatus::Completed
-                                {
-                                    st.status = project::SubtaskStatus::Passed;
-                                }
-                            }
-                        }
-                    }
-                    let _ = crate::save_project(&fix_proj);
-                });
-            }
-        }
-    }
 
     use project::WorkflowStep::*;
     let next = match step {
         // If at MilestoneReview, stop for human A/B/C
         MilestoneReview => {
-            return Ok(noop("到达大阶段边界，等待人工 A/B/C 决策", true, false, ""));
+            return Ok(AutopilotNextStep {
+                command: String::new(),
+                args: serde_json::json!({}),
+                description: "到达大阶段边界，等待人工 A/B/C 决策".to_string(),
+                at_milestone_boundary: true,
+                is_error: false,
+                error_message: String::new(),
+            });
         }
 
         // Select target milestone if not selected
         _ if proj.current_milestone_id.is_empty()
             || proj.current_milestone_id != *target_ms_id => {
-            step_resp(
-                "select_milestone",
-                serde_json::json!({ "projectName": project_name, "milestoneId": target_ms.id }),
-                &format!("选择大阶段：{}", target_ms.title),
-                false, false, "",
-            )
+            AutopilotNextStep {
+                command: "select_milestone".to_string(),
+                args: serde_json::json!({
+                    "projectName": project_name,
+                    "milestoneId": target_ms.id,
+                }),
+                description: format!("选择大阶段：{}", target_ms.title),
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
+            }
         }
 
         // Milestone selected → transition to mid-stage generation
         MilestoneSelection => {
-            step_resp(
-                "transition_workflow",
-                serde_json::json!({ "projectName": project_name, "targetStep": "MidStageGeneration", "reason": "autopilot: 进入中阶段生成" }),
-                "进入中阶段规划流程",
-                false, false, "",
-            )
+            AutopilotNextStep {
+                command: "transition_workflow".to_string(),
+                args: serde_json::json!({
+                    "projectName": project_name,
+                    "targetStep": "MidStageGeneration",
+                    "reason": "autopilot: 进入中阶段生成",
+                }),
+                description: "进入中阶段规划流程".to_string(),
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
+            }
         }
 
-        // Enter mid-stage generation → generate draft
+        // Enter mid-stage generation → generate draft (auto-transitions to MidStageCheck)
         MidStageGeneration => {
-            step_resp("generate_mid_stage_draft", serde_json::json!({ "projectName": project_name }),
-                "生成中阶段草稿", false, false, "")
+            AutopilotNextStep {
+                command: "generate_mid_stage_draft".to_string(),
+                args: serde_json::json!({ "projectName": project_name }),
+                description: "生成中阶段草稿".to_string(),
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
+            }
         }
 
-        // Mid-stage draft generated → check
+        // Mid-stage draft generated → check (auto-transitions to MidStageApproval)
         MidStageCheck => {
-            step_resp("check_mid_stage_draft", serde_json::json!({ "projectName": project_name }),
-                "检查中阶段草稿", false, false, "")
+            AutopilotNextStep {
+                command: "check_mid_stage_draft".to_string(),
+                args: serde_json::json!({ "projectName": project_name }),
+                description: "检查中阶段草稿".to_string(),
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
+            }
         }
 
-        // Mid-stage check passed → approve
+        // Mid-stage check passed → approve (auto-transitions to MidStageSelection)
         MidStageApproval => {
-            step_resp("approve_mid_stage_draft", serde_json::json!({ "projectName": project_name }),
-                "批准中阶段草稿", false, false, "")
+            AutopilotNextStep {
+                command: "approve_mid_stage_draft".to_string(),
+                args: serde_json::json!({ "projectName": project_name }),
+                description: "批准中阶段草稿".to_string(),
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
+            }
         }
 
-        // Mid-stages approved and current mid-stage has plan → go execute
+        // Mid-stages approved and at selection — select first non-completed mid-stage,
+        // then transition to plan generation
         MidStageSelection if !proj.current_mid_stage_id.is_empty()
             && target_ms.mid_stages.iter()
                 .find(|m| m.id == proj.current_mid_stage_id)
                 .map(|m| !m.subtasks.is_empty() && m.plan_approved_at.is_some())
                 .unwrap_or(false) => {
-            step_resp(
-                "transition_workflow",
-                serde_json::json!({ "projectName": project_name, "targetStep": "Execution", "reason": "autopilot: 进入执行阶段" }),
-                "进入执行阶段",
-                false, false, "",
-            )
-        }
-
-        // Mid-stage selected but no plan yet → go to plan generation
-        MidStageSelection if !proj.current_mid_stage_id.is_empty() => {
-            step_resp(
-                "transition_workflow",
-                serde_json::json!({ "projectName": project_name, "targetStep": "PlanGeneration", "reason": "autopilot: 进入执行计划生成" }),
-                "进入执行计划生成",
-                false, false, "",
-            )
-        }
-
-        // No mid-stage selected yet → select first non-completed
-        MidStageSelection => {
-            match target_ms.mid_stages.iter()
-                .find(|m| m.status != project::MidStageStatus::Completed)
-            {
-                Some(mid) => step_resp(
-                    "select_mid_stage",
-                    serde_json::json!({ "projectName": project_name, "midStageId": mid.id }),
-                    &format!("选择中阶段：{}", mid.title),
-                    false, false, "",
-                ),
-                None => noop("没有未完成的中阶段", false, true, "没有未完成的中阶段"),
+            // Mid-stage already selected AND has plan approved → execute
+            AutopilotNextStep {
+                command: "transition_workflow".to_string(),
+                args: serde_json::json!({
+                    "projectName": project_name,
+                    "targetStep": "Execution",
+                    "reason": "autopilot: 进入执行阶段",
+                }),
+                description: "进入执行阶段".to_string(),
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
             }
         }
 
-        // Plan generation → generate execution plan
+        MidStageSelection if !proj.current_mid_stage_id.is_empty() => {
+            // Mid-stage selected → transition to plan generation
+            AutopilotNextStep {
+                command: "transition_workflow".to_string(),
+                args: serde_json::json!({
+                    "projectName": project_name,
+                    "targetStep": "PlanGeneration",
+                    "reason": "autopilot: 进入执行计划生成",
+                }),
+                description: "进入执行计划生成".to_string(),
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
+            }
+        }
+
+        MidStageSelection => {
+            // No mid-stage selected yet → select first non-completed
+            let next_mid = target_ms.mid_stages.iter()
+                .find(|m| m.status != project::MidStageStatus::Completed);
+            match next_mid {
+                Some(mid) => AutopilotNextStep {
+                    command: "select_mid_stage".to_string(),
+                    args: serde_json::json!({
+                        "projectName": project_name,
+                        "midStageId": mid.id,
+                    }),
+                    description: format!("选择中阶段：{}", mid.title),
+                    at_milestone_boundary: false,
+                    is_error: false,
+                    error_message: String::new(),
+                },
+                None => AutopilotNextStep {
+                    command: String::new(),
+                    args: serde_json::json!({}),
+                    description: "没有未完成的中阶段".to_string(),
+                    at_milestone_boundary: false,
+                    is_error: true,
+                    error_message: "没有未完成的中阶段".to_string(),
+                },
+            }
+        }
+
+        // Plan generation → generate execution plan (auto-transitions to PlanCheck)
         PlanGeneration => {
-            step_resp("generate_execution_plan", serde_json::json!({ "projectName": project_name }),
-                "生成执行计划", false, false, "")
+            AutopilotNextStep {
+                command: "generate_execution_plan".to_string(),
+                args: serde_json::json!({ "projectName": project_name }),
+                description: "生成执行计划".to_string(),
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
+            }
         }
 
-        // Plan generated → check
+        // Plan generated → check (auto-transitions to PlanApproving)
         PlanCheck => {
-            step_resp("check_stage_plan", serde_json::json!({ "projectName": project_name }),
-                "检查执行计划", false, false, "")
+            AutopilotNextStep {
+                command: "check_stage_plan".to_string(),
+                args: serde_json::json!({ "projectName": project_name }),
+                description: "检查执行计划".to_string(),
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
+            }
         }
 
-        // Plan check passed → approve
+        // Plan check passed → approve (auto-transitions to Execution)
         PlanApproving => {
-            step_resp("approve_stage_plan", serde_json::json!({ "projectName": project_name }),
-                "批准执行计划，进入执行阶段", false, false, "")
+            AutopilotNextStep {
+                command: "approve_stage_plan".to_string(),
+                args: serde_json::json!({ "projectName": project_name }),
+                description: "批准执行计划，进入执行阶段".to_string(),
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
+            }
         }
 
-        // Phase 4 fix: In execution — execute next pending or confirm awaiting.
-        // When no pending/awaiting, check if all subtasks in current mid-stage are completed
-        // and advance rather than returning error.
-        // Phase 7 (2026-07-15): Scope to current mid-stage only, not all mid-stages.
+        // In execution — execute next pending or confirm awaiting
         Execution => {
-            // Find current mid-stage
-            let current_mid = if !proj.current_mid_stage_id.is_empty() {
-                target_ms.mid_stages.iter()
-                    .find(|m| m.id == proj.current_mid_stage_id)
-            } else {
-                None
-            };
-
-            // If no current mid-stage is selected, auto-select the first incomplete one
-            let current_mid = match current_mid {
-                Some(mid) => mid,
-                None => {
-                    match target_ms.mid_stages.iter()
-                        .find(|m| m.status != project::MidStageStatus::Completed)
-                    {
-                        Some(next_mid) => {
-                            return Ok(step_resp(
-                                "select_mid_stage",
-                                serde_json::json!({ "projectName": project_name, "midStageId": next_mid.id }),
-                                &format!("选择中阶段：{}", next_mid.title),
-                                false, false, "",
-                            ));
-                        }
-                        None => {
-                            // All mid-stages complete, go to milestone boundary
-                            return Ok(noop("所有中阶段已完成，等待进入大阶段审阅", true, false, ""));
-                        }
-                    }
-                }
-            };
-
-            // Scope checks to CURRENT mid-stage only
-            let has_awaiting = current_mid.subtasks.iter()
-                .any(|st| st.status == project::SubtaskStatus::AwaitingConfirmation);
-            let has_pending = current_mid.subtasks.iter()
-                .any(|st| st.status == project::SubtaskStatus::Pending);
+            let has_awaiting = target_ms.mid_stages.iter()
+                .any(|mid| mid.subtasks.iter()
+                    .any(|st| st.status == project::SubtaskStatus::AwaitingConfirmation));
+            let has_pending = target_ms.mid_stages.iter()
+                .any(|mid| mid.subtasks.iter()
+                    .any(|st| st.status == project::SubtaskStatus::Pending));
 
             if has_awaiting {
-                step_resp("confirm_subtask_result", serde_json::json!({ "projectName": project_name }),
-                    "自动确认小阶段执行结果", false, false, "")
+                AutopilotNextStep {
+                    command: "confirm_subtask_result".to_string(),
+                    args: serde_json::json!({ "projectName": project_name }),
+                    description: "自动确认小阶段执行结果".to_string(),
+                    at_milestone_boundary: false,
+                    is_error: false,
+                    error_message: String::new(),
+                }
             } else if has_pending {
-                step_resp("execute_current_subtask", serde_json::json!({ "projectName": project_name }),
-                    "执行下一个待处理小阶段", false, false, "")
+                AutopilotNextStep {
+                    command: "execute_current_subtask".to_string(),
+                    args: serde_json::json!({ "projectName": project_name }),
+                    description: "执行下一个待处理小阶段".to_string(),
+                    at_milestone_boundary: false,
+                    is_error: false,
+                    error_message: String::new(),
+                }
             } else {
-                // No pending/awaiting in current mid-stage
-                let all_passed = !current_mid.subtasks.is_empty()
-                    && current_mid.subtasks.iter().all(|st| st.status == project::SubtaskStatus::Passed);
-
-                // Phase 5: Recover stuck Executing subtasks (app closed/crashed during execution)
-                let stuck_executing = current_mid.subtasks.iter()
-                    .find(|st| st.status == project::SubtaskStatus::Executing);
-
-                if let Some(stuck) = stuck_executing {
-                    // Revert stuck subtask to Pending so autopilot can retry
-                    let subtask_id = stuck.id.clone();
-                    let subtask_title = stuck.title.clone();
-                    if let Ok(mut fix_proj) = crate::load_project(&project_name) {
-                        if let Some(ms) = fix_proj.milestones.iter_mut().find(|m| m.id == fix_proj.workflow_state.autopilot_target_milestone_id) {
-                            if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == fix_proj.current_mid_stage_id) {
-                                if let Some(st) = mid.subtasks.iter_mut().find(|s| s.id == subtask_id) {
-                                    if st.status == project::SubtaskStatus::Executing {
-                                        st.status = project::SubtaskStatus::Pending;
-                                    }
-                                }
-                            }
-                        }
-                        fix_proj.execution_session = None;
-                        let _ = crate::save_project(&fix_proj);
-                    }
-                    step_resp("execute_current_subtask", serde_json::json!({ "projectName": project_name }),
-                        &format!("恢复执行：{}（上次执行中断，已重置）", subtask_title),
-                        false, false, "")
-                } else if all_passed {
-                    // Current mid-stage fully passed — find next incomplete mid-stage
-                    let next_incomplete = target_ms.mid_stages.iter()
-                        .find(|m| m.status != project::MidStageStatus::Completed);
-                    if let Some(next_mid) = next_incomplete {
-                        step_resp(
-                            "select_mid_stage",
-                            serde_json::json!({ "projectName": project_name, "midStageId": next_mid.id }),
-                            &format!("当前中阶段完成，选择下一个：{}", next_mid.title),
-                            false, false, "",
-                        )
-                    } else {
-                        // All mid-stages completed in target milestone
-                        noop("所有中阶段已完成，等待进入大阶段审阅", true, false, "")
-                    }
-                } else {
-                    // Check if all mid-stages in target milestone are completed
-                    let all_mid_stages_done = target_ms.mid_stages.iter()
-                        .all(|m| m.status == project::MidStageStatus::Completed);
-                    if all_mid_stages_done {
-                        noop("所有中阶段已完成，等待进入大阶段审阅", true, false, "")
-                    } else {
-                        noop("等待状态推进（请同步项目状态）", false, false, "")
-                    }
+                AutopilotNextStep {
+                    command: String::new(),
+                    args: serde_json::json!({}),
+                    description: "等待状态推进（中阶段可能已完成）".to_string(),
+                    at_milestone_boundary: false,
+                    is_error: true,
+                    error_message: "Execution 步骤中未找到待处理或待确认的小阶段".to_string(),
                 }
             }
         }
@@ -1415,23 +1054,40 @@ pub(crate) async fn autopilot_next_step(
         // States where autopilot can't help
         Discussion | BranchDiscussion | PauseDecision | RollbackPreview
         | FuturePlanApproval | ThreeChecks | PlanApproval => {
-            noop(
-                &format!("当前步骤 {:?} 需要人工介入，无法自动推进", step),
-                false, true,
-                &format!("{:?} 步骤需要人工介入", step),
-            )
+            AutopilotNextStep {
+                command: String::new(),
+                args: serde_json::json!({}),
+                description: format!("当前步骤 {:?} 需要人工介入，无法自动推进", step),
+                at_milestone_boundary: false,
+                is_error: true,
+                error_message: format!("{:?} 步骤需要人工介入", step),
+            }
         }
 
         // Milestone generation/check/approval — user should handle these before autopilot
         MilestoneGeneration | MilestoneCheck | MilestoneApproval => {
-            noop("大阶段审批流程应由用户完成", false, true, "请先手动完成大阶段生成、检查和批准")
+            AutopilotNextStep {
+                command: "transition_workflow".to_string(),
+                args: serde_json::json!({
+                    "projectName": project_name,
+                    "targetStep": "MilestoneSelection",
+                    "reason": "autopilot: 跳过大阶段审批（已由用户完成）",
+                }),
+                description: "大阶段审批流程应由用户完成".to_string(),
+                at_milestone_boundary: false,
+                is_error: true,
+                error_message: "请先手动完成大阶段生成、检查和批准".to_string(),
+            }
         }
 
-        _ => noop(
-            &format!("未处理的步骤：{:?}", step),
-            false, true,
-            &format!("自动驾驶不支持从 {:?} 自动推进", step),
-        ),
+        _ => AutopilotNextStep {
+            command: String::new(),
+            args: serde_json::json!({}),
+            description: format!("未处理的步骤：{:?}", step),
+            at_milestone_boundary: false,
+            is_error: true,
+            error_message: format!("自动驾驶不支持从 {:?} 自动推进", step),
+        },
     };
 
     Ok(next)

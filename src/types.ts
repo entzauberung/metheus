@@ -34,22 +34,6 @@ export type PauseReason = "None" | "InStop" | "EDStop";
 
 export type AutopilotRunStatus = "Running" | "Paused" | "WaitingMilestoneReview" | "ErrorStopped";
 
-/** 自动驾驶下一步建议（与 Rust AutopilotNextStep 一一对应） */
-export interface AutopilotNextStep {
-  command: string;
-  args: Record<string, unknown>;
-  description: string;
-  at_milestone_boundary: boolean;
-  is_error: boolean;
-  error_message: string;
-  // Phase 3: progress fields
-  completed_subtasks: number;
-  total_subtasks: number;
-  current_mid_stage_index: number;
-  total_mid_stages: number;
-  current_action: string;
-}
-
 export interface AutopilotState {
   active: boolean;
   target_milestone_id: string;
@@ -57,18 +41,6 @@ export interface AutopilotState {
   last_action: string;
   last_action_at: string;
   error_message: string;
-  /** 最近一次自动补救原因（空字符串表示无补救） */
-  last_recovery_reason: string;
-  /** 累计自动补救次数 */
-  recovery_count: number;
-  /** 最近一次自动补救时间（ISO 8601） */
-  last_recovery_at: string;
-  /** 暂停时的步骤（用于恢复上下文） */
-  pause_step: string;
-  /** 暂停时的大阶段 ID（用于恢复上下文） */
-  pause_milestone_id: string;
-  /** 暂停时的中阶段 ID（用于恢复上下文） */
-  pause_mid_stage_id: string;
 }
 
 export type DiscussionScope = "FirstDiscussion" | "PauseAdjustment" | "FixPast" | "AdjustFuture";
@@ -224,8 +196,6 @@ export interface PauseContext {
   paused_at: string;
   discussion_start_revision: number;
   pending_action: string;
-  /** 是否由 autopilot 暂停触发 */
-  paused_by_autopilot: boolean;
 }
 
 // ========== 回退影响范围 ==========

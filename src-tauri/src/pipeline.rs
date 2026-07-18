@@ -247,49 +247,16 @@ pub(crate) async fn execute_current_subtask(
     }
 
     // Execute the approved prompt
-    // Phase 2: On failure, revert the Executing state back to Pending so
-    // the subtask isn't left in a zombie Executing state.
-    let exec_result = match crate::executor::execute_subtask_inner(
+    let exec_result = crate::executor::execute_subtask_inner(
         &project_path,
         &approved_prompt,
         &subtask_id,
         pipeline_state.clone(),
-    ).await {
-        Err(e) => {
-            let err_msg = match &e {
-                project::SubTaskError::UserPaused => "用户暂停".to_string(),
-                project::SubTaskError::ExecutionFailed { message } => message.clone(),
-                project::SubTaskError::Timeout => "执行超时".to_string(),
-            };
-            // Revert subtask status from Executing back to Pending
-            if let Ok(mut revert_proj) = crate::load_project(&project_name) {
-                if let Some(ms) = revert_proj.milestones.iter_mut().find(|m| m.id == *milestone_id) {
-                    if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == *mid_stage_id) {
-                        if let Some(st) = mid.subtasks.get_mut(next_idx) {
-                            if st.status == project::SubtaskStatus::Executing {
-                                st.status = project::SubtaskStatus::Pending;
-                            }
-                        }
-                    }
-                }
-                revert_proj.execution_session = None;
-                let _ = crate::save_project(&revert_proj);
-            }
-            // Clear pipeline state
-            {
-                let mut guard = pipeline_state.lock().await;
-                *guard = None;
-            }
-            // Write execution history: execution failed
-            write_execution_history(
-                &project_name, "error", project::ExecutionEventType::ExecutorComplete,
-                format!("❌ 执行失败 ({}/{})：{} — {}", next_idx + 1, total, subtask_title, err_msg),
-                Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
-            );
-            return Err(err_msg);
-        }
-        Ok(result) => result,
-    };
+    ).await.map_err(|e| match e {
+        project::SubTaskError::UserPaused => "用户暂停".to_string(),
+        project::SubTaskError::ExecutionFailed { message } => message,
+        project::SubTaskError::Timeout => "执行超时".to_string(),
+    })?;
 
     // Write execution history: executor complete
     write_execution_history(
@@ -1029,7 +996,6 @@ pub(crate) async fn request_in_stop(
         paused_at: now.clone(),
         discussion_start_revision: proj.discussion_revision,
         pending_action: String::new(),
-        paused_by_autopilot: false,
     });
 
     // Write execution history: user requested In Stop
@@ -1088,7 +1054,6 @@ pub(crate) async fn request_ed_stop(
         paused_at: now.clone(),
         discussion_start_revision: proj.discussion_revision,
         pending_action: "ed_stop_requested".to_string(),
-        paused_by_autopilot: false,
     });
 
     proj.workflow_state.pause_reason = project::PauseReason::EDStop;

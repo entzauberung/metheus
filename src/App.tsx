@@ -7,7 +7,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
 import "./App.css";
-import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, AutopilotNextStep } from "./types";
+import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus } from "./types";
 import { ProjectEntry } from "./ProjectEntry";
 import { ExistingBaselinePanel } from "./ExistingBaselinePanel";
 import { PreflightPanel } from "./PreflightPanel";
@@ -18,7 +18,7 @@ import { ActionButton } from "./components/ActionButton";
 import { Modal } from "./components/Modal";
 import { ConsoleStepShell } from "./components/ConsoleStepShell";
 import { WorkflowActionBar } from "./components/WorkflowActionBar";
-import { Bot, Check, GitBranch, ListTodo, Pause, Play, RotateCcw, Search, Square, WandSparkles, X } from "lucide-react";
+import { Check, GitBranch, ListTodo, Pause, Play, RotateCcw, Search, Square, WandSparkles, X } from "lucide-react";
 import ExecutionTree from "./ExecutionTree";
 import ChatRoom from "./ChatRoom";
 import TaskConsole from "./TaskConsole";
@@ -61,9 +61,6 @@ const WORKFLOW_STEPS = new Set<WorkflowStep>([
 // ============================================================
 
 function App() {
-  // Phase 5: startupPhase prevents flashing to entry page during recovery
-  type StartupPhase = "recovering" | "ready";
-  const [startupPhase, setStartupPhase] = useState<StartupPhase>("recovering");
   const [project, setProject] = useState<Project | null>(null);
   const projectRef = useRef<Project | null>(null);
   const [projectPath, setProjectPath] = useState<string>("");
@@ -115,29 +112,6 @@ function App() {
       if (updatedProject.workflow_state.data_revision < current.workflow_state.data_revision) {
         console.warn("拒绝应用较旧的 Project 修订", updatedProject.workflow_state.data_revision);
         return false;
-      }
-
-      // Phase 5: Protect execution session from stale overwrites.
-      // Don't let an older/inactive session overwrite a newer active one.
-      const curSess = current.execution_session;
-      const newSess = updatedProject.execution_session;
-      if (curSess?.active && (!newSess || !newSess.active)) {
-        console.warn("拒绝应用：当前有活跃执行会话，但新数据无活跃会话",
-          { curSubtaskId: curSess.subtask_id, curStatus: curSess.status });
-        return false;
-      }
-
-      // Phase 5: Protect autopilot state from racing backward.
-      // If currently Running and incoming says Paused/ErrorStopped, accept it (backend authority).
-      // If currently ErrorStopped/Paused and incoming says Running, verify the data_revision
-      // actually advanced (the backend intentionally restarted autopilot).
-      const curAp = current.workflow_state.autopilot_state;
-      const newAp = updatedProject.workflow_state.autopilot_state;
-      if (curAp && newAp && curAp.run_status === "Running" && newAp.run_status !== "Running"
-          && updatedProject.workflow_state.data_revision === current.workflow_state.data_revision) {
-        console.warn("暂停应用 autopilot 状态变更：data_revision 未递增",
-          { curStatus: curAp.run_status, newStatus: newAp.run_status });
-        // Accept it anyway — the backend is authoritative. Just log for debugging.
       }
     }
 
@@ -225,15 +199,8 @@ function App() {
       // No active session — clear any stale execution state
       setExecutionStatus(null);
       setIsExecuting(false);
-      // Phase 2: Signal recovery done so autopilot can start
-      startupRecoveryDoneRef.current = true;
       return;
     }
-
-    const markRecoveryDone = () => {
-      startupRecoveryDoneRef.current = true;
-      setRecoveryEpoch((e) => e + 1);
-    };
 
     // Recover based on disk session status
     if (session.status === "executing") {
@@ -275,7 +242,6 @@ function App() {
             setIsExecuting(true);
             // Poll in case backend recovers
           }
-          markRecoveryDone();
         })
         .catch(() => {
           // Can't reach backend — show disk-based state
@@ -296,7 +262,6 @@ function App() {
             log_history: [],
           });
           setIsExecuting(true);
-          markRecoveryDone();
         });
     } else if (session.status === "awaiting_confirmation") {
       // Was waiting for confirmation — restore that state directly
@@ -317,7 +282,6 @@ function App() {
         log_history: [],
       });
       setIsExecuting(false);
-      markRecoveryDone();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.name, project?.execution_session?.active, project?.execution_session?.status, project?.execution_session?.subtask_id]);
@@ -335,50 +299,8 @@ function App() {
   // 停止条件：大阶段边界（MilestoneReview）、出错、暂停
   const autopilotLoopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autopilotActiveRef = useRef(false);
-  const autopilotDrivingRef = useRef(false); // 防重入：true 表示当前正在执行一个循环步
-  const startupRecoveryDoneRef = useRef(false); // Phase 2: 启动恢复完成前不允许 autopilot 启动
-  const lastAutopilotErrorRef = useRef<{ message: string; count: number } | null>(null); // Phase 5: 相同错误连续检测
-  const [recoveryEpoch, setRecoveryEpoch] = useState(0); // Phase 2: 递增以触发 autopilot 重启
-  const [autopilotProgress, setAutopilotProgress] = useState<AutopilotNextStep | null>(null);
-
-  // Phase 7 (2026-07-15): Autopilot sanity check on startup recovery.
-  // If autopilot is Running but Execution is dead (no active session), reset to Paused.
-  // If autopilot target milestone is completed, redirect to next incomplete.
-  useEffect(() => {
-    if (!project || !startupRecoveryDoneRef.current) return;
-    const ap = project.workflow_state.autopilot_state;
-    if (!ap || ap.run_status !== "Running") return;
-
-    const step = project.workflow_state.current_step;
-    const execSession = project.execution_session;
-
-    // Case 1: Autopilot says Running but we're at Execution with no active session
-    if (step === "Execution" && (!execSession || !execSession.active)) {
-      console.warn("[recovery] Autopilot Running but execution is dead — resetting to Paused");
-      invokeWithTimeout<Project>("autopilot_pause", { projectName: project.name })
-        .then((p) => handleChatComplete(p))
-        .catch(() => {});
-      return;
-    }
-
-    // Case 2: Autopilot target milestone is completed — redirect via toggle
-    const targetMsId = project.workflow_state.autopilot_target_milestone_id;
-    if (targetMsId) {
-      const targetMs = project.milestones.find((m) => m.id === targetMsId);
-      if (targetMs && targetMs.status === "Completed") {
-        console.warn("[recovery] Autopilot target milestone completed — re-activating");
-        invokeWithTimeout<Project>("toggle_autopilot", { projectName: project.name, active: false })
-          .then(() => invokeWithTimeout<Project>("toggle_autopilot", { projectName: project.name, active: true }))
-          .then((p) => handleChatComplete(p))
-          .catch(() => {});
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project?.name, recoveryEpoch]);
 
   const runAutopilotCycle = useCallback(async (proj: Project) => {
-    // 防重入：已有循环步在执行中，跳过本次调度
-    if (autopilotDrivingRef.current) return;
     if (!proj.workflow_state.autopilot_active) return;
     if (proj.workflow_state.top_level_phase !== "Console") return;
 
@@ -390,76 +312,42 @@ function App() {
       if (autopilotState.run_status === "ErrorStopped") return;
     }
 
-    autopilotDrivingRef.current = true;
     try {
-      const next = await invokeWithTimeout<AutopilotNextStep>("autopilot_next_step", { projectName: proj.name });
-      setAutopilotProgress(next);
+      const next = await invokeWithTimeout<{
+        command: string;
+        args: Record<string, unknown>;
+        description: string;
+        at_milestone_boundary: boolean;
+        is_error: boolean;
+        error_message: string;
+      }>("autopilot_next_step", { projectName: proj.name });
 
       // Stop conditions
       if (next.at_milestone_boundary) {
+        // Sync project to get updated autopilot state
         const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
         handleChatComplete(latest);
         return;
       }
 
       if (next.is_error) {
+        // Sync and stop
         const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
         handleChatComplete(latest);
         return;
       }
 
       if (!next.command) {
-        // Phase 2: Distinguish "legal no-command" (autopilot paused/stopped by backend)
-        // from "abnormal no-command" (backend returned empty but should be running).
-        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-        const apState = latest.workflow_state.autopilot_state;
-        const isLegalStop = !apState
-          || apState.run_status === "Paused"
-          || apState.run_status === "WaitingMilestoneReview"
-          || apState.run_status === "ErrorStopped";
-
-        if (!isLegalStop && latest.workflow_state.autopilot_active) {
-          // Abnormal: autopilot is active and running but backend gave no command
-          console.warn("[autopilot] Abnormal no-command: autopilot reported Running but returned empty command");
-          try {
-            await invokeWithTimeout<Project>("autopilot_mark_error", {
-              projectName: proj.name,
-              message: "自动驾驶异常：后端未返回下一步命令但状态为运行中",
-            });
-          } catch (_) {}
-        }
-        handleChatComplete(latest);
+        // No action to take — stop
         return;
       }
 
-      // Phase 2: Action completion assertion — after executing a command,
-      // verify the project state actually changed (data_revision should have advanced
-      // or step should have changed).
-      const beforeRevision = proj.workflow_state.data_revision;
-      const beforeStep = proj.workflow_state.current_step;
-
+      // Execute the suggested command
       const updated = await invokeWithTimeout<Project>(next.command, {
         ...next.args,
         projectName: proj.name,
       });
-
-      const applied = handleChatComplete(updated);
-      if (!applied) {
-        // handleChatComplete rejected the result — stop the loop
-        console.warn("[autopilot] handleChatComplete rejected result, stopping loop");
-        return;
-      }
-
-      // Action completion assertion: if the command didn't change data_revision
-      // or step, it may have been silently skipped by the backend
-      const afterStep = updated.workflow_state.current_step;
-      const afterRevision = updated.workflow_state.data_revision;
-      if (beforeRevision === afterRevision && beforeStep === afterStep) {
-        console.warn("[autopilot] Command executed but no state change detected",
-          { command: next.command, beforeStep, afterStep, beforeRevision, afterRevision });
-        // Not necessarily an error — some commands like select_milestone may
-        // not change revision if already selected. But log for debugging.
-      }
+      handleChatComplete(updated);
 
       // Schedule next cycle (1 second delay to let UI update)
       if (autopilotActiveRef.current && updated.workflow_state.autopilot_active) {
@@ -469,52 +357,11 @@ function App() {
       }
     } catch (error) {
       console.warn("[autopilot] Cycle error:", error);
-      const errMsg = error instanceof Error ? error.message : String(error);
-      const errStep = proj.workflow_state.current_step;
-      const errMsId = proj.current_milestone_id || "(none)";
-      const errMidId = proj.current_mid_stage_id || "(none)";
-
-      // Phase 7 (2026-07-15): Error categorization
-      const isRecoverable = errMsg.includes("timeout")
-        || errMsg.includes("fetch failed")
-        || errMsg.includes("network")
-        || errMsg.includes("allowed_file_paths")
-        || errMsg.includes("acceptance_criteria")
-        || errMsg.includes("execution_prompt");
-      const isFatal = errMsg.includes("JSON") && errMsg.includes("parse")
-        || errMsg.includes("corrupt")
-        || errMsg.includes("disk");
-      const category = isFatal ? "[致命]" : isRecoverable ? "[可自动补救]" : "[需人工介入]";
-
-      // Phase 5: same-error guard — keyed on step+message for precise dedup
-      const errKey = `${errStep}:${errMsg}`;
-      const prevErr = lastAutopilotErrorRef.current;
-      if (prevErr && prevErr.message === errKey) {
-        prevErr.count += 1;
-      } else {
-        lastAutopilotErrorRef.current = { message: errKey, count: 1 };
-      }
-      const consecutiveCount = lastAutopilotErrorRef.current?.count ?? 1;
-      const finalMsg = consecutiveCount >= 3
-        ? `${category} [连续失败 ${consecutiveCount} 次] step=${errStep} ms=${errMsId} mid=${errMidId} | ${errMsg}`
-        : `${category} step=${errStep} ms=${errMsId} mid=${errMidId} | ${errMsg}`;
-
+      // Don't crash — sync and stop
       try {
-        await invokeWithTimeout<Project>("autopilot_mark_error", {
-          projectName: proj.name,
-          message: finalMsg,
-        });
         const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
         handleChatComplete(latest);
-      } catch (_) {
-        // Last resort: sync project state
-        try {
-          const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-          handleChatComplete(latest);
-        } catch (__) {}
-      }
-    } finally {
-      autopilotDrivingRef.current = false;
+      } catch (_) {}
     }
   }, []);
 
@@ -541,20 +388,11 @@ function App() {
       if (apState.run_status === "ErrorStopped") return;
     }
 
-    // Phase 2: Defer autopilot start if execution recovery is still pending.
-    // The execution recovery effect (above) will restart autopilot when done.
-    const execSession = project.execution_session;
-    if (execSession?.active && !startupRecoveryDoneRef.current) {
-      console.log("[autopilot] Deferring start: execution recovery pending",
-        { sessionStatus: execSession.status });
-      return;
-    }
-
     // Start the drive loop
     autopilotLoopRef.current = setTimeout(() => {
       runAutopilotCycle(project);
     }, 500);
-  }, [project?.workflow_state?.autopilot_active, project?.workflow_state?.autopilot_state?.run_status, project?.workflow_state?.top_level_phase, recoveryEpoch]);
+  }, [project?.workflow_state?.autopilot_active, project?.workflow_state?.autopilot_state?.run_status, project?.workflow_state?.top_level_phase]);
 
   // === 快照：保存 UI 状态到后端，用于刷新恢复和孤儿进程保护 ===
   const takeSnapshot = () => {
@@ -762,8 +600,7 @@ function App() {
   useEffect(() => {
     const storedName = localStorage.getItem("metheus_last_project");
     if (!storedName) {
-      // 没有存储的项目，直接进入就绪状态（停留在 Before 页面）
-      setStartupPhase("ready");
+      // 没有存储的项目，停留在 Before 页面
       return;
     }
 
@@ -772,7 +609,6 @@ function App() {
         // 检查项目是否有效且处于正确的阶段
         if (!project || !project.name) {
           setProject(null);
-          setStartupPhase("ready");
           return;
         }
 
@@ -818,14 +654,11 @@ function App() {
         if (project) {
           enterDiscussionMode('idle');
         }
-        // Phase 5: Mark startup recovery as complete
-        setStartupPhase("ready");
       })
       .catch((err) => {
         console.error("获取项目失败:", err);
         setProject(null);
         localStorage.removeItem("metheus_last_project");
-        setStartupPhase("ready");
       });
   }, []);
 
@@ -1068,46 +901,6 @@ function App() {
     }
   };
 
-  // === V1 autopilot 暂停恢复 ===
-  const handleResumeAutopilot = async () => {
-    if (!project) return;
-    try {
-      const updated = await invokeWithTimeout<Project>("resume_autopilot", {
-        projectName: project.name,
-      });
-      handleChatComplete(updated);
-      setFeedbackMsg({ type: "info", message: "自动驾驶已恢复，正在继续推进。" });
-    } catch (err) {
-      setFeedbackMsg({ type: "error", message: "恢复自动驾驶失败：" + String(err) });
-    }
-  };
-
-  const handleEnterAutopilotDiscussion = async () => {
-    if (!project) return;
-    try {
-      const updated = await invokeWithTimeout<Project>("enter_autopilot_discussion", {
-        projectName: project.name,
-      });
-      handleChatComplete(updated);
-      setFeedbackMsg({ type: "info", message: "已进入阶段讨论，完成后可恢复自动驾驶。" });
-    } catch (err) {
-      setFeedbackMsg({ type: "error", message: "进入讨论失败：" + String(err) });
-    }
-  };
-
-  const handleExitAutopilotKeepState = async () => {
-    if (!project) return;
-    try {
-      const updated = await invokeWithTimeout<Project>("exit_autopilot_keep_state", {
-        projectName: project.name,
-      });
-      handleChatComplete(updated);
-      setFeedbackMsg({ type: "info", message: "已退出自动驾驶，保留当前阶段进度。" });
-    } catch (err) {
-      setFeedbackMsg({ type: "error", message: "退出自动驾驶失败：" + String(err) });
-    }
-  };
-
   // === V1 回退预览 ===
   const handlePreviewRollback = async (checkpointSubtaskId: string): Promise<RollbackImpact | null> => {
     if (!project) return null;
@@ -1267,22 +1060,6 @@ function App() {
         return "策略产品经理";
     }
   };
-
-  // Phase 5: Show recovery shell during startup to prevent flash to entry page
-  if (startupPhase === "recovering") {
-    return (
-      <div className="startup-recovery-shell" style={{
-        display: "flex", flexDirection: "column", alignItems: "center",
-        justifyContent: "center", height: "100vh", background: "#0d1117", color: "#c9d1d9",
-      }}>
-        <div style={{ fontSize: "24px", marginBottom: "16px" }}>⟳</div>
-        <h2 style={{ margin: 0, fontSize: "18px" }}>Metheus 恢复中</h2>
-        <p style={{ color: "#8b949e", fontSize: "14px", marginTop: "8px" }}>
-          正在加载项目状态与执行上下文...
-        </p>
-      </div>
-    );
-  }
 
   if (!project) {
     return <ProjectEntry onProjectCreated={handleProjectCreated} />;
@@ -1445,48 +1222,6 @@ function App() {
           <div className="execution-layout">
             <FileTree projectPath={projectPath} />
             <div className="execution-main">
-              {/* Phase 3: Autopilot progress bar — visible when autopilot is actively running */}
-              {project.workflow_state.autopilot_active && (
-                <AutopilotProgressBar
-                  progress={autopilotProgress}
-                  project={project}
-                  autopilotState={project.workflow_state.autopilot_state}
-                  onPause={async () => {
-                    try {
-                      const updated = await invokeWithTimeout<Project>("autopilot_pause", { projectName: project.name });
-                      handleChatComplete(updated);
-                      setAutopilotProgress(null);
-                    } catch (err) {
-                      console.warn("暂停自动驾驶失败:", err);
-                    }
-                  }}
-                  onRetry={async () => {
-                    try {
-                      // Re-activate autopilot from ErrorStopped
-                      await invokeWithTimeout<Project>("toggle_autopilot", { projectName: project.name, active: false });
-                      const updated = await invokeWithTimeout<Project>("toggle_autopilot", { projectName: project.name, active: true });
-                      handleChatComplete(updated);
-                      setAutopilotProgress(null);
-                      setFeedbackMsg({ type: "info", message: "已重新激活自动驾驶。" });
-                    } catch (err) { console.warn("重试失败:", err); }
-                  }}
-                  onEnterDiscussion={async () => {
-                    try {
-                      const updated = await invokeWithTimeout<Project>("enter_autopilot_discussion", { projectName: project.name });
-                      handleChatComplete(updated);
-                      setAutopilotProgress(null);
-                    } catch (err) { console.warn("进入讨论失败:", err); }
-                  }}
-                  onExitAutopilot={async () => {
-                    try {
-                      const updated = await invokeWithTimeout<Project>("exit_autopilot_keep_state", { projectName: project.name });
-                      handleChatComplete(updated);
-                      setAutopilotProgress(null);
-                      setFeedbackMsg({ type: "info", message: "已退出自动驾驶。" });
-                    } catch (err) { console.warn("退出失败:", err); }
-                  }}
-                />
-              )}
               {/* V1 Console 规划闭环：大阶段 → 中阶段 → 执行计划 */}
               {(step === "MilestoneGeneration" || step === "MilestoneCheck" ||
                 step === "MilestoneApproval" || step === "MilestoneSelection" ||
@@ -1512,8 +1247,6 @@ function App() {
                     onInStop={handleInStop}
                     onEdStop={handleEdStop}
                     onSyncProject={handleSyncProject}
-                    autopilotRunning={project.workflow_state.autopilot_active === true
-                      && project.workflow_state.autopilot_state?.run_status === "Running"}
                   />
                   <TaskConsole
                     projectPath={projectPath}
@@ -1532,10 +1265,6 @@ function App() {
                   onContinue={() => handleResolvePause("continue")}
                   onAdjustOnly={() => handleResolvePause("adjust")}
                   onRollback={() => handleResolvePause("rollback")}
-                  isAutopilot={project.workflow_state.autopilot_active}
-                  onResumeAutopilot={handleResumeAutopilot}
-                  onEnterAutopilotDiscussion={handleEnterAutopilotDiscussion}
-                  onExitAutopilot={handleExitAutopilotKeepState}
                 />
               )}
               {/* V1 回退预览 */}
@@ -1615,7 +1344,7 @@ function App() {
 // V1 执行面板：单小阶段执行 + 人工确认
 // ============================================================
 function V1ExecutionPanel({
-  project, executionStatus, workspaceStatus, onWorkspaceStatusChange, onExecute, onConfirm, onReject, onInStop, onEdStop, onSyncProject, autopilotRunning,
+  project, executionStatus, workspaceStatus, onWorkspaceStatusChange, onExecute, onConfirm, onReject, onInStop, onEdStop, onSyncProject,
 }: {
   project: Project; executionStatus: PipelineState | null;
   workspaceStatus: ExecutionWorkspaceStatus | null;
@@ -1624,7 +1353,6 @@ function V1ExecutionPanel({
   onReject: (reason: string) => Promise<void>;
   onInStop: () => Promise<void>; onEdStop: () => Promise<void>;
   onSyncProject: () => Promise<void>;
-  autopilotRunning: boolean;
 }) {
   const [rejectReason, setRejectReason] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1685,7 +1413,7 @@ function V1ExecutionPanel({
       {planApproved && !workspaceReady && (
         <div style={{ marginBottom: "20px" }}>
           <ActionButton icon={<GitBranch size={16} />} loading={busy} loadingLabel="准备中"
-            disabled={autopilotRunning} onClick={handlePrepareWorkspace}>准备执行环境</ActionButton>
+            onClick={handlePrepareWorkspace}>准备执行环境</ActionButton>
           <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
             执行小阶段前需要初始化 Git 仓库并创建首次提交。
           </p>
@@ -1717,10 +1445,8 @@ function V1ExecutionPanel({
             </div>
           </div>
           <WorkflowActionBar>
-            <ActionButton icon={<Check size={16} />} loading={busy} loadingLabel="确认中"
-              disabled={autopilotRunning} onClick={handleConfirm}>确认通过</ActionButton>
-            <ActionButton icon={<X size={16} />} variant="danger" disabled={busy || autopilotRunning}
-              onClick={() => setShowReject(true)}>发现问题</ActionButton>
+            <ActionButton icon={<Check size={16} />} loading={busy} loadingLabel="确认中" onClick={handleConfirm}>确认通过</ActionButton>
+            <ActionButton icon={<X size={16} />} variant="danger" disabled={busy} onClick={() => setShowReject(true)}>发现问题</ActionButton>
           </WorkflowActionBar>
           <Modal isOpen={showReject} onClose={() => setShowReject(false)} title="驳回执行结果"
             description="请记录需要修正的问题。" isDanger lockClose={busy} isSubmitting={busy}
@@ -1750,7 +1476,6 @@ function V1ExecutionPanel({
             </div>
           </div>
           <ActionButton icon={<Play size={16} />} loading={busy || isExecuting} loadingLabel={isExecuting ? "执行中" : "启动中"}
-            disabled={busy || autopilotRunning}
             onClick={async () => { setBusy(true); await onExecute(); setBusy(false); }}>执行当前小阶段</ActionButton>
           <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
             一次只执行一个已批准小阶段。执行完成后需要人工确认结果。
@@ -1810,16 +1535,10 @@ function V1ExecutionPanel({
           <ActionButton
             icon={<RotateCcw size={16} />}
             variant="secondary"
-            disabled={autopilotRunning}
             onClick={onSyncProject}
           >
             同步项目状态
           </ActionButton>
-          {autopilotRunning && (
-            <p style={{ color: "#e6a23c", fontSize: "12px", marginTop: "8px" }}>
-              🤖 自动驾驶运行中，手动操作已锁定。请使用上方进度条的暂停按钮。
-            </p>
-          )}
         </div>
       )}
 
@@ -1852,42 +1571,13 @@ function BranchDiscussionPanel({
 }) {
   const scope = project.workflow_state.discussion_scope;
   const isFixPast = scope === "FixPast";
-  const isPauseAdjustment = scope === "PauseAdjustment";
 
   return (
-    <ConsoleStepShell icon={isPauseAdjustment ? <Pause /> : (isFixPast ? <RotateCcw /> : <GitBranch />)}
-      title={isPauseAdjustment ? "暂停调整讨论" : (isFixPast ? "B 分支：修正过去" : "C 分支：调整未来")}
-      description={isPauseAdjustment
-        ? "在阶段中讨论当前问题，讨论完成后可恢复自动驾驶"
-        : (isFixPast ? "分析执行证据并建议稳定回退点" : "保留已完成大阶段并调整后续")}
+    <ConsoleStepShell icon={isFixPast ? <RotateCcw /> : <GitBranch />}
+      title={isFixPast ? "B 分支：修正过去" : "C 分支：调整未来"}
+      description={isFixPast ? "分析执行证据并建议稳定回退点" : "保留已完成大阶段并调整后续"}
       status="pending" statusLabel="讨论中"
-      actions={<WorkflowActionBar>{
-      isPauseAdjustment ? (
-        <>
-          <ActionButton icon={<Bot size={16} />}
-            onClick={async () => {
-              try {
-                const updated = await invokeWithTimeout<Project>("resume_autopilot_after_discussion", {
-                  projectName: project.name,
-                });
-                onChatComplete(updated);
-              } catch (err) { console.error("恢复自动驾驶失败:", err); }
-            }}>
-            恢复自动驾驶
-          </ActionButton>
-          <ActionButton icon={<Square size={16} />} variant="secondary"
-            onClick={async () => {
-              try {
-                const updated = await invokeWithTimeout<Project>("exit_autopilot_keep_state", {
-                  projectName: project.name,
-                });
-                onChatComplete(updated);
-              } catch (err) { console.error("退出自动驾驶失败:", err); }
-            }}>
-            退出自动驾驶改手动
-          </ActionButton>
-        </>
-      ) : isFixPast ? (
+      actions={<WorkflowActionBar>{isFixPast ? (
         <ActionButton icon={<Search size={16} />} variant="danger" onClick={onSuggestRollback}>诊断并建议回退点</ActionButton>
       ) : (
         <ActionButton icon={<WandSparkles size={16} />} onClick={onGenerateFuture}>生成后续大阶段草稿</ActionButton>
@@ -1901,157 +1591,6 @@ function BranchDiscussionPanel({
         onProjectUpdated={onChatComplete}
       />
     </ConsoleStepShell>
-  );
-}
-
-// ============================================================
-// Phase 3: Autopilot progress bar
-// ============================================================
-function AutopilotProgressBar({
-  progress, project, autopilotState, onPause, onRetry, onEnterDiscussion, onExitAutopilot,
-}: {
-  progress: AutopilotNextStep | null;
-  project: Project;
-  autopilotState?: { run_status: string; last_action: string; error_message: string; last_recovery_reason?: string; recovery_count?: number };
-  onPause: () => Promise<void>;
-  onRetry?: () => void;
-  onEnterDiscussion?: () => void;
-  onExitAutopilot?: () => void;
-}) {
-  const [busy, setBusy] = useState(false);
-
-  // Phase 3: Dual-source progress data.
-  // Primary: autopilot_next_step response (real-time, from backend advisor).
-  // Fallback: compute from Project when autopilot_next_step hasn't returned yet
-  // (e.g., first render after activating autopilot, or mid-step execution).
-  const targetMs = project.milestones.find(
-    (m) => m.id === project.workflow_state.autopilot_target_milestone_id
-  );
-  const completedSubs = progress?.completed_subtasks
-    ?? targetMs?.mid_stages.reduce((sum, mid) =>
-      sum + mid.subtasks.filter((st) => st.status === "Passed").length, 0)
-    ?? 0;
-  const totalSubs = progress?.total_subtasks
-    ?? targetMs?.mid_stages.reduce((sum, mid) => sum + mid.subtasks.length, 0)
-    ?? 0;
-  const currentMidIdx = progress?.current_mid_stage_index
-    ?? (targetMs ? (targetMs.mid_stages.findIndex((m) => m.status !== "Completed") + 1) || targetMs.mid_stages.length : 0);
-  const totalMids = progress?.total_mid_stages ?? targetMs?.mid_stages.length ?? 0;
-  const currentAction = progress?.current_action
-    ?? (targetMs ? `大阶段「${targetMs.title}」` : "");
-
-  const pct = totalSubs > 0 ? Math.round((completedSubs / totalSubs) * 100) : 0;
-
-  const statusLabel = autopilotState?.run_status === "ErrorStopped" ? "已停止"
-    : autopilotState?.run_status === "Paused" ? "已暂停"
-    : autopilotState?.run_status === "WaitingMilestoneReview" ? "等待审阅"
-    : "自动驾驶中";
-
-  const isErrorStopped = autopilotState?.run_status === "ErrorStopped";
-  const hasRecovery = !!(autopilotState?.last_recovery_reason);
-
-  return (
-    <div className="autopilot-progress-bar" style={{
-      padding: "12px 24px", background: "linear-gradient(135deg, #1a1e2b 0%, #1f2940 100%)",
-      borderRadius: "10px", marginBottom: "16px", border: "1px solid #2d3a50",
-    }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "8px" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-          <span style={{
-            display: "inline-flex", alignItems: "center", gap: "4px",
-            background: isErrorStopped ? "#cf222e20" : "#0969da20",
-            color: isErrorStopped ? "#f85149" : "#58a6ff",
-            padding: "2px 10px",
-            borderRadius: "12px", fontSize: "12px", fontWeight: 600,
-          }}>
-            🤖 {statusLabel}
-          </span>
-          <span style={{ color: "#8b949e", fontSize: "13px" }}>
-            {progress?.description || currentAction}
-          </span>
-        </div>
-        {!isErrorStopped && (
-          <button
-            className="btn-autopilot-pause"
-            onClick={async () => { setBusy(true); await onPause(); setBusy(false); }}
-            disabled={busy}
-            style={{
-              padding: "4px 14px", fontSize: "12px", borderRadius: "6px",
-              border: "1px solid #e6a23c", background: "#e6a23c20",
-              color: "#e6a23c", cursor: "pointer", fontWeight: 600,
-            }}
-          >
-            {busy ? "暂停中..." : "⏸ 暂停"}
-          </button>
-        )}
-      </div>
-
-      {/* Progress bar */}
-      <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-        <div style={{
-          flex: 1, height: "6px", background: "#2d3a50", borderRadius: "3px", overflow: "hidden",
-        }}>
-          <div style={{
-            width: `${pct}%`, height: "100%",
-            background: isErrorStopped ? "#cf222e" : (pct >= 100 ? "#1a7f37" : "linear-gradient(90deg, #0969da, #58a6ff)"),
-            borderRadius: "3px", transition: "width 0.5s ease",
-          }} />
-        </div>
-        <span style={{ color: "#8b949e", fontSize: "12px", minWidth: "80px", textAlign: "right" }}>
-          {completedSubs}/{totalSubs} 小阶段
-          {totalMids > 0 && ` · 中阶段 ${currentMidIdx}/${totalMids}`}
-        </span>
-        <span style={{ color: isErrorStopped ? "#f85149" : "#58a6ff", fontSize: "12px", fontWeight: 600, minWidth: "36px" }}>
-          {pct}%
-        </span>
-      </div>
-
-      {/* Recovery info (Phase 5: auto-recovery notification) */}
-      {hasRecovery && !isErrorStopped && (
-        <div style={{ marginTop: "8px", padding: "6px 10px", background: "#0969da15", borderRadius: "6px", color: "#58a6ff", fontSize: "12px" }}>
-          🔄 自动驾驶已自动修复一次结构化输出异常，正在继续
-          {autopilotState?.recovery_count ? `（累计补救 ${autopilotState.recovery_count} 次）` : ""}
-        </div>
-      )}
-
-      {/* Error message + actions (Phase 5: ErrorStopped recovery) */}
-      {isErrorStopped && autopilotState?.error_message && (
-        <div style={{ marginTop: "8px" }}>
-          <div style={{ padding: "6px 10px", background: "#cf222e15", borderRadius: "6px", color: "#f85149", fontSize: "12px", marginBottom: "8px" }}>
-            ⚠ {autopilotState.error_message}
-          </div>
-          <div style={{ display: "flex", gap: "8px" }}>
-            {onRetry && (
-              <button onClick={onRetry} style={{
-                padding: "4px 12px", fontSize: "12px", borderRadius: "6px",
-                border: "1px solid #58a6ff", background: "#0969da20",
-                color: "#58a6ff", cursor: "pointer",
-              }}>
-                🔄 重试当前步骤
-              </button>
-            )}
-            {onEnterDiscussion && (
-              <button onClick={onEnterDiscussion} style={{
-                padding: "4px 12px", fontSize: "12px", borderRadius: "6px",
-                border: "1px solid #8b949e", background: "#30363d30",
-                color: "#8b949e", cursor: "pointer",
-              }}>
-                💬 进入阶段讨论
-              </button>
-            )}
-            {onExitAutopilot && (
-              <button onClick={onExitAutopilot} style={{
-                padding: "4px 12px", fontSize: "12px", borderRadius: "6px",
-                border: "1px solid #f85149", background: "#cf222e15",
-                color: "#f85149", cursor: "pointer",
-              }}>
-                ⏹ 退出自动驾驶
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-    </div>
   );
 }
 

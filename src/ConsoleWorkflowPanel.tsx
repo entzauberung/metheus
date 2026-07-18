@@ -232,20 +232,6 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
   }
 
   if (["MidStageGeneration", "MidStageCheck", "MidStageApproval", "MidStageSelection"].includes(step)) {
-    // Phase 4: Determine correct next step for onEnterNextStep.
-    // If plan is approved → go to Execution. Otherwise → PlanGeneration.
-    const mid = project.milestones
-      .find((m) => m.id === project.current_milestone_id)
-      ?.mid_stages.find((m) => m.id === project.current_mid_stage_id);
-    const planApproved = mid?.plan_approved_at != null && (mid?.plan_revision ?? 0) > 0;
-    const hasExecutionRecord = mid?.subtasks?.some(
-      (s) => s.status === "Executing" || s.status === "AwaitingConfirmation" || s.status === "Passed"
-    );
-
-    const handleEnterNextStep = planApproved || hasExecutionRecord
-      ? () => handleTransition("Execution")
-      : () => handleTransition("PlanGeneration");
-
     return <MidStagePlanningStep project={project} busy={busy || autopilotRunning} feedback={feedback}
       regenerationFeedback={regenerationFeedback} setRegenerationFeedback={setRegenerationFeedback}
       regenerationModalOpen={midStageModalOpen} setRegenerationModalOpen={setMidStageModalOpen}
@@ -254,7 +240,6 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
       onApprove={() => runProjectCommand("approve_mid_stage_draft", { projectName: project.name }, "中阶段已批准。")}
       onSelect={(midStageId) => runProjectCommand("select_mid_stage", { projectName: project.name, midStageId }, "已选择中阶段。")}
       onContinue={() => handleTransition("PlanGeneration")} onRegenerate={handleRegenerateMidStage}
-      onEnterNextStep={handleEnterNextStep}
       autopilotActive={autopilotActive}
       autopilotRunning={autopilotRunning}
       onAutopilotPause={handleAutopilotPause} />;

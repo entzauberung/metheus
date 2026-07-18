@@ -205,24 +205,6 @@ pub struct AutopilotState {
     pub last_action_at: String,
     /// 出错时的错误信息
     pub error_message: String,
-    /// 最近一次自动补救原因（空字符串表示无补救）
-    #[serde(default)]
-    pub last_recovery_reason: String,
-    /// 累计自动补救次数
-    #[serde(default)]
-    pub recovery_count: u32,
-    /// 最近一次自动补救时间（ISO 8601）
-    #[serde(default)]
-    pub last_recovery_at: String,
-    /// 暂停时的步骤（用于恢复上下文，空字符串表示未记录）
-    #[serde(default)]
-    pub pause_step: String,
-    /// 暂停时的大阶段 ID（用于恢复上下文）
-    #[serde(default)]
-    pub pause_milestone_id: String,
-    /// 暂停时的中阶段 ID（用于恢复上下文）
-    #[serde(default)]
-    pub pause_mid_stage_id: String,
 }
 
 impl Default for AutopilotState {
@@ -234,12 +216,6 @@ impl Default for AutopilotState {
             last_action: String::new(),
             last_action_at: String::new(),
             error_message: String::new(),
-            last_recovery_reason: String::new(),
-            recovery_count: 0,
-            last_recovery_at: String::new(),
-            pause_step: String::new(),
-            pause_milestone_id: String::new(),
-            pause_mid_stage_id: String::new(),
         }
     }
 }
@@ -707,8 +683,6 @@ pub struct PauseContext {
     pub paused_at: String,
     pub discussion_start_revision: u64,
     pub pending_action: String,       // 待选择动作
-    #[serde(default)]
-    pub paused_by_autopilot: bool,    // 是否由 autopilot 暂停触发
 }
 
 /// 回退影响范围
