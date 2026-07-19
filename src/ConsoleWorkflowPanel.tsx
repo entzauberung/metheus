@@ -17,7 +17,6 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
   const step = project.workflow_state.current_step;
   const [busy, setBusy] = useState(false);
   const [feedback, setFeedback] = useState<ConsoleFeedback | null>(null);
-  const [syncRequired, setSyncRequired] = useState(false);
   const [regenerationFeedback, setRegenerationFeedback] = useState("");
   const [milestoneModalOpen, setMilestoneModalOpen] = useState(false);
   const [midStageModalOpen, setMidStageModalOpen] = useState(false);
@@ -48,10 +47,8 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
     setFeedback({ type: "info", message: "正在同步项目状态..." });
     try {
       await syncProject();
-      setSyncRequired(false);
       setFeedback({ type: "success", message: "项目状态已同步。" });
     } catch (error) {
-      setSyncRequired(true);
       setFeedback({ type: "error", message: "同步失败：" + String(error) });
     } finally {
       setBusy(false);
@@ -119,7 +116,7 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
   const handleGenerateMilestone = async () => {
     if (busy) return;
     const startingRevision = project.workflow_state.data_revision;
-    setBusy(true); setFeedback(null); setSyncRequired(false);
+    setBusy(true); setFeedback(null);
     try {
       const updated = await invokeWithTimeout<Project>("generate_milestone_draft", { projectName: project.name });
       onProjectUpdated(updated);
@@ -130,7 +127,6 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
         const done = await coordinate((latest) => latest.workflow_state.data_revision > startingRevision && latest.workflow_state.current_step === "MilestoneCheck");
         if (done) setFeedback({ type: "success", message: "已同步后端完成的大阶段草稿。" });
         else {
-          setSyncRequired(true);
           setFeedback({ type: "info", message: "后端未完成，请稍后手动同步项目状态。" });
         }
       } else setFeedback({ type: "error", message: "生成失败：" + String(error) });
@@ -155,7 +151,7 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
       if (isInvokeTimeoutError(error)) {
         const done = await coordinate((latest) => latest.workflow_state.data_revision > revision && latest.milestone_draft?.draft_id !== draftId);
         if (done) { setMilestoneModalOpen(false); setFeedback({ type: "success", message: "已同步新大阶段草稿。" }); }
-        else { setSyncRequired(true); setFeedback({ type: "info", message: "后端未完成，请稍后同步项目状态。" }); }
+        else { setFeedback({ type: "info", message: "后端未完成，请稍后同步项目状态。" }); }
       } else setFeedback({ type: "error", message: "重新生成失败：" + String(error) });
     } finally { setBusy(false); }
   };
@@ -244,7 +240,7 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
   ) : null;
 
   if (["MilestoneGeneration", "MilestoneCheck", "MilestoneApproval", "MilestoneSelection", "FuturePlanApproval"].includes(step)) {
-    return <>{managedBanner}<MilestonePlanningStep project={project} busy={busy} feedback={feedback} syncRequired={syncRequired}
+    return <>{managedBanner}<MilestonePlanningStep project={project} busy={busy} feedback={feedback}
       regenerationFeedback={regenerationFeedback} setRegenerationFeedback={setRegenerationFeedback}
       regenerationModalOpen={milestoneModalOpen} setRegenerationModalOpen={setMilestoneModalOpen}
       onGenerate={handleGenerateMilestone}

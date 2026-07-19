@@ -346,9 +346,23 @@ pub(crate) async fn approve_existing_baseline(
         return Err("项目路径为空，无法写入宪法文件。".to_string());
     }
 
+    // 0. 保存回滚副本（若 Project 保存失败则恢复文件系统）
+    let already_path = std::path::Path::new(&project_path).join("ALREADY_CONSTITUTION.md");
+    let constitution_path = std::path::Path::new(&project_path).join("CONSTITUTION.md");
+
+    let already_backup = if already_path.exists() {
+        Some(std::fs::read_to_string(&already_path).unwrap_or_default())
+    } else {
+        None
+    };
+    let constitution_backup = if constitution_path.exists() {
+        Some(std::fs::read_to_string(&constitution_path).unwrap_or_default())
+    } else {
+        None
+    };
+
     // 1. 生成独立的 Already 项目宪法（与工作 CONSTITUTION.md 隔离）
     let already_constitution_content = build_already_constitution(baseline);
-    let already_path = std::path::Path::new(&project_path).join("ALREADY_CONSTITUTION.md");
     std::fs::write(&already_path, &already_constitution_content)
         .map_err(|e| format!("写入 Already 宪法失败：{}", e))?;
 
@@ -374,7 +388,25 @@ pub(crate) async fn approve_existing_baseline(
     project.workflow_state.current_step = project::WorkflowStep::Discussion;
     project.workflow_state.data_revision += 1;
 
-    crate::save_and_reload_project(&project)
+    // 保存 Project，失败时回滚文件系统写入
+    match crate::save_and_reload_project(&project) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            // 回滚 ALREADY_CONSTITUTION.md
+            if let Some(ref backup) = already_backup {
+                let _ = std::fs::write(&already_path, backup);
+            } else {
+                let _ = std::fs::remove_file(&already_path);
+            }
+            // 回滚 CONSTITUTION.md
+            if let Some(ref backup) = constitution_backup {
+                let _ = std::fs::write(&constitution_path, backup);
+            } else {
+                let _ = std::fs::remove_file(&constitution_path);
+            }
+            Err(format!("基线批准失败（文件已回滚）：{}", e))
+        }
+    }
 }
 
 /// 构建独立的 Already 项目宪法（隔离于工作 CONSTITUTION.md）

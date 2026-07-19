@@ -92,8 +92,17 @@ pub(crate) async fn run_preflight_check(
         .map(|t| t.messages.clone())
         .unwrap_or_default();
 
+    // Already 宪法低权重参考（仅 Half Project 且基线已批准时注入）
+    let already_ref = if proj.entry_kind == project::ProjectEntryKind::HalfProject
+        && proj.existing_baseline.as_ref().map(|b| b.approved).unwrap_or(false)
+    {
+        crate::constitution::read_already_constitution_reference(&proj.project_path)
+    } else {
+        String::new()
+    };
+
     let context = format!(
-        "项目名称：{}\n项目来源：{}\n项目路径：{}\n技术栈：{}\n讨论修订号：{}\n\n讨论历史：\n{}\n\n{}",
+        "项目名称：{}\n项目来源：{}\n项目路径：{}\n技术栈：{}\n讨论修订号：{}\n\n讨论历史：\n{}\n\n{}{}",
         proj.name,
         match proj.entry_kind {
             project::ProjectEntryKind::NoProject => "从零开始",
@@ -121,6 +130,11 @@ pub(crate) async fn run_preflight_check(
             )
         } else {
             "无已有项目基线（No Project）".to_string()
+        },
+        if already_ref.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", already_ref)
         }
     );
 

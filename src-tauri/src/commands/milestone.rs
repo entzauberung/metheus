@@ -1358,7 +1358,7 @@ pub(crate) async fn approve_stage_plan(
         return Err("执行计划为空，无法批准。".to_string());
     }
 
-    // Idempotency: if already approved, return current project without changes
+    // Idempotency: if already approved, ensure disk consistency
     if mid.plan_approved_at.is_some() && mid.plan_revision > 0 {
         if proj.workflow_state.current_step == project::WorkflowStep::PlanApproving {
             // Repair stale step: migrate to Execution
@@ -1367,7 +1367,8 @@ pub(crate) async fn approve_stage_plan(
             proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
             return crate::save_and_reload_project(&proj);
         }
-        return Ok(proj);
+        // 非修复路径也统一返回磁盘最终事实，不再返回未保存的内存对象
+        return crate::save_and_reload_project(&proj);
     }
 
     let now = chrono::Utc::now().to_rfc3339();

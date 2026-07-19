@@ -13,7 +13,6 @@ interface Props {
   project: Project;
   busy: boolean;
   feedback: ConsoleFeedback | null;
-  syncRequired: boolean;
   regenerationFeedback: string;
   setRegenerationFeedback: (value: string) => void;
   regenerationModalOpen: boolean;
@@ -68,7 +67,6 @@ export function MilestonePlanningStep(props: Props) {
         feedback={feedback} busy={busy}
         actions={<WorkflowActionBar>
           <ActionButton icon={<WandSparkles size={16} />} loading={busy} loadingLabel="生成中" onClick={props.onGenerate}>生成大阶段草稿</ActionButton>
-          {props.syncRequired && <ActionButton icon={<RefreshCw size={16} />} variant="ghost" onClick={props.onSync}>同步项目状态</ActionButton>}
         </WorkflowActionBar>}>
         <p className="console-step-summary">项目方案已就绪，可以开始编译候选大阶段。</p>
       </ConsoleStepShell>
@@ -85,7 +83,6 @@ export function MilestonePlanningStep(props: Props) {
         actions={<WorkflowActionBar>
           <ActionButton icon={<SearchCheck size={16} />} loading={busy} disabled={candidates.length === 0} onClick={props.onCheck}>运行检查</ActionButton>
           <ActionButton icon={<RefreshCw size={16} />} variant="danger" loading={busy} onClick={() => props.onRegenerate("check_failed")}>重新生成</ActionButton>
-          {props.syncRequired && <ActionButton variant="ghost" onClick={props.onSync}>同步项目状态</ActionButton>}
         </WorkflowActionBar>}>
         {draft?.check_result && <FeedbackBanner type={failed ? "error" : "success"} message={failed ? "检查未通过" : "检查通过"} details={[draft.check_result]} />}
         {candidates.length > 0 ? renderCandidates() : <EmptyState title="草稿数据缺失" message="工作流已进入检查步骤，但候选大阶段为空。" actionLabel="同步项目状态" onAction={props.onSync} />}

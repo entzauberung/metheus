@@ -110,8 +110,18 @@ function App() {
         return false;
       }
       if (updatedProject.workflow_state.data_revision < current.workflow_state.data_revision) {
-        console.warn("拒绝应用较旧的 Project 修订", updatedProject.workflow_state.data_revision);
+        console.warn("拒绝应用较旧的 Project 修订",
+          `incoming=${updatedProject.workflow_state.data_revision} current=${current.workflow_state.data_revision}`);
         return false;
+      }
+      // 同修订但子状态不一致：记录警告但不拒绝（可能只是不同字段的合法更新）
+      if (updatedProject.workflow_state.data_revision === current.workflow_state.data_revision) {
+        if (updatedProject.execution_session?.status !== current.execution_session?.status
+            || updatedProject.workflow_state.autopilot_active !== current.workflow_state.autopilot_active
+            || updatedProject.workflow_state.managed_flow_state?.active !== current.workflow_state.managed_flow_state?.active) {
+          console.warn("同修订子状态变化",
+            { exec: updatedProject.execution_session?.status, ap: updatedProject.workflow_state.autopilot_active, mf: updatedProject.workflow_state.managed_flow_state?.active });
+        }
       }
     }
 
@@ -176,7 +186,6 @@ function App() {
   const [isExecuting, setIsExecuting] = useState(false);
   const [feedbackMsg, setFeedbackMsg] = useState<{ type: "error" | "success" | "warning" | "info"; message: string } | null>(null);
   const [executionStatus, setExecutionStatus] = useState<PipelineState | null>(null);
-  const [_autoAdvance, _setAutoAdvance] = useState(false);
   // === 启动恢复完成标记（防止 UI 在恢复完成前渲染） ===
   const [startupRecoveryDone, setStartupRecoveryDone] = useState(false);
   // === 决策层统一提交锁（同一时间只能执行一个关键动作） ===
@@ -196,6 +205,10 @@ function App() {
   // 解决刷新后执行状态丢失的问题。
   useEffect(() => {
     if (!project) return;
+    // Guard: don't recover execution until startup recovery is complete.
+    // reconcile_on_startup must finish first to clean stale sessions.
+    if (!startupRecoveryDone) return;
+
     const session = project.execution_session;
     if (!session || !session.active) {
       // No active session — clear any stale execution state
@@ -223,67 +236,82 @@ function App() {
               .then((p) => handleChatComplete(p))
               .catch(() => {});
           } else {
-            // Memory state lost but disk says executing.
-            // Show the executing state from disk data so user isn't confused.
+            // Memory state lost. reconcile_on_startup already ran and
+            // should have marked the session as "session_lost".
+            // Reload from disk to get the reconciled state.
+            invokeWithTimeout<Project>("get_project", { projectName: project.name })
+              .then((p) => handleChatComplete(p))
+              .catch(() => {
+                // Last resort: show recovery message from session data
+                setFeedbackMsg({
+                  type: "warning",
+                  message: `执行状态已丢失 (${session.subtask_title})，请手动继续。`,
+                });
+              });
+          }
+        })
+        .catch(() => {
+          // Can't reach backend — reload project from disk
+          invokeWithTimeout<Project>("get_project", { projectName: project.name })
+            .then((p) => handleChatComplete(p))
+            .catch(() => {
+              setFeedbackMsg({
+                type: "warning",
+                message: "无法连接后端，请重启应用。",
+              });
+            });
+        });
+    } else if (session.status === "awaiting_confirmation") {
+      // Try backend memory first — may have richer subtask_statuses/log_history.
+      // Fall back to a minimal display state from session data if backend memory is gone.
+      invokeWithTimeout<PipelineState | null>("get_execution_status")
+        .then((memStatus) => {
+          if (memStatus && memStatus.awaiting_confirmation) {
+            // Backend memory has the full state — use it
+            setExecutionStatus(memStatus);
+          } else {
+            // Backend memory lost. Build minimal display state from disk session.
+            // subtask_statuses/log_history are lost (only in memory), but UI can still
+            // show the confirmation prompt from session data.
             setExecutionStatus({
               mid_stage_id: session.mid_stage_id,
-              status: "Running",
+              status: "Paused",
               current_subtask_index: session.subtask_index,
               total_subtasks: session.total_subtasks,
               subtask_statuses: [],
-              current_log: `▶ 执行中 (${session.subtask_index + 1}/${session.total_subtasks})：${session.subtask_title}`,
+              current_log: `⏳ 待确认 (${session.subtask_index + 1}/${session.total_subtasks})：${session.subtask_title}`,
               last_error: undefined,
               child_pid: undefined,
               project_name: project.name,
               milestone_id: session.milestone_id,
               plan_revision: session.plan_revision,
               current_subtask_id: session.subtask_id,
-              awaiting_confirmation: false,
+              awaiting_confirmation: true,
               log_history: [],
             });
-            setIsExecuting(true);
-            // Poll in case backend recovers
           }
+          setIsExecuting(false);
         })
         .catch(() => {
-          // Can't reach backend — show disk-based state
+          // Can't reach backend — minimal fallback
           setExecutionStatus({
             mid_stage_id: session.mid_stage_id,
-            status: "Running",
+            status: "Paused",
             current_subtask_index: session.subtask_index,
             total_subtasks: session.total_subtasks,
             subtask_statuses: [],
-            current_log: "⏳ 执行状态恢复中…请稍候或刷新页面。",
+            current_log: `⏳ 待确认 (${session.subtask_index + 1}/${session.total_subtasks})：${session.subtask_title}`,
             last_error: undefined,
             child_pid: undefined,
             project_name: project.name,
             milestone_id: session.milestone_id,
             plan_revision: session.plan_revision,
             current_subtask_id: session.subtask_id,
-            awaiting_confirmation: false,
+            awaiting_confirmation: true,
             log_history: [],
           });
-          setIsExecuting(true);
+          setIsExecuting(false);
         });
-    } else if (session.status === "awaiting_confirmation") {
-      // Was waiting for confirmation — restore that state directly
-      setExecutionStatus({
-        mid_stage_id: session.mid_stage_id,
-        status: "Paused",
-        current_subtask_index: session.subtask_index,
-        total_subtasks: session.total_subtasks,
-        subtask_statuses: [],
-        current_log: `⏳ 待确认 (${session.subtask_index + 1}/${session.total_subtasks})：${session.subtask_title}`,
-        last_error: undefined,
-        child_pid: undefined,
-        project_name: project.name,
-        milestone_id: session.milestone_id,
-        plan_revision: session.plan_revision,
-        current_subtask_id: session.subtask_id,
-        awaiting_confirmation: true,
-        log_history: [],
-      });
-      setIsExecuting(false);
     } else if (session.status === "session_lost") {
       // Previous execution was interrupted (process died).
       // Load fresh project from disk — the backend reconciled the state.
@@ -296,7 +324,7 @@ function App() {
       });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project?.name, project?.execution_session?.active, project?.execution_session?.status, project?.execution_session?.subtask_id]);
+  }, [project?.name, project?.execution_session?.active, project?.execution_session?.status, project?.execution_session?.subtask_id, startupRecoveryDone]);
 
   // Fetch workspace status when entering Execution
   useEffect(() => {
@@ -389,7 +417,7 @@ function App() {
     if (!managedActiveRef.current) return;
     const mf = proj.workflow_state.managed_flow_state;
     if (!mf || !mf.active) return;
-    if (mf.run_status === "Paused" || mf.run_status === "ErrorStopped") return;
+    if (mf.run_status === "Paused" || mf.run_status === "ErrorStopped" || mf.run_status === "WaitingHuman") return;
 
     try {
       const next = await invokeWithTimeout<{
@@ -427,23 +455,18 @@ function App() {
       }
 
       if (next.needs_human) {
+        // Transition managed flow to WaitingHuman — stop the loop, wait for user to resolve.
+        // User can resume via the "恢复托管" button which calls resume_managed_flow.
+        try {
+          await invokeWithTimeout<Project>("pause_managed_flow", { projectName: proj.name });
+        } catch { /* best effort */ }
         setFeedbackMsg({
           type: "info",
           message: `托管暂停：${next.description}`,
         });
-        // Sync and wait for human intervention
+        // Sync project to reflect the paused state
         const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
         handleChatComplete(latest);
-        // Don't fully stop — schedule a retry in 5s in case user resolves the block
-        if (managedActiveRef.current) {
-          managedLoopRef.current = setTimeout(() => {
-            invokeWithTimeout<Project>("get_project", { projectName: proj.name })
-              .then(latest => {
-                if (managedActiveRef.current) runManagedCycle(latest);
-              })
-              .catch(() => {});
-          }, 5000);
-        }
         return;
       }
 
@@ -773,18 +796,45 @@ function App() {
         }
 
         setProject(project);
-        // 检查是否需要迁移旧项目（workflow_state 仍为 WaitingEntry/Before）
+
+        // Build a sequential chain: migrate (if needed) → reconcile → snapshot
+        let chain: Promise<any> = Promise.resolve(project);
+
         const needsMigration = project.workflow_state.current_step === "WaitingEntry"
           && project.workflow_state.top_level_phase === "Before";
         if (needsMigration) {
-          invokeWithTimeout<Project>("migrate_project_workflow", {
-            projectName: project.name,
-          }).then((migrated) => {
-            handleChatComplete(migrated);
-          }).catch((err) => {
-            console.error("迁移旧项目工作流失败:", err);
-          });
+          chain = chain.then((p: Project) =>
+            invokeWithTimeout<Project>("migrate_project_workflow", {
+              projectName: p.name,
+            }).then((migrated) => {
+              handleChatComplete(migrated);
+              return migrated;
+            }).catch((err) => {
+              console.error("迁移旧项目工作流失败:", err);
+              return p;
+            })
+          );
         }
+
+        // 启动时对账执行状态：清理 stale session、修复工作流状态
+        chain = chain.then((p: Project) =>
+          invokeWithTimeout<Project>("reconcile_on_startup", {
+            projectName: p.name,
+          }).then((reconciled) => {
+            handleChatComplete(reconciled);
+            return reconciled;
+          }).catch((err) => {
+            console.error("启动执行状态对账失败:", err);
+            return p;
+          })
+        );
+
+        return chain;
+      })
+      .then((project: Project | null) => {
+        // null means the previous .then() bailed out — don't continue
+        if (project === null) return null;
+
         // 重建已发送总结的大阶段 Set
         if (project?.discussion_threads?.[0]?.messages) {
           const summaryIds = new Set<string>();

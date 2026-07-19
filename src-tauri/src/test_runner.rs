@@ -1,21 +1,54 @@
 use crate::project;
+use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
-pub(crate) fn detect_changes(before: &[String], after: &[String], project_path: &str) -> Vec<String> {
-    let mut changes = Vec::new();
+pub(crate) type FileSnapshot = BTreeMap<String, u64>;
 
-    // 检测新增文件（after 中有，before 中没有）
-    for file in after {
-        if !before.contains(file) {
-            // 转换为相对路径
-            if let Ok(relative) = std::path::Path::new(file).strip_prefix(project_path) {
-                changes.push(relative.to_string_lossy().to_string());
-            } else {
-                changes.push(file.clone());
-            }
-        }
+fn display_path(path: &str, project_path: &str) -> String {
+    std::path::Path::new(path)
+        .strip_prefix(project_path)
+        .map(|relative| relative.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Compare content fingerprints so additions, modifications, and deletions are all visible.
+pub(crate) fn detect_changes(
+    before: &FileSnapshot,
+    after: &FileSnapshot,
+    project_path: &str,
+) -> Vec<String> {
+    before
+        .keys()
+        .chain(after.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| before.get(*path) != after.get(*path))
+        .map(|path| display_path(path, project_path))
+        .collect()
+}
+
+#[cfg(test)]
+mod change_detection_tests {
+    use super::{detect_changes, FileSnapshot};
+
+    #[test]
+    fn detects_added_modified_and_deleted_files() {
+        let before = FileSnapshot::from([
+            ("/project/deleted.rs".to_string(), 1),
+            ("/project/modified.rs".to_string(), 2),
+            ("/project/unchanged.rs".to_string(), 3),
+        ]);
+        let after = FileSnapshot::from([
+            ("/project/added.rs".to_string(), 4),
+            ("/project/modified.rs".to_string(), 5),
+            ("/project/unchanged.rs".to_string(), 3),
+        ]);
+
+        assert_eq!(
+            detect_changes(&before, &after, "/project"),
+            vec!["added.rs", "deleted.rs", "modified.rs"]
+        );
     }
-
-    changes
 }
 /// 调用方（如 check_subtask）
 ///    ↓
@@ -54,6 +87,20 @@ pub(crate) fn get_tracked_files(project_path: &str) -> Vec<String> {
     files.sort();
     files
 }
+
+pub(crate) fn get_file_snapshot(project_path: &str) -> FileSnapshot {
+    get_tracked_files(project_path)
+        .into_iter()
+        .map(|path| {
+            let mut hasher = DefaultHasher::new();
+            match std::fs::read(&path) {
+                Ok(content) => content.hash(&mut hasher),
+                Err(error) => error.kind().hash(&mut hasher),
+            }
+            (path, hasher.finish())
+        })
+        .collect()
+}
 /// 执行测试命令，带超时控制（spawn + try_wait 轮询）
 /// 返回: (exit_code, stdout, stderr)
 /// 测试辅助函数
@@ -72,6 +119,28 @@ pub(crate) fn run_test_command(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("无法启动进程 '{}': {}", cmd, e))?;
+
+    // Read both pipes concurrently; otherwise a full pipe can block the child before it exits.
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "无法捕获测试进程 stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "无法捕获测试进程 stderr".to_string())?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut reader = stdout;
+        let _ = reader.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut reader = stderr;
+        let _ = reader.read_to_end(&mut bytes);
+        bytes
+    });
     // 记录开始时间
     let start = std::time::Instant::now();
     // 进入循环
@@ -80,22 +149,25 @@ pub(crate) fn run_test_command(
         match child.try_wait() {
             // 如果已结束（Ok(Some(status))）：读取 stdout/stderr 剩余内容，返回 (exit_code, stdout, stderr)
             Ok(Some(status)) => {
-                let mut out_str = String::new();
-                let mut err_str = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    out.read_to_string(&mut out_str).ok();
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    err.read_to_string(&mut err_str).ok();
-                }
-                let code = status.code().unwrap_or(-1);
-                return Ok((code, out_str, err_str));
+                let stdout = stdout_reader
+                    .join()
+                    .map_err(|_| "读取测试进程 stdout 的线程异常".to_string())?;
+                let stderr = stderr_reader
+                    .join()
+                    .map_err(|_| "读取测试进程 stderr 的线程异常".to_string())?;
+                return Ok((
+                    status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&stdout).into_owned(),
+                    String::from_utf8_lossy(&stderr).into_owned(),
+                ));
             }
             // 如果还在运行（Ok(None)）：检查是否超时，若超时则 child.kill() 并返回错误；否则休眠 500 毫秒后继续轮询
             Ok(None) => {
                 if start.elapsed() > std::time::Duration::from_secs(timeout_secs) {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
                     return Err(format!("测试超时（超过 {} 秒），已强制终止", timeout_secs));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
@@ -103,6 +175,9 @@ pub(crate) fn run_test_command(
             // 出错（Err(e)）：终止进程并返回错误
             Err(e) => {
                 let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 return Err(format!("进程异常: {}", e));
             }
         }

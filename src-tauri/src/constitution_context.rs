@@ -7,9 +7,13 @@ use crate::project;
 /// 1. 工作宪法摘要（从 CONSTITUTION.md 提取，权重最高）
 /// 2. 已批准方案（version_plan，权重高）
 /// 3. 当前讨论摘要（最后 5 条消息）
-/// 4. Already 宪法摘要（从 ALREADY_CONSTITUTION.md 提取，低权重）
+/// 4. 项目来源与基线信息（Half Project / NoProject）
+/// 5. Already 宪法摘要（从 ALREADY_CONSTITUTION.md 提取，低权重）
 ///
 /// 总长度限制为 ~3000 字符，多字节安全截断。
+///
+/// 此函数是聊天和生成上下文的统一来源。
+/// chat_with_role 也复用此函数获取项目级事实，再追加完整消息历史。
 pub(crate) fn build_context_injection(proj: &project::Project) -> String {
     let mut parts: Vec<String> = Vec::new();
     let max_len: usize = 3000;
@@ -61,7 +65,64 @@ pub(crate) fn build_context_injection(proj: &project::Project) -> String {
         }
     }
 
-    // 4. Already 宪法摘要（最低权重）
+    // 4. 项目来源与基线信息（统一聊天与生成的事实来源）
+    parts.push(format!(
+        "## 项目来源\n{}",
+        match proj.entry_kind {
+            project::ProjectEntryKind::NoProject => "从零开始新项目",
+            project::ProjectEntryKind::HalfProject => "改造已有项目（Half Project）",
+        }
+    ));
+
+    if let Some(ref baseline) = proj.existing_baseline {
+        if baseline.approved {
+            // 基线已批准 — 注入完整基线信息
+            if !baseline.tech_stack.is_empty() {
+                parts.push(format!("## 已有项目技术栈\n{}", baseline.tech_stack));
+            }
+            if !baseline.completed_capabilities.is_empty() {
+                parts.push(format!(
+                    "## 已完成能力\n{}",
+                    baseline.completed_capabilities.join(", ")
+                ));
+            }
+            if !baseline.pending_capabilities.is_empty() {
+                parts.push(format!(
+                    "## 待完成能力\n{}",
+                    baseline.pending_capabilities.join(", ")
+                ));
+            }
+            if !baseline.risks.is_empty() {
+                parts.push(format!(
+                    "## 已知风险\n{}",
+                    baseline.risks.join(", ")
+                ));
+            }
+        } else {
+            // 基线存在但尚未批准 — 防御性输出
+            parts.push(format!(
+                "## 项目路径\n{}",
+                proj.project_path
+            ));
+            parts.push(
+                "## 注意\n已有项目基线尚未批准，请先完成基线分析。当前仅能依赖项目路径和讨论内容。"
+                    .to_string(),
+            );
+        }
+    } else if proj.entry_kind == project::ProjectEntryKind::HalfProject {
+        // Half Project 但基线尚未生成 — 防御性输出
+        parts.push(format!(
+            "## 项目路径\n{}",
+            proj.project_path
+        ));
+        parts.push(
+            "## 注意\n这是已有项目模式（Half Project），但项目分析尚未完成。\n\
+             当前只能依赖已有路径和当前讨论。后续基线分析完成后会补充完整信息。"
+                .to_string(),
+        );
+    }
+
+    // 5. Already 宪法摘要（最低权重）
     if let Some(ref baseline) = proj.existing_baseline {
         if !baseline.already_constitution_summary.is_empty() {
             parts.push(format!(
@@ -71,8 +132,17 @@ pub(crate) fn build_context_injection(proj: &project::Project) -> String {
                 baseline.already_constitution_summary
             ));
         }
-        if !baseline.tech_stack.is_empty() {
-            parts.push(format!("## 已有项目技术栈\n{}", baseline.tech_stack));
+    }
+
+    // 6. Already 宪法全文参考（最低权重，从磁盘文件读取）
+    if let Some(ref baseline) = proj.existing_baseline {
+        if baseline.approved && !proj.project_path.is_empty() {
+            let already_ref = crate::constitution::read_already_constitution_reference(&proj.project_path);
+            if !already_ref.is_empty() {
+                // Take a shorter excerpt since this is lower priority
+                let shortened: String = already_ref.chars().take(800).collect();
+                parts.push(shortened);
+            }
         }
     }
 

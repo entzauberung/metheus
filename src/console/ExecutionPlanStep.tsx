@@ -89,7 +89,7 @@ export function ExecutionPlanStep(props: Props) {
     status={isApproved ? "success" : "pending"} statusLabel={isApproved ? "已批准" : "待批准"}
     feedback={props.feedback} busy={props.busy}
     actions={needsSyncToExecution ? (<WorkflowActionBar>
-      <ActionButton icon={<ArrowRight size={16} />} onClick={props.onApprove}>同步进入执行</ActionButton>
+      <ActionButton icon={<ArrowRight size={16} />} onClick={props.onApprove}>进入执行</ActionButton>
     </WorkflowActionBar>) : (isApproved || autopilotRunning) ? undefined : (<WorkflowActionBar>
       <ActionButton icon={<BadgeCheck size={16} />} loading={props.busy} onClick={props.onApprove}>批准执行计划</ActionButton>
       <ActionButton icon={<RefreshCw size={16} />} variant="danger" onClick={() => props.setRegenerationModalOpen(true)}>驳回并重新生成</ActionButton>

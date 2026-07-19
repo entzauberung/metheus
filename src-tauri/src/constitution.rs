@@ -823,7 +823,9 @@ pub(crate) fn write_constitution_part2(
 
 /// 读取 Already 项目宪法作为低权重背景参考
 /// 返回格式化的参考文本，或空字符串（如果 Already 宪法不存在）
-#[allow(dead_code)]
+///
+/// 用于 AI 生成提示词注入（方案/大阶段/中阶段/执行计划/检查/聊天），
+/// 权重低于工作宪法和当前讨论。
 pub(crate) fn read_already_constitution_reference(project_path: &str) -> String {
     use std::path::Path;
     let already_path = Path::new(project_path).join("ALREADY_CONSTITUTION.md");

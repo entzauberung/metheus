@@ -92,7 +92,7 @@ pub(crate) async fn chat_with_role(
         }
     }
 
-    // 5. Build AI context from thread history + project facts
+    // 5. Build AI context: 统一上下文注入链 + 聊天元数据 + 完整消息历史
     let thread = &proj.discussion_threads[thread_idx];
     let recent_messages: Vec<&project::Message> = thread.messages
         .iter()
@@ -106,49 +106,21 @@ pub(crate) async fn chat_with_role(
     let context = {
         let mut c = String::new();
 
-        // Project context
+        // 聊天元数据（轻量，仅标识当前会话位置）
         c.push_str(&format!("[项目: {}]\n", proj.name));
-        c.push_str(&format!("[来源: {}]\n",
-            match proj.entry_kind {
-                project::ProjectEntryKind::NoProject => "从零开始",
-                project::ProjectEntryKind::HalfProject => "改造已有项目",
-            }
-        ));
         c.push_str(&format!("[工作流步骤: {:?}]\n", proj.workflow_state.current_step));
         c.push_str(&format!("[讨论范围: {:?}]\n", proj.workflow_state.discussion_scope));
 
-        // Existing baseline summary (Half Project mode)
-        if let Some(ref baseline) = proj.existing_baseline {
-            if baseline.approved {
-                c.push_str(&format!("[已有项目技术栈: {}]\n", baseline.tech_stack));
-                if !baseline.completed_capabilities.is_empty() {
-                    c.push_str(&format!("[已完成能力: {}]\n", baseline.completed_capabilities.join(", ")));
-                }
-                if !baseline.pending_capabilities.is_empty() {
-                    c.push_str(&format!("[待完成能力: {}]\n", baseline.pending_capabilities.join(", ")));
-                }
-                if !baseline.risks.is_empty() {
-                    c.push_str(&format!("[已知风险: {}]\n", baseline.risks.join(", ")));
-                }
-                // Already 宪法摘要（低权重背景）
-                if !baseline.already_constitution_summary.is_empty() {
-                    c.push_str(&format!(
-                        "[低权重背景-Already宪法摘要: {}]\n",
-                        baseline.already_constitution_summary.chars().take(500).collect::<String>()
-                    ));
-                }
-            } else {
-                // 基线存在但尚未批准 — 注入项目路径和提示
-                c.push_str(&format!("[项目路径: {}]\n", proj.project_path));
-                c.push_str("[注意: 基线尚未批准，请先分析已有项目。]\n");
-            }
-        } else if proj.entry_kind == project::ProjectEntryKind::HalfProject {
-            // 基线尚未生成 — 防御性输出
-            c.push_str(&format!("[项目路径: {}]\n", proj.project_path));
-            c.push_str("[注意: 已有项目尚未分析，请等待基线分析完成。]\n");
+        // 统一上下文注入链：项目事实（宪法、基线、方案、讨论摘要等）
+        // 与 milestone / mid-stage / plan 生成共用同一来源
+        let injection = crate::constitution_context::build_context_injection(&proj);
+        if !injection.is_empty() {
+            c.push_str(&injection);
+            c.push('\n');
         }
 
-        // Discussion history
+        // 完整讨论历史（覆盖 build_context_injection 中的摘要版本）
+        c.push_str("## 讨论历史\n");
         for msg in &recent_messages {
             let display_role = if msg.role == "user" { "用户" } else { &msg.role };
             c.push_str(&format!("{}: {}\n", display_role, msg.content));

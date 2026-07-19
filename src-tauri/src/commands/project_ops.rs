@@ -141,8 +141,9 @@ pub(crate) async fn initialize_project_entry(
     // === 先检查同名项目是否已存在（冲突检测在目录操作之前） ===
     let project_data_path = crate::project_data_path(&project_name)?;
     if project_data_path.exists() {
-        if let Ok(mut existing) = crate::load_project(&project_name) {
-            if existing.project_path == project_path && !existing.project_path.is_empty() {
+        match crate::load_project(&project_name) {
+            Ok(mut existing) => {
+                if existing.project_path == project_path && !existing.project_path.is_empty() {
                 // Same name + same path — check for stale execution session
                 let had_stale_session = clean_stale_execution_session(&mut existing);
 
@@ -170,6 +171,17 @@ pub(crate) async fn initialize_project_entry(
                     "项目名称「{}」已被使用（路径：{}），请修改项目名称",
                     project_name, existing.project_path
                 ));
+            }
+            }
+            Err(e) => {
+                // 项目数据文件存在但无法解析（损坏或空文件）
+                // 删除损坏的数据文件，允许从头创建
+                let _ = std::fs::remove_file(&project_data_path);
+                eprintln!(
+                    "项目数据文件损坏，已删除并重新创建：{}（{}）",
+                    project_data_path.display(),
+                    e
+                );
             }
         }
     }
@@ -236,15 +248,44 @@ pub(crate) async fn initialize_project_entry(
 /// 3.3 执行引擎流水线
 /// 根据传入的中阶段信息和子任务列表，启动一个后台任务，逐个执行这些子任务，并实时更新执行状态（运行中、成功、失败等）
 /// 启动后台流水线执行一组子任务，立即返回成功，执行进度保存在全局状态中，前端可查询。
+/// 前端全量持久化（仅用于兼容旧路径，关键业务变更必须调用对应业务接口）
+/// 返回值改为完整 Project，确保前端拿到磁盘最终事实。
+/// 增加基础校验：名称和路径必须与磁盘一致，revision 不得低于磁盘值。
 #[tauri::command]
 #[allow(dead_code)]
-pub(crate) async fn persist_project(project_json: String) -> Result<String, String> {
-    //前端发来的 JSON 字符串转成 Project 对象
-    let project: project::Project =
+pub(crate) async fn persist_project(project_json: String) -> Result<project::Project, String> {
+    let incoming: project::Project =
         serde_json::from_str(&project_json).map_err(|e| format!("解析项目失败：{}", e))?;
-    //使用 save_and_reload 确保前后端状态一致
-    crate::save_and_reload_project(&project)?;
-    Ok("保存成功".to_string())
+
+    // 基础校验：名称非空
+    if incoming.name.is_empty() {
+        return Err("项目名称不能为空".to_string());
+    }
+
+    // 从磁盘加载当前事实进行校验
+    let disk = crate::load_project(&incoming.name)?;
+
+    // 路径不可变更
+    if incoming.project_path != disk.project_path {
+        return Err("不允许通过 persist_project 修改项目路径".to_string());
+    }
+
+    // 入口类型不可变更
+    if incoming.entry_kind != disk.entry_kind {
+        return Err("不允许通过 persist_project 修改项目入口类型".to_string());
+    }
+
+    // 修订防护：不允许用旧版本覆盖新版本
+    if incoming.workflow_state.data_revision < disk.workflow_state.data_revision {
+        return Err(format!(
+            "修订冲突：传入修订 {} 低于磁盘修订 {}，拒绝覆盖",
+            incoming.workflow_state.data_revision,
+            disk.workflow_state.data_revision
+        ));
+    }
+
+    // 使用 save_and_reload 确保前后端状态一致，返回磁盘最终事实
+    crate::save_and_reload_project(&incoming)
 }
 
 /// 审批命令

@@ -84,7 +84,8 @@ fn append_log(state: &mut PipelineState, level: &str, text: String) {
     state.current_log = text;
 }
 
-/// 写入持久化执行历史到 Project 磁盘文件
+/// 写入持久化执行历史到 Project 磁盘文件。
+/// 返回 Result 确保写入失败能被上层感知和处理。
 fn write_execution_history(
     project_name: &str,
     level: &str,
@@ -93,25 +94,24 @@ fn write_execution_history(
     milestone_id: Option<&str>,
     mid_stage_id: Option<&str>,
     subtask_id: Option<&str>,
-) {
-    if let Ok(mut proj) = crate::load_project(project_name) {
-        let entry = project::ExecutionHistoryEntry {
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            level: level.to_string(),
-            event_type,
-            text,
-            milestone_id: milestone_id.map(|s| s.to_string()),
-            mid_stage_id: mid_stage_id.map(|s| s.to_string()),
-            subtask_id: subtask_id.map(|s| s.to_string()),
-        };
-        proj.execution_history.push(entry);
-        // 限制历史上限
-        if proj.execution_history.len() > project::MAX_EXECUTION_HISTORY {
-            let excess = proj.execution_history.len() - project::MAX_EXECUTION_HISTORY;
-            proj.execution_history.drain(0..excess);
-        }
-        let _ = crate::save_project(&proj);
+) -> Result<(), String> {
+    let mut proj = crate::load_project(project_name)?;
+    let entry = project::ExecutionHistoryEntry {
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        level: level.to_string(),
+        event_type,
+        text,
+        milestone_id: milestone_id.map(|s| s.to_string()),
+        mid_stage_id: mid_stage_id.map(|s| s.to_string()),
+        subtask_id: subtask_id.map(|s| s.to_string()),
+    };
+    proj.execution_history.push(entry);
+    // 限制历史上限
+    if proj.execution_history.len() > project::MAX_EXECUTION_HISTORY {
+        let excess = proj.execution_history.len() - project::MAX_EXECUTION_HISTORY;
+        proj.execution_history.drain(0..excess);
     }
+    crate::save_project(&proj)
 }
 
 
@@ -128,7 +128,31 @@ pub(crate) async fn get_execution_status(
 // V1 人工执行命令：单小阶段执行 → 人工确认
 // ===================================================================
 
-/// V1 执行当前小阶段（从磁盘读取已批准计划，一次只执行一个）
+/// V1 执行当前小阶段（从磁盘读取已批准计划，一次只执行一个）。
+///
+/// # 返回值说明
+///
+/// 本命令是唯一修改 `Project` 但返回 `PipelineState` 而非 `Project` 的命令。
+/// 原因：
+///
+/// 1. **两阶段保存模式**：执行过程分为两个持久化点：
+///    - 阶段一（执行前）：保存 `SubtaskStatus::Executing` + `execution_session(status="executing")`
+///    - 阶段二（执行后）：保存 `SubtaskStatus::AwaitingConfirmation` + `execution_session(status="awaiting_confirmation")`
+///    两次保存之间执行器在运行，不适合每次都做 save+reload 往返。
+///
+/// 2. **前端需要实时状态流**：前端执行面板依赖 `PipelineState` 中的
+///    `subtask_statuses`、`current_log`、`awaiting_confirmation` 等实时字段
+///    来渲染进度条和日志流。`Project` 不包含这些运行时字段。
+///
+/// 3. **Project 同步由前端轮询完成**：前端执行轮询（`get_execution_status`）
+///    在检测到 `Completed`/`AwaitingConfirmation` 时调用 `get_project` 从磁盘
+///    刷新完整 `Project`，保持业务状态同步。
+///
+/// # 前端契约
+///
+/// - 调用方应立即使用返回的 `PipelineState` 更新 `executionStatus`
+/// - 调用方应启动执行轮询（`isExecuting = true`）持续获取最新状态
+/// - 轮询检测到终态后应调用 `get_project` 刷新完整 Project
 #[tauri::command]
 pub(crate) async fn execute_current_subtask(
     state: tauri::State<'_, AppState>,
@@ -179,7 +203,7 @@ pub(crate) async fn execute_current_subtask(
         &project_name, "info", project::ExecutionEventType::UserExecute,
         format!("👆 用户点击执行 ({}/{})：{}", next_idx + 1, total, subtask_title),
         Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
-    );
+    )?;
 
     // === 阶段一关键修复：执行前先持久化 "Executing" 到磁盘 ===
     // 这样刷新后前端能从磁盘 Project 中知道当前正在执行，
@@ -212,7 +236,7 @@ pub(crate) async fn execute_current_subtask(
         &project_name, "info", project::ExecutionEventType::SubtaskExecuting,
         format!("▶ 开始执行 ({}/{})：{}", next_idx + 1, total, subtask_title),
         Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
-    );
+    )?;
 
     // Initialize pipeline state (V1: single subtask context)
     let pipeline_state = state.pipeline_state.clone();
@@ -263,7 +287,7 @@ pub(crate) async fn execute_current_subtask(
         &project_name, "info", project::ExecutionEventType::ExecutorComplete,
         format!("✅ 执行完成 ({}/{})：{}", next_idx + 1, total, subtask_title),
         Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
-    );
+    )?;
 
     // Run test
     let test = crate::test_runner::check_subtask(
@@ -290,7 +314,7 @@ pub(crate) async fn execute_current_subtask(
             format!("🔍 测试未通过 ({}/{})：{} — {}", next_idx + 1, total, subtask_title, test.suggestion)
         },
         Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
-    );
+    )?;
 
     // Write results back to disk (with execution session update)
     let mut proj = crate::load_project(&project_name)?;
@@ -323,7 +347,7 @@ pub(crate) async fn execute_current_subtask(
         &project_name, "info", project::ExecutionEventType::AwaitingConfirmation,
         format!("⏳ 待确认 ({}/{})：{}", next_idx + 1, total, subtask_title),
         Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
-    );
+    )?;
 
     // Update pipeline state to awaiting confirmation
     let result_state;
@@ -456,7 +480,7 @@ pub(crate) async fn confirm_subtask_result(
             &project_name, "success", project::ExecutionEventType::MidStageComplete,
             format!("✅ 中阶段完成：{} (v{})", mid.title, mid.version),
             Some(&milestone_id), Some(&mid_stage_id), None,
-        );
+        )?;
 
         // 使用预先收集的状态：当前大阶段其他中阶段是否均已完成
         let all_mid_stages_done = other_mid_stages_all_completed;
@@ -479,7 +503,7 @@ pub(crate) async fn confirm_subtask_result(
                 &project_name, "success", project::ExecutionEventType::AdvanceMilestoneReview,
                 format!("📋 推进到大阶段审阅：{}", ms.title),
                 Some(&milestone_id), None, None,
-            );
+            )?;
         } else {
             // 大阶段仍有未完成中阶段 → 进入中阶段选择
             proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
@@ -488,7 +512,7 @@ pub(crate) async fn confirm_subtask_result(
                 &project_name, "success", project::ExecutionEventType::AdvanceNextMidStage,
                 "➡ 推进到下一中阶段选择".to_string(),
                 Some(&milestone_id), None, None,
-            );
+            )?;
         }
 
         proj.workflow_state.data_revision += 1;
@@ -543,7 +567,7 @@ pub(crate) async fn confirm_subtask_result(
         &project_name, "success", project::ExecutionEventType::UserConfirm,
         format!("✅ 用户确认通过：{}", subtask_title),
         Some(&milestone_id), Some(&mid_stage_id), Some(&subtask_id),
-    );
+    )?;
 
     // Clear execution session before saving (小阶段已确认)
     proj.execution_session = None;
@@ -621,7 +645,7 @@ pub(crate) async fn reject_subtask_result(
         &project_name, "error", project::ExecutionEventType::UserReject,
         format!("❌ 用户驳回：{} — {}", subtask_title, reason),
         Some(milestone_id), Some(mid_stage_id), Some(&subtask_id),
-    );
+    )?;
 
     // Clear execution session
     proj.execution_session = None;
@@ -771,7 +795,7 @@ pub(crate) async fn prepare_execution_workspace(
         &project_name, "info", project::ExecutionEventType::WorkspacePrepare,
         "🔧 用户点击准备执行环境".to_string(),
         None, None, None,
-    );
+    )?;
 
     let path = &proj.project_path;
     if path.is_empty() {
@@ -821,7 +845,7 @@ pub(crate) async fn prepare_execution_workspace(
             &project_name, "error", project::ExecutionEventType::WorkspacePrepareFailed,
             format!("Git 身份未配置（user.name={:?}, user.email={:?}）", user_name, user_email),
             None, None, None,
-        );
+        )?;
         return Err(format!(
             "Git 身份未配置（user.name={:?}, user.email={:?}）。请在项目目录下执行 git config user.name 和 git config user.email。",
             user_name, user_email
@@ -860,7 +884,7 @@ pub(crate) async fn prepare_execution_workspace(
         &project_name, "success", project::ExecutionEventType::WorkspaceReady,
         "Git 工作区已就绪，可以执行小阶段。".to_string(),
         None, None, None,
-    );
+    )?;
 
     // Re-probe and return status
     get_execution_workspace_status_inner(path)
@@ -1007,7 +1031,7 @@ pub(crate) async fn request_in_stop(
         }),
         Some(&proj.current_mid_stage_id),
         current_attempt.as_ref().map(|s| s.id.as_str()),
-    );
+    )?;
 
     // Clear execution session (execution is being aborted)
     proj.execution_session = None;
@@ -1040,7 +1064,7 @@ pub(crate) async fn request_ed_stop(
         &project_name, "pause", project::ExecutionEventType::UserEdStop,
         "⏸ 用户请求完成后暂停 (ED Stop)".to_string(),
         Some(&proj.current_milestone_id), Some(&proj.current_mid_stage_id), None,
-    );
+    )?;
 
     // Save pending action in PauseContext
     let now = chrono::Utc::now().to_rfc3339();
@@ -1081,7 +1105,7 @@ pub(crate) async fn resolve_pause_decision(
             write_execution_history(
                 &project_name, "info", project::ExecutionEventType::UserContinue,
                 "▶ 用户选择继续执行".to_string(), None, None, None,
-            );
+            )?;
         }
         "adjust" => {
             // Enter Discussion with PauseAdjustment scope
@@ -1091,7 +1115,7 @@ pub(crate) async fn resolve_pause_decision(
             write_execution_history(
                 &project_name, "info", project::ExecutionEventType::UserAdjust,
                 "🔧 用户选择调整后续方案".to_string(), None, None, None,
-            );
+            )?;
         }
         "rollback" => {
             // Enter RollbackPreview
@@ -1099,7 +1123,7 @@ pub(crate) async fn resolve_pause_decision(
             write_execution_history(
                 &project_name, "pause", project::ExecutionEventType::UserRollback,
                 "↩ 用户选择回退到更早稳定点".to_string(), None, None, None,
-            );
+            )?;
         }
         _ => return Err(format!("未知暂停动作：{}", action)),
     }
@@ -1323,16 +1347,20 @@ pub enum ExecutionReconciliation {
     SessionInvalid,
     /// 数据冲突：session 与当前 milestone/mid_stage 不匹配
     DataConflict,
+    /// 启动时可恢复：磁盘 session 存在但内存 PipelineState 尚未建立（应用刚启动 / 迁移中）
+    /// 不应立即清理或判为丢失，应保留会话等待后续恢复
+    StartupRecoverable,
 }
 
 /// 对账执行状态（启动恢复时调用）
 ///
-/// 区分五种情况：
+/// 区分六种情况：
 /// - Executing: 磁盘 session=executing + 内存 Running → 恢复轮询
 /// - AwaitingConfirmation: 磁盘 session=awaiting_confirmation → 恢复确认界面
-/// - SessionLost: 磁盘 session=executing 但进程已死 → 显示恢复中
+/// - SessionLost: 磁盘 session=executing 且内存有状态但非 Running → 进程已死
 /// - SessionInvalid: active=false 或字段缺失 → 清理 session
 /// - DataConflict: 与当前 milestone/mid_stage 不匹配 → cleanup
+/// - StartupRecoverable: 磁盘 session 存在但内存 PipelineState 尚未建立 → 保留等待恢复
 pub fn reconcile_execution_state(
     proj: &project::Project,
     pipeline_status: Option<&PipelineState>,
@@ -1374,14 +1402,19 @@ pub fn reconcile_execution_state(
 
     match session.status.as_str() {
         "executing" => {
-            // Check if PipelineState is still Running
             match pipeline_status {
+                // 内存 PipelineState 存在且正在运行 → 真执行中
                 Some(ps) if ps.status == PipelineStatus::Running => {
                     ExecutionReconciliation::Executing
                 }
-                _ => {
-                    // Session says executing but no running pipeline → process died
+                // 内存 PipelineState 存在但不在运行 → 进程已死
+                Some(_) => {
                     ExecutionReconciliation::SessionLost
+                }
+                // 内存 PipelineState 尚未建立（启动迁移中 / 刚启动）
+                // → 不判丢失，保留会话等待后续恢复流程处理
+                None => {
+                    ExecutionReconciliation::StartupRecoverable
                 }
             }
         }
@@ -1400,8 +1433,11 @@ pub fn apply_execution_reconciliation(
     reconciliation: &ExecutionReconciliation,
 ) -> bool {
     match reconciliation {
-        ExecutionReconciliation::Executing | ExecutionReconciliation::AwaitingConfirmation => {
-            // Valid states — keep session, don't modify
+        ExecutionReconciliation::Executing
+        | ExecutionReconciliation::AwaitingConfirmation
+        | ExecutionReconciliation::StartupRecoverable => {
+            // Valid or recoverable states — keep session, don't modify
+            // StartupRecoverable: 内存 PipelineState 尚未建立，保留会话等待后续恢复
             false
         }
         ExecutionReconciliation::SessionLost => {
@@ -1438,6 +1474,33 @@ pub fn apply_execution_reconciliation(
             }
             true
         }
+    }
+}
+
+/// 启动时对账执行状态：加载项目 → reconcile → apply → 保存 → 返回磁盘最终 Project。
+///
+/// 与独立函数 `reconcile_execution_state` + `apply_execution_reconciliation` 的区别：
+/// 本命令是一个完整的持久化流程，返回对账并保存后的磁盘事实，供前端启动恢复使用。
+#[tauri::command]
+pub(crate) async fn reconcile_on_startup(
+    state: tauri::State<'_, AppState>,
+    project_name: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
+
+    // 获取当前内存中的 PipelineState（可能为 None）
+    let pipeline_status = {
+        let guard = state.pipeline_state.lock().await;
+        guard.clone()
+    };
+
+    let reconciliation = reconcile_execution_state(&proj, pipeline_status.as_ref());
+    let modified = apply_execution_reconciliation(&mut proj, &reconciliation);
+
+    if modified {
+        crate::save_and_reload_project(&proj)
+    } else {
+        Ok(proj)
     }
 }
 

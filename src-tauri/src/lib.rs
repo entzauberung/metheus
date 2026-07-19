@@ -171,6 +171,7 @@ pub fn run() {
             crate::pipeline::resolve_pause_decision,
             crate::pipeline::preview_rollback_impact,
             crate::pipeline::confirm_rollback,
+            crate::pipeline::reconcile_on_startup,
             crate::commands::project_ops::approve_mid_stage,
             crate::commands::project_ops::reject_mid_stage,
             crate::git_ops::git_save_node,

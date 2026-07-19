@@ -1006,6 +1006,10 @@ pub(crate) async fn resume_managed_flow(
 }
 
 /// 停止托管层（交接给 autopilot 或回到手动模式）
+///
+/// 清除 managed_flow_state 并保持在当前步骤，由用户手动操作。
+/// 如果当前在托管范围内但未完成的步骤，保留当前步骤不变。
+/// 如果当前在 Console 阶段且有大阶段可选，过渡到对应的手动选择步骤。
 #[tauri::command]
 pub(crate) async fn stop_managed_flow(
     project_name: String,
@@ -1017,6 +1021,32 @@ pub(crate) async fn stop_managed_flow(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
+
+    // Determine the appropriate manual step based on current workflow state
+    use project::WorkflowStep::*;
+    let current_step = &proj.workflow_state.current_step;
+
+    // If we're at a milestone step and there are milestones, transition to
+    // the appropriate manual selection/generation step
+    let new_step = match current_step {
+        MilestoneApproval | MilestoneSelection => {
+            // Check if milestone draft exists and is approved
+            let draft_approved = proj.milestone_draft.as_ref()
+                .map(|d| d.status == project::MilestoneDraftStatus::Approved)
+                .unwrap_or(false);
+            if draft_approved {
+                MilestoneSelection
+            } else {
+                // Go back to milestone generation so user can manually approve
+                MilestoneGeneration
+            }
+        }
+        // For PlanApproval / MilestoneGeneration / MilestoneCheck: keep current step
+        // (user was in the middle of these — let them continue manually)
+        _ => current_step.clone(),
+    };
+
+    proj.workflow_state.current_step = new_step;
     proj.workflow_state.managed_flow_state = None;
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = now;
@@ -1428,25 +1458,78 @@ pub(crate) async fn autopilot_next_step(
         }
 
         // In execution — execute next pending or confirm awaiting
+        // 只围绕当前中阶段判断，不跨中阶段串扰
         Execution => {
-            let has_awaiting = target_ms.mid_stages.iter()
-                .any(|mid| mid.subtasks.iter()
-                    .any(|st| st.status == project::SubtaskStatus::AwaitingConfirmation));
-            let has_pending = target_ms.mid_stages.iter()
-                .any(|mid| mid.subtasks.iter()
-                    .any(|st| st.status == project::SubtaskStatus::Pending));
-            let has_rejected = target_ms.mid_stages.iter()
-                .any(|mid| mid.subtasks.iter()
-                    .any(|st| st.status == project::SubtaskStatus::Rejected));
+            // 先确定当前中阶段
+            let current_mid = if !proj.current_mid_stage_id.is_empty() {
+                target_ms.mid_stages.iter()
+                    .find(|m| m.id == proj.current_mid_stage_id)
+            } else {
+                None
+            };
 
+            // 当前中阶段不存在或未设置 → 尝试选择第一个未完成中阶段
+            let current_mid = match current_mid {
+                Some(mid) => mid,
+                None => {
+                    let next_mid = target_ms.mid_stages.iter()
+                        .find(|m| m.status != project::MidStageStatus::Completed);
+                    match next_mid {
+                        Some(mid) => {
+                            return Ok(AutopilotNextStep {
+                                command: "select_mid_stage".to_string(),
+                                args: serde_json::json!({
+                                    "projectName": project_name,
+                                    "midStageId": mid.id,
+                                }),
+                                description: format!("选择中阶段：{}", mid.title),
+                                at_milestone_boundary: false,
+                                is_error: false,
+                                error_message: String::new(),
+                            });
+                        }
+                        None => {
+                            // 所有中阶段已完成 → 进入大阶段审阅
+                            return Ok(AutopilotNextStep {
+                                command: "transition_workflow".to_string(),
+                                args: serde_json::json!({
+                                    "projectName": project_name,
+                                    "targetStep": "MilestoneReview",
+                                    "reason": "autopilot: 所有中阶段完成，进入大阶段审阅",
+                                }),
+                                description: "所有中阶段已完成，进入大阶段审阅".to_string(),
+                                at_milestone_boundary: true,
+                                is_error: false,
+                                error_message: String::new(),
+                            });
+                        }
+                    }
+                }
+            };
+
+            // 只在当前中阶段内判断 subtasks 状态
+            let has_awaiting = current_mid.subtasks.iter()
+                .any(|st| st.status == project::SubtaskStatus::AwaitingConfirmation);
+            let has_pending = current_mid.subtasks.iter()
+                .any(|st| st.status == project::SubtaskStatus::Pending);
+            let has_rejected = current_mid.subtasks.iter()
+                .any(|st| st.status == project::SubtaskStatus::Rejected);
+
+            // 当前中阶段有 Rejected 且无待确认/待执行 → 需人工处理
             if has_rejected && !has_awaiting && !has_pending {
                 AutopilotNextStep {
                     command: String::new(),
                     args: serde_json::json!({}),
-                    description: "存在已驳回的小阶段，需要人工决定是否重试或重新生成执行计划".to_string(),
+                    description: format!(
+                        "中阶段「{}」存在已驳回的小阶段，需要人工决定是否重试或重新生成执行计划",
+                        current_mid.title
+                    ),
                     at_milestone_boundary: false,
                     is_error: true,
-                    error_message: "Execution 步骤中存在 Rejected 小阶段，请人工处理。".to_string(),
+                    error_message: format!(
+                        "中阶段「{}」中存在 Rejected 小阶段，请人工处理。",
+                        current_mid.title
+                    ),
                 }
             } else if has_awaiting {
                 AutopilotNextStep {
@@ -1467,13 +1550,39 @@ pub(crate) async fn autopilot_next_step(
                     error_message: String::new(),
                 }
             } else {
-                AutopilotNextStep {
-                    command: String::new(),
-                    args: serde_json::json!({}),
-                    description: "等待状态推进（中阶段可能已完成）".to_string(),
-                    at_milestone_boundary: false,
-                    is_error: true,
-                    error_message: "Execution 步骤中未找到待处理或待确认的小阶段".to_string(),
+                // 当前中阶段没有 pending/awaiting/rejected → 已完成
+                // 显式切换到下一个中阶段或进入大阶段审阅
+                let next_mid = target_ms.mid_stages.iter()
+                    .filter(|m| m.id != current_mid.id)
+                    .find(|m| m.status != project::MidStageStatus::Completed);
+
+                match next_mid {
+                    Some(mid) => AutopilotNextStep {
+                        command: "select_mid_stage".to_string(),
+                        args: serde_json::json!({
+                            "projectName": project_name,
+                            "midStageId": mid.id,
+                        }),
+                        description: format!(
+                            "中阶段「{}」已完成，切换到下一中阶段：{}",
+                            current_mid.title, mid.title
+                        ),
+                        at_milestone_boundary: false,
+                        is_error: false,
+                        error_message: String::new(),
+                    },
+                    None => AutopilotNextStep {
+                        command: "transition_workflow".to_string(),
+                        args: serde_json::json!({
+                            "projectName": project_name,
+                            "targetStep": "MilestoneReview",
+                            "reason": "autopilot: 所有中阶段完成，进入大阶段审阅",
+                        }),
+                        description: "所有中阶段已完成，进入大阶段审阅".to_string(),
+                        at_milestone_boundary: true,
+                        is_error: false,
+                        error_message: String::new(),
+                    },
                 }
             }
         }
@@ -1521,17 +1630,24 @@ pub(crate) async fn autopilot_next_step(
 // ===================================================================
 
 /// 在 migrate_project_workflow 中执行会话对账
+///
+/// 迁移时没有 AppState，因此无法获取内存 PipelineState。
+/// 此时传递 None 意味着：
+/// - "executing" 会话 → StartupRecoverable（保留会话，不判丢失）
+/// - "awaiting_confirmation" 会话 → AwaitingConfirmation（保留）
+/// - 无效/冲突会话 → 照常清理
+///
+/// 真正的 SessionLost 判断只发生在 reconcile_on_startup 中，
+/// 那时 PipelineState 已可用，可以准确区分"进程已死"和"刚启动尚未恢复"。
 fn reconcile_execution_in_migration(proj: &mut crate::project::Project) {
     let reconciliation = {
-        // We don't have PipelineState access here (no AppState in migration)
-        // SessionLost is identified by the session status being "executing"
-        // without a running pipeline
         crate::pipeline::reconcile_execution_state(proj, None)
     };
 
+    // 只在真正不可恢复时才清理：无效会话、数据冲突。
+    // StartupRecoverable / Executing / AwaitingConfirmation 均保留不动。
     if matches!(reconciliation,
         crate::pipeline::ExecutionReconciliation::SessionInvalid
-        | crate::pipeline::ExecutionReconciliation::SessionLost
         | crate::pipeline::ExecutionReconciliation::DataConflict
     ) {
         crate::pipeline::apply_execution_reconciliation(proj, &reconciliation);

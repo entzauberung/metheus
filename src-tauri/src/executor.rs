@@ -1,7 +1,24 @@
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use crate::project;
 use crate::pipeline::{PipelineState, PipelineStatus};
+
+async fn clear_child_pid(state: &Arc<Mutex<Option<PipelineState>>>) {
+    let mut guard = state.lock().await;
+    if let Some(pipeline) = guard.as_mut() {
+        pipeline.child_pid = None;
+    }
+}
+
+async fn collect_pipe(reader: JoinHandle<std::io::Result<Vec<u8>>>, name: &str) -> Vec<u8> {
+    match reader.await {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => format!("[读取 Claude Code {} 失败: {}]", name, error).into_bytes(),
+        Err(error) => format!("[读取 Claude Code {} 任务失败: {}]", name, error).into_bytes(),
+    }
+}
 
 /// 执行子任务的内部实现（可被暂停中断）
 pub(crate) async fn execute_subtask_inner(
@@ -10,8 +27,8 @@ pub(crate) async fn execute_subtask_inner(
     subtask_id: &str,
     state: Arc<Mutex<Option<PipelineState>>>,
 ) -> Result<project::ExecutionResult, project::SubTaskError> {
-    // 1. 执行前记录文件列表
-    let before_files = crate::test_runner::get_tracked_files(project_path);
+    // 1. 执行前记录文件内容指纹
+    let before_files = crate::test_runner::get_file_snapshot(project_path);
     // 2. 拼接完整 prompt（V1：精确执行已批准任务，信息不足时停止）
     let full_prompt = format!(
         "{}\n\n=== V1 执行约束 ===\n\
@@ -58,6 +75,26 @@ pub(crate) async fn execute_subtask_inner(
             ),
         })?;
 
+    // Drain output concurrently so verbose CLI output cannot fill an OS pipe and stall execution.
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        project::SubTaskError::ExecutionFailed {
+            message: "无法捕获 Claude Code stdout".to_string(),
+        }
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| {
+        project::SubTaskError::ExecutionFailed {
+            message: "无法捕获 Claude Code stderr".to_string(),
+        }
+    })?;
+    let stdout_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+    let stderr_reader = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+    });
+
     // 存储子进程 PID 到 PipelineState，供 stop_execution 快速终止使用
     {
         let child_pid = child.id();
@@ -85,17 +122,14 @@ pub(crate) async fn execute_subtask_inner(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // 进程已结束 → 读取 stdout/stderr
-                let output = child.wait_with_output().await.map_err(|e| {
-                    project::SubTaskError::ExecutionFailed {
-                        message: format!("读取 Claude Code 输出失败: {}", e),
-                    }
-                })?;
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let stdout = collect_pipe(stdout_reader, "stdout").await;
+                let stderr = collect_pipe(stderr_reader, "stderr").await;
+                clear_child_pid(&state).await;
+                let stdout = String::from_utf8_lossy(&stdout).to_string();
+                let stderr = String::from_utf8_lossy(&stderr).to_string();
                 let success = status.success();
-                // 获取改动文件列表
-                let after_files = crate::test_runner::get_tracked_files(project_path);
+                // 获取新增、修改和删除的文件列表
+                let after_files = crate::test_runner::get_file_snapshot(project_path);
                 let file_changes = if success {
                     crate::test_runner::detect_changes(&before_files, &after_files, project_path)
                 } else {
@@ -139,13 +173,9 @@ pub(crate) async fn execute_subtask_inner(
                     // 用户点了暂停或停止 → 强制终止 Claude Code
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    // 清理 PID
-                    {
-                        let mut guard = state.lock().await;
-                        if let Some(s) = guard.as_mut() {
-                            s.child_pid = None;
-                        }
-                    }
+                    let _ = stdout_reader.await;
+                    let _ = stderr_reader.await;
+                    clear_child_pid(&state).await;
                     if is_failed {
                         return Err(project::SubTaskError::ExecutionFailed {
                             message: "用户停止执行".to_string(),
@@ -163,6 +193,9 @@ pub(crate) async fn execute_subtask_inner(
                     );
                     let _ = child.start_kill();
                     let _ = child.wait().await;
+                    let _ = stdout_reader.await;
+                    let _ = stderr_reader.await;
+                    clear_child_pid(&state).await;
                     return Err(project::SubTaskError::Timeout);
                 }
                 // 没暂停也没超时 → 等 500ms 再检查
@@ -170,6 +203,10 @@ pub(crate) async fn execute_subtask_inner(
             }
             Err(e) => {
                 let _ = child.start_kill();
+                let _ = child.wait().await;
+                let _ = stdout_reader.await;
+                let _ = stderr_reader.await;
+                clear_child_pid(&state).await;
                 return Err(project::SubTaskError::ExecutionFailed {
                     message: format!("Claude Code 进程异常: {}", e),
                 });
