@@ -1,5 +1,5 @@
-use crate::constants::SANITIZE_FALLBACK_JSON;
 use crate::api::call_deepseek_api_inner;
+use crate::constants::SANITIZE_FALLBACK_JSON;
 
 /// 清洗 AI 返回的文本，提取出纯净的 JSON 字符串
 /// 处理三种干扰：
@@ -124,13 +124,9 @@ pub(crate) async fn parse_json_with_retry<T: serde::de::DeserializeOwned>(
             let original_preview: String = response_text.chars().take(200).collect();
             eprintln!(
                 "[parse_json_with_retry] AI 修正请求失败（第 3 次）：{}。原始响应（前200字符）：{}",
-                e,
-                original_preview
+                e, original_preview
             );
-            Err(format!(
-                "AI 修正请求在 3 次重试后仍然失败：{}",
-                e
-            ))
+            Err(format!("AI 修正请求在 3 次重试后仍然失败：{}", e))
         }
     }
 }

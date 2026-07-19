@@ -773,10 +773,30 @@ pub(crate) fn write_constitution_part2(
          **证据来源**：扫描 {} 个文件，{}\n",
         baseline.project_summary,
         baseline.tech_stack,
-        baseline.completed_capabilities.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"),
-        baseline.pending_capabilities.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"),
-        baseline.risks.iter().map(|r| format!("- {}", r)).collect::<Vec<_>>().join("\n"),
-        baseline.uncertainties.iter().map(|u| format!("- {}", u)).collect::<Vec<_>>().join("\n"),
+        baseline
+            .completed_capabilities
+            .iter()
+            .map(|c| format!("- {}", c))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        baseline
+            .pending_capabilities
+            .iter()
+            .map(|c| format!("- {}", c))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        baseline
+            .risks
+            .iter()
+            .map(|r| format!("- {}", r))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        baseline
+            .uncertainties
+            .iter()
+            .map(|u| format!("- {}", u))
+            .collect::<Vec<_>>()
+            .join("\n"),
         baseline.scanned_files.len(),
         baseline.evidence_summary,
     );
@@ -790,22 +810,44 @@ pub(crate) fn write_constitution_part2(
             if let Some(part2_pos) = existing.find("## 第 2 部分") {
                 // 保留第一部分，替换第二部分
                 let part1 = &existing[..part2_pos];
-                format!("{}{}\n\n{}\n", part1.trim_end(), "\n\n## 第 2 部分：项目当前状态", part2_content)
+                format!(
+                    "{}{}\n\n{}\n",
+                    part1.trim_end(),
+                    "\n\n## 第 2 部分：项目当前状态",
+                    part2_content
+                )
             } else {
                 // 有第一部分但没有第二部分 — 追加
-                format!("{}\n\n## 第 2 部分：项目当前状态\n\n{}\n", existing.trim_end(), part2_content)
+                format!(
+                    "{}\n\n## 第 2 部分：项目当前状态\n\n{}\n",
+                    existing.trim_end(),
+                    part2_content
+                )
             }
         } else if existing.contains("## 第 2 部分") {
             // 只有第二部分（异常），整体替换第二部分
             if let Some(part2_pos) = existing.find("## 第 2 部分") {
                 let before = &existing[..part2_pos];
-                format!("{}{}\n\n{}\n", before.trim_end(), "\n\n## 第 2 部分：项目当前状态", part2_content)
+                format!(
+                    "{}{}\n\n{}\n",
+                    before.trim_end(),
+                    "\n\n## 第 2 部分：项目当前状态",
+                    part2_content
+                )
             } else {
-                format!("{}\n\n## 第 2 部分：项目当前状态\n\n{}\n", existing.trim_end(), part2_content)
+                format!(
+                    "{}\n\n## 第 2 部分：项目当前状态\n\n{}\n",
+                    existing.trim_end(),
+                    part2_content
+                )
             }
         } else {
             // 没有标准分区 — 在已有内容末尾安全追加
-            format!("{}\n\n---\n\n## 第 2 部分：项目当前状态\n\n{}\n", existing.trim_end(), part2_content)
+            format!(
+                "{}\n\n---\n\n## 第 2 部分：项目当前状态\n\n{}\n",
+                existing.trim_end(),
+                part2_content
+            )
         }
     } else {
         // 宪法文件不存在 — 创建新的，包含第一和第二部分的占位

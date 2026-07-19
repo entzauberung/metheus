@@ -1,9 +1,9 @@
+use crate::pipeline::{PipelineState, PipelineStatus};
+use crate::project;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use crate::project;
-use crate::pipeline::{PipelineState, PipelineStatus};
 
 async fn clear_child_pid(state: &Arc<Mutex<Option<PipelineState>>>) {
     let mut guard = state.lock().await;
@@ -76,16 +76,18 @@ pub(crate) async fn execute_subtask_inner(
         })?;
 
     // Drain output concurrently so verbose CLI output cannot fill an OS pipe and stall execution.
-    let mut stdout = child.stdout.take().ok_or_else(|| {
-        project::SubTaskError::ExecutionFailed {
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| project::SubTaskError::ExecutionFailed {
             message: "无法捕获 Claude Code stdout".to_string(),
-        }
-    })?;
-    let mut stderr = child.stderr.take().ok_or_else(|| {
-        project::SubTaskError::ExecutionFailed {
+        })?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| project::SubTaskError::ExecutionFailed {
             message: "无法捕获 Claude Code stderr".to_string(),
-        }
-    })?;
+        })?;
     let stdout_reader = tokio::spawn(async move {
         let mut bytes = Vec::new();
         stdout.read_to_end(&mut bytes).await.map(|_| bytes)
@@ -184,7 +186,9 @@ pub(crate) async fn execute_subtask_inner(
                     return Err(project::SubTaskError::UserPaused);
                 }
                 // 检查整体超时
-                if start_time.elapsed() > std::time::Duration::from_secs(crate::constants::CLAUDE_CODE_TIMEOUT_SECS) {
+                if start_time.elapsed()
+                    > std::time::Duration::from_secs(crate::constants::CLAUDE_CODE_TIMEOUT_SECS)
+                {
                     eprintln!(
                         "[execute_subtask_inner] 子任务 {} 执行超时（已运行 {:.0}s，上限 {}s），强制终止",
                         subtask_id,

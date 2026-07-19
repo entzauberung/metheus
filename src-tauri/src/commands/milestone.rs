@@ -8,11 +8,7 @@ use crate::project;
 const MILESTONE_REGEN_SOURCE_CHECK_FAILED: &str = "check_failed";
 const MILESTONE_REGEN_SOURCE_APPROVAL_REJECTED: &str = "approval_rejected";
 
-fn required_string(
-    value: &serde_json::Value,
-    field: &str,
-    entity: &str,
-) -> Result<String, String> {
+fn required_string(value: &serde_json::Value, field: &str, entity: &str) -> Result<String, String> {
     let result = value
         .get(field)
         .and_then(serde_json::Value::as_str)
@@ -126,7 +122,9 @@ async fn generate_milestone_candidates(
     let feedback_section = regeneration_feedback
         .map(str::trim)
         .filter(|feedback| !feedback.is_empty())
-        .map_or_else(String::new, |feedback| format!("\n\n=== 重新生成反馈 ===\n{}", feedback));
+        .map_or_else(String::new, |feedback| {
+            format!("\n\n=== 重新生成反馈 ===\n{}", feedback)
+        });
 
     let user_message = format!(
         "项目名称：{}\n项目来源：{}\n项目路径：{}\n讨论修订号：{}\n\n\
@@ -140,7 +138,11 @@ async fn generate_milestone_candidates(
         proj.project_path,
         proj.discussion_revision,
         proj.version_plan,
-        if constitution_part1.is_empty() { "（无）" } else { &constitution_part1 },
+        if constitution_part1.is_empty() {
+            "（无）"
+        } else {
+            &constitution_part1
+        },
         discussion_summary,
         feedback_section,
     );
@@ -156,17 +158,13 @@ async fn generate_milestone_candidates(
     } else {
         format!("{}\n\n{}", context_injection, user_message)
     };
-    let content = crate::api::call_deepseek_api_inner(
-        &system_prompt,
-        &augmented_user_message,
-        false,
-        0.5,
-    ).await?;
+    let content =
+        crate::api::call_deepseek_api_inner(&system_prompt, &augmented_user_message, false, 0.5)
+            .await?;
 
-    let raw_milestones: Vec<serde_json::Value> =
-        crate::json_utils::parse_json_with_retry(&content)
-            .await
-            .map_err(|error| format!("解析大阶段 JSON 失败：{}", error))?;
+    let raw_milestones: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&content)
+        .await
+        .map_err(|error| format!("解析大阶段 JSON 失败：{}", error))?;
     if raw_milestones.is_empty() {
         return Err("AI 返回的大阶段列表为空，请重新生成。".to_string());
     }
@@ -266,7 +264,9 @@ pub(crate) async fn regenerate_milestone_draft(
     let initial = crate::load_project(&project_name)?;
     let valid_source = match (&initial.workflow_state.current_step, source.as_str()) {
         (project::WorkflowStep::MilestoneCheck, MILESTONE_REGEN_SOURCE_CHECK_FAILED) => true,
-        (project::WorkflowStep::MilestoneApproval, MILESTONE_REGEN_SOURCE_APPROVAL_REJECTED) => true,
+        (project::WorkflowStep::MilestoneApproval, MILESTONE_REGEN_SOURCE_APPROVAL_REJECTED) => {
+            true
+        }
         _ => false,
     };
     if !valid_source {
@@ -436,7 +436,9 @@ pub(crate) async fn check_milestone_draft(
     let check_json: serde_json::Value = serde_json::from_str(&check_result_str)
         .map_err(|e| format!("解析检查结果 JSON 失败：{}", e))?;
 
-    let passed = check_json["passed"].as_bool().ok_or("检查结果缺少 'passed' 字段")?;
+    let passed = check_json["passed"]
+        .as_bool()
+        .ok_or("检查结果缺少 'passed' 字段")?;
     let summary = check_json
         .get("summary")
         .and_then(serde_json::Value::as_str)
@@ -498,9 +500,7 @@ pub(crate) async fn approve_milestone_draft(
 
     // 3. 验证检查已通过（状态不能是 CheckFailed）
     if draft.status == project::MilestoneDraftStatus::CheckFailed {
-        return Err(
-            "大阶段草稿检查未通过，无法批准。请根据检查反馈调整后重新生成。".to_string()
-        );
+        return Err("大阶段草稿检查未通过，无法批准。请根据检查反馈调整后重新生成。".to_string());
     }
     if draft.check_result.is_none() {
         return Err("大阶段草稿尚未经过检查，请先运行检查。".to_string());
@@ -512,14 +512,14 @@ pub(crate) async fn approve_milestone_draft(
     }
 
     // 5. 校验：已有执行中或已完成的大阶段时，禁止替换
-    let has_active_milestones = proj
-        .milestones
-        .iter()
-        .any(|m| m.status == project::MilestoneStatus::InProgress
-            || m.status == project::MilestoneStatus::Completed);
+    let has_active_milestones = proj.milestones.iter().any(|m| {
+        m.status == project::MilestoneStatus::InProgress
+            || m.status == project::MilestoneStatus::Completed
+    });
     if has_active_milestones {
         return Err(
-            "已有执行中或已完成的大阶段，禁止替换正式大阶段列表。请通过大阶段审阅 A/B/C 分支调整。".to_string()
+            "已有执行中或已完成的大阶段，禁止替换正式大阶段列表。请通过大阶段审阅 A/B/C 分支调整。"
+                .to_string(),
         );
     }
 
@@ -593,7 +593,9 @@ async fn generate_mid_stage_candidates(
     let feedback_section = regeneration_feedback
         .map(str::trim)
         .filter(|feedback| !feedback.is_empty())
-        .map_or_else(String::new, |feedback| format!("\n\n重新生成反馈：\n{}", feedback));
+        .map_or_else(String::new, |feedback| {
+            format!("\n\n重新生成反馈：\n{}", feedback)
+        });
     let context_injection = crate::constitution_context::build_context_injection(proj);
     let context = format!(
         "{}{}大阶段：{} ({})\n目标：{}\n范围：{}\n预期输出：{}\n验收标准：{}\n技术栈：{}\n\n项目方案：\n{}{}",
@@ -609,12 +611,10 @@ async fn generate_mid_stage_candidates(
         proj.version_plan,
         feedback_section,
     );
-    let reply = crate::api::call_deepseek_api_json(
-        crate::prompts::MID_STAGE_GENERATION_PROMPT,
-        &context,
-    )
-    .await
-    .map_err(|error| format!("中阶段生成 AI 调用失败：{}", error))?;
+    let reply =
+        crate::api::call_deepseek_api_json(crate::prompts::MID_STAGE_GENERATION_PROMPT, &context)
+            .await
+            .map_err(|error| format!("中阶段生成 AI 调用失败：{}", error))?;
     let raw: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&reply)
         .await
         .map_err(|error| format!("解析中阶段 JSON 失败：{}", error))?;
@@ -720,40 +720,57 @@ pub(crate) async fn regenerate_mid_stage_draft(
             | (project::WorkflowStep::MidStageApproval, "approval_rejected")
     );
     if !valid_source {
-        return Err(format!("当前步骤 {:?} 与中阶段重新生成来源不匹配", initial.workflow_state.current_step));
+        return Err(format!(
+            "当前步骤 {:?} 与中阶段重新生成来源不匹配",
+            initial.workflow_state.current_step
+        ));
     }
     if initial.workflow_state.data_revision != expected_data_revision {
         return Err("项目修订号已变化，请同步后重试。".to_string());
     }
-    let old_draft = initial.mid_stage_draft.as_ref()
+    let old_draft = initial
+        .mid_stage_draft
+        .as_ref()
         .ok_or_else(|| "没有可重新生成的中阶段草稿。".to_string())?;
     if old_draft.draft_id != current_draft_id
         || old_draft.milestone_id != initial.current_milestone_id
     {
         return Err("中阶段草稿或所属大阶段已变化，请同步后重试。".to_string());
     }
-    let milestone = initial.milestones.iter()
+    let milestone = initial
+        .milestones
+        .iter()
         .find(|milestone| milestone.id == initial.current_milestone_id)
         .ok_or_else(|| "当前大阶段不存在。".to_string())?;
-    if milestone.mid_stages.iter().any(|mid_stage| matches!(
-        mid_stage.status,
-        project::MidStageStatus::InProgress | project::MidStageStatus::Completed
-    )) {
+    if milestone.mid_stages.iter().any(|mid_stage| {
+        matches!(
+            mid_stage.status,
+            project::MidStageStatus::InProgress | project::MidStageStatus::Completed
+        )
+    }) {
         return Err("当前大阶段已有执行中或已完成的中阶段，禁止重新生成。".to_string());
     }
     let effective_feedback = if feedback.trim().is_empty() {
-        old_draft.check_result.as_deref().map(str::trim).filter(|text| !text.is_empty())
-            .ok_or_else(|| "请提供中阶段重新生成反馈。".to_string())?.to_string()
+        old_draft
+            .check_result
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| "请提供中阶段重新生成反馈。".to_string())?
+            .to_string()
     } else {
         feedback.trim().to_string()
     };
     let milestone_id = initial.current_milestone_id.clone();
     let initial_plan = initial.version_plan.clone();
     let old_count = old_draft.regeneration_count;
-    let candidates = generate_mid_stage_candidates(&initial, &milestone_id, Some(&effective_feedback)).await?;
+    let candidates =
+        generate_mid_stage_candidates(&initial, &milestone_id, Some(&effective_feedback)).await?;
 
     let mut latest = crate::load_project(&project_name)?;
-    let latest_draft = latest.mid_stage_draft.as_ref()
+    let latest_draft = latest
+        .mid_stage_draft
+        .as_ref()
         .ok_or_else(|| "生成期间原中阶段草稿已不存在。".to_string())?;
     if latest.workflow_state.data_revision != expected_data_revision
         || latest.workflow_state.current_step != initial.workflow_state.current_step
@@ -763,13 +780,17 @@ pub(crate) async fn regenerate_mid_stage_draft(
     {
         return Err("生成期间项目或中阶段草稿已变化，未覆盖原草稿。".to_string());
     }
-    let latest_milestone = latest.milestones.iter()
+    let latest_milestone = latest
+        .milestones
+        .iter()
         .find(|milestone| milestone.id == milestone_id)
         .ok_or_else(|| "生成期间当前大阶段已不存在。".to_string())?;
-    if latest_milestone.mid_stages.iter().any(|mid_stage| matches!(
-        mid_stage.status,
-        project::MidStageStatus::InProgress | project::MidStageStatus::Completed
-    )) {
+    if latest_milestone.mid_stages.iter().any(|mid_stage| {
+        matches!(
+            mid_stage.status,
+            project::MidStageStatus::InProgress | project::MidStageStatus::Completed
+        )
+    }) {
         return Err("生成期间出现了中阶段执行事实，未覆盖原草稿。".to_string());
     }
 
@@ -823,7 +844,15 @@ pub(crate) async fn check_mid_stage_draft(
         .candidate_mid_stages
         .iter()
         .enumerate()
-        .map(|(i, m)| format!("{}. {} — {} (tech: {})", i + 1, m.title, m.description, m.tech_focus))
+        .map(|(i, m)| {
+            format!(
+                "{}. {} — {} (tech: {})",
+                i + 1,
+                m.title,
+                m.description,
+                m.tech_focus
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -832,12 +861,10 @@ pub(crate) async fn check_mid_stage_draft(
         milestone.title, milestone.goal, candidates_text
     );
 
-    let reply = crate::api::call_deepseek_api_json(
-        crate::prompts::MID_STAGE_CHECK_PROMPT,
-        &context,
-    )
-    .await
-    .map_err(|e| format!("中阶段检查 AI 调用失败：{}", e))?;
+    let reply =
+        crate::api::call_deepseek_api_json(crate::prompts::MID_STAGE_CHECK_PROMPT, &context)
+            .await
+            .map_err(|e| format!("中阶段检查 AI 调用失败：{}", e))?;
 
     let check: serde_json::Value =
         serde_json::from_str(&reply).map_err(|e| format!("解析检查结果失败：{}", e))?;
@@ -913,13 +940,14 @@ pub(crate) async fn approve_mid_stage_draft(
         .ok_or("关联的大阶段不存在。".to_string())?;
 
     // 禁止覆盖已有执行进度的中阶段
-    let has_active = ms
-        .mid_stages
-        .iter()
-        .any(|m| m.status == project::MidStageStatus::InProgress
-            || m.status == project::MidStageStatus::Completed);
+    let has_active = ms.mid_stages.iter().any(|m| {
+        m.status == project::MidStageStatus::InProgress
+            || m.status == project::MidStageStatus::Completed
+    });
     if has_active {
-        return Err("该大阶段已有执行中或已完成的中阶段，禁止替换。请通过回退流程修改。".to_string());
+        return Err(
+            "该大阶段已有执行中或已完成的中阶段，禁止替换。请通过回退流程修改。".to_string(),
+        );
     }
 
     ms.mid_stages = candidates;
@@ -952,7 +980,10 @@ pub(crate) async fn select_mid_stage(
         project::WorkflowStep::Execution,
     ];
     if !valid_steps.contains(&proj.workflow_state.current_step) {
-        return Err(format!("当前步骤 {:?} 不允许选择中阶段", proj.workflow_state.current_step));
+        return Err(format!(
+            "当前步骤 {:?} 不允许选择中阶段",
+            proj.workflow_state.current_step
+        ));
     }
 
     let milestone_id = &proj.current_milestone_id;
@@ -966,7 +997,9 @@ pub(crate) async fn select_mid_stage(
         .find(|m| m.id == *milestone_id)
         .ok_or("大阶段不存在。".to_string())?;
 
-    let mid = ms.mid_stages.iter()
+    let mid = ms
+        .mid_stages
+        .iter()
         .find(|m| m.id == mid_stage_id)
         .ok_or("中阶段不在当前大阶段中。".to_string())?;
 
@@ -976,7 +1009,10 @@ pub(crate) async fn select_mid_stage(
     // 不再固定跳转到 PlanGeneration，而是根据中阶段状态智能判断。
     let next_step = if mid.status == project::MidStageStatus::Completed {
         // 中阶段已完成 — 检查大阶段是否全部完成
-        let all_done = ms.mid_stages.iter().all(|m| m.status == project::MidStageStatus::Completed);
+        let all_done = ms
+            .mid_stages
+            .iter()
+            .all(|m| m.status == project::MidStageStatus::Completed);
         if all_done {
             project::WorkflowStep::MilestoneReview
         } else {
@@ -1047,22 +1083,32 @@ async fn generate_execution_plan_tasks(
     mid_stage_id: &str,
     regeneration_feedback: Option<&str>,
 ) -> Result<Vec<project::Subtask>, String> {
-    let milestone = proj.milestones.iter()
+    let milestone = proj
+        .milestones
+        .iter()
         .find(|milestone| milestone.id == milestone_id)
         .ok_or_else(|| "大阶段不存在。".to_string())?;
-    let mid_stage = milestone.mid_stages.iter()
+    let mid_stage = milestone
+        .mid_stages
+        .iter()
         .find(|mid_stage| mid_stage.id == mid_stage_id)
         .ok_or_else(|| "中阶段不存在。".to_string())?;
     let feedback_section = regeneration_feedback
         .map(str::trim)
         .filter(|feedback| !feedback.is_empty())
-        .map_or_else(String::new, |feedback| format!("\n\n重新生成反馈：\n{}", feedback));
+        .map_or_else(String::new, |feedback| {
+            format!("\n\n重新生成反馈：\n{}", feedback)
+        });
     let context_injection = crate::constitution_context::build_context_injection(proj);
     let context = format!(
         "{}中阶段：{} ({})\n描述：{}\n技术重点：{}\n\n所属大阶段：{} — {}\n\
          项目方案摘要（仅相关部分）：\n{}\n\n项目路径：{}\n\
          已有文件（仅作参考，不得无差别注入）：\n（由执行器在运行时按 evidence_files 精确读取）{}",
-        if context_injection.is_empty() { String::new() } else { format!("{}\n\n---\n\n", context_injection) },
+        if context_injection.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n\n---\n\n", context_injection)
+        },
         mid_stage.title,
         mid_stage.version,
         mid_stage.description,
@@ -1073,12 +1119,9 @@ async fn generate_execution_plan_tasks(
         proj.project_path,
         feedback_section,
     );
-    let reply = crate::api::call_deepseek_api_json(
-        crate::prompts::EXECUTION_PLAN_PROMPT,
-        &context,
-    )
-    .await
-    .map_err(|error| format!("执行计划生成 AI 调用失败：{}", error))?;
+    let reply = crate::api::call_deepseek_api_json(crate::prompts::EXECUTION_PLAN_PROMPT, &context)
+        .await
+        .map_err(|error| format!("执行计划生成 AI 调用失败：{}", error))?;
     let raw: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&reply)
         .await
         .map_err(|error| format!("解析执行计划 JSON 失败：{}", error))?;
@@ -1137,7 +1180,8 @@ pub(crate) async fn generate_execution_plan(
     }
     let initial_revision = initial.workflow_state.data_revision;
     let initial_plan = initial.version_plan.clone();
-    let subtasks = generate_execution_plan_tasks(&initial, &milestone_id, &mid_stage_id, None).await?;
+    let subtasks =
+        generate_execution_plan_tasks(&initial, &milestone_id, &mid_stage_id, None).await?;
     let mut proj = crate::load_project(&project_name)?;
     if proj.workflow_state.current_step != project::WorkflowStep::PlanGeneration
         || proj.workflow_state.data_revision != initial_revision
@@ -1189,27 +1233,38 @@ pub(crate) async fn regenerate_execution_plan(
             | (project::WorkflowStep::PlanApproving, "approval_rejected")
     );
     if !valid_source {
-        return Err(format!("当前步骤 {:?} 与执行计划重新生成来源不匹配", initial.workflow_state.current_step));
+        return Err(format!(
+            "当前步骤 {:?} 与执行计划重新生成来源不匹配",
+            initial.workflow_state.current_step
+        ));
     }
     if initial.workflow_state.data_revision != expected_data_revision {
         return Err("项目修订号已变化，请同步后重试。".to_string());
     }
     let milestone_id = initial.current_milestone_id.clone();
     let mid_stage_id = initial.current_mid_stage_id.clone();
-    let milestone = initial.milestones.iter()
+    let milestone = initial
+        .milestones
+        .iter()
         .find(|milestone| milestone.id == milestone_id)
         .ok_or_else(|| "当前大阶段不存在。".to_string())?;
-    let mid_stage = milestone.mid_stages.iter()
+    let mid_stage = milestone
+        .mid_stages
+        .iter()
         .find(|mid_stage| mid_stage.id == mid_stage_id)
         .ok_or_else(|| "当前中阶段不存在。".to_string())?;
     if mid_stage.plan_draft_revision != expected_plan_draft_revision {
         return Err("执行计划草稿修订已变化，请同步后重试。".to_string());
     }
     if has_plan_execution_facts(mid_stage) {
-        return Err("执行计划已有执行进度或稳定标签，禁止直接重新生成；请使用回退流程。".to_string());
+        return Err(
+            "执行计划已有执行进度或稳定标签，禁止直接重新生成；请使用回退流程。".to_string(),
+        );
     }
     let effective_feedback = if feedback.trim().is_empty() {
-        mid_stage.plan_check_result.as_ref()
+        mid_stage
+            .plan_check_result
+            .as_ref()
             .map(plan_check_feedback)
             .filter(|text| !text.is_empty())
             .ok_or_else(|| "请提供执行计划重新生成反馈。".to_string())?
@@ -1223,7 +1278,8 @@ pub(crate) async fn regenerate_execution_plan(
         &milestone_id,
         &mid_stage_id,
         Some(&effective_feedback),
-    ).await?;
+    )
+    .await?;
 
     let mut latest = crate::load_project(&project_name)?;
     if latest.workflow_state.data_revision != expected_data_revision
@@ -1234,10 +1290,14 @@ pub(crate) async fn regenerate_execution_plan(
     {
         return Err("生成期间项目选择或正式方案已变化，未覆盖原执行计划。".to_string());
     }
-    let latest_milestone = latest.milestones.iter_mut()
+    let latest_milestone = latest
+        .milestones
+        .iter_mut()
         .find(|milestone| milestone.id == milestone_id)
         .ok_or_else(|| "生成期间当前大阶段已不存在。".to_string())?;
-    let latest_mid_stage = latest_milestone.mid_stages.iter_mut()
+    let latest_mid_stage = latest_milestone
+        .mid_stages
+        .iter_mut()
         .find(|mid_stage| mid_stage.id == mid_stage_id)
         .ok_or_else(|| "生成期间当前中阶段已不存在。".to_string())?;
     if latest_mid_stage.plan_draft_revision != expected_plan_draft_revision
@@ -1262,44 +1322,64 @@ pub(crate) async fn regenerate_execution_plan(
 
 /// 检查执行计划
 #[tauri::command]
-pub(crate) async fn check_stage_plan(
-    project_name: String,
-) -> Result<project::Project, String> {
+pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Project, String> {
     let proj = crate::load_project(&project_name)?;
 
     if proj.workflow_state.current_step != project::WorkflowStep::PlanCheck {
-        return Err(format!("当前步骤 {:?} 不允许检查执行计划", proj.workflow_state.current_step));
+        return Err(format!(
+            "当前步骤 {:?} 不允许检查执行计划",
+            proj.workflow_state.current_step
+        ));
     }
 
     let milestone_id = &proj.current_milestone_id;
     let mid_stage_id = &proj.current_mid_stage_id;
 
-    let ms = proj.milestones.iter().find(|m| m.id == *milestone_id).ok_or("大阶段不存在。")?;
-    let mid = ms.mid_stages.iter().find(|m| m.id == *mid_stage_id).ok_or("中阶段不存在。")?;
+    let ms = proj
+        .milestones
+        .iter()
+        .find(|m| m.id == *milestone_id)
+        .ok_or("大阶段不存在。")?;
+    let mid = ms
+        .mid_stages
+        .iter()
+        .find(|m| m.id == *mid_stage_id)
+        .ok_or("中阶段不存在。")?;
 
-    let plan_text = mid.subtasks.iter().enumerate()
-        .map(|(i, st)| format!(
-            "{}. {} — goal: {} — files: [{}] — new: [{}] — criteria: [{}]",
-            i + 1, st.title, st.goal,
-            st.allowed_file_paths.join(", "),
-            st.new_file_paths.join(", "),
-            st.acceptance_criteria.join("; "),
-        ))
+    let plan_text = mid
+        .subtasks
+        .iter()
+        .enumerate()
+        .map(|(i, st)| {
+            format!(
+                "{}. {} — goal: {} — files: [{}] — new: [{}] — criteria: [{}]",
+                i + 1,
+                st.title,
+                st.goal,
+                st.allowed_file_paths.join(", "),
+                st.new_file_paths.join(", "),
+                st.acceptance_criteria.join("; "),
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
     let context = format!(
         "中阶段：{} — {}\n技术重点：{}\n\n执行计划（{} 个小阶段）：\n{}",
-        mid.title, mid.description, mid.tech_focus, mid.subtasks.len(), plan_text
+        mid.title,
+        mid.description,
+        mid.tech_focus,
+        mid.subtasks.len(),
+        plan_text
     );
 
-    let reply = crate::api::call_deepseek_api_json(
-        crate::prompts::EXECUTION_PLAN_CHECK_PROMPT,
-        &context,
-    ).await.map_err(|e| format!("执行计划检查 AI 调用失败：{}", e))?;
+    let reply =
+        crate::api::call_deepseek_api_json(crate::prompts::EXECUTION_PLAN_CHECK_PROMPT, &context)
+            .await
+            .map_err(|e| format!("执行计划检查 AI 调用失败：{}", e))?;
 
-    let check: serde_json::Value = serde_json::from_str(&reply)
-        .map_err(|e| format!("解析检查结果失败：{}", e))?;
+    let check: serde_json::Value =
+        serde_json::from_str(&reply).map_err(|e| format!("解析检查结果失败：{}", e))?;
 
     let passed = check["passed"].as_bool().ok_or("缺少 passed 字段")?;
 
@@ -1308,8 +1388,16 @@ pub(crate) async fn check_stage_plan(
         return Err("当前项目已不在计划检查步骤。".to_string());
     }
 
-    let ms = proj.milestones.iter_mut().find(|m| m.id == *milestone_id).ok_or("大阶段不存在。")?;
-    let mid = ms.mid_stages.iter_mut().find(|m| m.id == *mid_stage_id).ok_or("中阶段不存在。")?;
+    let ms = proj
+        .milestones
+        .iter_mut()
+        .find(|m| m.id == *milestone_id)
+        .ok_or("大阶段不存在。")?;
+    let mid = ms
+        .mid_stages
+        .iter_mut()
+        .find(|m| m.id == *mid_stage_id)
+        .ok_or("中阶段不存在。")?;
     mid.plan_check_result = Some(project::StagePlanCheckResult {
         passed,
         omissions: arr_str(&check["omissions"]),
@@ -1332,24 +1420,33 @@ pub(crate) async fn check_stage_plan(
 
 /// 批准执行计划（写入 plan_revision 和批准时间）
 #[tauri::command]
-pub(crate) async fn approve_stage_plan(
-    project_name: String,
-) -> Result<project::Project, String> {
+pub(crate) async fn approve_stage_plan(project_name: String) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
 
     if proj.workflow_state.current_step != project::WorkflowStep::PlanApproving {
-        return Err(format!("当前步骤 {:?} 不允许批准执行计划", proj.workflow_state.current_step));
+        return Err(format!(
+            "当前步骤 {:?} 不允许批准执行计划",
+            proj.workflow_state.current_step
+        ));
     }
 
     let milestone_id = &proj.current_milestone_id;
     let mid_stage_id = &proj.current_mid_stage_id;
 
-    let ms = proj.milestones.iter().find(|m| m.id == *milestone_id).ok_or("大阶段不存在。")?;
-    let mid = ms.mid_stages.iter().find(|m| m.id == *mid_stage_id).ok_or("中阶段不存在。")?;
+    let ms = proj
+        .milestones
+        .iter()
+        .find(|m| m.id == *milestone_id)
+        .ok_or("大阶段不存在。")?;
+    let mid = ms
+        .mid_stages
+        .iter()
+        .find(|m| m.id == *mid_stage_id)
+        .ok_or("中阶段不存在。")?;
 
     // Verify check passed
     match &mid.plan_check_result {
-        Some(r) if r.passed => {},
+        Some(r) if r.passed => {}
         Some(_) => return Err("执行计划检查未通过，无法批准。".to_string()),
         None => return Err("执行计划尚未检查，请先运行检查。".to_string()),
     }
@@ -1375,8 +1472,16 @@ pub(crate) async fn approve_stage_plan(
     let plan_rev = proj.workflow_state.data_revision + 1;
 
     // Write approval metadata
-    let ms = proj.milestones.iter_mut().find(|m| m.id == *milestone_id).ok_or("大阶段不存在。")?;
-    let mid = ms.mid_stages.iter_mut().find(|m| m.id == *mid_stage_id).ok_or("中阶段不存在。")?;
+    let ms = proj
+        .milestones
+        .iter_mut()
+        .find(|m| m.id == *milestone_id)
+        .ok_or("大阶段不存在。")?;
+    let mid = ms
+        .mid_stages
+        .iter_mut()
+        .find(|m| m.id == *mid_stage_id)
+        .ok_or("中阶段不存在。")?;
     mid.plan_approved_at = Some(now);
     mid.plan_revision = plan_rev;
 
@@ -1404,7 +1509,9 @@ pub(crate) async fn enter_milestone_review(
         return Err("未选择大阶段。".to_string());
     }
 
-    let ms = proj.milestones.iter_mut()
+    let ms = proj
+        .milestones
+        .iter_mut()
         .find(|m| m.id == *milestone_id)
         .ok_or("大阶段不存在。".to_string())?;
 
@@ -1412,7 +1519,9 @@ pub(crate) async fn enter_milestone_review(
     if ms.mid_stages.is_empty() {
         return Err("当前大阶段没有中阶段。".to_string());
     }
-    let all_complete = ms.mid_stages.iter()
+    let all_complete = ms
+        .mid_stages
+        .iter()
         .all(|m| m.status == project::MidStageStatus::Completed);
     if !all_complete {
         return Err("大阶段尚有未完成的中阶段，无法进入审阅。".to_string());
@@ -1437,13 +1546,18 @@ pub(crate) async fn approve_milestone_outcome(
     let mut proj = crate::load_project(&project_name)?;
 
     if proj.workflow_state.current_step != project::WorkflowStep::MilestoneReview {
-        return Err(format!("当前步骤 {:?} 不是 MilestoneReview", proj.workflow_state.current_step));
+        return Err(format!(
+            "当前步骤 {:?} 不是 MilestoneReview",
+            proj.workflow_state.current_step
+        ));
     }
 
     let milestone_id = &proj.current_milestone_id;
     let now = chrono::Utc::now().to_rfc3339();
 
-    let ms = proj.milestones.iter_mut()
+    let ms = proj
+        .milestones
+        .iter_mut()
         .find(|m| m.id == *milestone_id)
         .ok_or("大阶段不存在。".to_string())?;
 
@@ -1454,8 +1568,11 @@ pub(crate) async fn approve_milestone_outcome(
             ms.approved_at = Some(now.clone());
 
             // Check if there are subsequent milestones
-            let current_idx = proj.milestones.iter()
-                .position(|m| m.id == *milestone_id).unwrap_or(0);
+            let current_idx = proj
+                .milestones
+                .iter()
+                .position(|m| m.id == *milestone_id)
+                .unwrap_or(0);
             let has_next = current_idx + 1 < proj.milestones.len();
 
             if has_next {
@@ -1490,9 +1607,7 @@ pub(crate) async fn approve_milestone_outcome(
 
 /// B 分支：AI 生成回退建议（基于失败证据、测试结果、稳定标签、用户反馈）
 #[tauri::command]
-pub(crate) async fn suggest_rollback_checkpoint(
-    project_name: String,
-) -> Result<String, String> {
+pub(crate) async fn suggest_rollback_checkpoint(project_name: String) -> Result<String, String> {
     let proj = crate::load_project(&project_name)?;
 
     if proj.workflow_state.discussion_scope != project::DiscussionScope::FixPast {
@@ -1500,7 +1615,11 @@ pub(crate) async fn suggest_rollback_checkpoint(
     }
 
     let milestone_id = &proj.current_milestone_id;
-    let ms = proj.milestones.iter().find(|m| m.id == *milestone_id).ok_or("大阶段不存在。")?;
+    let ms = proj
+        .milestones
+        .iter()
+        .find(|m| m.id == *milestone_id)
+        .ok_or("大阶段不存在。")?;
 
     // Collect evidence
     let mut evidence = String::new();
@@ -1513,9 +1632,12 @@ pub(crate) async fn suggest_rollback_checkpoint(
                 project::SubtaskStatus::AwaitingConfirmation => "⏳ 待确认",
                 _ => "—",
             };
-            evidence.push_str(&format!("  - {} [{}] tag:{}\n",
-                st.title, status,
-                st.auto_tag.as_deref().unwrap_or("无")));
+            evidence.push_str(&format!(
+                "  - {} [{}] tag:{}\n",
+                st.title,
+                status,
+                st.auto_tag.as_deref().unwrap_or("无")
+            ));
             if let Some(ref t) = st.test_result {
                 if !t.passed {
                     evidence.push_str(&format!("    测试失败：{}\n", t.suggestion));
@@ -1525,11 +1647,16 @@ pub(crate) async fn suggest_rollback_checkpoint(
     }
 
     // Get branch discussion messages
-    let discussion = proj.discussion_threads.first()
-        .map(|t| t.messages.iter()
-            .map(|m| format!("[{}]: {}", m.role, m.content))
-            .collect::<Vec<_>>()
-            .join("\n"))
+    let discussion = proj
+        .discussion_threads
+        .first()
+        .map(|t| {
+            t.messages
+                .iter()
+                .map(|m| format!("[{}]: {}", m.role, m.content))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
         .unwrap_or_default();
 
     let context = format!(
@@ -1548,7 +1675,9 @@ pub(crate) async fn suggest_rollback_checkpoint(
         &context,
         false,
         0.3,
-    ).await.map_err(|e| format!("AI 调用失败：{}", e))?;
+    )
+    .await
+    .map_err(|e| format!("AI 调用失败：{}", e))?;
 
     Ok(reply)
 }
@@ -1565,7 +1694,9 @@ pub(crate) async fn generate_future_milestone_draft(
     }
 
     let milestone_id = &proj.current_milestone_id;
-    let split_idx = proj.milestones.iter()
+    let split_idx = proj
+        .milestones
+        .iter()
         .position(|m| m.id == *milestone_id)
         .ok_or("大阶段不存在。")?;
 
@@ -1573,26 +1704,35 @@ pub(crate) async fn generate_future_milestone_draft(
     let completed: Vec<&project::Milestone> = proj.milestones[..=split_idx].iter().collect();
 
     // Build context
-    let completed_titles: Vec<String> = completed.iter()
-        .map(|m| format!("- {} ({})", m.title, m.version)).collect();
+    let completed_titles: Vec<String> = completed
+        .iter()
+        .map(|m| format!("- {} ({})", m.title, m.version))
+        .collect();
 
     let context = format!(
         "项目方案：{}\n\n已完成大阶段：\n{}\n\n讨论反馈：\n{}\n\n\
          只生成上述已完成大阶段之后的后续大阶段。已完成大阶段必须完全保留。",
         proj.version_plan,
         completed_titles.join("\n"),
-        proj.discussion_threads.first()
-            .map(|t| t.messages.iter().map(|m| format!("[{}]: {}", m.role, m.content)).collect::<Vec<_>>().join("\n"))
+        proj.discussion_threads
+            .first()
+            .map(|t| t
+                .messages
+                .iter()
+                .map(|m| format!("[{}]: {}", m.role, m.content))
+                .collect::<Vec<_>>()
+                .join("\n"))
             .unwrap_or_default(),
     );
 
-    let reply = crate::api::call_deepseek_api_json(
-        crate::prompts::MILESTONE_GENERATION_PROMPT,
-        &context,
-    ).await.map_err(|e| format!("AI 调用失败：{}", e))?;
+    let reply =
+        crate::api::call_deepseek_api_json(crate::prompts::MILESTONE_GENERATION_PROMPT, &context)
+            .await
+            .map_err(|e| format!("AI 调用失败：{}", e))?;
 
     let raw: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&reply)
-        .await.map_err(|e| format!("解析失败：{}", e))?;
+        .await
+        .map_err(|e| format!("解析失败：{}", e))?;
 
     if raw.is_empty() {
         return Err("AI 返回的后续大阶段为空。".to_string());
@@ -1626,7 +1766,8 @@ pub(crate) async fn generate_future_milestone_draft(
 
     // === 阶段五关键修复：版本归一化 ===
     // AI 输出的 version 仅作参考，系统基于最后一个保留阶段重新计算版本序列
-    let last_retained_version = completed.last()
+    let last_retained_version = completed
+        .last()
         .map(|m| m.version.clone())
         .unwrap_or_else(|| "v0.0".to_string());
     let normalized = normalize_future_versions(&last_retained_version, &new_milestones);
@@ -1643,14 +1784,18 @@ pub(crate) async fn generate_future_milestone_draft(
     // Collect metadata
     let retained_ids: Vec<String> = completed.iter().map(|m| m.id.clone()).collect();
     let future_ids: Vec<String> = new_milestones.iter().map(|m| m.id.clone()).collect();
-    let ai_versions: Vec<String> = raw.iter()
+    let ai_versions: Vec<String> = raw
+        .iter()
         .map(|r| r["version"].as_str().unwrap_or("v0.0").to_string())
         .collect();
 
     // === 阶段六：数量守恒检查 ===
     // 计算分割点之后原有的大阶段数量（被替换的部分）
     let proj_for_count = crate::load_project(&project_name)?;
-    let original_remaining = proj_for_count.milestones.len().saturating_sub(split_idx + 1);
+    let original_remaining = proj_for_count
+        .milestones
+        .len()
+        .saturating_sub(split_idx + 1);
     let new_count = new_milestones.len();
     let count_expansion = new_count > original_remaining.saturating_mul(3) / 2
         && new_count.saturating_sub(original_remaining) > 1;
@@ -1661,19 +1806,22 @@ pub(crate) async fn generate_future_milestone_draft(
         if fm.goal.is_empty() && fm.description.is_empty() {
             granularity_issues.push(format!(
                 "未来大阶段 #{}「{}」缺少目标和描述，可能为空壳阶段。",
-                i + 1, fm.title
+                i + 1,
+                fm.title
             ));
         }
         if fm.scope.is_empty() {
             granularity_issues.push(format!(
                 "未来大阶段 #{}「{}」缺少范围边界，粒度可能不足。",
-                i + 1, fm.title
+                i + 1,
+                fm.title
             ));
         }
         if fm.acceptance_criteria.is_empty() {
             granularity_issues.push(format!(
                 "未来大阶段 #{}「{}」缺少验收标准。",
-                i + 1, fm.title
+                i + 1,
+                fm.title
             ));
         }
     }
@@ -1726,7 +1874,9 @@ pub(crate) async fn approve_future_milestones(
         return Err("当前不在 FuturePlanApproval 步骤。".to_string());
     }
 
-    let draft = proj.milestone_draft.as_ref()
+    let draft = proj
+        .milestone_draft
+        .as_ref()
         .ok_or("没有未来大阶段草稿。".to_string())?;
 
     // === 阶段五关键修复：批准前一致性校验 ===
@@ -1765,7 +1915,11 @@ pub(crate) async fn approve_future_milestones(
     }
 
     // Verify no completed milestone appears in future candidates
-    let retained_set: std::collections::HashSet<&str> = draft.retained_milestone_ids.iter().map(|s| s.as_str()).collect();
+    let retained_set: std::collections::HashSet<&str> = draft
+        .retained_milestone_ids
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
     for fm in &draft.candidate_milestones {
         if retained_set.contains(fm.id.as_str()) {
             return Err(format!(
@@ -1776,7 +1930,9 @@ pub(crate) async fn approve_future_milestones(
     }
 
     // Verify future versions are unique and don't duplicate retained versions
-    let retained_versions: std::collections::HashSet<String> = proj.milestones.iter()
+    let retained_versions: std::collections::HashSet<String> = proj
+        .milestones
+        .iter()
         .filter(|m| retained_set.contains(m.id.as_str()))
         .map(|m| m.version.clone())
         .collect();
@@ -1792,7 +1948,9 @@ pub(crate) async fn approve_future_milestones(
     }
 
     let milestone_id = &proj.current_milestone_id;
-    let split_idx = proj.milestones.iter()
+    let split_idx = proj
+        .milestones
+        .iter()
         .position(|m| m.id == *milestone_id)
         .unwrap_or(0);
 
@@ -1821,7 +1979,11 @@ pub(crate) async fn approve_future_milestones(
 /// Helper: extract string array from JSON value
 fn arr_str(v: &serde_json::Value) -> Vec<String> {
     v.as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -1889,12 +2051,8 @@ pub(crate) async fn generate_milestones(
         crate::prompts::PM_PROMPT, mode
     );
     let user_message = format!("请根据以下版本方案拆解为3-5个大阶段：\n{}", version_plan);
-    let content = crate::api::call_deepseek_api_inner(
-        &system_prompt,
-        &user_message,
-        false,
-        0.5,
-    ).await?;
+    let content =
+        crate::api::call_deepseek_api_inner(&system_prompt, &user_message, false, 0.5).await?;
     //（上面的文字）JSON数组转化为Rust数组,json改动替换
     let raw_milestones: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&content)
         .await
@@ -1951,37 +2109,43 @@ pub(crate) async fn generate_milestones(
     );
 
     // 步骤 3：调用 DeepSeek Flash 执行质检（纯文本模式，低 temperature）
-    let qa_response =
-        match crate::api::call_deepseek_api_inner(crate::prompts::QA_CHECK_PROMPT, &qa_user_message, false, 0.1).await {
-            Ok(reply) => reply,
-            Err(e) => {
-                eprintln!("[generate_milestones] 质检 API 调用失败：{}，跳过质检", e);
-                return Ok(milestones);
-            }
-        };
-
-    // 步骤 4：使用 parse_json_with_retry 解析 AI 返回的 QAResult JSON
-    let qa_result = match crate::json_utils::parse_json_with_retry::<project::QAResult>(&qa_response).await {
-        Ok(mut result) => {
-            result.checked_at = chrono::Utc::now().to_rfc3339();
-            result
-        }
+    let qa_response = match crate::api::call_deepseek_api_inner(
+        crate::prompts::QA_CHECK_PROMPT,
+        &qa_user_message,
+        false,
+        0.1,
+    )
+    .await
+    {
+        Ok(reply) => reply,
         Err(e) => {
-            eprintln!(
-                "[generate_milestones] 质检 JSON 解析失败：{}，默认判定为不通过",
-                e
-            );
-            project::QAResult {
-                passed: false,
-                reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案"
-                    .to_string(),
-                details: vec![],
-                attention_points: vec![],
-                checked_at: chrono::Utc::now().to_rfc3339(),
-                warnings: vec![format!("质检 JSON 解析失败：{}", e)],
-            }
+            eprintln!("[generate_milestones] 质检 API 调用失败：{}，跳过质检", e);
+            return Ok(milestones);
         }
     };
+
+    // 步骤 4：使用 parse_json_with_retry 解析 AI 返回的 QAResult JSON
+    let qa_result =
+        match crate::json_utils::parse_json_with_retry::<project::QAResult>(&qa_response).await {
+            Ok(mut result) => {
+                result.checked_at = chrono::Utc::now().to_rfc3339();
+                result
+            }
+            Err(e) => {
+                eprintln!(
+                    "[generate_milestones] 质检 JSON 解析失败：{}，默认判定为不通过",
+                    e
+                );
+                project::QAResult {
+                    passed: false,
+                    reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案".to_string(),
+                    details: vec![],
+                    attention_points: vec![],
+                    checked_at: chrono::Utc::now().to_rfc3339(),
+                    warnings: vec![format!("质检 JSON 解析失败：{}", e)],
+                }
+            }
+        };
 
     // 步骤 5：将 QAResult 写入每个 Milestone
     for milestone in &mut milestones {
@@ -2014,12 +2178,8 @@ pub(crate) async fn regenerate_milestones_with_feedback(
         "上次拆解被需求质检驳回，原因：\n{}\n\n请根据此反馈，重新根据以下版本方案拆解为3-5个大阶段：\n{}",
         feedback, version_plan
     );
-    let content = crate::api::call_deepseek_api_inner(
-        &system_prompt,
-        &user_message,
-        false,
-        0.5,
-    ).await?;
+    let content =
+        crate::api::call_deepseek_api_inner(&system_prompt, &user_message, false, 0.5).await?;
     // 5. 解析 JSON 数组
     let raw_milestones: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&content)
         .await
@@ -2075,37 +2235,46 @@ pub(crate) async fn regenerate_milestones_with_feedback(
     );
 
     // 步骤 7.3：调用 DeepSeek Flash 执行质检（纯文本模式，低 temperature）
-    let qa_response =
-        match crate::api::call_deepseek_api_inner(crate::prompts::QA_CHECK_PROMPT, &qa_user_message, false, 0.1).await {
-            Ok(reply) => reply,
-            Err(e) => {
-                eprintln!(
-                    "[regenerate_milestones_with_feedback] 质检 API 调用失败：{}，跳过质检",
-                    e
-                );
-                return Ok(milestones);
-            }
-        };
-
-    // 步骤 7.4：使用 parse_json_with_retry 解析 AI 返回的 QAResult JSON
-    let qa_result = match crate::json_utils::parse_json_with_retry::<project::QAResult>(&qa_response).await {
-        Ok(mut result) => {
-            result.checked_at = chrono::Utc::now().to_rfc3339();
-            result
-        }
+    let qa_response = match crate::api::call_deepseek_api_inner(
+        crate::prompts::QA_CHECK_PROMPT,
+        &qa_user_message,
+        false,
+        0.1,
+    )
+    .await
+    {
+        Ok(reply) => reply,
         Err(e) => {
-            eprintln!("[regenerate_milestones_with_feedback] 质检 JSON 解析失败：{}，默认判定为不通过", e);
-            project::QAResult {
-                passed: false,
-                reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案"
-                    .to_string(),
-                details: vec![],
-                attention_points: vec![],
-                checked_at: chrono::Utc::now().to_rfc3339(),
-                warnings: vec![format!("质检 JSON 解析失败：{}", e)],
-            }
+            eprintln!(
+                "[regenerate_milestones_with_feedback] 质检 API 调用失败：{}，跳过质检",
+                e
+            );
+            return Ok(milestones);
         }
     };
+
+    // 步骤 7.4：使用 parse_json_with_retry 解析 AI 返回的 QAResult JSON
+    let qa_result =
+        match crate::json_utils::parse_json_with_retry::<project::QAResult>(&qa_response).await {
+            Ok(mut result) => {
+                result.checked_at = chrono::Utc::now().to_rfc3339();
+                result
+            }
+            Err(e) => {
+                eprintln!(
+                "[regenerate_milestones_with_feedback] 质检 JSON 解析失败：{}，默认判定为不通过",
+                e
+            );
+                project::QAResult {
+                    passed: false,
+                    reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案".to_string(),
+                    details: vec![],
+                    attention_points: vec![],
+                    checked_at: chrono::Utc::now().to_rfc3339(),
+                    warnings: vec![format!("质检 JSON 解析失败：{}", e)],
+                }
+            }
+        };
 
     // 步骤 7.5：将 QAResult 写入每个 Milestone
     for milestone in &mut milestones {
@@ -2130,7 +2299,8 @@ pub(crate) async fn generate_mid_stages(
     let mut system_prompt = format!(
         "{}\n\n当前项目模式：{}。请根据版本方案，将大阶段拆解为 3-6 个中阶段。\
          每个中阶段是一个垂直切片。",
-        crate::prompts::DOMAIN_LEAD_PROMPT, mode
+        crate::prompts::DOMAIN_LEAD_PROMPT,
+        mode
     );
     // 注入 attention_points（若不为空）
     if !attention_points.is_empty() {
@@ -2143,12 +2313,8 @@ pub(crate) async fn generate_mid_stages(
         "请根据版本方案，为大阶段「{} - {}」拆解中阶段：\n{}",
         milestone_title, milestone_description, version_plan
     );
-    let content = crate::api::call_deepseek_api_inner(
-        &system_prompt,
-        &user_message,
-        false,
-        0.5,
-    ).await?;
+    let content =
+        crate::api::call_deepseek_api_inner(&system_prompt, &user_message, false, 0.5).await?;
     // 5. 解析 JSON,json 解析改动
     let raw_mid_stages: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&content)
         .await
@@ -2184,9 +2350,6 @@ pub(crate) async fn generate_mid_stages(
 }
 
 // src-tauri/src/lib.rs
-
-
-
 
 /// 在保留已完成大阶段的前提下，根据用户反馈重新生成后续大阶段
 ///
@@ -2269,18 +2432,13 @@ pub(crate) async fn regenerate_milestones_from_point(
         if feedback.is_empty() { "（用户未提供额外反馈）" } else { &feedback }
     );
 
-    let content = crate::api::call_deepseek_api_inner(
-        &system_prompt,
-        &user_message,
-        false,
-        0.5,
-    ).await?;
+    let content =
+        crate::api::call_deepseek_api_inner(&system_prompt, &user_message, false, 0.5).await?;
 
     // 8. 解析 AI 返回的 JSON 数组
-    let raw_milestones: Vec<serde_json::Value> =
-        crate::json_utils::parse_json_with_retry(&content)
-            .await
-            .map_err(|e| format!("解析大阶段 JSON 失败：{}", e))?;
+    let raw_milestones: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&content)
+        .await
+        .map_err(|e| format!("解析大阶段 JSON 失败：{}", e))?;
 
     // 9. 构造新的 Milestone 结构体
     let mut new_milestones: Vec<project::Milestone> = Vec::new();
@@ -2360,27 +2518,29 @@ pub(crate) async fn regenerate_milestones_from_point(
             }
         };
 
-        let qa_result = match crate::json_utils::parse_json_with_retry::<project::QAResult>(&qa_response).await {
-            Ok(mut result) => {
-                result.checked_at = chrono::Utc::now().to_rfc3339();
-                result
-            }
-            Err(e) => {
-                eprintln!(
+        let qa_result =
+            match crate::json_utils::parse_json_with_retry::<project::QAResult>(&qa_response).await
+            {
+                Ok(mut result) => {
+                    result.checked_at = chrono::Utc::now().to_rfc3339();
+                    result
+                }
+                Err(e) => {
+                    eprintln!(
                     "[regenerate_milestones_from_point] 质检 JSON 解析失败：{}，默认判定为不通过",
                     e
                 );
-                project::QAResult {
-                    passed: false,
-                    reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案"
-                        .to_string(),
-                    details: vec![],
-                    attention_points: vec![],
-                    checked_at: chrono::Utc::now().to_rfc3339(),
-                    warnings: vec![format!("质检 JSON 解析失败：{}", e)],
+                    project::QAResult {
+                        passed: false,
+                        reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案"
+                            .to_string(),
+                        details: vec![],
+                        attention_points: vec![],
+                        checked_at: chrono::Utc::now().to_rfc3339(),
+                        warnings: vec![format!("质检 JSON 解析失败：{}", e)],
+                    }
                 }
-            }
-        };
+            };
 
         // 质检不通过 → 返回错误，不修改 project.json
         if !qa_result.passed {
@@ -2413,8 +2573,8 @@ pub(crate) async fn regenerate_milestones_from_point(
     let project = crate::save_and_reload_project(&project)?;
 
     // 13. 返回完整 Project JSON
-    let json_str = serde_json::to_string_pretty(&project)
-        .map_err(|e| format!("序列化项目文件失败: {}", e))?;
+    let json_str =
+        serde_json::to_string_pretty(&project).map_err(|e| format!("序列化项目文件失败: {}", e))?;
 
     Ok(json_str)
 }
@@ -2500,13 +2660,19 @@ pub(crate) async fn regenerate_plan_from_checkpoint(
             let result_summary = match (&st.execution_result, &st.test_result) {
                 (Some(exec), Some(test)) => {
                     if test.passed {
-                        format!("通过 — {}", exec.output.chars().take(100).collect::<String>())
+                        format!(
+                            "通过 — {}",
+                            exec.output.chars().take(100).collect::<String>()
+                        )
                     } else {
                         format!("未通过 — {}", test.suggestion)
                     }
                 }
                 (Some(exec), None) => {
-                    format!("已执行 — {}", exec.output.chars().take(100).collect::<String>())
+                    format!(
+                        "已执行 — {}",
+                        exec.output.chars().take(100).collect::<String>()
+                    )
                 }
                 _ => "待执行".to_string(),
             };
@@ -2567,10 +2733,9 @@ pub(crate) async fn regenerate_plan_from_checkpoint(
     .map_err(|e| format!("AI 调用失败: {}", e))?;
 
     // 8. 解析 AI 返回的 JSON 数组
-    let raw_subtasks: Vec<serde_json::Value> =
-        crate::json_utils::parse_json_with_retry(&reply)
-            .await
-            .map_err(|e| format!("解析小阶段 JSON 失败：{}", e))?;
+    let raw_subtasks: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&reply)
+        .await
+        .map_err(|e| format!("解析小阶段 JSON 失败：{}", e))?;
 
     // 9. 构建新的 subtask 列表
     let mut new_subtasks: Vec<project::Subtask> = Vec::new();
@@ -2738,7 +2903,14 @@ pub(crate) async fn summarize_milestone(
          - Git 标签：{}\n\n\
          子任务测试通过率：{}\n\n\
          项目剩余大阶段数：{} 个",
-        title, version, total_mid_stages, completed_count, failed_count, tags_line, pass_rate, remaining
+        title,
+        version,
+        total_mid_stages,
+        completed_count,
+        failed_count,
+        tags_line,
+        pass_rate,
+        remaining
     );
 
     // 7. 调用 AI（纯文本模式，低 temperature = 0.3，语气中性）

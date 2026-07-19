@@ -13,7 +13,9 @@ pub(crate) async fn validate_project_path(
 /// 使用 walkdir 递归遍历项目目录（最大深度 5），跳过 .git、node_modules、
 /// target 等构建产物目录，同时跳过隐藏文件（以 . 开头），但保留 .env.example。
 #[tauri::command]
-pub(crate) async fn get_project_files(project_path: String) -> Result<Vec<project::FileEntry>, String> {
+pub(crate) async fn get_project_files(
+    project_path: String,
+) -> Result<Vec<project::FileEntry>, String> {
     let project = std::path::Path::new(&project_path);
     if !project.exists() || !project.is_dir() {
         return Ok(vec![]);
@@ -144,34 +146,34 @@ pub(crate) async fn initialize_project_entry(
         match crate::load_project(&project_name) {
             Ok(mut existing) => {
                 if existing.project_path == project_path && !existing.project_path.is_empty() {
-                // Same name + same path — check for stale execution session
-                let had_stale_session = clean_stale_execution_session(&mut existing);
+                    // Same name + same path — check for stale execution session
+                    let had_stale_session = clean_stale_execution_session(&mut existing);
 
-                // Check for stale autopilot state (autopilot active but target milestone gone)
-                let had_stale_autopilot = clean_stale_autopilot_state(&mut existing);
+                    // Check for stale autopilot state (autopilot active but target milestone gone)
+                    let had_stale_autopilot = clean_stale_autopilot_state(&mut existing);
 
-                if had_stale_session || had_stale_autopilot {
-                    // Persist the cleaned state and reload
-                    existing = crate::save_and_reload_project(&existing)?;
+                    if had_stale_session || had_stale_autopilot {
+                        // Persist the cleaned state and reload
+                        existing = crate::save_and_reload_project(&existing)?;
+                    }
+
+                    // Verify project path still exists
+                    let proj_path = std::path::Path::new(&existing.project_path);
+                    if !proj_path.exists() || !proj_path.is_dir() {
+                        // Project path no longer valid — reset to Before
+                        existing.workflow_state.top_level_phase = project::TopLevelPhase::Before;
+                        existing.workflow_state.current_step = project::WorkflowStep::WaitingEntry;
+                        existing.workflow_state.data_revision += 1;
+                        existing = crate::save_and_reload_project(&existing)?;
+                    }
+
+                    return Ok(existing);
+                } else if !existing.project_path.is_empty() {
+                    return Err(format!(
+                        "项目名称「{}」已被使用（路径：{}），请修改项目名称",
+                        project_name, existing.project_path
+                    ));
                 }
-
-                // Verify project path still exists
-                let proj_path = std::path::Path::new(&existing.project_path);
-                if !proj_path.exists() || !proj_path.is_dir() {
-                    // Project path no longer valid — reset to Before
-                    existing.workflow_state.top_level_phase = project::TopLevelPhase::Before;
-                    existing.workflow_state.current_step = project::WorkflowStep::WaitingEntry;
-                    existing.workflow_state.data_revision += 1;
-                    existing = crate::save_and_reload_project(&existing)?;
-                }
-
-                return Ok(existing);
-            } else if !existing.project_path.is_empty() {
-                return Err(format!(
-                    "项目名称「{}」已被使用（路径：{}），请修改项目名称",
-                    project_name, existing.project_path
-                ));
-            }
             }
             Err(e) => {
                 // 项目数据文件存在但无法解析（损坏或空文件）
@@ -208,8 +210,7 @@ pub(crate) async fn initialize_project_entry(
             }
         } else {
             // Path doesn't exist — create it
-            std::fs::create_dir_all(path)
-                .map_err(|e| format!("创建项目目录失败：{}", e))?;
+            std::fs::create_dir_all(path).map_err(|e| format!("创建项目目录失败：{}", e))?;
             // Verify the created directory is writable
             if !path.is_dir() {
                 return Err(format!(
@@ -279,8 +280,7 @@ pub(crate) async fn persist_project(project_json: String) -> Result<project::Pro
     if incoming.workflow_state.data_revision < disk.workflow_state.data_revision {
         return Err(format!(
             "修订冲突：传入修订 {} 低于磁盘修订 {}，拒绝覆盖",
-            incoming.workflow_state.data_revision,
-            disk.workflow_state.data_revision
+            incoming.workflow_state.data_revision, disk.workflow_state.data_revision
         ));
     }
 
@@ -291,7 +291,10 @@ pub(crate) async fn persist_project(project_json: String) -> Result<project::Pro
 /// 审批命令
 /// 根据 project_id 和 mid_stage_id，找到对应的中阶段，把它的状态改为 "approved"，然后保存回文件
 #[tauri::command]
-pub(crate) async fn approve_mid_stage(project_id: String, mid_stage_id: String) -> Result<String, String> {
+pub(crate) async fn approve_mid_stage(
+    project_id: String,
+    mid_stage_id: String,
+) -> Result<String, String> {
     // 使用统一加载方法
     let mut project = crate::load_project(&project_id)?;
 
@@ -396,7 +399,10 @@ pub(crate) async fn approve_mid_stage(project_id: String, mid_stage_id: String) 
 }
 /// 拒绝指定的中阶段：把它的状态改成 "rejected"，然后保存回项目文件
 #[tauri::command]
-pub(crate) async fn reject_mid_stage(project_id: String, mid_stage_id: String) -> Result<(), String> {
+pub(crate) async fn reject_mid_stage(
+    project_id: String,
+    mid_stage_id: String,
+) -> Result<(), String> {
     let mut project = crate::load_project(&project_id)?;
     let mut found = false;
     for milestone in &mut project.milestones {
@@ -441,7 +447,9 @@ fn clean_stale_execution_session(proj: &mut project::Project) -> bool {
     // Check 1: session is active but refers to non-existent entities
     if session.active {
         // Find the referenced subtask
-        let subtask_exists = proj.milestones.iter()
+        let subtask_exists = proj
+            .milestones
+            .iter()
             .filter(|ms| ms.id == session.milestone_id)
             .flat_map(|ms| ms.mid_stages.iter())
             .filter(|mid| mid.id == session.mid_stage_id)
@@ -453,13 +461,16 @@ fn clean_stale_execution_session(proj: &mut project::Project) -> bool {
             should_clean = true;
         } else if session.status == "executing" {
             // Check if subtask is still marked as Executing
-            let still_executing = proj.milestones.iter()
+            let still_executing = proj
+                .milestones
+                .iter()
                 .filter(|ms| ms.id == session.milestone_id)
                 .flat_map(|ms| ms.mid_stages.iter())
                 .filter(|mid| mid.id == session.mid_stage_id)
                 .flat_map(|mid| mid.subtasks.iter())
-                .any(|st| st.id == session.subtask_id
-                    && st.status == project::SubtaskStatus::Executing);
+                .any(|st| {
+                    st.id == session.subtask_id && st.status == project::SubtaskStatus::Executing
+                });
 
             if !still_executing {
                 // Session says executing but subtask doesn't — process died
@@ -529,7 +540,10 @@ fn clean_stale_autopilot_state(proj: &mut project::Project) -> bool {
 
     // Check: all milestones completed
     let all_completed = !proj.milestones.is_empty()
-        && proj.milestones.iter().all(|m| m.status == project::MilestoneStatus::Completed);
+        && proj
+            .milestones
+            .iter()
+            .all(|m| m.status == project::MilestoneStatus::Completed);
     if all_completed {
         should_clean = true;
     }

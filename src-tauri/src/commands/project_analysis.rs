@@ -5,12 +5,29 @@ const MAX_DIR_DEPTH: usize = 8;
 const MAX_SINGLE_FILE_LINES: usize = 200;
 const MAX_TOTAL_CONTEXT_CHARS: usize = 15000;
 const SKIP_DIRS: &[&str] = &[
-    ".git", "node_modules", "target", "__pycache__", "dist",
-    ".next", "build", "coverage", ".venv", "env", ".env",
+    ".git",
+    "node_modules",
+    "target",
+    "__pycache__",
+    "dist",
+    ".next",
+    "build",
+    "coverage",
+    ".venv",
+    "env",
+    ".env",
 ];
 const SENSITIVE_FILES: &[&str] = &[
-    ".env", ".env.local", ".env.production", "id_rsa", "id_ed25519",
-    "*.key", "*.pem", "*.cert", "*.p12", "keystore",
+    ".env",
+    ".env.local",
+    ".env.production",
+    "id_rsa",
+    "id_ed25519",
+    "*.key",
+    "*.pem",
+    "*.cert",
+    "*.p12",
+    "keystore",
 ];
 
 /// Internal scan (sync, reusable)
@@ -36,14 +53,16 @@ fn scan_internal(project_path: &str) -> Result<project::ExistingProjectBaseline,
             continue;
         }
 
-        let rel_path = entry.path()
+        let rel_path = entry
+            .path()
             .strip_prefix(&project_path)
             .unwrap_or(entry.path())
             .to_string_lossy()
             .to_string();
 
         // Skip excluded directories
-        let is_skipped = rel_path.split('/')
+        let is_skipped = rel_path
+            .split('/')
             .any(|component| SKIP_DIRS.contains(&component));
         if is_skipped {
             continue;
@@ -57,24 +76,60 @@ fn scan_internal(project_path: &str) -> Result<project::ExistingProjectBaseline,
 
         // Check for sensitive files
         let file_name = entry.file_name().to_string_lossy().to_string();
-        if SENSITIVE_FILES.iter().any(|sf| file_name.contains(sf.trim_start_matches('*'))) {
+        if SENSITIVE_FILES
+            .iter()
+            .any(|sf| file_name.contains(sf.trim_start_matches('*')))
+        {
             continue;
         }
 
         // Determine file type
-        let ext = entry.path().extension()
+        let ext = entry
+            .path()
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
 
         let is_text = matches!(
             ext.as_str(),
-            "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "java"
-            | "c" | "cpp" | "h" | "hpp" | "cs" | "swift" | "kt"
-            | "md" | "txt" | "yml" | "yaml" | "json" | "toml"
-            | "css" | "html" | "vue" | "svelte" | "sql" | "rb" | "php"
-            | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat"
-            | "dockerfile" | "cmake" | "gradle" | "xml"
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "py"
+                | "go"
+                | "java"
+                | "c"
+                | "cpp"
+                | "h"
+                | "hpp"
+                | "cs"
+                | "swift"
+                | "kt"
+                | "md"
+                | "txt"
+                | "yml"
+                | "yaml"
+                | "json"
+                | "toml"
+                | "css"
+                | "html"
+                | "vue"
+                | "svelte"
+                | "sql"
+                | "rb"
+                | "php"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "fish"
+                | "ps1"
+                | "bat"
+                | "dockerfile"
+                | "cmake"
+                | "gradle"
+                | "xml"
         );
 
         // Read relevant files for content analysis
@@ -82,29 +137,55 @@ fn scan_internal(project_path: &str) -> Result<project::ExistingProjectBaseline,
             if let Ok(content) = std::fs::read_to_string(entry.path()) {
                 let lines: Vec<&str> = content.lines().collect();
                 let excerpt = if lines.len() > MAX_SINGLE_FILE_LINES {
-                    let head: Vec<String> = lines.iter().take(MAX_SINGLE_FILE_LINES / 2).map(|s| s.to_string()).collect();
-                    let mut tail: Vec<String> = lines.iter().rev().take(MAX_SINGLE_FILE_LINES / 2).map(|s| s.to_string()).collect();
+                    let head: Vec<String> = lines
+                        .iter()
+                        .take(MAX_SINGLE_FILE_LINES / 2)
+                        .map(|s| s.to_string())
+                        .collect();
+                    let mut tail: Vec<String> = lines
+                        .iter()
+                        .rev()
+                        .take(MAX_SINGLE_FILE_LINES / 2)
+                        .map(|s| s.to_string())
+                        .collect();
                     tail.reverse();
-                    format!("{}\n... ({} lines truncated) ...\n{}",
-                        head.join("\n"), lines.len() - MAX_SINGLE_FILE_LINES, tail.join("\n"))
+                    format!(
+                        "{}\n... ({} lines truncated) ...\n{}",
+                        head.join("\n"),
+                        lines.len() - MAX_SINGLE_FILE_LINES,
+                        tail.join("\n")
+                    )
                 } else {
                     content.clone()
                 };
 
-                let excerpt_chars = excerpt.chars().count().min(MAX_TOTAL_CONTEXT_CHARS - total_chars);
+                let excerpt_chars = excerpt
+                    .chars()
+                    .count()
+                    .min(MAX_TOTAL_CONTEXT_CHARS - total_chars);
 
                 // Classify files
                 let lower_rel = rel_path.to_lowercase();
                 if lower_rel.contains("readme") {
                     readme_content = excerpt.chars().take(excerpt_chars).collect();
-                } else if lower_rel.contains("package.json") || lower_rel.contains("cargo.toml")
-                    || lower_rel.contains("go.mod") || lower_rel.contains("pyproject.toml")
-                    || lower_rel.contains("gemfile") || lower_rel.contains("cmakelists.txt")
-                    || lower_rel.contains("pom.xml") || lower_rel.contains("build.gradle")
+                } else if lower_rel.contains("package.json")
+                    || lower_rel.contains("cargo.toml")
+                    || lower_rel.contains("go.mod")
+                    || lower_rel.contains("pyproject.toml")
+                    || lower_rel.contains("gemfile")
+                    || lower_rel.contains("cmakelists.txt")
+                    || lower_rel.contains("pom.xml")
+                    || lower_rel.contains("build.gradle")
                 {
-                    manifest_files.push((rel_path.clone(), excerpt.chars().take(excerpt_chars).collect()));
+                    manifest_files.push((
+                        rel_path.clone(),
+                        excerpt.chars().take(excerpt_chars).collect(),
+                    ));
                 } else {
-                    source_files.push((rel_path.clone(), excerpt.chars().take(excerpt_chars).collect()));
+                    source_files.push((
+                        rel_path.clone(),
+                        excerpt.chars().take(excerpt_chars).collect(),
+                    ));
                 }
 
                 total_chars += excerpt_chars;
@@ -118,7 +199,14 @@ fn scan_internal(project_path: &str) -> Result<project::ExistingProjectBaseline,
         "项目包含 {} 个源文件。\n技术栈：{}\nReadme：{}\n",
         scanned_files.len(),
         tech_stack,
-        if readme_content.chars().count() > 200 { format!("{}...", readme_content.chars().take(200).collect::<String>()) } else { readme_content.clone() }
+        if readme_content.chars().count() > 200 {
+            format!(
+                "{}...",
+                readme_content.chars().take(200).collect::<String>()
+            )
+        } else {
+            readme_content.clone()
+        }
     );
 
     // Sort: manifests first, then source
@@ -129,15 +217,20 @@ fn scan_internal(project_path: &str) -> Result<project::ExistingProjectBaseline,
     Ok(project::ExistingProjectBaseline {
         project_summary: summary,
         tech_stack,
-        architecture_evidence: format!("总文件数：{}，已读取 {} 个文件的核心内容（约 {} 字符）", file_count, evidence_count, total_chars),
+        architecture_evidence: format!(
+            "总文件数：{}，已读取 {} 个文件的核心内容（约 {} 字符）",
+            file_count, evidence_count, total_chars
+        ),
         completed_capabilities: vec![],
         pending_capabilities: vec![],
         risks: vec![],
         uncertainties: vec![],
         scanned_files,
         scan_complete: true,
-        evidence_summary: format!("扫描 {} 个文件，读取 {} 个清单和核心文件（约 {} 字符）",
-            file_count, evidence_count, total_chars),
+        evidence_summary: format!(
+            "扫描 {} 个文件，读取 {} 个清单和核心文件（约 {} 字符）",
+            file_count, evidence_count, total_chars
+        ),
         generated_at: chrono::Utc::now().to_rfc3339(),
         approved: false,
         approved_at: None,
@@ -151,7 +244,9 @@ fn scan_internal(project_path: &str) -> Result<project::ExistingProjectBaseline,
 
 /// 扫描已有项目目录（Tauri 命令 — 保留用于前端手动调用）
 #[tauri::command]
-pub(crate) async fn scan_existing_project(project_path: String) -> Result<project::ExistingProjectBaseline, String> {
+pub(crate) async fn scan_existing_project(
+    project_path: String,
+) -> Result<project::ExistingProjectBaseline, String> {
     scan_internal(&project_path)
 }
 
@@ -174,7 +269,9 @@ pub(crate) async fn analyze_existing_project(
     let manifest_text = if baseline.manifest_details.is_empty() {
         "（未检测到依赖清单文件）".to_string()
     } else {
-        baseline.manifest_details.iter()
+        baseline
+            .manifest_details
+            .iter()
             .map(|(path, content)| {
                 let truncated: String = content.chars().take(2000).collect();
                 format!("### {}\n```\n{}\n```", path, truncated)
@@ -186,7 +283,9 @@ pub(crate) async fn analyze_existing_project(
     let source_text = if baseline.source_abstracts.is_empty() {
         "（未提取源文件摘要）".to_string()
     } else {
-        baseline.source_abstracts.iter()
+        baseline
+            .source_abstracts
+            .iter()
             .map(|(path, content)| {
                 let truncated: String = content.chars().take(1500).collect();
                 format!("### {}\n```\n{}\n```", path, truncated)
@@ -224,31 +323,34 @@ pub(crate) async fn analyze_existing_project(
         baseline.scanned_files.join("\n")
     );
 
-    let result_str = crate::api::call_deepseek_api_json(
-        &crate::prompts::EXISTING_BASELINE_PROMPT,
-        &prompt,
-    ).await?;
+    let result_str =
+        crate::api::call_deepseek_api_json(&crate::prompts::EXISTING_BASELINE_PROMPT, &prompt)
+            .await?;
 
     let result: serde_json::Value = serde_json::from_str(&result_str)
         .map_err(|e| format!("解析 AI 返回的 JSON 失败：{}", e))?;
 
     if let Some(capabilities) = result["completed_capabilities"].as_array() {
-        baseline.completed_capabilities = capabilities.iter()
+        baseline.completed_capabilities = capabilities
+            .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
     }
     if let Some(pending) = result["pending_capabilities"].as_array() {
-        baseline.pending_capabilities = pending.iter()
+        baseline.pending_capabilities = pending
+            .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
     }
     if let Some(risks) = result["risks"].as_array() {
-        baseline.risks = risks.iter()
+        baseline.risks = risks
+            .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
     }
     if let Some(uncertainties) = result["uncertainties"].as_array() {
-        baseline.uncertainties = uncertainties.iter()
+        baseline.uncertainties = uncertainties
+            .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
     }
@@ -290,31 +392,34 @@ pub(crate) async fn generate_existing_baseline(
         baseline.scanned_files.join("\n")
     );
 
-    let result_str = crate::api::call_deepseek_api_json(
-        &crate::prompts::EXISTING_BASELINE_PROMPT,
-        &prompt,
-    ).await?;
+    let result_str =
+        crate::api::call_deepseek_api_json(&crate::prompts::EXISTING_BASELINE_PROMPT, &prompt)
+            .await?;
 
     let result: serde_json::Value = serde_json::from_str(&result_str)
         .map_err(|e| format!("解析 AI 返回的 JSON 失败：{}", e))?;
 
     if let Some(capabilities) = result["completed_capabilities"].as_array() {
-        baseline.completed_capabilities = capabilities.iter()
+        baseline.completed_capabilities = capabilities
+            .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
     }
     if let Some(pending) = result["pending_capabilities"].as_array() {
-        baseline.pending_capabilities = pending.iter()
+        baseline.pending_capabilities = pending
+            .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
     }
     if let Some(risks) = result["risks"].as_array() {
-        baseline.risks = risks.iter()
+        baseline.risks = risks
+            .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
     }
     if let Some(uncertainties) = result["uncertainties"].as_array() {
-        baseline.uncertainties = uncertainties.iter()
+        baseline.uncertainties = uncertainties
+            .iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
     }
@@ -421,7 +526,9 @@ fn build_already_constitution(baseline: &project::ExistingProjectBaseline) -> St
     let manifest_section = if baseline.manifest_details.is_empty() {
         "未检测到依赖清单文件".to_string()
     } else {
-        baseline.manifest_details.iter()
+        baseline
+            .manifest_details
+            .iter()
             .map(|(path, content)| {
                 let excerpt: String = content.chars().take(1000).collect();
                 format!("### {}\n```\n{}\n```", path, excerpt)
@@ -449,10 +556,30 @@ fn build_already_constitution(baseline: &project::ExistingProjectBaseline) -> St
         baseline.architecture_evidence,
         readme_section,
         manifest_section,
-        baseline.completed_capabilities.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"),
-        baseline.pending_capabilities.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"),
-        baseline.risks.iter().map(|r| format!("- {}", r)).collect::<Vec<_>>().join("\n"),
-        baseline.uncertainties.iter().map(|u| format!("- {}", u)).collect::<Vec<_>>().join("\n"),
+        baseline
+            .completed_capabilities
+            .iter()
+            .map(|c| format!("- {}", c))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        baseline
+            .pending_capabilities
+            .iter()
+            .map(|c| format!("- {}", c))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        baseline
+            .risks
+            .iter()
+            .map(|r| format!("- {}", r))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        baseline
+            .uncertainties
+            .iter()
+            .map(|u| format!("- {}", u))
+            .collect::<Vec<_>>()
+            .join("\n"),
         baseline.scanned_files.len(),
         baseline.evidence_summary,
         baseline.generated_at,
@@ -479,9 +606,13 @@ fn summarize_manifest_deps(manifest_details: &[(String, String)]) -> String {
                 !trimmed.is_empty()
                     && !trimmed.starts_with('#')
                     && !trimmed.starts_with("//")
-                    && (trimmed.contains("dep") || trimmed.contains("version") || trimmed.contains("script")
-                        || trimmed.contains("name") || trimmed.contains("require")
-                        || trimmed.contains("import") || trimmed.contains("module"))
+                    && (trimmed.contains("dep")
+                        || trimmed.contains("version")
+                        || trimmed.contains("script")
+                        || trimmed.contains("name")
+                        || trimmed.contains("require")
+                        || trimmed.contains("import")
+                        || trimmed.contains("module"))
             })
             .take(15)
             .collect();
@@ -502,7 +633,9 @@ fn build_already_summary(baseline: &project::ExistingProjectBaseline) -> String 
     let capabilities_summary = if baseline.completed_capabilities.is_empty() {
         "暂无已识别能力".to_string()
     } else {
-        baseline.completed_capabilities.iter()
+        baseline
+            .completed_capabilities
+            .iter()
             .take(5)
             .map(|c| format!("- {}", c))
             .collect::<Vec<_>>()
@@ -511,7 +644,9 @@ fn build_already_summary(baseline: &project::ExistingProjectBaseline) -> String 
     let risk_summary = if baseline.risks.is_empty() {
         "暂无已识别风险".to_string()
     } else {
-        baseline.risks.iter()
+        baseline
+            .risks
+            .iter()
             .take(3)
             .map(|r| format!("- {}", r))
             .collect::<Vec<_>>()
@@ -540,19 +675,12 @@ fn build_already_summary(baseline: &project::ExistingProjectBaseline) -> String 
          已有能力：\n{}\n\
          主要风险：\n{}\n\
          详细参见：ALREADY_CONSTITUTION.md（低权重参考，不可覆盖当前决策）",
-        baseline.tech_stack,
-        readme_excerpt,
-        manifest_summary,
-        capabilities_summary,
-        risk_summary,
+        baseline.tech_stack, readme_excerpt, manifest_summary, capabilities_summary, risk_summary,
     )
 }
 
 /// 将 Already 摘要注入工作宪法第一部分"已有信息"段落
-fn inject_already_summary_into_part1(
-    project_path: &str,
-    summary: &str,
-) -> Result<(), String> {
+fn inject_already_summary_into_part1(project_path: &str, summary: &str) -> Result<(), String> {
     use std::fs;
     use std::path::Path;
 
@@ -619,36 +747,63 @@ fn inject_already_summary_into_part1(
 }
 
 /// 检测技术栈
-fn detect_tech_stack(
-    manifests: &[(String, String)],
-    sources: &[(String, String)],
-) -> String {
+fn detect_tech_stack(manifests: &[(String, String)], sources: &[(String, String)]) -> String {
     let mut techs: Vec<String> = Vec::new();
 
     for (path, _) in manifests {
         let lower = path.to_lowercase();
-        if lower.contains("cargo.toml") { techs.push("Rust".to_string()); }
-        if lower.contains("package.json") { techs.push("Node.js/JavaScript/TypeScript".to_string()); }
-        if lower.contains("go.mod") { techs.push("Go".to_string()); }
+        if lower.contains("cargo.toml") {
+            techs.push("Rust".to_string());
+        }
+        if lower.contains("package.json") {
+            techs.push("Node.js/JavaScript/TypeScript".to_string());
+        }
+        if lower.contains("go.mod") {
+            techs.push("Go".to_string());
+        }
         if lower.contains("pyproject.toml") || lower.contains("requirements.txt") {
             techs.push("Python".to_string());
         }
         if lower.contains("pom.xml") || lower.contains("build.gradle") {
             techs.push("Java/Kotlin".to_string());
         }
-        if lower.contains("gemfile") { techs.push("Ruby".to_string()); }
-        if lower.contains("cmakelists.txt") { techs.push("C/C++".to_string()); }
+        if lower.contains("gemfile") {
+            techs.push("Ruby".to_string());
+        }
+        if lower.contains("cmakelists.txt") {
+            techs.push("C/C++".to_string());
+        }
     }
 
     // Detect from source files
     for (path, _) in sources {
         let ext = path.rsplit('.').next().unwrap_or("");
         match ext {
-            "rs" => { if !techs.iter().any(|t| t == "Rust") { techs.push("Rust".to_string()); }},
-            "ts" | "tsx" => { if !techs.iter().any(|t| t.contains("TypeScript")) { techs.push("TypeScript".to_string()); }},
-            "js" | "jsx" => { if !techs.iter().any(|t| t.contains("JavaScript")) { techs.push("JavaScript".to_string()); }},
-            "py" => { if !techs.iter().any(|t| t == "Python") { techs.push("Python".to_string()); }},
-            "go" => { if !techs.iter().any(|t| t == "Go") { techs.push("Go".to_string()); }},
+            "rs" => {
+                if !techs.iter().any(|t| t == "Rust") {
+                    techs.push("Rust".to_string());
+                }
+            }
+            "ts" | "tsx" => {
+                if !techs.iter().any(|t| t.contains("TypeScript")) {
+                    techs.push("TypeScript".to_string());
+                }
+            }
+            "js" | "jsx" => {
+                if !techs.iter().any(|t| t.contains("JavaScript")) {
+                    techs.push("JavaScript".to_string());
+                }
+            }
+            "py" => {
+                if !techs.iter().any(|t| t == "Python") {
+                    techs.push("Python".to_string());
+                }
+            }
+            "go" => {
+                if !techs.iter().any(|t| t == "Go") {
+                    techs.push("Go".to_string());
+                }
+            }
             _ => {}
         }
     }

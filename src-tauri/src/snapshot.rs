@@ -149,7 +149,10 @@ pub(crate) fn load_snapshot(project_id: &str) -> Result<Option<AppSnapshot>, Str
 ///
 /// 用于执行引擎侧（executor/pipeline）在 PID 变更时同步到快照，
 /// 无需前端重新传递 UI 状态。
-pub(crate) fn update_snapshot_pid(project_id: &str, running_pid: Option<u32>) -> Result<(), String> {
+pub(crate) fn update_snapshot_pid(
+    project_id: &str,
+    running_pid: Option<u32>,
+) -> Result<(), String> {
     // 读取现有快照（如果存在）
     let ui = match load_snapshot(project_id)? {
         Some(existing) => existing.ui,
@@ -190,9 +193,7 @@ pub(crate) async fn save_snapshot_event(
 ///
 /// 返回 `Ok(None)` 表示无快照或快照不可用，前端沿用默认状态。
 #[tauri::command]
-pub(crate) async fn restore_snapshot(
-    project_id: String,
-) -> Result<Option<AppSnapshot>, String> {
+pub(crate) async fn restore_snapshot(project_id: String) -> Result<Option<AppSnapshot>, String> {
     load_snapshot(&project_id)
 }
 

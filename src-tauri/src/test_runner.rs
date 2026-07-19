@@ -261,7 +261,12 @@ pub(crate) fn summarize_test_output(exit_code: i32, stdout: &str, stderr: &str) 
 }
 
 /// 格式化测试结果
-pub(crate) fn format_test_result(_label: &str, command: &str, exit_code: i32, summary: &str) -> String {
+pub(crate) fn format_test_result(
+    _label: &str,
+    command: &str,
+    exit_code: i32,
+    summary: &str,
+) -> String {
     let status = if exit_code == 0 {
         "✅ 通过"
     } else {
@@ -569,7 +574,8 @@ pub(crate) async fn check_subtask(
         .unwrap_or_else(|e| {
             eprintln!("[check_subtask] AI API 调用失败：{}，返回兜底 JSON", e);
             diagnosis_warnings.push(format!("AI API 调用失败：{}", e));
-            r#"{"passed": false, "issues": ["AI API 调用失败"], "suggestion": "", "warnings": []}"#.to_string()
+            r#"{"passed": false, "issues": ["AI API 调用失败"], "suggestion": "", "warnings": []}"#
+                .to_string()
         });
     // 解析 JSON 响应（带兜底）
     let test_result: project::TestResult =

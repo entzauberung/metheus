@@ -72,7 +72,14 @@ pub(crate) async fn git_save_subtask(
     mid_stage_version: String,
     subtask_title: String,
 ) -> Result<String, String> {
-    git_save_subtask_inner(project_path, subtask_index, mid_stage_version, subtask_title, false).await
+    git_save_subtask_inner(
+        project_path,
+        subtask_index,
+        mid_stage_version,
+        subtask_title,
+        false,
+    )
+    .await
 }
 
 /// 内部实现：支持快速/专业两种模式的 tag 前缀
@@ -114,7 +121,11 @@ pub(crate) async fn git_save_subtask_inner(
     }
 
     // 3. git tag -f（覆盖已有 tag）
-    let tag_prefix = if is_quick_mode { "metheus/q/" } else { "metheus/auto/" };
+    let tag_prefix = if is_quick_mode {
+        "metheus/q/"
+    } else {
+        "metheus/auto/"
+    };
     let tag_name = format!("{}{}/task-{}", tag_prefix, version, subtask_index);
     let tag_output = std::process::Command::new("git")
         .args(["tag", "-f", &tag_name])
@@ -410,36 +421,47 @@ pub(crate) async fn get_git_tags_summary(
 ) -> Result<project::GitTagTree, String> {
     let proj = crate::load_project(&project_name)?;
 
-    let milestones: Vec<project::MilestoneTagNode> = proj.milestones.iter().map(|ms| {
-        let mid_stages: Vec<project::MidStageTagNode> = ms.mid_stages.iter().map(|mid| {
-            let subtasks: Vec<project::SubtaskTagNode> = mid.subtasks.iter().enumerate().map(|(idx, st)| {
-                project::SubtaskTagNode {
-                    subtask_id: st.id.clone(),
-                    subtask_title: st.title.clone(),
-                    subtask_index: (idx + 1) as u32,
-                    subtask_tag: st.auto_tag.clone().unwrap_or_default(),
-                    subtask_status: format!("{:?}", st.status),
-                }
-            }).collect();
+    let milestones: Vec<project::MilestoneTagNode> = proj
+        .milestones
+        .iter()
+        .map(|ms| {
+            let mid_stages: Vec<project::MidStageTagNode> = ms
+                .mid_stages
+                .iter()
+                .map(|mid| {
+                    let subtasks: Vec<project::SubtaskTagNode> = mid
+                        .subtasks
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, st)| project::SubtaskTagNode {
+                            subtask_id: st.id.clone(),
+                            subtask_title: st.title.clone(),
+                            subtask_index: (idx + 1) as u32,
+                            subtask_tag: st.auto_tag.clone().unwrap_or_default(),
+                            subtask_status: format!("{:?}", st.status),
+                        })
+                        .collect();
 
-            project::MidStageTagNode {
-                mid_stage_id: mid.id.clone(),
-                mid_stage_title: mid.title.clone(),
-                mid_stage_version: mid.version.clone(),
-                mid_stage_tag: mid.git_tag.clone(),
-                mid_stage_status: format!("{:?}", mid.status),
-                subtasks,
+                    project::MidStageTagNode {
+                        mid_stage_id: mid.id.clone(),
+                        mid_stage_title: mid.title.clone(),
+                        mid_stage_version: mid.version.clone(),
+                        mid_stage_tag: mid.git_tag.clone(),
+                        mid_stage_status: format!("{:?}", mid.status),
+                        subtasks,
+                    }
+                })
+                .collect();
+
+            project::MilestoneTagNode {
+                milestone_id: ms.id.clone(),
+                milestone_title: ms.title.clone(),
+                milestone_version: ms.version.clone(),
+                milestone_status: format!("{:?}", ms.status),
+                mid_stages,
             }
-        }).collect();
-
-        project::MilestoneTagNode {
-            milestone_id: ms.id.clone(),
-            milestone_title: ms.title.clone(),
-            milestone_version: ms.version.clone(),
-            milestone_status: format!("{:?}", ms.status),
-            mid_stages,
-        }
-    }).collect();
+        })
+        .collect();
 
     Ok(project::GitTagTree { milestones })
 }
@@ -675,11 +697,14 @@ pub(crate) async fn rollback_to_subtask_with_reset(
         }
     }
 
-    let (t_mi, t_msi, t_si) =
-        match (target_milestone_idx, target_mid_stage_idx, target_subtask_idx) {
-            (Some(mi), Some(msi), Some(si)) => (mi, msi, si),
-            _ => return Err(format!("未找到 tag {} 对应的小阶段", tag_name)),
-        };
+    let (t_mi, t_msi, t_si) = match (
+        target_milestone_idx,
+        target_mid_stage_idx,
+        target_subtask_idx,
+    ) {
+        (Some(mi), Some(msi), Some(si)) => (mi, msi, si),
+        _ => return Err(format!("未找到 tag {} 对应的小阶段", tag_name)),
+    };
 
     // === 回退后清理后续 git tag（确保 git tag 列表与 Project 结构体状态一致）===
 
@@ -727,10 +752,7 @@ pub(crate) async fn rollback_to_subtask_with_reset(
                             );
                         }
                     }
-                    Err(e) => eprintln!(
-                        "警告: 执行 git tag -d {} 失败: {}",
-                        mid_stage.git_tag, e
-                    ),
+                    Err(e) => eprintln!("警告: 执行 git tag -d {} 失败: {}", mid_stage.git_tag, e),
                 }
             }
             for subtask in mid_stage.subtasks.iter() {
@@ -774,10 +796,7 @@ pub(crate) async fn rollback_to_subtask_with_reset(
                             );
                         }
                     }
-                    Err(e) => eprintln!(
-                        "警告: 执行 git tag -d {} 失败: {}",
-                        mid_stage.git_tag, e
-                    ),
+                    Err(e) => eprintln!("警告: 执行 git tag -d {} 失败: {}", mid_stage.git_tag, e),
                 }
             }
             for subtask in mid_stage.subtasks.iter() {

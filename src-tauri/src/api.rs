@@ -1,16 +1,18 @@
+use crate::constants::{DEEPSEEK_API_TIMEOUT_SECS, DEEPSEEK_API_URL, DEEPSEEK_WORKFLOW_MODEL};
 use std::env;
-use crate::constants::{
-    DEEPSEEK_API_TIMEOUT_SECS,
-    DEEPSEEK_API_URL,
-    DEEPSEEK_WORKFLOW_MODEL,
-};
 
-pub(crate) async fn call_deepseek_api(system_prompt: &str, user_message: &str) -> Result<String, String> {
+pub(crate) async fn call_deepseek_api(
+    system_prompt: &str,
+    user_message: &str,
+) -> Result<String, String> {
     call_deepseek_api_inner(system_prompt, user_message, false, 0.1).await
 }
 
 // ===== 结构化输出用（强制 JSON） =====
-pub(crate) async fn call_deepseek_api_json(system_prompt: &str, user_message: &str) -> Result<String, String> {
+pub(crate) async fn call_deepseek_api_json(
+    system_prompt: &str,
+    user_message: &str,
+) -> Result<String, String> {
     call_deepseek_api_inner(system_prompt, user_message, true, 0.5).await
 }
 
@@ -77,8 +79,12 @@ pub(crate) async fn call_deepseek_api_messages(
 
     let status = response.status();
     if !status.is_success() {
-        let error_body = response.text().await
-            .map_err(|error| format!("DeepSeek API 返回 HTTP {}，且错误正文读取失败：{}", status, error))?;
+        let error_body = response.text().await.map_err(|error| {
+            format!(
+                "DeepSeek API 返回 HTTP {}，且错误正文读取失败：{}",
+                status, error
+            )
+        })?;
         return Err(format!("DeepSeek API 返回 HTTP {}：{}", status, error_body));
     }
 

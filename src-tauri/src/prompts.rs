@@ -422,7 +422,8 @@ pub(crate) const EXECUTION_PLAN_CHECK_PROMPT: &str = "\
 omissions（字符串数组）、out_of_scope（字符串数组）、not_executable（字符串数组）、suggestions（字符串数组）。\
 只输出 JSON。";
 
-pub(crate) const EXISTING_BASELINE_PROMPT: &str = "你是一个项目分析专家。你的任务是根据用户提供的项目文件扫描结果，\
+pub(crate) const EXISTING_BASELINE_PROMPT: &str =
+    "你是一个项目分析专家。你的任务是根据用户提供的项目文件扫描结果，\
     识别项目的技术栈、已完成功能、待处理功能、风险和不确定项。\
     请基于实际证据评估，不确定的事项必须写入 uncertainties，不得编造。\
     输出格式必须是 JSON 对象，包含以下字段：completed_capabilities（字符串数组）、\

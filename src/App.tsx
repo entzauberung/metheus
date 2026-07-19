@@ -7,7 +7,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
 import "./App.css";
-import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus } from "./types";
+import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, AutopilotNextStep } from "./types";
 import { ProjectEntry } from "./ProjectEntry";
 import { ExistingBaselinePanel } from "./ExistingBaselinePanel";
 import { PreflightPanel } from "./PreflightPanel";
@@ -19,6 +19,7 @@ import { Modal } from "./components/Modal";
 import { ConsoleStepShell } from "./components/ConsoleStepShell";
 import { WorkflowActionBar } from "./components/WorkflowActionBar";
 import { Check, GitBranch, ListTodo, Pause, Play, RotateCcw, Search, Square, WandSparkles, X } from "lucide-react";
+import { AutopilotControlBar } from "./components/AutopilotControlBar";
 import ExecutionTree from "./ExecutionTree";
 import ChatRoom from "./ChatRoom";
 import TaskConsole from "./TaskConsole";
@@ -41,6 +42,15 @@ const WORKFLOW_STEPS = new Set<WorkflowStep>([
   "PauseDecision", "RollbackPreview", "BranchDiscussion", "FuturePlanApproval",
   "MilestoneReview", "Completed",
 ]);
+
+/** 自动驾驶两个原子动作之间的等待周期（ms） */
+const AUTOPILOT_STEP_DELAY_MS = 1000;
+
+/** 执行状态轮询周期（ms） */
+const EXECUTION_POLL_INTERVAL_MS = 1500;
+
+/** 连续轮询失败最大次数，防止界面无限静默等待 */
+const EXECUTION_POLL_MAX_FAILURES = 10;
 
 // ============================================================
 // App.tsx — 「弥」的前端总指挥
@@ -339,6 +349,12 @@ function App() {
   // 停止条件：大阶段边界（MilestoneReview）、出错、暂停
   const autopilotLoopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autopilotActiveRef = useRef(false);
+  // 单飞锁：同一项目同一时刻只允许一个自动动作在途
+  const autopilotGenerationRef = useRef(0);
+  // 执行状态轮询失败计数器
+  const executionPollFailuresRef = useRef(0);
+  // 执行状态轮询定时器
+  const executionPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // === 托管层驱动循环 ===
   // 覆盖范围：ThreeChecks → PlanApproval → Console → MilestoneGeneration → MilestoneCheck → MilestoneApproval
@@ -346,12 +362,34 @@ function App() {
   const managedLoopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const managedActiveRef = useRef(false);
 
-  const runAutopilotCycle = useCallback(async (proj: Project) => {
+  /** 自动驾驶唯一驱动入口：建立代次和单飞锁，阻止重复循环和旧循环回写 */
+  const driveAutopilot = useCallback(async (proj: Project) => {
+    // 递增代次，使旧循环失效
+    autopilotGenerationRef.current += 1;
+    const myGen = autopilotGenerationRef.current;
+
+    // 检查是否已有人在飞
+    if (autopilotLoopRef.current) {
+      clearTimeout(autopilotLoopRef.current);
+      autopilotLoopRef.current = null;
+    }
+
+    const cycle = async (p: Project): Promise<void> => {
+      // 代次失效检查
+      if (autopilotGenerationRef.current !== myGen) return;
+      if (!autopilotActiveRef.current) return;
+
+      await runAutopilotCycle(p, myGen);
+    };
+
+    await cycle(proj);
+  }, []);
+
+  const runAutopilotCycle = useCallback(async (proj: Project, generation: number) => {
     if (!proj.workflow_state.autopilot_active) return;
     if (proj.workflow_state.top_level_phase !== "Console") return;
 
     const autopilotState = proj.workflow_state.autopilot_state;
-    // Check if autopilot is paused, at boundary, or errored
     if (autopilotState) {
       if (autopilotState.run_status === "Paused") return;
       if (autopilotState.run_status === "WaitingMilestoneReview") return;
@@ -359,56 +397,179 @@ function App() {
     }
 
     try {
-      const next = await invokeWithTimeout<{
-        command: string;
-        args: Record<string, unknown>;
-        description: string;
-        at_milestone_boundary: boolean;
-        is_error: boolean;
-        error_message: string;
-      }>("autopilot_next_step", { projectName: proj.name });
+      const next = await invokeWithTimeout<AutopilotNextStep>("autopilot_next_step", { projectName: proj.name });
 
-      // Stop conditions
-      if (next.at_milestone_boundary) {
-        // Sync project to get updated autopilot state
+      // 代次失效检查
+      if (autopilotGenerationRef.current !== generation) return;
+
+      switch (next.result_kind) {
+        case "ProjectState": {
+          // 状态转换命令 — 返回完整项目
+          if (!next.command) {
+            // NoResult 伪装成了 ProjectState（MilestoneReview 等边界）
+            const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+            handleChatComplete(latest);
+            return;
+          }
+          const updated = await invokeWithTimeout<Project>(next.command, {
+            ...next.args,
+            projectName: proj.name,
+          });
+          // 检查代次和数据修订号，防止旧结果覆盖新项目
+          if (autopilotGenerationRef.current !== generation) return;
+          if (updated.workflow_state.data_revision >= (proj.workflow_state.data_revision ?? 0)) {
+            handleChatComplete(updated);
+          } else {
+            // 项目被其他操作更新了，重新读取
+            const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+            handleChatComplete(latest);
+          }
+          break;
+        }
+
+        case "PipelineState": {
+          // 执行命令 — 返回流水线状态
+          if (!next.command) return;
+          const pipelineState = await invokeWithTimeout<PipelineState>(next.command, {
+            ...next.args,
+            projectName: proj.name,
+          });
+          // 立即更新执行状态，不通过 handleChatComplete
+          setExecutionStatus(pipelineState);
+          setIsExecuting(pipelineState.status === "Running");
+          // 启动轮询（如果还在运行）
+          if (pipelineState.status === "Running" && autopilotGenerationRef.current === generation) {
+            startExecutionPolling(proj.name, generation);
+          }
+          // 执行结束后读取磁盘项目事实
+          if (pipelineState.status !== "Running") {
+            const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+            handleChatComplete(latest);
+          }
+          break;
+        }
+
+        case "WorkspaceState": {
+          // 工作区准备命令
+          if (!next.command) return;
+          const wsStatus = await invokeWithTimeout<ExecutionWorkspaceStatus>(next.command, {
+            ...next.args,
+            projectName: proj.name,
+          });
+          setWorkspaceStatus(wsStatus);
+          if (!wsStatus.ready) {
+            // 工作区未就绪，同步项目并停止
+            const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+            handleChatComplete(latest);
+          } else {
+            // 工作区就绪，继续循环
+            const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+            handleChatComplete(latest);
+          }
+          break;
+        }
+
+        case "NoResult": {
+          // 无返回数据：暂停、边界、错误停止等
+          const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+          handleChatComplete(latest);
+          return; // 不继续循环
+        }
+      }
+
+      // 调度下一循环
+      if (
+        autopilotGenerationRef.current === generation &&
+        autopilotActiveRef.current
+      ) {
         const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-        handleChatComplete(latest);
-        return;
-      }
-
-      if (next.is_error) {
-        // Sync and stop
-        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-        handleChatComplete(latest);
-        return;
-      }
-
-      if (!next.command) {
-        // No action to take — stop
-        return;
-      }
-
-      // Execute the suggested command
-      const updated = await invokeWithTimeout<Project>(next.command, {
-        ...next.args,
-        projectName: proj.name,
-      });
-      handleChatComplete(updated);
-
-      // Schedule next cycle (1 second delay to let UI update)
-      if (autopilotActiveRef.current && updated.workflow_state.autopilot_active) {
-        autopilotLoopRef.current = setTimeout(() => {
-          runAutopilotCycle(updated);
-        }, 1000);
+        if (
+          latest.workflow_state.autopilot_active &&
+          latest.workflow_state.autopilot_state?.run_status === "Running" &&
+          latest.workflow_state.top_level_phase === "Console"
+        ) {
+          autopilotLoopRef.current = setTimeout(() => {
+            runAutopilotCycle(latest, generation);
+          }, AUTOPILOT_STEP_DELAY_MS);
+        } else {
+          handleChatComplete(latest);
+        }
       }
     } catch (error) {
       console.warn("[autopilot] Cycle error:", error);
-      // Don't crash — sync and stop
+      // 持久化错误，不静默吞错
+      const errorMsg = error instanceof Error ? error.message : String(error);
       try {
-        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-        handleChatComplete(latest);
-      } catch (_) {}
+        const updated = await invokeWithTimeout<Project>("autopilot_mark_error", {
+          projectName: proj.name,
+          actionDescription: "自动驾驶循环异常",
+          errorDetail: errorMsg.slice(0, 2048),
+        });
+        handleChatComplete(updated);
+      } catch (markError) {
+        console.error("[autopilot] Failed to persist error state:", markError);
+        // 无法持久化时仍尝试同步，但标记警告
+        try {
+          const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+          handleChatComplete(latest);
+          setFeedbackMsg({ type: "error", message: "自动驾驶错误状态可能未落盘，请手动同步项目。" });
+        } catch (_) {
+          setFeedbackMsg({ type: "error", message: "自动驾驶异常且无法同步项目，请检查后端连接。" });
+        }
+      }
     }
+  }, []);
+
+  /** 执行状态轮询：在执行命令发出后持续监控流水线状态 */
+  const startExecutionPolling = useCallback(async (projectName: string, generation: number) => {
+    executionPollFailuresRef.current = 0;
+
+    const poll = async () => {
+      if (autopilotGenerationRef.current !== generation) return;
+      try {
+        const status = await invokeWithTimeout<PipelineState>("get_execution_status", {});
+        if (autopilotGenerationRef.current !== generation) return;
+
+        executionPollFailuresRef.current = 0; // 重置失败计数
+        setExecutionStatus(status);
+        setIsExecuting(status.status === "Running");
+
+        if (status.status === "Running") {
+          // 继续轮询
+          executionPollTimerRef.current = setTimeout(poll, EXECUTION_POLL_INTERVAL_MS);
+        } else {
+          // 执行结束，读取磁盘项目事实
+          const latest = await invokeWithTimeout<Project>("get_project", { projectName });
+          handleChatComplete(latest);
+          // 如果自动驾驶仍活跃，继续驱动
+          if (
+            autopilotGenerationRef.current === generation &&
+            autopilotActiveRef.current &&
+            latest.workflow_state.autopilot_active &&
+            latest.workflow_state.autopilot_state?.run_status === "Running"
+          ) {
+            autopilotLoopRef.current = setTimeout(() => {
+              runAutopilotCycle(latest, generation);
+            }, AUTOPILOT_STEP_DELAY_MS);
+          }
+        }
+      } catch (_) {
+        executionPollFailuresRef.current += 1;
+        if (executionPollFailuresRef.current >= EXECUTION_POLL_MAX_FAILURES) {
+          console.error("[autopilot] Execution polling exceeded max failures, stopping.");
+          // 同步磁盘项目并禁止自动发送下一动作
+          try {
+            const latest = await invokeWithTimeout<Project>("get_project", { projectName });
+            handleChatComplete(latest);
+          } catch (_) {}
+          return;
+        }
+        // 继续尝试
+        executionPollTimerRef.current = setTimeout(poll, EXECUTION_POLL_INTERVAL_MS);
+      }
+    };
+
+    poll();
   }, []);
 
   // === 托管层驱动循环 ===
@@ -514,16 +675,20 @@ function App() {
     }
   }, []);
 
-  // Start/stop managed flow loop when managed_flow_state changes
+  // Start/stop autopilot loop when autopilot state changes
   useEffect(() => {
     if (!project) return;
     const active = project.workflow_state.autopilot_active === true;
     autopilotActiveRef.current = active;
 
-    // Clear any pending loop
+    // Clear any pending loop and poll timer
     if (autopilotLoopRef.current) {
       clearTimeout(autopilotLoopRef.current);
       autopilotLoopRef.current = null;
+    }
+    if (executionPollTimerRef.current) {
+      clearTimeout(executionPollTimerRef.current);
+      executionPollTimerRef.current = null;
     }
 
     if (!active) return;
@@ -537,9 +702,9 @@ function App() {
       if (apState.run_status === "ErrorStopped") return;
     }
 
-    // Start the drive loop
+    // Start the drive loop via the unique entry point
     autopilotLoopRef.current = setTimeout(() => {
-      runAutopilotCycle(project);
+      driveAutopilot(project);
     }, 500);
   }, [
     project?.workflow_state?.autopilot_active,
@@ -1216,6 +1381,92 @@ function App() {
     }
   };
 
+  // === V1 人工执行：恢复基线并重试 ===
+  const handleRetryCurrentSubtask = async () => {
+    if (!project) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("retry_current_subtask", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+      setExecutionStatus(null);
+      setFeedbackMsg({ type: "info", message: "已恢复执行基线，可重新执行小阶段。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "重试失败：" + String(err) });
+    }
+  };
+
+  // === 自动驾驶控制 ===
+  const handleToggleAutopilot = async (active: boolean) => {
+    if (!project) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("toggle_autopilot", {
+        projectName: project.name,
+        active,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({
+        type: active ? "info" : "info",
+        message: active ? "自动驾驶已激活。" : "自动驾驶已关闭。",
+      });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "切换自动驾驶失败：" + String(err) });
+    }
+  };
+
+  const handleAutopilotPauseNow = async () => {
+    if (!project) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("autopilot_pause", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "info", message: "自动驾驶已暂停。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "暂停失败：" + String(err) });
+    }
+  };
+
+  const handleAutopilotPauseAfterCurrent = async () => {
+    if (!project) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("request_ed_stop", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "info", message: "将在当前任务完成后暂停。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "ED Stop 失败：" + String(err) });
+    }
+  };
+
+  const handleAutopilotResume = async () => {
+    if (!project) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("autopilot_resume", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "info", message: "自动驾驶已恢复。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "恢复失败：" + String(err) });
+    }
+  };
+
+  // === 启动恢复确认：用户看到中断提示后清理恢复标记 ===
+  const handleAcknowledgeExecutionRecovery = async () => {
+    if (!project) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("acknowledge_execution_recovery", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "info", message: "执行恢复状态已确认。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "确认失败：" + String(err) });
+    }
+  };
+
   // === V1 手动同步项目状态（不依赖浏览器 reload） ===
   const handleSyncProject = async () => {
     if (!project) return;
@@ -1463,6 +1714,19 @@ function App() {
           <div className="execution-layout">
             <FileTree projectPath={projectPath} />
             <div className="execution-main">
+              {/* 全局自动驾驶控制条 */}
+              <AutopilotControlBar
+                project={project}
+                executionStatus={executionStatus}
+                busy={false}
+                onToggle={handleToggleAutopilot}
+                onPauseNow={handleAutopilotPauseNow}
+                onPauseAfterCurrent={handleAutopilotPauseAfterCurrent}
+                onResume={handleAutopilotResume}
+                onSync={handleSyncProject}
+                onRetryCurrent={handleRetryCurrentSubtask}
+                onAcknowledgeRecovery={handleAcknowledgeExecutionRecovery}
+              />
               {/* V1 Console 规划闭环：大阶段 → 中阶段 → 执行计划 */}
               {(step === "MilestoneGeneration" || step === "MilestoneCheck" ||
                 step === "MilestoneApproval" || step === "MilestoneSelection" ||
@@ -1485,6 +1749,7 @@ function App() {
                     onExecute={handleExecuteCurrentSubtask}
                     onConfirm={handleConfirmSubtask}
                     onReject={handleRejectSubtask}
+                    onRetry={handleRetryCurrentSubtask}
                     onInStop={handleInStop}
                     onEdStop={handleEdStop}
                     onSyncProject={handleSyncProject}
@@ -1585,13 +1850,14 @@ function App() {
 // V1 执行面板：单小阶段执行 + 人工确认
 // ============================================================
 function V1ExecutionPanel({
-  project, executionStatus, workspaceStatus, onWorkspaceStatusChange, onExecute, onConfirm, onReject, onInStop, onEdStop, onSyncProject,
+  project, executionStatus, workspaceStatus, onWorkspaceStatusChange, onExecute, onConfirm, onReject, onRetry, onInStop, onEdStop, onSyncProject,
 }: {
   project: Project; executionStatus: PipelineState | null;
   workspaceStatus: ExecutionWorkspaceStatus | null;
   onWorkspaceStatusChange: (status: ExecutionWorkspaceStatus) => void;
   onExecute: () => Promise<void>; onConfirm: () => Promise<void>;
   onReject: (reason: string) => Promise<void>;
+  onRetry: () => Promise<void>;
   onInStop: () => Promise<void>; onEdStop: () => Promise<void>;
   onSyncProject: () => Promise<void>;
 }) {
@@ -1638,6 +1904,20 @@ function V1ExecutionPanel({
     setShowReject(false);
     setBusy(false);
   };
+
+  const handleRetry = async () => {
+    setBusy(true);
+    await onRetry();
+    setBusy(false);
+  };
+
+  // 质量判定：判断当前待确认任务是否可以确认通过
+  const execOk = awaitingSubtask?.execution_result?.success === true;
+  const testOk = awaitingSubtask?.test_result?.passed === true;
+  const canConfirm = execOk && testOk && isAwaiting;
+  const failureReason = !canConfirm && isAwaiting
+    ? (!execOk ? "执行未成功" : !testOk ? "测试未通过" : null)
+    : null;
 
   const workspaceReady = workspaceStatus?.ready === true;
 
@@ -1686,9 +1966,18 @@ function V1ExecutionPanel({
             </div>
           </div>
           <WorkflowActionBar>
-            <ActionButton icon={<Check size={16} />} loading={busy} loadingLabel="确认中" onClick={handleConfirm}>确认通过</ActionButton>
+            {canConfirm ? (
+              <ActionButton icon={<Check size={16} />} loading={busy} loadingLabel="确认中" onClick={handleConfirm}>确认通过</ActionButton>
+            ) : (
+              <ActionButton icon={<RotateCcw size={16} />} loading={busy} loadingLabel="恢复中" onClick={handleRetry}>恢复基线并重试</ActionButton>
+            )}
             <ActionButton icon={<X size={16} />} variant="danger" disabled={busy} onClick={() => setShowReject(true)}>发现问题</ActionButton>
           </WorkflowActionBar>
+          {failureReason && (
+            <div style={{ padding: "10px 14px", background: "#fff8c5", borderRadius: "6px", border: "1px solid #d4a72c", marginTop: "12px", fontSize: "13px", color: "#9a6700" }}>
+              ⚠️ 质量门禁阻断：{failureReason}。请先恢复基线并重试，或驳回后人工处理。
+            </div>
+          )}
           <Modal isOpen={showReject} onClose={() => setShowReject(false)} title="驳回执行结果"
             description="请记录需要修正的问题。" isDanger lockClose={busy} isSubmitting={busy}
             actions={[

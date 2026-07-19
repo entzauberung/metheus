@@ -13,19 +13,14 @@ fn validate_preflight_checks(proj: &project::Project) -> Result<(), String> {
             .preflight_results
             .iter()
             .find(|r| r.check_type == *check_type)
-            .ok_or_else(|| {
-                format!("检查「{}」尚未执行，请先完成所有三项检查", label)
-            })?;
+            .ok_or_else(|| format!("检查「{}」尚未执行，请先完成所有三项检查", label))?;
 
         if !result.passed {
             return Err(format!("检查「{}」未通过，无法继续操作", label));
         }
 
         if result.stale || result.discussion_revision < proj.discussion_revision {
-            return Err(format!(
-                "检查「{}」已过期（讨论已更新），请重新检查",
-                label
-            ));
+            return Err(format!("检查「{}」已过期（讨论已更新），请重新检查", label));
         }
     }
 
@@ -96,9 +91,7 @@ pub(crate) async fn generate_version_plan(
     // === 3.6. 当前不存在待审批草稿 ===
     if let Some(ref existing) = proj.plan_draft {
         if existing.draft_status == project::DraftStatus::Pending {
-            return Err(
-                "已存在待审批草稿，请先处理（批准或驳回）后再生成新方案。".to_string()
-            );
+            return Err("已存在待审批草稿，请先处理（批准或驳回）后再生成新方案。".to_string());
         }
     }
 
@@ -162,27 +155,21 @@ pub(crate) async fn generate_version_plan(
     let current_proj = crate::load_project(&project_name)?;
 
     if current_proj.workflow_state.current_step != snapshot_step {
-        return Err(
-            "工作流步骤已变化（可能在生成期间发生了操作），请刷新后重新生成。".to_string()
-        );
+        return Err("工作流步骤已变化（可能在生成期间发生了操作），请刷新后重新生成。".to_string());
     }
 
     if current_proj.discussion_revision != snapshot_discussion_revision {
         return Err(
-            "讨论已变化（可能在生成期间发送了新消息），请重新开始检查并生成方案。".to_string()
+            "讨论已变化（可能在生成期间发送了新消息），请重新开始检查并生成方案。".to_string(),
         );
     }
 
     if current_proj.workflow_state.data_revision != snapshot_data_revision {
-        return Err(
-            "项目数据已变化（可能在生成期间发生了操作），请刷新后重新生成。".to_string()
-        );
+        return Err("项目数据已变化（可能在生成期间发生了操作），请刷新后重新生成。".to_string());
     }
 
     if current_proj.project_path != snapshot_project_path {
-        return Err(
-            "项目路径已变化，请刷新后重新生成。".to_string()
-        );
+        return Err("项目路径已变化，请刷新后重新生成。".to_string());
     }
 
     // 重新校验三项检查仍然有效
@@ -193,23 +180,20 @@ pub(crate) async fn generate_version_plan(
     let separator_pos = ai_content.find("---CONSTITUTION_PART1---");
 
     // Split into plan content and constitution part 1 draft
-    let (plan_content, constitution_draft) =
-        if let Some(pos) = separator_pos {
-            let part1 = ai_content[pos + "---CONSTITUTION_PART1---".len()..]
-                .trim()
-                .to_string();
-            let plan = ai_content[..pos].trim().to_string();
-            (plan, part1)
-        } else {
-            (ai_content.trim().to_string(), String::new())
-        };
+    let (plan_content, constitution_draft) = if let Some(pos) = separator_pos {
+        let part1 = ai_content[pos + "---CONSTITUTION_PART1---".len()..]
+            .trim()
+            .to_string();
+        let plan = ai_content[..pos].trim().to_string();
+        (plan, part1)
+    } else {
+        (ai_content.trim().to_string(), String::new())
+    };
 
     // 验证方案正文非空且不是只有空白/标题/错误说明
     let plan_trimmed = plan_content.trim();
     if plan_trimmed.is_empty() {
-        return Err(
-            "AI 未生成有效的项目方案正文。请返回讨论补充需求后重新生成。".to_string()
-        );
+        return Err("AI 未生成有效的项目方案正文。请返回讨论补充需求后重新生成。".to_string());
     }
     // 检查是否只有标题没有实质内容（粗略判断：去除 Markdown 标题后仍有内容）
     let plan_without_headings = plan_trimmed
@@ -219,22 +203,21 @@ pub(crate) async fn generate_version_plan(
         .join("\n");
     if plan_without_headings.trim().is_empty() {
         return Err(
-            "AI 生成的方案仅包含标题，缺少实质内容。请返回讨论补充需求后重新生成。".to_string()
+            "AI 生成的方案仅包含标题，缺少实质内容。请返回讨论补充需求后重新生成。".to_string(),
         );
     }
 
     // 验证宪法第一部分分隔标记存在
     if separator_pos.is_none() {
         return Err(
-            "AI 输出缺少宪法第一部分（---CONSTITUTION_PART1--- 分隔标记）。请重新生成。".to_string()
+            "AI 输出缺少宪法第一部分（---CONSTITUTION_PART1--- 分隔标记）。请重新生成。"
+                .to_string(),
         );
     }
 
     // 验证宪法第一部分草稿非空
     if constitution_draft.trim().is_empty() {
-        return Err(
-            "AI 未生成有效的宪法第一部分草稿。请重新生成。".to_string()
-        );
+        return Err("AI 未生成有效的宪法第一部分草稿。请重新生成。".to_string());
     }
 
     let draft = project::PlanDraft {

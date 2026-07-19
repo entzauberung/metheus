@@ -124,7 +124,9 @@ pub enum DiscussionScope {
 }
 
 impl Default for DiscussionScope {
-    fn default() -> Self { DiscussionScope::FirstDiscussion }
+    fn default() -> Self {
+        DiscussionScope::FirstDiscussion
+    }
 }
 
 /// 统一工作流状态 — 前端显示和按钮权限的唯一判断来源
@@ -221,6 +223,25 @@ impl Default for AutopilotState {
             last_action_at: String::new(),
             error_message: String::new(),
         }
+    }
+}
+
+/// 自动驾驶命令返回类别 — 前端按类别分流处理
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AutopilotCommandResultKind {
+    /// 返回完整项目（状态转换、审批等）
+    ProjectState,
+    /// 返回流水线状态（执行命令）
+    PipelineState,
+    /// 返回工作区状态（工作区准备命令）
+    WorkspaceState,
+    /// 无返回数据（暂停、边界停止、错误停止等）
+    NoResult,
+}
+
+impl Default for AutopilotCommandResultKind {
+    fn default() -> Self {
+        AutopilotCommandResultKind::NoResult
     }
 }
 
@@ -640,7 +661,7 @@ pub struct ExistingProjectBaseline {
 /// 三项检查结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PreflightCheckResult {
-    pub check_type: String,         // "goal_completeness" | "reality_consistency" | "task_executability"
+    pub check_type: String, // "goal_completeness" | "reality_consistency" | "task_executability"
     pub passed: bool,
     pub summary: String,
     pub issues: Vec<String>,
@@ -735,23 +756,29 @@ impl Default for PlanDraft {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StagePlanCheckResult {
     pub passed: bool,
-    pub omissions: Vec<String>,       // 遗漏项
-    pub out_of_scope: Vec<String>,    // 越界项
-    pub not_executable: Vec<String>,  // 不可执行项
-    pub suggestions: Vec<String>,     // 建议
+    pub omissions: Vec<String>,      // 遗漏项
+    pub out_of_scope: Vec<String>,   // 越界项
+    pub not_executable: Vec<String>, // 不可执行项
+    pub suggestions: Vec<String>,    // 建议
     pub checked_at: String,
 }
 
 /// 暂停上下文
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PauseContext {
-    pub pause_type: String,           // "in_stop" | "ed_stop"
+    pub pause_type: String, // "in_stop" | "ed_stop"
     pub current_subtask_id: String,
     pub last_passed_subtask_id: String,
     pub stable_tag: String,
     pub paused_at: String,
     pub discussion_start_revision: u64,
-    pub pending_action: String,       // 待选择动作
+    pub pending_action: String, // 待选择动作
+    /// 暂停后应恢复到的步骤（ED Stop 完成后保存）。旧项目缺失时默认为 Execution。
+    #[serde(default)]
+    pub resume_step: Option<WorkflowStep>,
+    /// 暂停时自动驾驶是否活跃
+    #[serde(default)]
+    pub autopilot_was_active: bool,
 }
 
 /// 回退影响范围
@@ -1344,6 +1371,19 @@ pub struct ConstitutionChangeHistory {
     pub needs_compaction: bool,
 }
 
+/// 执行会话状态 — 明确区分四类持久化会话状态
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ExecutionSessionStatus {
+    /// 执行中
+    Executing,
+    /// 待确认
+    AwaitingConfirmation,
+    /// 质量门禁阻断
+    QualityBlocked,
+    /// 进程失联（应用重启后发现进程已死）
+    SessionLost,
+}
+
 /// 执行会话 — 记录当前正在执行或待确认的小阶段，用于刷新恢复
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionSession {
@@ -1357,8 +1397,11 @@ pub struct ExecutionSession {
     pub subtask_id: String,
     /// 小阶段标题
     pub subtask_title: String,
-    /// 会话状态："executing" | "awaiting_confirmation"
+    /// 会话状态："executing" | "awaiting_confirmation"（兼容旧项目小写文本）
     pub status: String,
+    /// 执行开始前的 Git commit 标识，用于回退基线
+    #[serde(default)]
+    pub base_commit: String,
     /// 会话开始时间（ISO 8601）
     pub started_at: String,
     /// 进入当前状态的时间
@@ -1371,6 +1414,29 @@ pub struct ExecutionSession {
     pub total_subtasks: usize,
 }
 
+impl ExecutionSession {
+    /// 将字符串状态解析为类型化状态，兼容旧项目小写文本
+    pub fn parsed_status(&self) -> ExecutionSessionStatus {
+        match self.status.as_str() {
+            "executing" | "Executing" => ExecutionSessionStatus::Executing,
+            "awaiting_confirmation" | "AwaitingConfirmation" => {
+                ExecutionSessionStatus::AwaitingConfirmation
+            }
+            "quality_blocked" | "QualityBlocked" => ExecutionSessionStatus::QualityBlocked,
+            "session_lost" | "SessionLost" => ExecutionSessionStatus::SessionLost,
+            "execution_failed" | "ExecutionFailed" => ExecutionSessionStatus::QualityBlocked,
+            _ => {
+                // 未知状态：根据 active 标志推断
+                if self.active {
+                    ExecutionSessionStatus::Executing
+                } else {
+                    ExecutionSessionStatus::SessionLost
+                }
+            }
+        }
+    }
+}
+
 impl Default for ExecutionSession {
     fn default() -> Self {
         ExecutionSession {
@@ -1380,6 +1446,7 @@ impl Default for ExecutionSession {
             subtask_id: String::new(),
             subtask_title: String::new(),
             status: String::new(),
+            base_commit: String::new(),
             started_at: String::new(),
             state_entered_at: String::new(),
             plan_revision: 0,
@@ -1430,6 +1497,12 @@ pub enum ExecutionEventType {
     AdvanceMilestoneReview,
     /// 系统自动推进
     SystemAdvance,
+    /// 质量门禁阻断（确认前校验失败）
+    QualityGateBlocked,
+    /// 用户确认恢复基线并重新执行
+    RetryScheduled,
+    /// 执行器失败并完成状态收尾
+    ExecutionFailed,
 }
 
 impl Default for ExecutionEventType {
@@ -1478,4 +1551,84 @@ pub struct ChangeHistoryEntry {
     pub diff_text: String,
     /// diff 是否已被截断
     pub diff_truncated: bool,
+}
+
+// ===================================================================
+// 测试
+// ===================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_pause_context_without_resume_step_defaults_to_none() {
+        let json = r#"{
+            "pause_type": "in_stop",
+            "current_subtask_id": "st-1",
+            "last_passed_subtask_id": "",
+            "stable_tag": "",
+            "paused_at": "2024-01-01T00:00:00Z",
+            "discussion_start_revision": 0,
+            "pending_action": ""
+        }"#;
+        let pc: PauseContext =
+            serde_json::from_str(json).expect("should deserialize old pause context");
+        // resume_step should default to None for old projects
+        assert!(pc.resume_step.is_none());
+        // autopilot_was_active should default to false
+        assert!(!pc.autopilot_was_active);
+    }
+
+    #[test]
+    fn execution_session_parsed_status_executing() {
+        let session = ExecutionSession {
+            active: true,
+            status: "executing".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(session.parsed_status(), ExecutionSessionStatus::Executing);
+    }
+
+    #[test]
+    fn execution_session_parsed_status_awaiting() {
+        let session = ExecutionSession {
+            active: true,
+            status: "awaiting_confirmation".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            session.parsed_status(),
+            ExecutionSessionStatus::AwaitingConfirmation
+        );
+    }
+
+    #[test]
+    fn execution_session_parsed_status_session_lost() {
+        let session = ExecutionSession {
+            active: true,
+            status: "session_lost".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(session.parsed_status(), ExecutionSessionStatus::SessionLost);
+    }
+
+    #[test]
+    fn new_pause_context_with_resume_step_serializes_roundtrip() {
+        let pc = PauseContext {
+            pause_type: "ed_stop".to_string(),
+            current_subtask_id: "st-1".to_string(),
+            last_passed_subtask_id: String::new(),
+            stable_tag: String::new(),
+            paused_at: "2024-01-01T00:00:00Z".to_string(),
+            discussion_start_revision: 0,
+            pending_action: "ed_stop_requested".to_string(),
+            resume_step: Some(WorkflowStep::MilestoneReview),
+            autopilot_was_active: true,
+        };
+        let json = serde_json::to_string(&pc).expect("serialize");
+        let back: PauseContext = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.resume_step, Some(WorkflowStep::MilestoneReview));
+        assert!(back.autopilot_was_active);
+    }
 }

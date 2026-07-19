@@ -6,23 +6,23 @@
 // ...
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use std::fs;
+mod api;
+mod commands;
+mod constants;
+mod constitution;
+mod constitution_context;
+mod diff;
+mod executor;
+mod git_ops;
+mod json_utils;
+mod pipeline;
 mod project;
 mod prompts;
-mod constants;
-mod api;
-mod json_utils;
-mod git_ops;
-mod constitution;
-mod diff;
-mod test_runner;
-mod commands;
-mod pipeline;
-mod executor;
 mod snapshot;
-mod constitution_context;
+mod test_runner;
+use crate::pipeline::PipelineState;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::pipeline::PipelineState;
 
 /// 获取项目数据文件的统一存储路径
 ///
@@ -112,7 +112,6 @@ pub(crate) fn save_and_reload_project(
 
 fn load_env() {
     dotenvy::dotenv().ok();
-
 }
 
 pub struct AppState {
@@ -163,6 +162,7 @@ pub fn run() {
             crate::pipeline::execute_current_subtask,
             crate::pipeline::confirm_subtask_result,
             crate::pipeline::reject_subtask_result,
+            crate::pipeline::retry_current_subtask,
             crate::pipeline::get_execution_workspace_status,
             crate::pipeline::prepare_execution_workspace,
             crate::pipeline::get_execution_status,
@@ -172,6 +172,7 @@ pub fn run() {
             crate::pipeline::preview_rollback_impact,
             crate::pipeline::confirm_rollback,
             crate::pipeline::reconcile_on_startup,
+            crate::pipeline::acknowledge_execution_recovery,
             crate::commands::project_ops::approve_mid_stage,
             crate::commands::project_ops::reject_mid_stage,
             crate::git_ops::git_save_node,
@@ -191,6 +192,8 @@ pub fn run() {
             crate::commands::workflow::migrate_project_workflow,
             crate::commands::workflow::toggle_autopilot,
             crate::commands::workflow::autopilot_pause,
+            crate::commands::workflow::autopilot_resume,
+            crate::commands::workflow::autopilot_mark_error,
             crate::commands::workflow::autopilot_next_step,
             crate::commands::workflow::start_managed_flow,
             crate::commands::workflow::managed_next_step,

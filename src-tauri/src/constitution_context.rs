@@ -20,8 +20,7 @@ pub(crate) fn build_context_injection(proj: &project::Project) -> String {
 
     // 1. 工作宪法摘要（最高优先级）
     if !proj.project_path.is_empty() {
-        let constitution_path =
-            std::path::Path::new(&proj.project_path).join("CONSTITUTION.md");
+        let constitution_path = std::path::Path::new(&proj.project_path).join("CONSTITUTION.md");
         if constitution_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&constitution_path) {
                 if let Some(part1_start) = content.find("## 第 1 部分") {
@@ -93,17 +92,11 @@ pub(crate) fn build_context_injection(proj: &project::Project) -> String {
                 ));
             }
             if !baseline.risks.is_empty() {
-                parts.push(format!(
-                    "## 已知风险\n{}",
-                    baseline.risks.join(", ")
-                ));
+                parts.push(format!("## 已知风险\n{}", baseline.risks.join(", ")));
             }
         } else {
             // 基线存在但尚未批准 — 防御性输出
-            parts.push(format!(
-                "## 项目路径\n{}",
-                proj.project_path
-            ));
+            parts.push(format!("## 项目路径\n{}", proj.project_path));
             parts.push(
                 "## 注意\n已有项目基线尚未批准，请先完成基线分析。当前仅能依赖项目路径和讨论内容。"
                     .to_string(),
@@ -111,10 +104,7 @@ pub(crate) fn build_context_injection(proj: &project::Project) -> String {
         }
     } else if proj.entry_kind == project::ProjectEntryKind::HalfProject {
         // Half Project 但基线尚未生成 — 防御性输出
-        parts.push(format!(
-            "## 项目路径\n{}",
-            proj.project_path
-        ));
+        parts.push(format!("## 项目路径\n{}", proj.project_path));
         parts.push(
             "## 注意\n这是已有项目模式（Half Project），但项目分析尚未完成。\n\
              当前只能依赖已有路径和当前讨论。后续基线分析完成后会补充完整信息。"
@@ -137,7 +127,8 @@ pub(crate) fn build_context_injection(proj: &project::Project) -> String {
     // 6. Already 宪法全文参考（最低权重，从磁盘文件读取）
     if let Some(ref baseline) = proj.existing_baseline {
         if baseline.approved && !proj.project_path.is_empty() {
-            let already_ref = crate::constitution::read_already_constitution_reference(&proj.project_path);
+            let already_ref =
+                crate::constitution::read_already_constitution_reference(&proj.project_path);
             if !already_ref.is_empty() {
                 // Take a shorter excerpt since this is lower priority
                 let shortened: String = already_ref.chars().take(800).collect();

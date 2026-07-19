@@ -3751,3 +3751,163 @@ button.tree-node:not(:disabled) {
   font-size: 14px;
   color: #0550ae;
 }
+
+/* ============================================================
+   自动驾驶控制条
+   ============================================================ */
+.autopilot-control-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px;
+  margin-bottom: 16px;
+  border: 1px solid #d0d7de;
+  border-radius: 8px;
+  background: #ffffff;
+  flex-wrap: wrap;
+  min-height: 44px;
+}
+.autopilot-control-bar.ap-running {
+  border-color: #0969da;
+  background: #f6f8ff;
+}
+.autopilot-control-bar.ap-error {
+  border-color: #cf222e;
+  background: #fff8f8;
+}
+.ap-bar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  flex: 1;
+  min-width: 0;
+}
+.ap-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.ap-bar-status {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #1f2328;
+  white-space: nowrap;
+}
+.ap-bar-target {
+  font-size: 12px;
+  color: #656d76;
+  white-space: nowrap;
+}
+.ap-bar-action {
+  font-size: 12px;
+  color: #656d76;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 300px;
+}
+.ap-bar-error {
+  font-size: 12px;
+  color: #cf222e;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+.ap-bar-warning {
+  font-size: 12px;
+  color: #9a6700;
+  background: #fff8c5;
+  padding: 2px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.ap-bar-mutex {
+  font-size: 12px;
+  color: #656d76;
+  background: #f6f8fa;
+  padding: 2px 8px;
+  border-radius: 4px;
+}
+.ap-bar-hint {
+  font-size: 12px;
+  color: #656d76;
+  white-space: nowrap;
+}
+.ap-bar-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #f6f8fa;
+  font-size: 12px;
+  color: #1f2328;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  white-space: nowrap;
+}
+.ap-bar-btn:hover:not(:disabled) {
+  background: #eaeef2;
+}
+.ap-bar-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.ap-bar-btn-primary {
+  background: #0969da;
+  color: #fff;
+  border-color: #0969da;
+}
+.ap-bar-btn-primary:hover:not(:disabled) {
+  background: #0550ae;
+}
+.ap-bar-btn-danger {
+  border-color: #cf222e;
+  color: #cf222e;
+}
+.ap-bar-btn-danger:hover:not(:disabled) {
+  background: #fff1f0;
+}
+@keyframes ap-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.ap-spin {
+  animation: ap-spin 1.5s linear infinite;
+}
+
+/* ============================================================
+   执行恢复状态
+   ============================================================ */
+.execution-recovery-banner {
+  padding: 12px 16px;
+  background: #fff8c5;
+  border: 1px solid #d4a72c;
+  border-radius: 6px;
+  margin-bottom: 16px;
+  font-size: 13px;
+  color: #9a6700;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+@media (max-width: 720px) {
+  .autopilot-control-bar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .ap-bar-right {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+}

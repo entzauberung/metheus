@@ -53,15 +53,12 @@ pub(crate) async fn run_preflight_check(
     // === 2. 强制执行检查顺序：前一项必须有效（已通过、未过期、讨论修订号匹配） ===
     for i in 0..check_idx {
         let prev_type = CHECK_ORDER[i];
-        let prev_valid = proj
-            .preflight_results
-            .iter()
-            .any(|r| {
-                r.check_type == prev_type
-                    && r.passed
-                    && !r.stale
-                    && r.discussion_revision == proj.discussion_revision
-            });
+        let prev_valid = proj.preflight_results.iter().any(|r| {
+            r.check_type == prev_type
+                && r.passed
+                && !r.stale
+                && r.discussion_revision == proj.discussion_revision
+        });
         if !prev_valid {
             let prev_label = CHECK_LABELS
                 .iter()
@@ -94,7 +91,11 @@ pub(crate) async fn run_preflight_check(
 
     // Already 宪法低权重参考（仅 Half Project 且基线已批准时注入）
     let already_ref = if proj.entry_kind == project::ProjectEntryKind::HalfProject
-        && proj.existing_baseline.as_ref().map(|b| b.approved).unwrap_or(false)
+        && proj
+            .existing_baseline
+            .as_ref()
+            .map(|b| b.approved)
+            .unwrap_or(false)
     {
         crate::constitution::read_already_constitution_reference(&proj.project_path)
     } else {
@@ -157,15 +158,13 @@ pub(crate) async fn run_preflight_check(
         .map_err(|e| format!("解析检查结果 JSON 失败（{}）：{}", check_type, e))?;
 
     // === 6. 提取字段（不使用 unwrap_or — 缺失字段按错误处理） ===
-    let passed = result["passed"]
-        .as_bool()
-        .ok_or_else(|| {
-            format!(
-                "检查结果缺少 'passed' 字段（{}），原始响应：{}",
-                check_type,
-                &result_str[..result_str.len().min(300)]
-            )
-        })?;
+    let passed = result["passed"].as_bool().ok_or_else(|| {
+        format!(
+            "检查结果缺少 'passed' 字段（{}），原始响应：{}",
+            check_type,
+            &result_str[..result_str.len().min(300)]
+        )
+    })?;
 
     let summary = result["summary"]
         .as_str()
@@ -200,9 +199,7 @@ pub(crate) async fn run_preflight_check(
 
     // 验证讨论修订号未变化
     if current_proj.discussion_revision != snapshot_discussion_revision {
-        return Err(
-            "讨论已变化（可能在检查期间发送了新消息），请重新开始检查。".to_string(),
-        );
+        return Err("讨论已变化（可能在检查期间发送了新消息），请重新开始检查。".to_string());
     }
 
     // 验证项目数据修订号未变化（防止并发写入）
@@ -227,7 +224,8 @@ pub(crate) async fn run_preflight_check(
 
     // 覆盖同类型旧结果，使用重新加载后的项目数据
     let mut proj = current_proj;
-    proj.preflight_results.retain(|r| r.check_type != check_type);
+    proj.preflight_results
+        .retain(|r| r.check_type != check_type);
     proj.preflight_results.push(check_result);
     proj.workflow_state.data_revision += 1;
 

@@ -34,6 +34,9 @@ export type PauseReason = "None" | "InStop" | "EDStop";
 
 export type AutopilotRunStatus = "Running" | "Paused" | "WaitingMilestoneReview" | "ErrorStopped";
 
+/** 自动驾驶命令返回类别 */
+export type AutopilotCommandResultKind = "ProjectState" | "PipelineState" | "WorkspaceState" | "NoResult";
+
 export interface AutopilotState {
   active: boolean;
   target_milestone_id: string;
@@ -41,6 +44,16 @@ export interface AutopilotState {
   last_action: string;
   last_action_at: string;
   error_message: string;
+}
+
+export interface AutopilotNextStep {
+  command: string;
+  args: Record<string, unknown>;
+  description: string;
+  at_milestone_boundary: boolean;
+  is_error: boolean;
+  error_message: string;
+  result_kind: AutopilotCommandResultKind;
 }
 
 // ========== V2 托管层 ==========
@@ -211,6 +224,8 @@ export interface PauseContext {
   paused_at: string;
   discussion_start_revision: number;
   pending_action: string;
+  resume_step?: WorkflowStep;
+  autopilot_was_active: boolean;
 }
 
 // ========== 回退影响范围 ==========
@@ -413,6 +428,8 @@ export interface Project {
   project_path: string;
 }
 
+export type ExecutionSessionStatus = "Executing" | "AwaitingConfirmation" | "QualityBlocked" | "SessionLost";
+
 /** 执行会话 — 记录当前正在执行或待确认的小阶段 */
 export interface ExecutionSession {
   active: boolean;
@@ -420,7 +437,8 @@ export interface ExecutionSession {
   mid_stage_id: string;
   subtask_id: string;
   subtask_title: string;
-  status: string;        // "executing" | "awaiting_confirmation"
+  status: string;        // "executing" | "awaiting_confirmation"（兼容旧项目小写文本）
+  base_commit: string;   // 执行前的 Git commit，用于回退基线
   started_at: string;
   state_entered_at: string;
   plan_revision: number;
@@ -467,7 +485,10 @@ export type ExecutionEventType =
   | "MidStageComplete"
   | "AdvanceNextMidStage"
   | "AdvanceMilestoneReview"
-  | "SystemAdvance";
+  | "SystemAdvance"
+  | "QualityGateBlocked"
+  | "RetryScheduled"
+  | "ExecutionFailed";
 
 /** 执行历史条目 — 持久化到 Project 中，刷新不丢 */
 export interface ExecutionHistoryEntry {
