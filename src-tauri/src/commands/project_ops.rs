@@ -112,6 +112,11 @@ pub(crate) async fn get_project(project_name: String) -> Result<project::Project
 
 /// 初始化项目入口（Before 页面调用）
 /// 创建新项目或安全恢复同名同路径项目。
+///
+/// 恢复时区分三种情况：
+/// - 有效恢复：同名同路径，无陈旧执行会话
+/// - 陈旧会话清理后恢复：同名同路径，有已失效的 execution_session 需清理
+/// - 拒绝恢复：同名不同路径（名称冲突）
 #[tauri::command]
 pub(crate) async fn initialize_project_entry(
     project_name: String,
@@ -136,9 +141,29 @@ pub(crate) async fn initialize_project_entry(
     // === 先检查同名项目是否已存在（冲突检测在目录操作之前） ===
     let project_data_path = crate::project_data_path(&project_name)?;
     if project_data_path.exists() {
-        if let Ok(existing) = crate::load_project(&project_name) {
+        if let Ok(mut existing) = crate::load_project(&project_name) {
             if existing.project_path == project_path && !existing.project_path.is_empty() {
-                // Same name + same path = recovery — don't recreate or reset
+                // Same name + same path — check for stale execution session
+                let had_stale_session = clean_stale_execution_session(&mut existing);
+
+                // Check for stale autopilot state (autopilot active but target milestone gone)
+                let had_stale_autopilot = clean_stale_autopilot_state(&mut existing);
+
+                if had_stale_session || had_stale_autopilot {
+                    // Persist the cleaned state and reload
+                    existing = crate::save_and_reload_project(&existing)?;
+                }
+
+                // Verify project path still exists
+                let proj_path = std::path::Path::new(&existing.project_path);
+                if !proj_path.exists() || !proj_path.is_dir() {
+                    // Project path no longer valid — reset to Before
+                    existing.workflow_state.top_level_phase = project::TopLevelPhase::Before;
+                    existing.workflow_state.current_step = project::WorkflowStep::WaitingEntry;
+                    existing.workflow_state.data_revision += 1;
+                    existing = crate::save_and_reload_project(&existing)?;
+                }
+
                 return Ok(existing);
             } else if !existing.project_path.is_empty() {
                 return Err(format!(
@@ -205,9 +230,7 @@ pub(crate) async fn initialize_project_entry(
     }
 
     // Persist
-    crate::save_project(&project)?;
-
-    Ok(project)
+    crate::save_and_reload_project(&project)
 }
 
 /// 3.3 执行引擎流水线
@@ -219,8 +242,8 @@ pub(crate) async fn persist_project(project_json: String) -> Result<String, Stri
     //前端发来的 JSON 字符串转成 Project 对象
     let project: project::Project =
         serde_json::from_str(&project_json).map_err(|e| format!("解析项目失败：{}", e))?;
-    //调用已有的保存函数，把项目写入文件
-    crate::save_project(&project)?;
+    //使用 save_and_reload 确保前后端状态一致
+    crate::save_and_reload_project(&project)?;
     Ok("保存成功".to_string())
 }
 
@@ -228,19 +251,10 @@ pub(crate) async fn persist_project(project_json: String) -> Result<String, Stri
 /// 根据 project_id 和 mid_stage_id，找到对应的中阶段，把它的状态改为 "approved"，然后保存回文件
 #[tauri::command]
 pub(crate) async fn approve_mid_stage(project_id: String, mid_stage_id: String) -> Result<String, String> {
-    // 1. 获取home 目录
-    let app_dir = dirs::home_dir().ok_or("无法获取 home 目录".to_string())?;
-    // 2. 构造项目文件路径
-    let project_file = app_dir
-        .join(".metheus")
-        .join(format!("{}.json", project_id));
-    // 3. 读取文件内容
-    let content =
-        std::fs::read_to_string(&project_file).map_err(|e| format!("读取项目文件失败：{}", e))?;
-    // 4. 解析为 Project 结构
-    let mut project: project::Project =
-        serde_json::from_str(&content).map_err(|e| format!("解析项目文件失败：{}", e))?;
-    // 5. 双层循环查找并批准 mid_stage
+    // 使用统一加载方法
+    let mut project = crate::load_project(&project_id)?;
+
+    // 双层循环查找并批准 mid_stage
     let mut found = false;
     let mut current_milestone_index = 0;
     for (mi, milestone) in project.milestones.iter().enumerate() {
@@ -268,7 +282,7 @@ pub(crate) async fn approve_mid_stage(project_id: String, mid_stage_id: String) 
             }
         }
     }
-    // 6. 查找下一个可推进的中阶段（在当前 milestone 内）
+    // 查找下一个可推进的中阶段（在当前 milestone 内）
     let mut next_mid_stage_id: Option<String> = None;
     let mut next_milestone_id: Option<String> = None;
     let mut project_completed = false;
@@ -302,7 +316,6 @@ pub(crate) async fn approve_mid_stage(project_id: String, mid_stage_id: String) 
             if ms.status == project::MilestoneStatus::Pending
                 || ms.status == project::MilestoneStatus::InProgress
             {
-                // 找到下一个大阶段，将其第一个 mid_stage 设为 Ready
                 if let Some(first_mid) = ms.mid_stages.first() {
                     next_mid_stage_id = Some(first_mid.id.clone());
                     next_milestone_id = Some(ms.id.clone());
@@ -311,7 +324,6 @@ pub(crate) async fn approve_mid_stage(project_id: String, mid_stage_id: String) 
             }
         }
 
-        // 如果仍然没有找到下一个，标记项目完成
         if next_mid_stage_id.is_none() {
             project.status = project::ProjectStatus::Completed;
             project_completed = true;
@@ -330,9 +342,8 @@ pub(crate) async fn approve_mid_stage(project_id: String, mid_stage_id: String) 
         }
     }
 
-    // 序列化回 JSON 并写回文件
-    let json = serde_json::to_string_pretty(&project).map_err(|e| format!("序列化失败：{}", e))?;
-    std::fs::write(&project_file, json).map_err(|e| format!("保存失败：{}", e))?;
+    // 使用统一的 save_and_reload 确保前后端状态一致
+    crate::save_and_reload_project(&project)?;
 
     // 构造返回值
     let result = serde_json::json!({
@@ -345,14 +356,7 @@ pub(crate) async fn approve_mid_stage(project_id: String, mid_stage_id: String) 
 /// 拒绝指定的中阶段：把它的状态改成 "rejected"，然后保存回项目文件
 #[tauri::command]
 pub(crate) async fn reject_mid_stage(project_id: String, mid_stage_id: String) -> Result<(), String> {
-    let app_dir = dirs::home_dir().ok_or("无法获取 home 目录".to_string())?;
-    let project_path = app_dir
-        .join(".metheus")
-        .join(format!("{}.json", project_id));
-    let content =
-        std::fs::read_to_string(&project_path).map_err(|e| format!("读取项目文件失败: {}", e))?;
-    let mut project: project::Project =
-        serde_json::from_str(&content).map_err(|e| format!("解析项目文件失败: {}", e))?;
+    let mut project = crate::load_project(&project_id)?;
     let mut found = false;
     for milestone in &mut project.milestones {
         for mid_stage in &mut milestone.mid_stages {
@@ -369,7 +373,133 @@ pub(crate) async fn reject_mid_stage(project_id: String, mid_stage_id: String) -
     if !found {
         return Err("未找到指定的中阶段".to_string());
     }
-    let json = serde_json::to_string_pretty(&project).map_err(|e| format!("序列化失败: {}", e))?;
-    std::fs::write(&project_path, json).map_err(|e| format!("保存失败: {}", e))?;
+    crate::save_and_reload_project(&project)?;
     Ok(())
+}
+
+// ===================================================================
+// 恢复辅助函数
+// ===================================================================
+
+/// 清理陈旧的 execution_session。
+///
+/// 以下情况视为陈旧：
+/// - session 状态为 "executing" 但对应小阶段状态不是 Executing（进程已死但磁盘状态未更新）
+/// - session 状态为 "awaiting_confirmation" 但对应小阶段不存在或状态不对
+/// - session 的 milestone_id / mid_stage_id 与当前 Project 不匹配
+///
+/// 返回 true 表示清理了陈旧会话。
+fn clean_stale_execution_session(proj: &mut project::Project) -> bool {
+    let session = match proj.execution_session.as_ref() {
+        Some(s) => s.clone(),
+        None => return false,
+    };
+
+    let mut should_clean = false;
+
+    // Check 1: session is active but refers to non-existent entities
+    if session.active {
+        // Find the referenced subtask
+        let subtask_exists = proj.milestones.iter()
+            .filter(|ms| ms.id == session.milestone_id)
+            .flat_map(|ms| ms.mid_stages.iter())
+            .filter(|mid| mid.id == session.mid_stage_id)
+            .flat_map(|mid| mid.subtasks.iter())
+            .any(|st| st.id == session.subtask_id);
+
+        if !subtask_exists {
+            // Referenced subtask no longer exists — stale session
+            should_clean = true;
+        } else if session.status == "executing" {
+            // Check if subtask is still marked as Executing
+            let still_executing = proj.milestones.iter()
+                .filter(|ms| ms.id == session.milestone_id)
+                .flat_map(|ms| ms.mid_stages.iter())
+                .filter(|mid| mid.id == session.mid_stage_id)
+                .flat_map(|mid| mid.subtasks.iter())
+                .any(|st| st.id == session.subtask_id
+                    && st.status == project::SubtaskStatus::Executing);
+
+            if !still_executing {
+                // Session says executing but subtask doesn't — process died
+                should_clean = true;
+            }
+        }
+
+        // Check 2: current milestone/mid_stage mismatch
+        if !session.milestone_id.is_empty() && proj.current_milestone_id != session.milestone_id {
+            should_clean = true;
+        }
+        if !session.mid_stage_id.is_empty() && proj.current_mid_stage_id != session.mid_stage_id {
+            should_clean = true;
+        }
+    } else {
+        // Inactive session is just stale data
+        should_clean = true;
+    }
+
+    if should_clean {
+        proj.execution_session = None;
+        // If current step is Execution with stale session, go back to MidStageSelection
+        if proj.workflow_state.current_step == project::WorkflowStep::Execution {
+            proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
+            proj.workflow_state.data_revision += 1;
+            proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+        }
+    }
+
+    should_clean
+}
+
+/// 清理陈旧的 autopilot 状态。
+///
+/// 以下情况视为陈旧：
+/// - autopilot_active 为 true 但 autopilot_state 为 None
+/// - autopilot_target_milestone_id 指向不存在的大阶段
+/// - autopilot 激活但所有大阶段已完成
+///
+/// 返回 true 表示清理了。
+fn clean_stale_autopilot_state(proj: &mut project::Project) -> bool {
+    if !proj.workflow_state.autopilot_active {
+        // Deactivate if active flag is false but state still exists
+        if proj.workflow_state.autopilot_state.is_some() {
+            proj.workflow_state.autopilot_state = None;
+            proj.workflow_state.autopilot_target_milestone_id = String::new();
+            return true;
+        }
+        return false;
+    }
+
+    let mut should_clean = false;
+
+    // Check: autopilot state missing
+    if proj.workflow_state.autopilot_state.is_none() {
+        should_clean = true;
+    }
+
+    // Check: target milestone exists
+    let target_id = &proj.workflow_state.autopilot_target_milestone_id;
+    if !target_id.is_empty() {
+        let target_exists = proj.milestones.iter().any(|m| m.id == *target_id);
+        if !target_exists {
+            should_clean = true;
+        }
+    }
+
+    // Check: all milestones completed
+    let all_completed = !proj.milestones.is_empty()
+        && proj.milestones.iter().all(|m| m.status == project::MilestoneStatus::Completed);
+    if all_completed {
+        should_clean = true;
+    }
+
+    if should_clean {
+        proj.workflow_state.autopilot_active = false;
+        proj.workflow_state.autopilot_target_milestone_id = String::new();
+        proj.workflow_state.autopilot_state = None;
+        proj.workflow_state.data_revision += 1;
+        proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+    }
+
+    should_clean
 }

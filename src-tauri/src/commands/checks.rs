@@ -217,7 +217,5 @@ pub(crate) async fn run_preflight_check(
     proj.preflight_results.push(check_result);
     proj.workflow_state.data_revision += 1;
 
-    crate::save_project(&proj)?;
-
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }

@@ -548,7 +548,7 @@ pub(crate) async fn confirm_subtask_result(
     // Clear execution session before saving (小阶段已确认)
     proj.execution_session = None;
 
-    crate::save_project(&proj)?;
+    let proj = crate::save_and_reload_project(&proj)?;
 
     // === 中阶段节点 Git 标签（项目状态已持久化，标签为补充元数据） ===
     if all_subtasks_passed {
@@ -626,7 +626,7 @@ pub(crate) async fn reject_subtask_result(
     // Clear execution session
     proj.execution_session = None;
 
-    crate::save_project(&proj)?;
+    let proj = crate::save_and_reload_project(&proj)?;
 
     // Clear pipeline state
     {
@@ -1016,8 +1016,7 @@ pub(crate) async fn request_in_stop(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = now;
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// V1 ED Stop：当前任务完成后暂停（标记请求，执行器完成后检查）
@@ -1058,8 +1057,7 @@ pub(crate) async fn request_ed_stop(
 
     proj.workflow_state.pause_reason = project::PauseReason::EDStop;
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// V1 暂停决策：继续 / 调整 / 回退
@@ -1109,8 +1107,7 @@ pub(crate) async fn resolve_pause_decision(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// V1 预览回退影响范围
@@ -1228,8 +1225,7 @@ pub(crate) async fn confirm_rollback(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 // === 辅助函数 ===
@@ -1312,6 +1308,137 @@ pub(crate) fn find_last_passed_subtask(proj: &project::Project) -> Option<projec
         }
     }
     last
+}
+
+/// 执行状态对账结果
+#[derive(Debug, Clone)]
+pub enum ExecutionReconciliation {
+    /// 真执行中：磁盘 session 为 executing，内存 PipelineState 为 Running
+    Executing,
+    /// 待确认：磁盘 session 为 awaiting_confirmation
+    AwaitingConfirmation,
+    /// 会话失联：磁盘 session 为 executing 但进程已死
+    SessionLost,
+    /// 会话无效：session 字段缺失或 active=false
+    SessionInvalid,
+    /// 数据冲突：session 与当前 milestone/mid_stage 不匹配
+    DataConflict,
+}
+
+/// 对账执行状态（启动恢复时调用）
+///
+/// 区分五种情况：
+/// - Executing: 磁盘 session=executing + 内存 Running → 恢复轮询
+/// - AwaitingConfirmation: 磁盘 session=awaiting_confirmation → 恢复确认界面
+/// - SessionLost: 磁盘 session=executing 但进程已死 → 显示恢复中
+/// - SessionInvalid: active=false 或字段缺失 → 清理 session
+/// - DataConflict: 与当前 milestone/mid_stage 不匹配 → cleanup
+pub fn reconcile_execution_state(
+    proj: &project::Project,
+    pipeline_status: Option<&PipelineState>,
+) -> ExecutionReconciliation {
+    let session = match proj.execution_session.as_ref() {
+        Some(s) => s,
+        None => {
+            // No session at all — check if we're still in Execution step
+            if proj.workflow_state.current_step == project::WorkflowStep::Execution {
+                return ExecutionReconciliation::SessionInvalid;
+            }
+            return ExecutionReconciliation::SessionInvalid;
+        }
+    };
+
+    // Check session validity
+    if !session.active || session.subtask_id.is_empty() {
+        return ExecutionReconciliation::SessionInvalid;
+    }
+
+    // Check data consistency: session milestone/mid_stage match current
+    if proj.current_milestone_id != session.milestone_id
+        || proj.current_mid_stage_id != session.mid_stage_id
+    {
+        return ExecutionReconciliation::DataConflict;
+    }
+
+    // Check if referenced subtask still exists
+    let subtask_exists = proj.milestones.iter()
+        .filter(|ms| ms.id == session.milestone_id)
+        .flat_map(|ms| ms.mid_stages.iter())
+        .filter(|mid| mid.id == session.mid_stage_id)
+        .flat_map(|mid| mid.subtasks.iter())
+        .any(|st| st.id == session.subtask_id);
+
+    if !subtask_exists {
+        return ExecutionReconciliation::DataConflict;
+    }
+
+    match session.status.as_str() {
+        "executing" => {
+            // Check if PipelineState is still Running
+            match pipeline_status {
+                Some(ps) if ps.status == PipelineStatus::Running => {
+                    ExecutionReconciliation::Executing
+                }
+                _ => {
+                    // Session says executing but no running pipeline → process died
+                    ExecutionReconciliation::SessionLost
+                }
+            }
+        }
+        "awaiting_confirmation" => {
+            ExecutionReconciliation::AwaitingConfirmation
+        }
+        _ => ExecutionReconciliation::SessionInvalid,
+    }
+}
+
+/// 清理无效的执行会话并修正工作流状态
+///
+/// 根据对账结果更新 Project，返回是否做了修改。
+pub fn apply_execution_reconciliation(
+    proj: &mut project::Project,
+    reconciliation: &ExecutionReconciliation,
+) -> bool {
+    match reconciliation {
+        ExecutionReconciliation::Executing | ExecutionReconciliation::AwaitingConfirmation => {
+            // Valid states — keep session, don't modify
+            false
+        }
+        ExecutionReconciliation::SessionLost => {
+            // Process died — preserve session with "session_lost" marker
+            // so frontend can detect interrupted execution and display recovery info.
+            // session.active stays true so the frontend recovery effect triggers.
+            if let Some(ref mut session) = proj.execution_session {
+                session.status = "session_lost".to_string();
+                // Keep active=true — frontend will check status to show "interrupted" state
+            }
+            proj.workflow_state.data_revision += 1;
+            true
+        }
+        ExecutionReconciliation::SessionInvalid => {
+            proj.execution_session = None;
+            if proj.workflow_state.current_step == project::WorkflowStep::Execution {
+                // No valid session in Execution step → go back
+                proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
+                proj.workflow_state.data_revision += 1;
+                proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+            }
+            true
+        }
+        ExecutionReconciliation::DataConflict => {
+            // Data mismatch — full cleanup
+            proj.execution_session = None;
+            // Go back to a safe state
+            if proj.workflow_state.current_step == project::WorkflowStep::Execution
+                || proj.workflow_state.current_step == project::WorkflowStep::PauseDecision
+            {
+                proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
+                proj.workflow_state.data_revision += 1;
+                proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+            }
+            true
+        }
+    }
 }
 
 fn find_current_subtask(proj: &project::Project) -> Option<project::Subtask> {

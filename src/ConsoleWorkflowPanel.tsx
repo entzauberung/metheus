@@ -213,9 +213,38 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
 
   const autopilotActive = project.workflow_state.autopilot_active === true;
   const autopilotRunning = autopilotActive && project.workflow_state.autopilot_state?.run_status === "Running";
+  const managedActive = project.workflow_state.managed_flow_state?.active === true;
+  const managedRunning = managedActive && project.workflow_state.managed_flow_state?.run_status === "Running";
+  const managedPaused = managedActive && project.workflow_state.managed_flow_state?.run_status === "Paused";
+
+  // Managed flow banner (shown during any Console step when managed flow is active)
+  const managedBanner = managedActive ? (
+    <div className="feedback-banner" style={{ marginBottom: "12px", padding: "10px 14px", background: managedRunning ? "#f0e6ff" : "#fff8e1", border: `1px solid ${managedRunning ? "#6e40c9" : "#d4a72c"}`, borderRadius: "6px", fontSize: "13px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span>
+          🤖 <strong>托管层{managedRunning ? "运行中" : "已暂停"}</strong>
+          {" — "}{project.workflow_state.managed_flow_state?.last_action || "自动推进中..."}
+        </span>
+        {managedRunning && (
+          <button className="action-btn secondary" style={{ fontSize: "12px", padding: "4px 10px" }}
+            onClick={async () => {
+              const updated = await invokeWithTimeout<Project>("pause_managed_flow", { projectName: project.name });
+              onProjectUpdated(updated);
+            }}>暂停托管</button>
+        )}
+        {managedPaused && (
+          <button className="action-btn primary" style={{ fontSize: "12px", padding: "4px 10px" }}
+            onClick={async () => {
+              const updated = await invokeWithTimeout<Project>("resume_managed_flow", { projectName: project.name });
+              onProjectUpdated(updated);
+            }}>恢复托管</button>
+        )}
+      </div>
+    </div>
+  ) : null;
 
   if (["MilestoneGeneration", "MilestoneCheck", "MilestoneApproval", "MilestoneSelection", "FuturePlanApproval"].includes(step)) {
-    return <MilestonePlanningStep project={project} busy={busy} feedback={feedback} syncRequired={syncRequired}
+    return <>{managedBanner}<MilestonePlanningStep project={project} busy={busy} feedback={feedback} syncRequired={syncRequired}
       regenerationFeedback={regenerationFeedback} setRegenerationFeedback={setRegenerationFeedback}
       regenerationModalOpen={milestoneModalOpen} setRegenerationModalOpen={setMilestoneModalOpen}
       onGenerate={handleGenerateMilestone}
@@ -228,11 +257,11 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
       onToggleAutopilot={handleToggleAutopilot}
       onAutopilotPause={handleAutopilotPause}
       autopilotActive={autopilotActive}
-      autopilotRunning={autopilotRunning} />;
+      autopilotRunning={autopilotRunning} /></>;
   }
 
   if (["MidStageGeneration", "MidStageCheck", "MidStageApproval", "MidStageSelection"].includes(step)) {
-    return <MidStagePlanningStep project={project} busy={busy || autopilotRunning} feedback={feedback}
+    return <>{managedBanner}<MidStagePlanningStep project={project} busy={busy || autopilotRunning} feedback={feedback}
       regenerationFeedback={regenerationFeedback} setRegenerationFeedback={setRegenerationFeedback}
       regenerationModalOpen={midStageModalOpen} setRegenerationModalOpen={setMidStageModalOpen}
       onGenerate={() => runProjectCommand("generate_mid_stage_draft", { projectName: project.name }, "中阶段草稿已生成。")}
@@ -242,11 +271,11 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
       onContinue={() => handleTransition("PlanGeneration")} onRegenerate={handleRegenerateMidStage}
       autopilotActive={autopilotActive}
       autopilotRunning={autopilotRunning}
-      onAutopilotPause={handleAutopilotPause} />;
+      onAutopilotPause={handleAutopilotPause} /></>;
   }
 
   if (["PlanGeneration", "PlanCheck", "PlanApproving"].includes(step)) {
-    return <ExecutionPlanStep project={project} busy={busy || autopilotRunning} feedback={feedback}
+    return <>{managedBanner}<ExecutionPlanStep project={project} busy={busy || autopilotRunning} feedback={feedback}
       regenerationFeedback={regenerationFeedback} setRegenerationFeedback={setRegenerationFeedback}
       regenerationModalOpen={planModalOpen} setRegenerationModalOpen={setPlanModalOpen}
       onGenerate={() => runProjectCommand("generate_execution_plan", { projectName: project.name }, "执行计划已生成。")}
@@ -255,7 +284,7 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
       onRegenerate={handleRegeneratePlan}
       autopilotActive={autopilotActive}
       autopilotRunning={autopilotRunning}
-      onAutopilotPause={handleAutopilotPause} />;
+      onAutopilotPause={handleAutopilotPause} /></>;
   }
 
   return null;

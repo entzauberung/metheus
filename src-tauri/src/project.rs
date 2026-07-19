@@ -152,6 +152,9 @@ pub struct WorkflowState {
     /// autopilot 运行状态快照（持久化，用于刷新恢复）
     #[serde(default)]
     pub autopilot_state: Option<AutopilotState>,
+    /// 托管层状态（ThreeChecks 后到大阶段批准，独立于 autopilot）
+    #[serde(default)]
+    pub managed_flow_state: Option<ManagedFlowState>,
 }
 
 impl Default for WorkflowState {
@@ -167,6 +170,7 @@ impl Default for WorkflowState {
             autopilot_active: false,
             autopilot_target_milestone_id: String::new(),
             autopilot_state: None,
+            managed_flow_state: None,
         }
     }
 }
@@ -215,6 +219,62 @@ impl Default for AutopilotState {
             run_status: AutopilotRunStatus::Running,
             last_action: String::new(),
             last_action_at: String::new(),
+            error_message: String::new(),
+        }
+    }
+}
+
+// ===================================================================
+// V2 托管层（Managed Flow）— ThreeChecks 后到大阶段批准的自动化
+// ===================================================================
+
+/// 托管层运行状态
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ManagedRunStatus {
+    /// 运行中
+    Running,
+    /// 已暂停（用户手动暂停）
+    Paused,
+    /// 等待人工决策（方案审批、大阶段审批等）
+    WaitingHuman,
+    /// 出错停止
+    ErrorStopped,
+}
+
+impl Default for ManagedRunStatus {
+    fn default() -> Self {
+        ManagedRunStatus::Running
+    }
+}
+
+/// 托管层持久化状态（独立于 autopilot）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedFlowState {
+    /// 是否激活
+    pub active: bool,
+    /// 当前托管子状态（对应 WorkflowStep）
+    pub managed_state: String,
+    /// 托管终点（固定为 "MilestoneApproval"）
+    pub managed_target: String,
+    /// 最近一次托管动作说明
+    pub last_action: String,
+    /// 最近一次动作时间
+    pub last_action_at: String,
+    /// 运行状态
+    pub run_status: ManagedRunStatus,
+    /// 出错信息
+    pub error_message: String,
+}
+
+impl Default for ManagedFlowState {
+    fn default() -> Self {
+        ManagedFlowState {
+            active: false,
+            managed_state: String::new(),
+            managed_target: "MilestoneApproval".to_string(),
+            last_action: String::new(),
+            last_action_at: String::new(),
+            run_status: ManagedRunStatus::Running,
             error_message: String::new(),
         }
     }
@@ -566,6 +626,15 @@ pub struct ExistingProjectBaseline {
     /// Already 宪法摘要（注入工作宪法第一部分"已有信息"）
     #[serde(default)]
     pub already_constitution_summary: String,
+    /// 完整 README 内容（最长约 15K 字符）
+    #[serde(default)]
+    pub readme_full: String,
+    /// Manifest 文件详情：[(文件路径, 内容)] — 依赖、脚本、配置
+    #[serde(default)]
+    pub manifest_details: Vec<(String, String)>,
+    /// 关键源文件摘要：[(文件路径, 摘要)] — 源码结构概览
+    #[serde(default)]
+    pub source_abstracts: Vec<(String, String)>,
 }
 
 /// 三项检查结果

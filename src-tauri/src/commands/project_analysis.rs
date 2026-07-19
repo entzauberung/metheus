@@ -143,6 +143,9 @@ fn scan_internal(project_path: &str) -> Result<project::ExistingProjectBaseline,
         approved_at: None,
         already_constitution_path: String::new(),
         already_constitution_summary: String::new(),
+        readme_full: readme_content,
+        manifest_details: manifest_files,
+        source_abstracts: source_files,
     })
 }
 
@@ -168,9 +171,42 @@ pub(crate) async fn analyze_existing_project(
     let mut baseline = scan_internal(&project_path)?;
 
     // Step 2: Generate AI analysis
+    let manifest_text = if baseline.manifest_details.is_empty() {
+        "（未检测到依赖清单文件）".to_string()
+    } else {
+        baseline.manifest_details.iter()
+            .map(|(path, content)| {
+                let truncated: String = content.chars().take(2000).collect();
+                format!("### {}\n```\n{}\n```", path, truncated)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+
+    let source_text = if baseline.source_abstracts.is_empty() {
+        "（未提取源文件摘要）".to_string()
+    } else {
+        baseline.source_abstracts.iter()
+            .map(|(path, content)| {
+                let truncated: String = content.chars().take(1500).collect();
+                format!("### {}\n```\n{}\n```", path, truncated)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+
+    let readme_text = if baseline.readme_full.is_empty() {
+        "（未检测到 README 文件）".to_string()
+    } else {
+        baseline.readme_full.chars().take(5000).collect::<String>()
+    };
+
     let prompt = format!(
         "你是一个项目分析专家。请分析以下已有项目信息，识别项目的完成能力和待处理能力。\n\n\
         项目摘要：\n{}\n\n技术栈：{}\n\n架构证据：{}\n\n\
+        完整 README：\n{}\n\n\
+        依赖清单详情：\n{}\n\n\
+        关键源文件摘要：\n{}\n\n\
         文件列表（共 {} 个）：\n{}\n\n\
         请以 JSON 格式返回分析结果，包含以下字段：\n\
         - completed_capabilities: 已完成的功能/能力列表（字符串数组）\n\
@@ -181,6 +217,9 @@ pub(crate) async fn analyze_existing_project(
         baseline.project_summary,
         baseline.tech_stack,
         baseline.architecture_evidence,
+        readme_text,
+        manifest_text,
+        source_text,
         baseline.scanned_files.len(),
         baseline.scanned_files.join("\n")
     );
@@ -221,9 +260,8 @@ pub(crate) async fn analyze_existing_project(
     proj.existing_baseline = Some(baseline.clone());
     proj.workflow_state.current_step = project::WorkflowStep::BaselineApproval;
     proj.workflow_state.data_revision += 1;
-    crate::save_project(&proj)?;
 
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// 通过 AI 生成详细基线内容
@@ -336,12 +374,30 @@ pub(crate) async fn approve_existing_baseline(
     project.workflow_state.current_step = project::WorkflowStep::Discussion;
     project.workflow_state.data_revision += 1;
 
-    crate::save_project(&project)?;
-    Ok(project)
+    crate::save_and_reload_project(&project)
 }
 
 /// 构建独立的 Already 项目宪法（隔离于工作 CONSTITUTION.md）
 fn build_already_constitution(baseline: &project::ExistingProjectBaseline) -> String {
+    let readme_section = if baseline.readme_full.is_empty() {
+        "未检测到 README 文件".to_string()
+    } else {
+        let excerpt: String = baseline.readme_full.chars().take(2000).collect();
+        format!("```\n{}\n```", excerpt)
+    };
+
+    let manifest_section = if baseline.manifest_details.is_empty() {
+        "未检测到依赖清单文件".to_string()
+    } else {
+        baseline.manifest_details.iter()
+            .map(|(path, content)| {
+                let excerpt: String = content.chars().take(1000).collect();
+                format!("### {}\n```\n{}\n```", path, excerpt)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+
     format!(
         "# Already 项目宪法（低权重全局记忆）\n\n\
          > 本文档由 AI 读取已有项目文件自动生成，作为背景参考。\n\
@@ -349,6 +405,8 @@ fn build_already_constitution(baseline: &project::ExistingProjectBaseline) -> St
          ## 项目摘要\n{}\n\n\
          ## 技术栈\n{}\n\n\
          ## 架构证据\n{}\n\n\
+         ## README 全文（节选）\n{}\n\n\
+         ## 依赖清单\n{}\n\n\
          ## 已完成能力\n{}\n\n\
          ## 待完成能力\n{}\n\n\
          ## 风险\n{}\n\n\
@@ -357,6 +415,8 @@ fn build_already_constitution(baseline: &project::ExistingProjectBaseline) -> St
         baseline.project_summary,
         baseline.tech_stack,
         baseline.architecture_evidence,
+        readme_section,
+        manifest_section,
         baseline.completed_capabilities.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"),
         baseline.pending_capabilities.iter().map(|c| format!("- {}", c)).collect::<Vec<_>>().join("\n"),
         baseline.risks.iter().map(|r| format!("- {}", r)).collect::<Vec<_>>().join("\n"),
@@ -365,6 +425,44 @@ fn build_already_constitution(baseline: &project::ExistingProjectBaseline) -> St
         baseline.evidence_summary,
         baseline.generated_at,
     )
+}
+
+/// 从 manifest 文件中提取关键依赖摘要
+fn summarize_manifest_deps(manifest_details: &[(String, String)]) -> String {
+    if manifest_details.is_empty() {
+        return "未检测到依赖清单文件".to_string();
+    }
+
+    let mut lines = Vec::new();
+    for (path, content) in manifest_details {
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+        // 提取关键行（依赖、脚本、版本信息）
+        let key_lines: Vec<&str> = content
+            .lines()
+            .filter(|l| {
+                let trimmed = l.trim();
+                !trimmed.is_empty()
+                    && !trimmed.starts_with('#')
+                    && !trimmed.starts_with("//")
+                    && (trimmed.contains("dep") || trimmed.contains("version") || trimmed.contains("script")
+                        || trimmed.contains("name") || trimmed.contains("require")
+                        || trimmed.contains("import") || trimmed.contains("module"))
+            })
+            .take(15)
+            .collect();
+        if !key_lines.is_empty() {
+            lines.push(format!("{}:\n{}", file_name, key_lines.join("\n")));
+        }
+    }
+
+    if lines.is_empty() {
+        "依赖清单已扫描但未提取关键信息".to_string()
+    } else {
+        lines.join("\n\n")
+    }
 }
 
 /// 构建 Already 宪法精炼摘要（注入工作宪法第一部分）
@@ -388,14 +486,31 @@ fn build_already_summary(baseline: &project::ExistingProjectBaseline) -> String 
             .join("\n")
     };
 
+    // README 摘录：取前 800 字符，提供实质性项目背景
+    let readme_excerpt = if baseline.readme_full.is_empty() {
+        "未检测到 README".to_string()
+    } else {
+        let excerpt: String = baseline.readme_full.chars().take(800).collect();
+        if baseline.readme_full.chars().count() > 800 {
+            format!("{}...", excerpt)
+        } else {
+            excerpt
+        }
+    };
+
+    // 依赖摘要
+    let manifest_summary = summarize_manifest_deps(&baseline.manifest_details);
+
     format!(
         "已有项目技术栈：{}。\n\
-         项目摘要：{}\n\
+         项目 README 摘要：{}\n\
+         关键依赖：{}\n\
          已有能力：\n{}\n\
          主要风险：\n{}\n\
-         详细参见：ALREADY_CONSTITUTION.md（低权重参考）",
+         详细参见：ALREADY_CONSTITUTION.md（低权重参考，不可覆盖当前决策）",
         baseline.tech_stack,
-        baseline.project_summary.chars().take(300).collect::<String>(),
+        readme_excerpt,
+        manifest_summary,
         capabilities_summary,
         risk_summary,
     )

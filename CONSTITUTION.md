@@ -587,3 +587,131 @@ cd ~/metheus && npm run build
 6. **执行轮询由多条件共同决定**：轮询开启条件 = 当前步骤为 `Execution` + `execution_session.active` 为真或后端 `PipelineState.status` 为 `Running`。不能只依赖旧的 `isExecuting` 布尔值。
 7. **所有改造只在 V1 人工执行链上进行**，不修改旧自动流水线核心逻辑。
 8. **本轮不新增任何前后端依赖**。不修改 Cargo.toml、package.json 及锁文件。
+
+---
+
+## 17. 恢复优先级链（2026-07-18 固化）
+
+以下优先级从高到低，启动恢复和运行时状态对账必须严格遵守：
+
+### 17.1 事实源优先级
+
+1. **真实工作目录事实**：项目路径是否存在、是否为目录、.git 是否存在
+2. **磁盘 `Project`**（`~/.metheus/{name}.json`）：唯一持久化业务事实
+3. **后端内存 `PipelineState`**：执行链实时事实（仅存活于进程生命周期内）
+4. **前端临时状态**：纯派生展示态，不得作为恢复判断依据
+
+### 17.2 恢复固定顺序
+
+启动恢复必须按以下顺序执行，前一步未完成时禁止进入后一步：
+
+1. `Project` 加载（`load_project`）
+2. `workflow` 迁移（`migrate_project_workflow`）
+3. `execution` 对账（`reconcile_execution_state`）
+4. `autopilot` sanity（检查 autopilot_state 与当前步骤自洽）
+5. `snapshot` 恢复（`restore_snapshot`）
+6. 解锁界面（释放 `startupRecoveryDoneRef`）
+
+### 17.3 恢复对账规则
+
+`reconcile_execution_state` 必须区分以下五种情况：
+
+| 情况 | 磁盘 execution_session | 内存 PipelineState | 动作 |
+|------|----------------------|-------------------|------|
+| 真执行中 | status="executing" | Running | 恢复轮询 |
+| 待确认 | status="awaiting_confirmation" | 无或 Idle | 恢复确认界面 |
+| 会话失联 | status="executing" | 无（进程已死） | 显示"执行状态恢复中"，不清除磁盘 session |
+| 会话无效 | active=false 或字段缺失 | 无关 | 清理 execution_session，回到当前步骤 |
+| 数据冲突 | 与当前 milestone/mid_stage 不匹配 | 无关 | cleanup，回 Discussion 或 Before |
+
+### 17.4 禁止事项
+
+- execution 恢复未完成前，禁止启动 autopilot 驱动循环
+- 禁止前端自造"恢复执行态"
+- 禁止 `handleChatComplete` 中旧修订/旧步骤/旧执行会话覆盖更新状态
+- 禁止旧异步结果拉回新状态
+
+---
+
+## 18. 托管层（Managed Flow）定义（2026-07-18 新增）
+
+### 18.1 定位
+
+托管层是一个独立于 autopilot 的轻量状态机，覆盖从 ThreeChecks 通过后到大阶段批准完成的完整链路。它不替代 autopilot，而是填补 autopilot 之前的自动化空白。
+
+### 18.2 作用范围
+
+```
+ThreeChecks 通过 → 方案草稿生成 → 方案批准 → 进入 Console → 大阶段生成/检查/批准 → 交接给 autopilot
+```
+
+### 18.3 托管层状态字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `managed_active` | bool | 托管是否激活 |
+| `managed_state` | string | 当前托管子状态 |
+| `managed_target` | string | 托管终点（当前固定为 "MilestoneApproval" 即大阶段批准完成） |
+| `managed_last_action` | string | 最近一次托管动作说明 |
+
+### 18.4 托管层命令
+
+| 命令 | 说明 |
+|------|------|
+| `start_managed_flow` | 从 ThreeChecks 启动托管 |
+| `managed_next_step` | 执行下一步托管动作（只读顾问，返回原子命令） |
+| `pause_managed_flow` | 暂停托管（仅暂停托管，保留当前步骤） |
+| `resume_managed_flow` | 恢复托管 |
+
+### 18.5 托管层与 autopilot 边界
+
+- **托管层**：ThreeChecks 后 → 方案草稿 → 方案批准 → Console → 大阶段生成/检查/批准
+- **autopilot**：大阶段批准完成后 → 中阶段生成/检查/批准 → 执行计划生成/检查/批准 → 小阶段执行/确认
+- 大阶段批准完成是托管层和 autopilot 的交接点
+- 托管层和 autopilot 不得同时激活
+
+---
+
+## 19. 暂停语义分层（2026-07-18 新增）
+
+### 19.1 托管暂停（Managed Pause）
+
+- 仅暂停托管推进
+- 保留当前步骤不变
+- 不走 InStop / EDStop
+- 恢复时调用 `resume_managed_flow`
+
+### 19.2 Autopilot 暂停
+
+- **执行中暂停**：走 InStop 语义，kill 子进程，回退到最近已完成小阶段
+- **非执行中暂停**：仅置 autopilot 为 Paused，保留当前步骤
+- **完成后暂停**：走 EDStop 语义，当前任务完成后进入 PauseDecision
+
+### 19.3 讨论后恢复区分
+
+| 暂停类型 | 讨论范围 | 恢复命令 |
+|----------|---------|---------|
+| 托管暂停 | FirstDiscussion | `resume_managed_flow` |
+| Autopilot 暂停（非执行中） | PauseAdjustment | `toggle_autopilot(active=true)` |
+| Autopilot 暂停（InStop） | PauseAdjustment | `resolve_pause_decision("continue")` |
+| EDStop 暂停 | PauseAdjustment | `resolve_pause_decision("continue")` |
+
+---
+
+## 20. Phase: 数据对齐 / 稳定性 / 托管层 施工（2026-07-18 启动）
+
+**本轮范围**：按 P0 → P1 → P2 顺序执行。每个优先级桶内连续做完，桶结束后执行构建验证。前一桶构建通过后自动进入下一桶。
+
+| 优先级 | 施工内容 | 状态 |
+|--------|----------|------|
+| P0 | 统一命令返回、修旧项目误恢复、收紧恢复顺序、手动模式语义 | 🔄 进行中 |
+| P1 | Already 宪法低权重记忆、Half Project 全局记忆、布局收口 | ⏳ 待开始 |
+| P2 | 托管层、autopilot 收边、暂停语义分层、文档同步 | ⏳ 待开始 |
+
+### P0 通过标准
+- [ ] 决策层和 Console 主链关键命令统一返回磁盘最终事实
+- [ ] 空目录/无效 JSON 不再误恢复执行链
+- [ ] execution/autopilot 恢复不再互抢
+- [ ] 手动模式下一步动作语义统一
+- [ ] `npm run build` 通过
+- [ ] `cargo build` 通过

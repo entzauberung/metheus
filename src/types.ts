@@ -43,6 +43,20 @@ export interface AutopilotState {
   error_message: string;
 }
 
+// ========== V2 托管层 ==========
+
+export type ManagedRunStatus = "Running" | "Paused" | "WaitingHuman" | "ErrorStopped";
+
+export interface ManagedFlowState {
+  active: boolean;
+  managed_state: string;
+  managed_target: string;
+  last_action: string;
+  last_action_at: string;
+  run_status: ManagedRunStatus;
+  error_message: string;
+}
+
 export type DiscussionScope = "FirstDiscussion" | "PauseAdjustment" | "FixPast" | "AdjustFuture";
 
 export interface WorkflowState {
@@ -56,6 +70,7 @@ export interface WorkflowState {
   autopilot_active: boolean;
   autopilot_target_milestone_id: string;
   autopilot_state?: AutopilotState;
+  managed_flow_state?: ManagedFlowState;
 }
 
 // ========== 项目来源 ==========
@@ -224,8 +239,9 @@ export interface BranchDecision {
   confirmed: boolean;
 }
 
-// ========== 项目状态（保留用于旧数据兼容） ==========
+// ========== 项目状态（已退役，新界面使用 workflow_state） ==========
 
+/// @deprecated 使用 WorkflowState 替代。保留用于旧项目文件反序列化兼容。
 export type ProjectStatus = "Idle" | "Discussing" | "Planning" | "MilestoneReady" | "Executing" | "Paused" | "Completed";
 
 export type MilestoneStatus = "Pending" | "InProgress" | "Completed" | "Paused";
@@ -369,7 +385,8 @@ export interface DiscussionThread {
 
 export interface Project {
   name: string;
-  status: ProjectStatus;
+  /// @deprecated 使用 workflow_state 替代。仅在旧项目文件加载时存在。
+  status?: ProjectStatus;
   entry_kind: ProjectEntryKind;
   workflow_state: WorkflowState;
   mode: ProjectMode;

@@ -195,8 +195,14 @@ export function PlanApprovalPanel({
 
   // === 已批准视图 ===
   if (isApproved) {
+    const managedActive = project.workflow_state.managed_flow_state?.active === true;
     return (
       <div className="plan-approval-panel" style={{ padding: "24px" }}>
+        {managedActive && (
+          <div style={{ padding: "10px 14px", background: "#f0e6ff", border: "1px solid #6e40c9", borderRadius: "6px", fontSize: "13px", marginBottom: "12px", color: "#6e40c9" }}>
+            🤖 <strong>托管层运行中</strong> — 方案已批准，托管层将自动进入控制台并推进大阶段审批。
+          </div>
+        )}
         <div className="plan-approved-banner" style={{
           background: "#dafbe1", border: "1px solid #1a7f37", borderRadius: "8px",
           padding: "16px", marginBottom: "16px",

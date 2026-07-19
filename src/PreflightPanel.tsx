@@ -23,6 +23,10 @@ interface PreflightPanelProps {
   onRestartChecks: () => void;
   /** 当前是否有操作正在提交 */
   isSubmitting?: boolean;
+  /** 启动托管层（ThreeChecks 后自动推进到大阶段批准） */
+  onStartManagedFlow?: () => void;
+  /** 托管层是否激活 */
+  managedFlowActive?: boolean;
 }
 
 const CHECK_ORDER = ["goal_completeness", "reality_consistency", "task_executability"] as const;
@@ -52,6 +56,8 @@ export function PreflightPanel({
   onAllPassed,
   onRestartChecks,
   isSubmitting,
+  onStartManagedFlow,
+  managedFlowActive,
 }: PreflightPanelProps) {
   // 仅保留 UI 状态：当前正在加载的检查类型、错误信息
   const [loadingType, setLoadingType] = useState<string | null>(null);
@@ -257,14 +263,31 @@ export function PreflightPanel({
           <p style={{ color: "#1a7f37", fontSize: "14px", marginBottom: "12px" }}>
             ✅ 三项检查全部通过！
           </p>
-          <button
-            className="project-entry-submit"
-            onClick={onAllPassed}
-            disabled={isSubmitting}
-            style={{ maxWidth: "300px" }}
-          >
-            生成项目方案草稿
-          </button>
+          <div style={{ display: "flex", gap: "10px", justifyContent: "center", flexWrap: "wrap" }}>
+            <button
+              className="project-entry-submit"
+              onClick={onAllPassed}
+              disabled={isSubmitting}
+              style={{ maxWidth: "300px" }}
+            >
+              生成项目方案草稿
+            </button>
+            {onStartManagedFlow && !managedFlowActive && (
+              <button
+                className="project-entry-submit"
+                onClick={onStartManagedFlow}
+                disabled={isSubmitting}
+                style={{ maxWidth: "300px", background: "#6e40c9" }}
+              >
+                🚀 启动托管（自动推进到 Console）
+              </button>
+            )}
+          </div>
+          {managedFlowActive && (
+            <p style={{ color: "#6e40c9", fontSize: "13px", marginTop: "8px" }}>
+              🤖 托管层已激活，正在自动推进…
+            </p>
+          )}
         </div>
       )}
 

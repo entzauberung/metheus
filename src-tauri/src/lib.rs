@@ -19,6 +19,7 @@ mod commands;
 mod pipeline;
 mod executor;
 mod snapshot;
+mod constitution_context;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::pipeline::PipelineState;
@@ -190,6 +191,11 @@ pub fn run() {
             crate::commands::workflow::toggle_autopilot,
             crate::commands::workflow::autopilot_pause,
             crate::commands::workflow::autopilot_next_step,
+            crate::commands::workflow::start_managed_flow,
+            crate::commands::workflow::managed_next_step,
+            crate::commands::workflow::pause_managed_flow,
+            crate::commands::workflow::resume_managed_flow,
+            crate::commands::workflow::stop_managed_flow,
             crate::commands::workflow::start_preflight_check,
             crate::commands::workflow::return_to_discussion,
             crate::commands::workflow::resume_plan_approval,

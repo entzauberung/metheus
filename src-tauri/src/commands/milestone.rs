@@ -149,9 +149,16 @@ async fn generate_milestone_candidates(
         "{}\n\n当前项目模式：Professional。输出的每个大阶段应包含 mid_stages 字段（空列表）和 subtasks 字段（空列表）。",
         crate::prompts::MILESTONE_GENERATION_PROMPT
     );
+    // Inject context: working constitution, approved plan, discussion, Already constitution
+    let context_injection = crate::constitution_context::build_context_injection(&proj);
+    let augmented_user_message = if context_injection.is_empty() {
+        user_message
+    } else {
+        format!("{}\n\n{}", context_injection, user_message)
+    };
     let content = crate::api::call_deepseek_api_inner(
         &system_prompt,
-        &user_message,
+        &augmented_user_message,
         false,
         0.5,
     ).await?;
@@ -587,8 +594,11 @@ async fn generate_mid_stage_candidates(
         .map(str::trim)
         .filter(|feedback| !feedback.is_empty())
         .map_or_else(String::new, |feedback| format!("\n\n重新生成反馈：\n{}", feedback));
+    let context_injection = crate::constitution_context::build_context_injection(proj);
     let context = format!(
-        "大阶段：{} ({})\n目标：{}\n范围：{}\n预期输出：{}\n验收标准：{}\n技术栈：{}\n\n项目方案：\n{}{}",
+        "{}{}大阶段：{} ({})\n目标：{}\n范围：{}\n预期输出：{}\n验收标准：{}\n技术栈：{}\n\n项目方案：\n{}{}",
+        if context_injection.is_empty() { String::new() } else { format!("{}\n\n", context_injection) },
+        if context_injection.is_empty() { String::new() } else { "---\n\n".to_string() },
         milestone.title,
         milestone.version,
         milestone.goal,
@@ -1047,10 +1057,12 @@ async fn generate_execution_plan_tasks(
         .map(str::trim)
         .filter(|feedback| !feedback.is_empty())
         .map_or_else(String::new, |feedback| format!("\n\n重新生成反馈：\n{}", feedback));
+    let context_injection = crate::constitution_context::build_context_injection(proj);
     let context = format!(
-        "中阶段：{} ({})\n描述：{}\n技术重点：{}\n\n所属大阶段：{} — {}\n\
+        "{}中阶段：{} ({})\n描述：{}\n技术重点：{}\n\n所属大阶段：{} — {}\n\
          项目方案摘要（仅相关部分）：\n{}\n\n项目路径：{}\n\
          已有文件（仅作参考，不得无差别注入）：\n（由执行器在运行时按 evidence_files 精确读取）{}",
+        if context_injection.is_empty() { String::new() } else { format!("{}\n\n---\n\n", context_injection) },
         mid_stage.title,
         mid_stage.version,
         mid_stage.description,
@@ -1412,8 +1424,7 @@ pub(crate) async fn enter_milestone_review(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// 大阶段审阅决策：A（继续）/ B（修正过去）/ C（调整未来）
@@ -1473,8 +1484,7 @@ pub(crate) async fn approve_milestone_outcome(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = now;
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// B 分支：AI 生成回退建议（基于失败证据、测试结果、稳定标签、用户反馈）
@@ -1701,8 +1711,7 @@ pub(crate) async fn generate_future_milestone_draft(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// C 分支：批准未来大阶段（替换正式 future milestones）
@@ -1805,8 +1814,7 @@ pub(crate) async fn approve_future_milestones(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// Helper: extract string array from JSON value
@@ -2316,7 +2324,7 @@ pub(crate) async fn regenerate_milestones_from_point(
                 // 序列化失败不阻塞流程，跳过质检
                 let merged = merge_milestones(completed_milestones, new_milestones);
                 project.milestones = merged;
-                crate::save_project(&project)?;
+                let project = crate::save_and_reload_project(&project)?;
                 let json_str = serde_json::to_string_pretty(&project)
                     .map_err(|e| format!("序列化项目文件失败: {}", e))?;
                 return Ok(json_str);
@@ -2344,7 +2352,7 @@ pub(crate) async fn regenerate_milestones_from_point(
                 );
                 let merged = merge_milestones(completed_milestones, new_milestones);
                 project.milestones = merged;
-                crate::save_project(&project)?;
+                let project = crate::save_and_reload_project(&project)?;
                 let json_str = serde_json::to_string_pretty(&project)
                     .map_err(|e| format!("序列化项目文件失败: {}", e))?;
                 return Ok(json_str);
@@ -2401,7 +2409,7 @@ pub(crate) async fn regenerate_milestones_from_point(
     project.milestones = merged;
 
     // 12. 持久化
-    crate::save_project(&project)?;
+    let project = crate::save_and_reload_project(&project)?;
 
     // 13. 返回完整 Project JSON
     let json_str = serde_json::to_string_pretty(&project)
@@ -2614,7 +2622,7 @@ pub(crate) async fn regenerate_plan_from_checkpoint(
     }
 
     // 11. 持久化
-    crate::save_project(&project)?;
+    let project = crate::save_and_reload_project(&project)?;
 
     // 12. 序列化并返回更新后的 mid_stage
     let updated_mid_stage = project

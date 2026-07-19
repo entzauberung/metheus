@@ -117,9 +117,12 @@ pub(crate) async fn generate_version_plan(
         .map(|t| t.messages.clone())
         .unwrap_or_default();
 
+    // Build context injection (working constitution, approved plan, discussion, Already constitution)
+    let context_injection = crate::constitution_context::build_context_injection(&proj);
+
     // Build system prompt
     let system_prompt = format!(
-        "{} {}",
+        "{}{}{}",
         "你是一个产品战略顾问，角色名「策略产品经理」。\
          请根据以下对话历史，输出一份结构化的「版本方案摘要」。\
          使用 Markdown 格式，包含以下章节：\
@@ -128,6 +131,11 @@ pub(crate) async fn generate_version_plan(
          回答风格：结构化、清晰、可直接用于执行。\
          在版本方案之后，用分隔符 ---CONSTITUTION_PART1--- 分隔宪法第 1 部分。\
          宪法第 1 部分包含：技术选型理由、架构决策记录、编码规范等长期规则。",
+        if context_injection.is_empty() {
+            String::new()
+        } else {
+            format!("\n\n{}", context_injection)
+        },
         crate::prompts::CONSTITUTION_PART1_PROMPT
     );
 
@@ -253,9 +261,8 @@ pub(crate) async fn generate_version_plan(
     proj.workflow_state.top_level_phase = project::TopLevelPhase::FirstDiscussion;
     proj.workflow_state.current_step = project::WorkflowStep::PlanApproval;
     proj.workflow_state.data_revision += 1;
-    crate::save_project(&proj)?;
 
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// 批准版本方案（必须三项检查全部通过且未过期，draft_id 匹配）
@@ -419,21 +426,19 @@ pub(crate) async fn approve_version_plan(
     proj.workflow_state.data_revision += 1;
 
     // 原子保存 Project；失败时回退宪法
-    if let Err(save_err) = crate::save_project(&proj) {
+    crate::save_and_reload_project(&proj).map_err(|save_err| {
         // 回退宪法到批准前内容
         if let Some(ref constitution_path) = constitution_path {
             let rollback_content = old_constitution.as_deref().unwrap_or("");
             if let Err(rollback_err) = std::fs::write(constitution_path, rollback_content) {
-                return Err(format!(
+                return format!(
                     "严重不一致：Project 保存失败（{}），且宪法回退也失败（{}）。请手动检查 CONSTITUTION.md 和项目数据文件是否一致。",
                     save_err, rollback_err
-                ));
+                );
             }
         }
-        return Err(format!("Project 保存失败，宪法已回退：{}", save_err));
-    }
-
-    Ok(proj)
+        format!("Project 保存失败，宪法已回退：{}", save_err)
+    })
 }
 
 /// 驳回方案：验证 draft_id，清除检查结果，回到 Discussion
@@ -495,8 +500,7 @@ pub(crate) async fn reject_version_plan(
     proj.workflow_state.top_level_phase = project::TopLevelPhase::FirstDiscussion;
     proj.workflow_state.data_revision += 1;
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// 进入控制台（严格验证批准事实，任一条件不满足则拒绝）
@@ -562,6 +566,5 @@ pub(crate) async fn enter_console(project_name: String) -> Result<project::Proje
     proj.workflow_state.current_step = project::WorkflowStep::MilestoneGeneration;
     proj.workflow_state.data_revision += 1;
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }

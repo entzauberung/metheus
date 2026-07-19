@@ -1,4 +1,4 @@
-import { BadgeCheck, ClipboardList, Pause, RefreshCw, SearchCheck, WandSparkles } from "lucide-react";
+import { ArrowRight, BadgeCheck, ClipboardList, Pause, RefreshCw, SearchCheck, WandSparkles } from "lucide-react";
 import { Project, StagePlanCheckResult, Subtask } from "../types";
 import { ActionButton } from "../components/ActionButton";
 import { ConsoleFeedback, ConsoleStepShell } from "../components/ConsoleStepShell";
@@ -79,11 +79,18 @@ export function ExecutionPlanStep(props: Props) {
   );
 
   const isApproved = midStage?.plan_approved_at != null && (midStage?.plan_revision ?? 0) > 0;
+  const isAtApprovalStep = step === "PlanApproving";
+
+  // If plan is approved but step hasn't transitioned to Execution (e.g., after refresh),
+  // show a sync/continue button to let the user advance.
+  const needsSyncToExecution = isApproved && isAtApprovalStep;
 
   return <ConsoleStepShell icon={<BadgeCheck />} title="批准执行计划" description={`${tasks.length} 个小阶段`}
     status={isApproved ? "success" : "pending"} statusLabel={isApproved ? "已批准" : "待批准"}
     feedback={props.feedback} busy={props.busy}
-    actions={(isApproved || autopilotRunning) ? undefined : (<WorkflowActionBar>
+    actions={needsSyncToExecution ? (<WorkflowActionBar>
+      <ActionButton icon={<ArrowRight size={16} />} onClick={props.onApprove}>同步进入执行</ActionButton>
+    </WorkflowActionBar>) : (isApproved || autopilotRunning) ? undefined : (<WorkflowActionBar>
       <ActionButton icon={<BadgeCheck size={16} />} loading={props.busy} onClick={props.onApprove}>批准执行计划</ActionButton>
       <ActionButton icon={<RefreshCw size={16} />} variant="danger" onClick={() => props.setRegenerationModalOpen(true)}>驳回并重新生成</ActionButton>
     </WorkflowActionBar>)}>

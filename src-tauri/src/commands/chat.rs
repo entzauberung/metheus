@@ -117,14 +117,35 @@ pub(crate) async fn chat_with_role(
         c.push_str(&format!("[工作流步骤: {:?}]\n", proj.workflow_state.current_step));
         c.push_str(&format!("[讨论范围: {:?}]\n", proj.workflow_state.discussion_scope));
 
-        // Existing baseline summary
+        // Existing baseline summary (Half Project mode)
         if let Some(ref baseline) = proj.existing_baseline {
             if baseline.approved {
                 c.push_str(&format!("[已有项目技术栈: {}]\n", baseline.tech_stack));
                 if !baseline.completed_capabilities.is_empty() {
-                    c.push_str(&format!("[已完成: {}]\n", baseline.completed_capabilities.join(", ")));
+                    c.push_str(&format!("[已完成能力: {}]\n", baseline.completed_capabilities.join(", ")));
                 }
+                if !baseline.pending_capabilities.is_empty() {
+                    c.push_str(&format!("[待完成能力: {}]\n", baseline.pending_capabilities.join(", ")));
+                }
+                if !baseline.risks.is_empty() {
+                    c.push_str(&format!("[已知风险: {}]\n", baseline.risks.join(", ")));
+                }
+                // Already 宪法摘要（低权重背景）
+                if !baseline.already_constitution_summary.is_empty() {
+                    c.push_str(&format!(
+                        "[低权重背景-Already宪法摘要: {}]\n",
+                        baseline.already_constitution_summary.chars().take(500).collect::<String>()
+                    ));
+                }
+            } else {
+                // 基线存在但尚未批准 — 注入项目路径和提示
+                c.push_str(&format!("[项目路径: {}]\n", proj.project_path));
+                c.push_str("[注意: 基线尚未批准，请先分析已有项目。]\n");
             }
+        } else if proj.entry_kind == project::ProjectEntryKind::HalfProject {
+            // 基线尚未生成 — 防御性输出
+            c.push_str(&format!("[项目路径: {}]\n", proj.project_path));
+            c.push_str("[注意: 已有项目尚未分析，请等待基线分析完成。]\n");
         }
 
         // Discussion history
@@ -135,8 +156,8 @@ pub(crate) async fn chat_with_role(
         c
     };
 
-    // 5.5. 用户消息已写入内存 → 立即保存 Project（用户消息落盘后再调用 AI）
-    crate::save_project(&proj).map_err(|e| {
+    // 5.5. 用户消息已写入内存 → 立即保存并重读 Project（用户消息落盘后再调用 AI）
+    proj = crate::save_and_reload_project(&proj).map_err(|e| {
         format!("用户消息保存失败：{}。请重试。", e)
     })?;
 
@@ -163,10 +184,9 @@ pub(crate) async fn chat_with_role(
             };
             proj.discussion_threads[thread_idx].messages.push(failure_msg);
             // 保存并返回完整 Project（用户消息 + 失败提示均已持久化）
-            crate::save_project(&proj).map_err(|save_err| {
+            return crate::save_and_reload_project(&proj).map_err(|save_err| {
                 format!("AI 调用失败（{}），且保存失败提示时也失败：{}", e, save_err)
-            })?;
-            return Ok(proj);
+            });
         }
     };
 
@@ -187,9 +207,6 @@ pub(crate) async fn chat_with_role(
 
     proj.discussion_threads[thread_idx].messages.push(ai_message);
 
-    // 8. Save project and return the complete updated Project
-    crate::save_project(&proj)?;
-
-    // 前端应使用此完整 Project 替换本地状态，消息已在 discussion_threads 中
-    Ok(proj)
+    // 8. Save and reload project, return disk-verified Project
+    crate::save_and_reload_project(&proj)
 }

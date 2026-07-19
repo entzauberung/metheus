@@ -100,19 +100,25 @@ export function MidStagePlanningStep(props: Props) {
   const hasCompletedMidStages = formal.some(m => m.status === "Completed");
   const pendingMidStages = formal.filter(m => m.status !== "Completed");
 
-  // Build contextual action label and description based on selected mid-stage state
+  // Build contextual action based on selected mid-stage state
   let actionLabel = "开始生成执行计划";
+  let actionHandler: (() => void) | undefined;
   let stepDescription = "选择正式中阶段后生成执行计划";
   if (selectedMid) {
     if (selectedIsCompleted) {
-      actionLabel = "同步当前中阶段状态";
-      stepDescription = "该中阶段已完成。选择一个未完成的中阶段继续，或同步项目状态。";
+      actionLabel = "进入大阶段审阅";
+      actionHandler = props.onContinue;
+      stepDescription = "该中阶段已完成。点击进入大阶段审阅或选择其他中阶段。";
     } else if (selectedMid.plan_approved_at && (selectedMid.plan_revision ?? 0) > 0) {
       actionLabel = "进入执行";
+      actionHandler = () => props.onContinue();
       stepDescription = "该中阶段执行计划已批准，可以进入执行。";
     } else if (selectedMid.subtasks?.some(s => s.status === "Executing" || s.status === "AwaitingConfirmation" || s.status === "Passed")) {
       actionLabel = "回到执行";
+      actionHandler = () => props.onContinue();
       stepDescription = "该中阶段已有执行记录，将回到执行步骤。";
+    } else {
+      actionHandler = () => props.onContinue();
     }
   }
 
@@ -120,8 +126,8 @@ export function MidStagePlanningStep(props: Props) {
     status={props.project.current_mid_stage_id ? (selectedIsCompleted ? "success" : "success") : "pending"}
     statusLabel={props.project.current_mid_stage_id ? (selectedIsCompleted ? "已完成" : "已选择") : "待选择"}
     feedback={props.feedback} busy={props.busy}
-    actions={(props.project.current_mid_stage_id && !autopilotRunning) ? <WorkflowActionBar>
-      <ActionButton icon={<ArrowRight size={16} />} onClick={props.onSelect.bind(null, props.project.current_mid_stage_id)}>{actionLabel}</ActionButton>
+    actions={actionHandler && !autopilotRunning ? <WorkflowActionBar>
+      <ActionButton icon={<ArrowRight size={16} />} onClick={actionHandler}>{actionLabel}</ActionButton>
     </WorkflowActionBar> : undefined}>
     {autopilotBanner}
     {formal.length > 0 ? (

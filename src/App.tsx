@@ -177,6 +177,8 @@ function App() {
   const [feedbackMsg, setFeedbackMsg] = useState<{ type: "error" | "success" | "warning" | "info"; message: string } | null>(null);
   const [executionStatus, setExecutionStatus] = useState<PipelineState | null>(null);
   const [_autoAdvance, _setAutoAdvance] = useState(false);
+  // === 启动恢复完成标记（防止 UI 在恢复完成前渲染） ===
+  const [startupRecoveryDone, setStartupRecoveryDone] = useState(false);
   // === 决策层统一提交锁（同一时间只能执行一个关键动作） ===
   const [decisionAction, setDecisionAction] = useState<string | null>(null);
   const isDecisionSubmitting = decisionAction !== null;
@@ -282,6 +284,16 @@ function App() {
         log_history: [],
       });
       setIsExecuting(false);
+    } else if (session.status === "session_lost") {
+      // Previous execution was interrupted (process died).
+      // Load fresh project from disk — the backend reconciled the state.
+      invokeWithTimeout<Project>("get_project", { projectName: project.name })
+        .then((p) => handleChatComplete(p))
+        .catch(() => {});
+      setFeedbackMsg({
+        type: "warning",
+        message: `上次执行中断 (${session.subtask_title})，已恢复到安全状态。`,
+      });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.name, project?.execution_session?.active, project?.execution_session?.status, project?.execution_session?.subtask_id]);
@@ -299,6 +311,12 @@ function App() {
   // 停止条件：大阶段边界（MilestoneReview）、出错、暂停
   const autopilotLoopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autopilotActiveRef = useRef(false);
+
+  // === 托管层驱动循环 ===
+  // 覆盖范围：ThreeChecks → PlanApproval → Console → MilestoneGeneration → MilestoneCheck → MilestoneApproval
+  // 停止条件：reached_target、needs_human、is_error
+  const managedLoopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const managedActiveRef = useRef(false);
 
   const runAutopilotCycle = useCallback(async (proj: Project) => {
     if (!proj.workflow_state.autopilot_active) return;
@@ -365,7 +383,115 @@ function App() {
     }
   }, []);
 
-  // Start/stop autopilot loop when autopilot_active changes
+  // === 托管层驱动循环 ===
+  // 调用 managed_next_step 获取下一步建议，执行返回的原子命令，循环推进
+  const runManagedCycle = useCallback(async (proj: Project) => {
+    if (!managedActiveRef.current) return;
+    const mf = proj.workflow_state.managed_flow_state;
+    if (!mf || !mf.active) return;
+    if (mf.run_status === "Paused" || mf.run_status === "ErrorStopped") return;
+
+    try {
+      const next = await invokeWithTimeout<{
+        command: string;
+        args: Record<string, unknown>;
+        description: string;
+        reached_target: boolean;
+        needs_human: boolean;
+        is_error: boolean;
+        error_message: string;
+      }>("managed_next_step", { projectName: proj.name });
+
+      // Stop conditions
+      if (next.reached_target) {
+        // Stop managed flow to release the autopilot mutual exclusion lock
+        try {
+          const stopped = await invokeWithTimeout<Project>("stop_managed_flow", {
+            projectName: proj.name,
+          });
+          handleChatComplete(stopped);
+          setFeedbackMsg({
+            type: "success",
+            message: "托管完成：大阶段已批准。可启动自动驾驶继续推进中阶段和子任务。",
+          });
+        } catch (_) {
+          // Fallback: sync and stop driving loop
+          const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+          handleChatComplete(latest);
+          setFeedbackMsg({
+            type: "success",
+            message: `托管完成：${next.description}`,
+          });
+        }
+        return;
+      }
+
+      if (next.needs_human) {
+        setFeedbackMsg({
+          type: "info",
+          message: `托管暂停：${next.description}`,
+        });
+        // Sync and wait for human intervention
+        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+        handleChatComplete(latest);
+        // Don't fully stop — schedule a retry in 5s in case user resolves the block
+        if (managedActiveRef.current) {
+          managedLoopRef.current = setTimeout(() => {
+            invokeWithTimeout<Project>("get_project", { projectName: proj.name })
+              .then(latest => {
+                if (managedActiveRef.current) runManagedCycle(latest);
+              })
+              .catch(() => {});
+          }, 5000);
+        }
+        return;
+      }
+
+      if (next.is_error) {
+        setFeedbackMsg({
+          type: "error",
+          message: `托管错误：${next.error_message}`,
+        });
+        // Sync and stop
+        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+        handleChatComplete(latest);
+        return;
+      }
+
+      if (!next.command) {
+        // No action — sync and retry
+        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+        handleChatComplete(latest);
+        if (managedActiveRef.current) {
+          managedLoopRef.current = setTimeout(() => runManagedCycle(latest), 2000);
+        }
+        return;
+      }
+
+      // Execute the suggested command
+      const updated = await invokeWithTimeout<Project>(next.command, {
+        ...next.args,
+        projectName: proj.name,
+      });
+      handleChatComplete(updated);
+
+      // Schedule next cycle
+      if (managedActiveRef.current && updated.workflow_state.managed_flow_state?.active) {
+        managedLoopRef.current = setTimeout(() => {
+          runManagedCycle(updated);
+        }, 1500);
+      }
+    } catch (error) {
+      console.warn("[managed-flow] Cycle error:", error);
+      // Sync and stop on error
+      try {
+        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+        handleChatComplete(latest);
+      } catch (_) {}
+    }
+  }, []);
+
+  // Start/stop managed flow loop when managed_flow_state changes
   useEffect(() => {
     if (!project) return;
     const active = project.workflow_state.autopilot_active === true;
@@ -392,7 +518,37 @@ function App() {
     autopilotLoopRef.current = setTimeout(() => {
       runAutopilotCycle(project);
     }, 500);
-  }, [project?.workflow_state?.autopilot_active, project?.workflow_state?.autopilot_state?.run_status, project?.workflow_state?.top_level_phase]);
+  }, [
+    project?.workflow_state?.autopilot_active,
+    project?.workflow_state?.autopilot_state?.run_status,
+    project?.workflow_state?.top_level_phase,
+    project?.workflow_state?.current_step, // Re-check when step changes (e.g., PauseDecision → Execution)
+  ]);
+
+  // Start/stop managed flow loop when managed_flow_state changes
+  useEffect(() => {
+    if (!project) return;
+    const mf = project.workflow_state.managed_flow_state;
+    const active = mf?.active === true && mf?.run_status === "Running";
+    managedActiveRef.current = active;
+
+    // Clear any pending loop
+    if (managedLoopRef.current) {
+      clearTimeout(managedLoopRef.current);
+      managedLoopRef.current = null;
+    }
+
+    if (!active) return;
+
+    // Start the drive loop
+    managedLoopRef.current = setTimeout(() => {
+      runManagedCycle(project);
+    }, 500);
+  }, [
+    project?.workflow_state?.managed_flow_state?.active,
+    project?.workflow_state?.managed_flow_state?.run_status,
+    project?.workflow_state?.current_step, // Re-check when step changes
+  ]);
 
   // === 快照：保存 UI 状态到后端，用于刷新恢复和孤儿进程保护 ===
   const takeSnapshot = () => {
@@ -601,6 +757,7 @@ function App() {
     const storedName = localStorage.getItem("metheus_last_project");
     if (!storedName) {
       // 没有存储的项目，停留在 Before 页面
+      setStartupRecoveryDone(true);
       return;
     }
 
@@ -608,8 +765,11 @@ function App() {
       .then((project) => {
         // 检查项目是否有效且处于正确的阶段
         if (!project || !project.name) {
+          // 项目数据无效 — 清除失效记录，进入 Before
           setProject(null);
-          return;
+          localStorage.removeItem("metheus_last_project");
+          setStartupRecoveryDone(true);
+          return null; // 阻止后续 .then() 执行
         }
 
         setProject(project);
@@ -641,6 +801,9 @@ function App() {
         return invokeWithTimeout<any>("restore_snapshot", { projectId: project.name });
       })
       .then((snapshot) => {
+        // null means the previous .then() bailed out — don't continue
+        if (snapshot === null) return;
+
         if (snapshot && snapshot.ui) {
           const ui = snapshot.ui;
           if (ui.view_phase === 'execution') {
@@ -654,11 +817,13 @@ function App() {
         if (project) {
           enterDiscussionMode('idle');
         }
+        setStartupRecoveryDone(true);
       })
       .catch((err) => {
         console.error("获取项目失败:", err);
         setProject(null);
         localStorage.removeItem("metheus_last_project");
+        setStartupRecoveryDone(true);
       });
   }, []);
 
@@ -706,6 +871,24 @@ function App() {
       setDecisionAction(null);
     }
   };
+  // 启动托管层（ThreeChecks 后自动推进到大阶段批准）
+  const handleStartManagedFlow = useCallback(async () => {
+    if (!project || isDecisionSubmitting) return;
+    setDecisionAction("start_managed");
+    try {
+      const updated = await invokeWithTimeout<Project>("start_managed_flow", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "info", message: "托管层已激活。将自动推进到 Console 并完成大阶段审批。" });
+      // The useEffect on managed_flow_state will automatically start the drive loop
+    } catch (err) {
+      console.error("启动托管失败", err);
+      setFeedbackMsg({ type: "error", message: "启动托管失败：" + String(err) });
+    } finally {
+      setDecisionAction(null);
+    }
+  }, [project, isDecisionSubmitting]);
   // 批准方案（传入 draft_id 和 generation_revision）
   const handleApproveWithDraft = useCallback(async (draftId: string, generationRevision: number) => {
     if (!project || isDecisionSubmitting) return;
@@ -1061,6 +1244,12 @@ function App() {
     }
   };
 
+  // 启动恢复尚未完成且存在可能恢复的项目记录时，短暂等待以避免闪回 ProjectEntry
+  const hasStoredProject = !!localStorage.getItem("metheus_last_project");
+  if (!startupRecoveryDone && hasStoredProject) {
+    return <div className="app-shell"><div className="loading-hint">正在恢复项目状态…</div></div>;
+  }
+
   if (!project) {
     return <ProjectEntry onProjectCreated={handleProjectCreated} />;
   }
@@ -1140,6 +1329,8 @@ function App() {
                 onAllPassed={handleGeneratePlan}
                 onRestartChecks={handleRestartChecks}
                 isSubmitting={isDecisionSubmitting}
+                onStartManagedFlow={handleStartManagedFlow}
+                managedFlowActive={project.workflow_state.managed_flow_state?.active === true}
               />
             )}
 

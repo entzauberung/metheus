@@ -122,16 +122,21 @@ pub(crate) async fn transition_workflow(
         _ => project::TopLevelPhase::Console,
     };
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
-/// 迁移旧项目到新工作流
+/// 迁移旧项目到新工作流（含执行会话对账与 autopilot sanity）
 #[tauri::command]
 pub(crate) async fn migrate_project_workflow(
     project_name: String,
 ) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
+
+    // === 0. 执行会话对账（最先执行，防止误恢复） ===
+    reconcile_execution_in_migration(&mut proj);
+
+    // === 0.5. autopilot sanity 检查 ===
+    reconcile_autopilot_in_migration(&mut proj);
 
     // Repair rule: PlanApproving + approved plan → Execution
     // Fixes projects stuck in the old "stay at PlanApproving" state after approval.
@@ -214,8 +219,7 @@ pub(crate) async fn migrate_project_workflow(
     if proj.workflow_state.current_step != project::WorkflowStep::WaitingEntry
         || proj.workflow_state.top_level_phase != project::TopLevelPhase::Before
     {
-        crate::save_project(&proj)?;
-        return Ok(proj); // Already migrated or repaired above
+        return crate::save_and_reload_project(&proj); // Already migrated or repaired above
     }
 
     // Try to deduce from old fields
@@ -232,8 +236,7 @@ pub(crate) async fn migrate_project_workflow(
         proj.workflow_state.current_step = project::WorkflowStep::Discussion;
         proj.workflow_state.data_revision = 1;
         proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
-        crate::save_project(&proj)?;
-        return Ok(proj);
+        return crate::save_and_reload_project(&proj);
     }
 
     if !has_version_plan && !has_milestones {
@@ -247,8 +250,7 @@ pub(crate) async fn migrate_project_workflow(
         }
         proj.workflow_state.data_revision = 1;
         proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
-        crate::save_project(&proj)?;
-        return Ok(proj);
+        return crate::save_and_reload_project(&proj);
     }
 
     // Has version plan but no milestones — validate approval consistency
@@ -285,8 +287,7 @@ pub(crate) async fn migrate_project_workflow(
         proj.workflow_state.top_level_phase = project::TopLevelPhase::FirstDiscussion;
         proj.workflow_state.data_revision = 1;
         proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
-        crate::save_project(&proj)?;
-        return Ok(proj);
+        return crate::save_and_reload_project(&proj);
     }
 
     // Has milestones — preserve Console state (never force back to decision layer)
@@ -304,8 +305,7 @@ pub(crate) async fn migrate_project_workflow(
         }
         proj.workflow_state.data_revision = 1;
         proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
-        crate::save_project(&proj)?;
-        return Ok(proj);
+        return crate::save_and_reload_project(&proj);
     }
 
     // Fallback
@@ -346,8 +346,7 @@ pub(crate) async fn migrate_project_workflow(
         }
     }
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 fn parse_step(s: &str) -> Option<project::WorkflowStep> {
@@ -415,8 +414,7 @@ pub(crate) async fn start_preflight_check(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// 返回继续讨论（从 ThreeChecks 或 PlanApproval 返回 Discussion）
@@ -475,8 +473,7 @@ pub(crate) async fn return_to_discussion(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// 从 Discussion 恢复方案审批（仅当存在有效待审批草稿、讨论未变化、检查有效时）
@@ -536,8 +533,7 @@ pub(crate) async fn resume_plan_approval(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// 重新讨论已批准方案（将已批准方案移入历史，回到 Discussion）
@@ -588,8 +584,7 @@ pub(crate) async fn restart_discussion_from_approved(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
 }
 
 /// 重新开始三项检查（清除当前所有检查结果，从第一项开始）
@@ -610,8 +605,423 @@ pub(crate) async fn restart_checks(
     proj.preflight_results.clear();
     proj.workflow_state.data_revision += 1;
 
-    crate::save_project(&proj)?;
-    Ok(proj)
+    crate::save_and_reload_project(&proj)
+}
+
+// ===================================================================
+// V2 托管层（Managed Flow）：ThreeChecks 后自动推进到大阶段批准
+// ===================================================================
+
+/// 激活托管层：从当前步骤开始自动推进到大阶段批准完成
+#[tauri::command]
+pub(crate) async fn start_managed_flow(
+    project_name: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
+
+    // 仅允许在 ThreeChecks 或 PlanApproval 步骤启动托管
+    match proj.workflow_state.current_step {
+        project::WorkflowStep::ThreeChecks
+        | project::WorkflowStep::PlanApproval
+        | project::WorkflowStep::MilestoneGeneration => {}
+        _ => {
+            return Err(format!(
+                "当前步骤为 {:?}，托管层只能在 ThreeChecks、PlanApproval 或 MilestoneGeneration 启动",
+                proj.workflow_state.current_step
+            ));
+        }
+    }
+
+    // 托管层和 autopilot 不得同时激活
+    if proj.workflow_state.autopilot_active {
+        return Err("自动驾驶已激活，无法同时启动托管层。请先关闭自动驾驶。".to_string());
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let current_step_str = format!("{:?}", proj.workflow_state.current_step);
+
+    proj.workflow_state.managed_flow_state = Some(project::ManagedFlowState {
+        active: true,
+        managed_state: current_step_str,
+        managed_target: "MilestoneApproval".to_string(),
+        last_action: "托管层已激活，开始自动推进".to_string(),
+        last_action_at: now.clone(),
+        run_status: project::ManagedRunStatus::Running,
+        error_message: String::new(),
+    });
+
+    proj.workflow_state.data_revision += 1;
+    proj.workflow_state.last_transition_at = now;
+
+    crate::save_and_reload_project(&proj)
+}
+
+/// 托管层下一步顾问：只读判断，返回下一步该执行的原子命令
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ManagedNextStep {
+    pub command: String,
+    pub args: serde_json::Value,
+    pub description: String,
+    pub reached_target: bool,
+    pub needs_human: bool,
+    pub is_error: bool,
+    pub error_message: String,
+}
+
+#[tauri::command]
+pub(crate) async fn managed_next_step(
+    project_name: String,
+) -> Result<ManagedNextStep, String> {
+    let proj = crate::load_project(&project_name)?;
+
+    let managed = match proj.workflow_state.managed_flow_state.as_ref() {
+        Some(m) => m,
+        None => {
+            return Ok(ManagedNextStep {
+                command: String::new(),
+                args: serde_json::json!({}),
+                description: "托管层未激活".to_string(),
+                reached_target: false,
+                needs_human: false,
+                is_error: true,
+                error_message: "托管层未激活".to_string(),
+            });
+        }
+    };
+
+    if !managed.active {
+        return Ok(ManagedNextStep {
+            command: String::new(),
+            args: serde_json::json!({}),
+            description: "托管层未激活".to_string(),
+            reached_target: false,
+            needs_human: false,
+            is_error: false,
+            error_message: String::new(),
+        });
+    }
+
+    if managed.run_status == project::ManagedRunStatus::Paused {
+        return Ok(ManagedNextStep {
+            command: String::new(),
+            args: serde_json::json!({}),
+            description: "托管层已暂停".to_string(),
+            reached_target: false,
+            needs_human: false,
+            is_error: false,
+            error_message: String::new(),
+        });
+    }
+
+    if managed.run_status == project::ManagedRunStatus::ErrorStopped {
+        return Ok(ManagedNextStep {
+            command: String::new(),
+            args: serde_json::json!({}),
+            description: format!("托管层因错误停止：{}", managed.error_message),
+            reached_target: false,
+            needs_human: true,
+            is_error: true,
+            error_message: managed.error_message.clone(),
+        });
+    }
+
+    let step = &proj.workflow_state.current_step;
+    use project::WorkflowStep::*;
+
+    let next = match step {
+        // MilestoneApproval: auto-approve if possible, then signal target reached
+        MilestoneApproval => {
+            let draft_approved = proj.milestone_draft.as_ref()
+                .map(|d| d.status == project::MilestoneDraftStatus::Approved && d.approved_at.is_some())
+                .unwrap_or(false);
+
+            if draft_approved {
+                ManagedNextStep {
+                    command: String::new(),
+                    args: serde_json::json!({}),
+                    description: "大阶段已批准，托管层目标达成。可启动自动驾驶继续推进。".to_string(),
+                    reached_target: true,
+                    needs_human: false,
+                    is_error: false,
+                    error_message: String::new(),
+                }
+            } else {
+                // Check if we can auto-approve (check passed, draft exists)
+                let can_approve = proj.milestone_draft.as_ref()
+                    .map(|d| {
+                        d.status != project::MilestoneDraftStatus::CheckFailed
+                            && d.check_result.is_some()
+                            && !d.candidate_milestones.is_empty()
+                    })
+                    .unwrap_or(false);
+
+                if can_approve {
+                    ManagedNextStep {
+                        command: "approve_milestone_draft".to_string(),
+                        args: serde_json::json!({ "projectName": project_name }),
+                        description: "大阶段检查已通过，自动批准大阶段草稿".to_string(),
+                        reached_target: false,
+                        needs_human: false,
+                        is_error: false,
+                        error_message: String::new(),
+                    }
+                } else {
+                    ManagedNextStep {
+                        command: String::new(),
+                        args: serde_json::json!({}),
+                        description: "大阶段草稿尚未通过检查，等待检查完成".to_string(),
+                        reached_target: false,
+                        needs_human: true,
+                        is_error: false,
+                        error_message: String::new(),
+                    }
+                }
+            }
+        }
+
+        // MilestoneSelection: managed flow target is reached after milestone is approved
+        // (MilestoneSelection follows MilestoneApproval; autopilot takes over from here)
+        MilestoneSelection => {
+            ManagedNextStep {
+                command: String::new(),
+                args: serde_json::json!({}),
+                description: "大阶段已批准并进入选择阶段，托管层目标达成。可启动自动驾驶继续推进。".to_string(),
+                reached_target: true,
+                needs_human: false,
+                is_error: false,
+                error_message: String::new(),
+            }
+        }
+
+        // ThreeChecks → generate plan draft
+        ThreeChecks => {
+            // Check if all three checks passed
+            let all_passed = ["goal_completeness", "reality_consistency", "task_executability"]
+                .iter()
+                .all(|ct| {
+                    proj.preflight_results.iter().any(|r| r.check_type == *ct && r.passed && !r.stale)
+                });
+
+            if all_passed {
+                ManagedNextStep {
+                    command: "generate_version_plan".to_string(),
+                    args: serde_json::json!({
+                        "projectName": project_name,
+                        "expectedDiscussionRevision": proj.discussion_revision,
+                        "expectedDataRevision": proj.workflow_state.data_revision,
+                    }),
+                    description: "三项检查全部通过，生成方案草稿".to_string(),
+                    reached_target: false,
+                    needs_human: false,
+                    is_error: false,
+                    error_message: String::new(),
+                }
+            } else {
+                ManagedNextStep {
+                    command: String::new(),
+                    args: serde_json::json!({}),
+                    description: "等待三项检查全部通过".to_string(),
+                    reached_target: false,
+                    needs_human: true,
+                    is_error: false,
+                    error_message: String::new(),
+                }
+            }
+        }
+
+        // PlanApproval: auto-approve if possible, then enter Console
+        PlanApproval => {
+            let is_approved = proj.plan_draft.as_ref()
+                .map(|d| d.draft_status == project::DraftStatus::Approved)
+                .unwrap_or(false);
+
+            if is_approved {
+                ManagedNextStep {
+                    command: "enter_console".to_string(),
+                    args: serde_json::json!({ "projectName": project_name }),
+                    description: "方案已批准，进入控制台".to_string(),
+                    reached_target: false,
+                    needs_human: false,
+                    is_error: false,
+                    error_message: String::new(),
+                }
+            } else {
+                // Check if we can auto-approve: draft exists, is pending, and can_approve
+                let can_auto_approve = proj.plan_draft.as_ref()
+                    .map(|d| {
+                        d.draft_status == project::DraftStatus::Pending
+                            && !d.plan_content.trim().is_empty()
+                            && !d.constitution_part1_draft.trim().is_empty()
+                            && d.generation_revision == proj.discussion_revision
+                    })
+                    .unwrap_or(false);
+
+                if can_auto_approve {
+                    ManagedNextStep {
+                        command: "approve_version_plan".to_string(),
+                        args: serde_json::json!({
+                            "projectName": project_name,
+                            "draftId": proj.plan_draft.as_ref().map(|d| d.draft_id.clone()).unwrap_or_default(),
+                            "generationRevision": proj.plan_draft.as_ref().map(|d| d.generation_revision).unwrap_or(0),
+                        }),
+                        description: "托管层自动批准方案草稿".to_string(),
+                        reached_target: false,
+                        needs_human: false,
+                        is_error: false,
+                        error_message: String::new(),
+                    }
+                } else {
+                    ManagedNextStep {
+                        command: String::new(),
+                        args: serde_json::json!({}),
+                        description: "等待方案草稿生成（需先生成方案草稿方可自动批准）".to_string(),
+                        reached_target: false,
+                        needs_human: true,
+                        is_error: false,
+                        error_message: String::new(),
+                    }
+                }
+            }
+        }
+
+        // MilestoneGeneration → generate milestones (this is the entry step after enter_console)
+        MilestoneGeneration => {
+            ManagedNextStep {
+                command: "generate_milestone_draft".to_string(),
+                args: serde_json::json!({ "projectName": project_name }),
+                description: "生成大阶段草稿".to_string(),
+                reached_target: false,
+                needs_human: false,
+                is_error: false,
+                error_message: String::new(),
+            }
+        }
+
+        // MilestoneCheck → check draft
+        MilestoneCheck => {
+            ManagedNextStep {
+                command: "check_milestone_draft".to_string(),
+                args: serde_json::json!({ "projectName": project_name }),
+                description: "检查大阶段草稿".to_string(),
+                reached_target: false,
+                needs_human: false,
+                is_error: false,
+                error_message: String::new(),
+            }
+        }
+
+        // Steps where managed flow cannot help
+        Discussion | BranchDiscussion | PauseDecision | Execution
+        | MidStageGeneration | MidStageCheck | MidStageApproval
+        | MidStageSelection | PlanGeneration | PlanCheck | PlanApproving => {
+            ManagedNextStep {
+                command: String::new(),
+                args: serde_json::json!({}),
+                description: format!("当前步骤 {:?} 不在托管范围内", step),
+                reached_target: false,
+                needs_human: true,
+                is_error: false,
+                error_message: format!("{:?} 不在托管层范围内", step),
+            }
+        }
+
+        _ => ManagedNextStep {
+            command: String::new(),
+            args: serde_json::json!({}),
+            description: format!("托管层未覆盖步骤：{:?}", step),
+            reached_target: false,
+            needs_human: true,
+            is_error: true,
+            error_message: format!("托管层不支持从 {:?} 自动推进", step),
+        },
+    };
+
+    Ok(next)
+}
+
+/// 暂停托管层
+#[tauri::command]
+pub(crate) async fn pause_managed_flow(
+    project_name: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
+
+    let managed = proj.workflow_state.managed_flow_state.as_ref()
+        .ok_or("托管层未激活。".to_string())?;
+
+    if !managed.active {
+        return Err("托管层未激活。".to_string());
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(ref mut m) = proj.workflow_state.managed_flow_state {
+        m.run_status = project::ManagedRunStatus::Paused;
+        m.last_action = "托管层已暂停".to_string();
+        m.last_action_at = now.clone();
+    }
+
+    proj.workflow_state.data_revision += 1;
+    proj.workflow_state.last_transition_at = now;
+
+    crate::save_and_reload_project(&proj)
+}
+
+/// 恢复托管层
+#[tauri::command]
+pub(crate) async fn resume_managed_flow(
+    project_name: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
+
+    let managed = proj.workflow_state.managed_flow_state.as_ref()
+        .ok_or("托管层未激活。".to_string())?;
+
+    if !managed.active {
+        return Err("托管层未激活。".to_string());
+    }
+
+    if managed.run_status != project::ManagedRunStatus::Paused {
+        return Err(format!(
+            "托管层当前状态为 {:?}，只有暂停状态可以恢复",
+            managed.run_status
+        ));
+    }
+
+    // Prevent simultaneous automated systems
+    if proj.workflow_state.autopilot_active {
+        return Err("自动驾驶已激活，无法恢复托管层。请先关闭自动驾驶。".to_string());
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(ref mut m) = proj.workflow_state.managed_flow_state {
+        m.run_status = project::ManagedRunStatus::Running;
+        m.last_action = "托管层已恢复".to_string();
+        m.last_action_at = now.clone();
+    }
+
+    proj.workflow_state.data_revision += 1;
+    proj.workflow_state.last_transition_at = now;
+
+    crate::save_and_reload_project(&proj)
+}
+
+/// 停止托管层（交接给 autopilot 或回到手动模式）
+#[tauri::command]
+pub(crate) async fn stop_managed_flow(
+    project_name: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
+
+    if proj.workflow_state.managed_flow_state.is_none() {
+        return Err("托管层未激活。".to_string());
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    proj.workflow_state.managed_flow_state = None;
+    proj.workflow_state.data_revision += 1;
+    proj.workflow_state.last_transition_at = now;
+
+    crate::save_and_reload_project(&proj)
 }
 
 // ===================================================================
@@ -629,6 +1039,11 @@ pub(crate) async fn toggle_autopilot(
     // Only allow toggling within Console phase
     if proj.workflow_state.top_level_phase != project::TopLevelPhase::Console {
         return Err("自动驾驶仅可在 Console 阶段使用。".to_string());
+    }
+
+    // Prevent simultaneous autopilot and managed flow
+    if active && proj.workflow_state.managed_flow_state.as_ref().map(|m| m.active).unwrap_or(false) {
+        return Err("托管层正在运行，无法激活自动驾驶。请先停止托管层。".to_string());
     }
 
     if active {
@@ -1020,8 +1435,20 @@ pub(crate) async fn autopilot_next_step(
             let has_pending = target_ms.mid_stages.iter()
                 .any(|mid| mid.subtasks.iter()
                     .any(|st| st.status == project::SubtaskStatus::Pending));
+            let has_rejected = target_ms.mid_stages.iter()
+                .any(|mid| mid.subtasks.iter()
+                    .any(|st| st.status == project::SubtaskStatus::Rejected));
 
-            if has_awaiting {
+            if has_rejected && !has_awaiting && !has_pending {
+                AutopilotNextStep {
+                    command: String::new(),
+                    args: serde_json::json!({}),
+                    description: "存在已驳回的小阶段，需要人工决定是否重试或重新生成执行计划".to_string(),
+                    at_milestone_boundary: false,
+                    is_error: true,
+                    error_message: "Execution 步骤中存在 Rejected 小阶段，请人工处理。".to_string(),
+                }
+            } else if has_awaiting {
                 AutopilotNextStep {
                     command: "confirm_subtask_result".to_string(),
                     args: serde_json::json!({ "projectName": project_name }),
@@ -1067,16 +1494,12 @@ pub(crate) async fn autopilot_next_step(
         // Milestone generation/check/approval — user should handle these before autopilot
         MilestoneGeneration | MilestoneCheck | MilestoneApproval => {
             AutopilotNextStep {
-                command: "transition_workflow".to_string(),
-                args: serde_json::json!({
-                    "projectName": project_name,
-                    "targetStep": "MilestoneSelection",
-                    "reason": "autopilot: 跳过大阶段审批（已由用户完成）",
-                }),
-                description: "大阶段审批流程应由用户完成".to_string(),
+                command: String::new(),
+                args: serde_json::json!({}),
+                description: "请先手动完成大阶段生成、检查和批准，然后激活自动驾驶。".to_string(),
                 at_milestone_boundary: false,
                 is_error: true,
-                error_message: "请先手动完成大阶段生成、检查和批准".to_string(),
+                error_message: "请先手动完成大阶段生成、检查和批准。".to_string(),
             }
         }
 
@@ -1091,4 +1514,79 @@ pub(crate) async fn autopilot_next_step(
     };
 
     Ok(next)
+}
+
+// ===================================================================
+// 迁移时执行会话与 autopilot 对账
+// ===================================================================
+
+/// 在 migrate_project_workflow 中执行会话对账
+fn reconcile_execution_in_migration(proj: &mut crate::project::Project) {
+    let reconciliation = {
+        // We don't have PipelineState access here (no AppState in migration)
+        // SessionLost is identified by the session status being "executing"
+        // without a running pipeline
+        crate::pipeline::reconcile_execution_state(proj, None)
+    };
+
+    if matches!(reconciliation,
+        crate::pipeline::ExecutionReconciliation::SessionInvalid
+        | crate::pipeline::ExecutionReconciliation::SessionLost
+        | crate::pipeline::ExecutionReconciliation::DataConflict
+    ) {
+        crate::pipeline::apply_execution_reconciliation(proj, &reconciliation);
+    }
+}
+
+/// 在 migrate_project_workflow 中 autopilot sanity 检查
+fn reconcile_autopilot_in_migration(proj: &mut crate::project::Project) {
+    if !proj.workflow_state.autopilot_active {
+        if proj.workflow_state.autopilot_state.is_some() {
+            proj.workflow_state.autopilot_state = None;
+            proj.workflow_state.autopilot_target_milestone_id = String::new();
+            proj.workflow_state.data_revision += 1;
+        }
+        return;
+    }
+
+    // Verify autopilot state exists
+    if proj.workflow_state.autopilot_state.is_none() {
+        proj.workflow_state.autopilot_active = false;
+        proj.workflow_state.autopilot_target_milestone_id = String::new();
+        proj.workflow_state.data_revision += 1;
+        return;
+    }
+
+    // Verify target milestone still exists
+    let target_id = &proj.workflow_state.autopilot_target_milestone_id;
+    if !target_id.is_empty() {
+        let target_exists = proj.milestones.iter().any(|m| m.id == *target_id);
+        if !target_exists {
+            // Target milestone gone — find new target or deactivate
+            if let Some(next) = proj.milestones.iter()
+                .find(|m| m.status != crate::project::MilestoneStatus::Completed)
+            {
+                proj.workflow_state.autopilot_target_milestone_id = next.id.clone();
+                if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
+                    ap.target_milestone_id = next.id.clone();
+                    ap.last_action = "目标大阶段已自动修复（原目标不存在）".to_string();
+                    ap.last_action_at = chrono::Utc::now().to_rfc3339();
+                }
+            } else {
+                // All milestones complete
+                proj.workflow_state.autopilot_active = false;
+                proj.workflow_state.autopilot_target_milestone_id = String::new();
+                proj.workflow_state.autopilot_state = None;
+            }
+            proj.workflow_state.data_revision += 1;
+        }
+    }
+
+    // Check autopilot not active outside Console
+    if proj.workflow_state.top_level_phase != crate::project::TopLevelPhase::Console {
+        proj.workflow_state.autopilot_active = false;
+        proj.workflow_state.autopilot_target_milestone_id = String::new();
+        proj.workflow_state.autopilot_state = None;
+        proj.workflow_state.data_revision += 1;
+    }
 }
