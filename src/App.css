@@ -125,6 +125,7 @@
 /* 右侧：聊天区 */
 .main-content {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   background-color: #f0f0f0;
@@ -809,6 +810,7 @@
 
 .execution-main {
   flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -2680,21 +2682,38 @@
 }
 
 .branch-card {
+  width: 100%;
   display: flex;
   align-items: flex-start;
   gap: 14px;
   padding: 16px 20px;
   border: 2px solid #e8e8e8;
-  border-radius: 10px;
+  border-radius: 8px;
   cursor: pointer;
   transition: all 0.2s;
   text-align: left;
   background: white;
+  font: inherit;
 }
 
-.branch-card:hover {
+.branch-card:hover:not(:disabled) {
   border-color: #0969da;
   box-shadow: 0 2px 8px rgba(9, 105, 218, 0.1);
+}
+
+.branch-card.selected {
+  border-color: #0969da;
+  background: #f6f8fa;
+}
+
+.branch-card:focus-visible {
+  outline: 3px solid rgba(9, 105, 218, 0.35);
+  outline-offset: 2px;
+}
+
+.branch-card:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .branch-card-icon {
@@ -3682,6 +3701,12 @@ button.tree-node:not(:disabled) {
   letter-spacing: 0;
 }
 
+.v1-execution-panel {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 .rollback-preview-panel {
   padding: 24px;
 }
@@ -3756,16 +3781,16 @@ button.tree-node:not(:disabled) {
    自动驾驶控制条
    ============================================================ */
 .autopilot-control-bar {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
   padding: 10px 16px;
   margin-bottom: 16px;
   border: 1px solid #d0d7de;
   border-radius: 8px;
   background: #ffffff;
-  flex-wrap: wrap;
+  flex-shrink: 0;
   min-height: 44px;
 }
 .autopilot-control-bar.ap-running {
@@ -3781,14 +3806,16 @@ button.tree-node:not(:disabled) {
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
-  flex: 1;
+  flex: 1 0 100%;
   min-width: 0;
 }
 .ap-bar-right {
   display: flex;
   align-items: center;
   gap: 8px;
-  flex-shrink: 0;
+  flex: 1 0 100%;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 .ap-bar-status {
   display: flex;
@@ -3802,22 +3829,23 @@ button.tree-node:not(:disabled) {
 .ap-bar-target {
   font-size: 12px;
   color: #656d76;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 .ap-bar-action {
+  flex-basis: 100%;
   font-size: 12px;
   color: #656d76;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
   max-width: 300px;
 }
 .ap-bar-error {
+  flex-basis: 100%;
   font-size: 12px;
   color: #cf222e;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
   max-width: 200px;
 }
 .ap-bar-warning {
@@ -3853,6 +3881,9 @@ button.tree-node:not(:disabled) {
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s;
   white-space: nowrap;
+}
+.autopilot-control-bar > .ap-bar-btn {
+  justify-self: start;
 }
 .ap-bar-btn:hover:not(:disabled) {
   background: #eaeef2;
@@ -3907,7 +3938,21 @@ button.tree-node:not(:disabled) {
     align-items: flex-start;
   }
   .ap-bar-right {
-    width: 100%;
+    width: auto;
     flex-wrap: wrap;
+  }
+  .ap-bar-target,
+  .ap-bar-action,
+  .ap-bar-error,
+  .ap-bar-warning {
+    width: 100%;
+    max-width: none;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .ap-bar-btn {
+    max-width: 100%;
+    white-space: normal;
+    text-align: left;
   }
 }

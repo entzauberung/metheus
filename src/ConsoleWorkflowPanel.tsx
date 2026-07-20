@@ -9,18 +9,31 @@ import { ExecutionPlanStep } from "./console/ExecutionPlanStep";
 interface Props {
   project: Project;
   onProjectUpdated: (project: Project) => void;
+  externalBusy: boolean;
+  onActionStart: (action: string) => boolean;
+  onActionEnd: () => void;
+  onFeedback: (feedback: ConsoleFeedback | null) => void;
 }
 
 type RegenerationSource = "check_failed" | "approval_rejected";
 
-export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
+export function ConsoleWorkflowPanel({
+  project, onProjectUpdated, externalBusy, onActionStart, onActionEnd, onFeedback,
+}: Props) {
   const step = project.workflow_state.current_step;
-  const [busy, setBusy] = useState(false);
-  const [feedback, setFeedback] = useState<ConsoleFeedback | null>(null);
+  const busy = externalBusy;
+  const [feedback, setLocalFeedback] = useState<ConsoleFeedback | null>(null);
   const [regenerationFeedback, setRegenerationFeedback] = useState("");
   const [milestoneModalOpen, setMilestoneModalOpen] = useState(false);
   const [midStageModalOpen, setMidStageModalOpen] = useState(false);
   const [planModalOpen, setPlanModalOpen] = useState(false);
+
+  const setFeedback = (next: ConsoleFeedback | null) => {
+    setLocalFeedback(next);
+    onFeedback(next);
+  };
+
+  const beginAction = (action: string) => !busy && onActionStart(action);
 
   const syncProject = async () => {
     const latest = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
@@ -42,8 +55,7 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
   };
 
   const handleSync = async () => {
-    if (busy) return;
-    setBusy(true);
+    if (!beginAction("console_sync")) return;
     setFeedback({ type: "info", message: "正在同步项目状态..." });
     try {
       await syncProject();
@@ -51,7 +63,7 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
     } catch (error) {
       setFeedback({ type: "error", message: "同步失败：" + String(error) });
     } finally {
-      setBusy(false);
+      onActionEnd();
     }
   };
 
@@ -60,8 +72,7 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
     args: Record<string, unknown>,
     successMessage: string,
   ) => {
-    if (busy) return;
-    setBusy(true);
+    if (!beginAction(command)) return;
     setFeedback(null);
     try {
       const updated = await invokeWithTimeout<Project>(command, args);
@@ -70,7 +81,7 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
     } catch (error) {
       setFeedback({ type: "error", message: String(error) });
     } finally {
-      setBusy(false);
+      onActionEnd();
     }
   };
 
@@ -80,43 +91,10 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
     "已进入下一规划步骤。",
   );
 
-  const handleToggleAutopilot = async (active: boolean) => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      const updated = await invokeWithTimeout<Project>("toggle_autopilot", {
-        projectName: project.name,
-        active,
-      });
-      onProjectUpdated(updated);
-      setFeedback({ type: active ? "info" : "success", message: active ? "自动驾驶已激活 — 将自动串联大阶段内部所有步骤，仅在大阶段边界停下。" : "自动驾驶已关闭。" });
-    } catch (error) {
-      setFeedback({ type: "error", message: String(error) });
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const handleAutopilotPause = async () => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      const updated = await invokeWithTimeout<Project>("autopilot_pause", {
-        projectName: project.name,
-      });
-      onProjectUpdated(updated);
-      setFeedback({ type: "info", message: "自动驾驶已暂停。" });
-    } catch (error) {
-      setFeedback({ type: "error", message: String(error) });
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const handleGenerateMilestone = async () => {
-    if (busy) return;
+    if (!beginAction("generate_milestone_draft")) return;
     const startingRevision = project.workflow_state.data_revision;
-    setBusy(true); setFeedback(null);
+    setFeedback(null);
     try {
       const updated = await invokeWithTimeout<Project>("generate_milestone_draft", { projectName: project.name });
       onProjectUpdated(updated);
@@ -130,15 +108,15 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
           setFeedback({ type: "info", message: "后端未完成，请稍后手动同步项目状态。" });
         }
       } else setFeedback({ type: "error", message: "生成失败：" + String(error) });
-    } finally { setBusy(false); }
+    } finally { onActionEnd(); }
   };
 
   const handleRegenerateMilestone = async (source: RegenerationSource) => {
     const draft = project.milestone_draft;
-    if (busy || !draft) return;
+    if (!draft || !beginAction("regenerate_milestone_draft")) return;
     const revision = project.workflow_state.data_revision;
     const draftId = draft.draft_id;
-    setBusy(true); setFeedback(null);
+    setFeedback(null);
     try {
       const updated = await invokeWithTimeout<Project>("regenerate_milestone_draft", {
         projectName: project.name, currentDraftId: draftId,
@@ -153,15 +131,15 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
         if (done) { setMilestoneModalOpen(false); setFeedback({ type: "success", message: "已同步新大阶段草稿。" }); }
         else { setFeedback({ type: "info", message: "后端未完成，请稍后同步项目状态。" }); }
       } else setFeedback({ type: "error", message: "重新生成失败：" + String(error) });
-    } finally { setBusy(false); }
+    } finally { onActionEnd(); }
   };
 
   const handleRegenerateMidStage = async (source: RegenerationSource) => {
     const draft = project.mid_stage_draft;
-    if (busy || !draft) return;
+    if (!draft || !beginAction("regenerate_mid_stage_draft")) return;
     const revision = project.workflow_state.data_revision;
     const draftId = draft.draft_id;
-    setBusy(true); setFeedback(null);
+    setFeedback(null);
     try {
       const updated = await invokeWithTimeout<Project>("regenerate_mid_stage_draft", {
         projectName: project.name, currentDraftId: draftId,
@@ -176,16 +154,16 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
         if (done) { setMidStageModalOpen(false); setFeedback({ type: "success", message: "已同步新中阶段草稿。" }); }
         else setFeedback({ type: "info", message: "后端未完成，请稍后同步项目状态。" });
       } else setFeedback({ type: "error", message: "重新生成失败：" + String(error) });
-    } finally { setBusy(false); }
+    } finally { onActionEnd(); }
   };
 
   const handleRegeneratePlan = async (source: RegenerationSource) => {
     const milestone = project.milestones.find((item) => item.id === project.current_milestone_id);
     const midStage = milestone?.mid_stages.find((item) => item.id === project.current_mid_stage_id);
-    if (busy || !midStage) return;
+    if (!midStage || !beginAction("regenerate_execution_plan")) return;
     const revision = project.workflow_state.data_revision;
     const planRevision = midStage.plan_draft_revision;
-    setBusy(true); setFeedback(null);
+    setFeedback(null);
     try {
       const updated = await invokeWithTimeout<Project>("regenerate_execution_plan", {
         projectName: project.name, expectedDataRevision: revision,
@@ -204,11 +182,12 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
         if (done) { setPlanModalOpen(false); setFeedback({ type: "success", message: "已同步新执行计划。" }); }
         else setFeedback({ type: "info", message: "后端未完成，请稍后同步项目状态。" });
       } else setFeedback({ type: "error", message: "重新生成失败：" + String(error) });
-    } finally { setBusy(false); }
+    } finally { onActionEnd(); }
   };
 
-  const autopilotActive = project.workflow_state.autopilot_active === true;
-  const autopilotRunning = autopilotActive && project.workflow_state.autopilot_state?.run_status === "Running";
+  const autopilotRunning = project.workflow_state.autopilot_active === true
+    && project.workflow_state.autopilot_state?.run_status === "Running";
+  const planningBusy = busy || autopilotRunning;
   const managedActive = project.workflow_state.managed_flow_state?.active === true;
   const managedRunning = managedActive && project.workflow_state.managed_flow_state?.run_status === "Running";
   const managedPaused = managedActive && project.workflow_state.managed_flow_state?.run_status === "Paused";
@@ -223,24 +202,20 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
         </span>
         {managedRunning && (
           <button className="action-btn secondary" style={{ fontSize: "12px", padding: "4px 10px" }}
-            onClick={async () => {
-              const updated = await invokeWithTimeout<Project>("pause_managed_flow", { projectName: project.name });
-              onProjectUpdated(updated);
-            }}>暂停托管</button>
+            disabled={busy}
+            onClick={() => runProjectCommand("pause_managed_flow", { projectName: project.name }, "托管层已暂停。")}>暂停托管</button>
         )}
         {managedPaused && (
           <button className="action-btn primary" style={{ fontSize: "12px", padding: "4px 10px" }}
-            onClick={async () => {
-              const updated = await invokeWithTimeout<Project>("resume_managed_flow", { projectName: project.name });
-              onProjectUpdated(updated);
-            }}>恢复托管</button>
+            disabled={busy}
+            onClick={() => runProjectCommand("resume_managed_flow", { projectName: project.name }, "托管层已恢复。")}>恢复托管</button>
         )}
       </div>
     </div>
   ) : null;
 
   if (["MilestoneGeneration", "MilestoneCheck", "MilestoneApproval", "MilestoneSelection", "FuturePlanApproval"].includes(step)) {
-    return <>{managedBanner}<MilestonePlanningStep project={project} busy={busy} feedback={feedback}
+    return <>{managedBanner}<MilestonePlanningStep project={project} busy={planningBusy} feedback={feedback}
       regenerationFeedback={regenerationFeedback} setRegenerationFeedback={setRegenerationFeedback}
       regenerationModalOpen={milestoneModalOpen} setRegenerationModalOpen={setMilestoneModalOpen}
       onGenerate={handleGenerateMilestone}
@@ -250,14 +225,11 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
       onSelect={(milestoneId) => runProjectCommand("select_milestone", { projectName: project.name, milestoneId }, "已选择大阶段。")}
       onContinue={() => handleTransition("MidStageGeneration")}
       onRegenerate={handleRegenerateMilestone} onSync={handleSync}
-      onToggleAutopilot={handleToggleAutopilot}
-      onAutopilotPause={handleAutopilotPause}
-      autopilotActive={autopilotActive}
-      autopilotRunning={autopilotRunning} /></>;
+    /></>;
   }
 
   if (["MidStageGeneration", "MidStageCheck", "MidStageApproval", "MidStageSelection"].includes(step)) {
-    return <>{managedBanner}<MidStagePlanningStep project={project} busy={busy || autopilotRunning} feedback={feedback}
+    return <>{managedBanner}<MidStagePlanningStep project={project} busy={planningBusy} feedback={feedback}
       regenerationFeedback={regenerationFeedback} setRegenerationFeedback={setRegenerationFeedback}
       regenerationModalOpen={midStageModalOpen} setRegenerationModalOpen={setMidStageModalOpen}
       onGenerate={() => runProjectCommand("generate_mid_stage_draft", { projectName: project.name }, "中阶段草稿已生成。")}
@@ -265,22 +237,18 @@ export function ConsoleWorkflowPanel({ project, onProjectUpdated }: Props) {
       onApprove={() => runProjectCommand("approve_mid_stage_draft", { projectName: project.name }, "中阶段已批准。")}
       onSelect={(midStageId) => runProjectCommand("select_mid_stage", { projectName: project.name, midStageId }, "已选择中阶段。")}
       onContinue={() => handleTransition("PlanGeneration")} onRegenerate={handleRegenerateMidStage}
-      autopilotActive={autopilotActive}
-      autopilotRunning={autopilotRunning}
-      onAutopilotPause={handleAutopilotPause} /></>;
+    /></>;
   }
 
   if (["PlanGeneration", "PlanCheck", "PlanApproving"].includes(step)) {
-    return <>{managedBanner}<ExecutionPlanStep project={project} busy={busy || autopilotRunning} feedback={feedback}
+    return <>{managedBanner}<ExecutionPlanStep project={project} busy={planningBusy} feedback={feedback}
       regenerationFeedback={regenerationFeedback} setRegenerationFeedback={setRegenerationFeedback}
       regenerationModalOpen={planModalOpen} setRegenerationModalOpen={setPlanModalOpen}
       onGenerate={() => runProjectCommand("generate_execution_plan", { projectName: project.name }, "执行计划已生成。")}
       onCheck={() => runProjectCommand("check_stage_plan", { projectName: project.name }, "执行计划检查已完成。")}
       onApprove={() => runProjectCommand("approve_stage_plan", { projectName: project.name }, "执行计划已冻结，已进入执行阶段。")}
       onRegenerate={handleRegeneratePlan}
-      autopilotActive={autopilotActive}
-      autopilotRunning={autopilotRunning}
-      onAutopilotPause={handleAutopilotPause} /></>;
+    /></>;
   }
 
   return null;

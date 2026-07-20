@@ -1,4 +1,4 @@
-import { ArrowRight, BadgeCheck, Bot, Layers3, Pause, RefreshCw, SearchCheck, WandSparkles } from "lucide-react";
+import { ArrowRight, BadgeCheck, Layers3, RefreshCw, SearchCheck, WandSparkles } from "lucide-react";
 import { Project } from "../types";
 import { ActionButton } from "../components/ActionButton";
 import { ConsoleFeedback, ConsoleStepShell } from "../components/ConsoleStepShell";
@@ -25,10 +25,6 @@ interface Props {
   onContinue: () => void;
   onRegenerate: (source: "check_failed" | "approval_rejected") => void;
   onSync: () => void;
-  onToggleAutopilot?: (active: boolean) => void;
-  onAutopilotPause?: () => void;
-  autopilotActive?: boolean;
-  autopilotRunning?: boolean;
 }
 
 export function MilestonePlanningStep(props: Props) {
@@ -45,8 +41,8 @@ export function MilestonePlanningStep(props: Props) {
           version={milestone.version}
           description={milestone.description}
           selected={project.current_milestone_id === milestone.id}
-          readOnly={!selectable}
-          onSelect={() => props.onSelect(milestone.id)}
+          readOnly={!selectable || busy}
+          onSelect={busy ? undefined : () => props.onSelect(milestone.id)}
           fields={[
             { label: "目标", value: milestone.goal },
             { label: "范围", value: milestone.scope },
@@ -216,34 +212,13 @@ export function MilestonePlanningStep(props: Props) {
     );
   }
 
-  const autopilotActive = props.autopilotActive === true;
-  const autopilotRunning = props.autopilotRunning === true;
-
   return (
     <ConsoleStepShell icon={<Layers3 />} title="选择大阶段" description="选择正式大阶段后继续规划"
       status={project.current_milestone_id ? "success" : "pending"} statusLabel={project.current_milestone_id ? "已选择" : "待选择"}
       feedback={feedback} busy={busy}
-      actions={project.current_milestone_id && !autopilotRunning ? <WorkflowActionBar>
+      actions={project.current_milestone_id && !busy ? <WorkflowActionBar>
         <ActionButton icon={<ArrowRight size={16} />} onClick={props.onContinue}>开始中阶段规划</ActionButton>
-        {props.onToggleAutopilot && (
-          autopilotActive ? (
-            <ActionButton icon={<Bot size={16} />} variant="secondary" onClick={() => props.onToggleAutopilot!(false)}>关闭自动驾驶</ActionButton>
-          ) : (
-            <ActionButton icon={<Bot size={16} />} variant="secondary" onClick={() => props.onToggleAutopilot!(true)}>自动执行此大阶段</ActionButton>
-          )
-        )}
       </WorkflowActionBar> : undefined}>
-      {autopilotRunning && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-          <FeedbackBanner type="info" message={`自动驾驶运行中：${project.workflow_state.autopilot_state?.last_action || "自动推进中..."}`} />
-          {props.onAutopilotPause && (
-            <ActionButton icon={<Pause size={16} />} variant="secondary" onClick={props.onAutopilotPause}>暂停自动驾驶</ActionButton>
-          )}
-        </div>
-      )}
-      {autopilotActive && !autopilotRunning && (
-        <FeedbackBanner type="info" message="自动驾驶暂停中。可在右侧恢复或关闭。" />
-      )}
       {project.milestones.length > 0 ? renderCandidates(true) : <EmptyState title="没有正式大阶段" message="请先完成大阶段批准。" />}
     </ConsoleStepShell>
   );

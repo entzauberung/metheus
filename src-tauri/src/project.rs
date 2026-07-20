@@ -1337,6 +1337,9 @@ pub struct ExecutionWorkspaceStatus {
     pub git_user_available: bool,
     /// Git user.email 是否可用
     pub git_email_available: bool,
+    /// Git 工作树是否无已跟踪和未跟踪变更；非 Git 仓库为 false
+    #[serde(default)]
+    pub working_tree_clean: bool,
     /// 是否满足执行前置条件
     pub ready: bool,
     /// 给前端显示的状态说明
@@ -1387,6 +1390,9 @@ pub enum ExecutionSessionStatus {
 /// 执行会话 — 记录当前正在执行或待确认的小阶段，用于刷新恢复
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionSession {
+    /// 单次后台执行的唯一标识；旧项目默认空值
+    #[serde(default)]
+    pub execution_id: String,
     /// 是否活跃（有执行中的会话）
     pub active: bool,
     /// 当前大阶段 ID
@@ -1440,6 +1446,7 @@ impl ExecutionSession {
 impl Default for ExecutionSession {
     fn default() -> Self {
         ExecutionSession {
+            execution_id: String::new(),
             active: false,
             milestone_id: String::new(),
             mid_stage_id: String::new(),
@@ -1630,5 +1637,26 @@ mod tests {
         let back: PauseContext = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.resume_step, Some(WorkflowStep::MilestoneReview));
         assert!(back.autopilot_was_active);
+    }
+
+    #[test]
+    fn old_execution_session_without_execution_id_defaults_to_empty() -> Result<(), String> {
+        let session = ExecutionSession {
+            active: true,
+            status: "executing".to_string(),
+            subtask_id: "subtask-1".to_string(),
+            ..Default::default()
+        };
+        let mut value = serde_json::to_value(session)
+            .map_err(|error| format!("序列化执行会话失败：{}", error))?;
+        let object = value
+            .as_object_mut()
+            .ok_or("执行会话未序列化为对象".to_string())?;
+        object.remove("execution_id");
+        let restored: ExecutionSession = serde_json::from_value(value)
+            .map_err(|error| format!("反序列化旧执行会话失败：{}", error))?;
+        assert!(restored.execution_id.is_empty());
+        assert_eq!(restored.status, "executing");
+        Ok(())
     }
 }

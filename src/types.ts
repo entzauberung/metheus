@@ -432,6 +432,7 @@ export type ExecutionSessionStatus = "Executing" | "AwaitingConfirmation" | "Qua
 
 /** 执行会话 — 记录当前正在执行或待确认的小阶段 */
 export interface ExecutionSession {
+  execution_id: string;
   active: boolean;
   milestone_id: string;
   mid_stage_id: string;
@@ -529,6 +530,7 @@ export interface LogEntry {
 }
 
 export interface PipelineState {
+  execution_id: string;
   mid_stage_id: string;
   status: PipelineStatus;
   current_subtask_index: number;
@@ -655,6 +657,7 @@ export interface ExecutionWorkspaceStatus {
   has_commits: boolean;
   git_user_available: boolean;
   git_email_available: boolean;
+  working_tree_clean: boolean;
   ready: boolean;
   status_message: string;
 }

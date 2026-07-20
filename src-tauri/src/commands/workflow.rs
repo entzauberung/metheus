@@ -1089,6 +1089,34 @@ pub(crate) async fn stop_managed_flow(project_name: String) -> Result<project::P
 /// 自动驾驶持久化错误信息最大长度，防止项目文件异常膨胀
 const AUTOPILOT_ERROR_MESSAGE_MAX_LENGTH: usize = 2048;
 
+fn autopilot_can_activate_from(step: &project::WorkflowStep) -> bool {
+    matches!(
+        step,
+        project::WorkflowStep::MilestoneSelection
+            | project::WorkflowStep::MidStageGeneration
+            | project::WorkflowStep::MidStageCheck
+            | project::WorkflowStep::MidStageApproval
+            | project::WorkflowStep::MidStageSelection
+            | project::WorkflowStep::PlanGeneration
+            | project::WorkflowStep::PlanCheck
+            | project::WorkflowStep::PlanApproving
+            | project::WorkflowStep::Execution
+    )
+}
+
+fn truncate_autopilot_error(error_msg: &str) -> String {
+    let mut chars = error_msg.chars();
+    let truncated: String = chars
+        .by_ref()
+        .take(AUTOPILOT_ERROR_MESSAGE_MAX_LENGTH)
+        .collect();
+    if chars.next().is_some() {
+        format!("{}...", truncated)
+    } else {
+        truncated
+    }
+}
+
 // ===================================================================
 // V1 大阶段自动驾驶：可见、可监督、可中断
 // ===================================================================
@@ -1119,21 +1147,35 @@ pub(crate) async fn toggle_autopilot(
     }
 
     if active {
-        // Auto-select first non-Completed milestone
-        let target = proj
-            .milestones
-            .iter()
-            .find(|m| m.status != project::MilestoneStatus::Completed)
+        if !autopilot_can_activate_from(&proj.workflow_state.current_step) {
+            return Err(format!(
+                "当前步骤为 {:?}，请先完成人工大阶段生成、检查和批准，并进入大阶段选择后再激活自动驾驶。",
+                proj.workflow_state.current_step
+            ));
+        }
+
+        // 优先沿用用户已选择且未完成的大阶段，否则选择第一个未完成阶段。
+        let selected_target = proj.milestones.iter().find(|m| {
+            m.id == proj.current_milestone_id && m.status != project::MilestoneStatus::Completed
+        });
+        let target = selected_target
+            .or_else(|| {
+                proj.milestones
+                    .iter()
+                    .find(|m| m.status != project::MilestoneStatus::Completed)
+            })
             .ok_or("所有大阶段已完成，无法激活自动驾驶。".to_string())?;
+        let target_id = target.id.clone();
+        let target_title = target.title.clone();
 
         let now = chrono::Utc::now().to_rfc3339();
         proj.workflow_state.autopilot_active = true;
-        proj.workflow_state.autopilot_target_milestone_id = target.id.clone();
+        proj.workflow_state.autopilot_target_milestone_id = target_id.clone();
         proj.workflow_state.autopilot_state = Some(project::AutopilotState {
             active: true,
-            target_milestone_id: target.id.clone(),
+            target_milestone_id: target_id,
             run_status: project::AutopilotRunStatus::Running,
-            last_action: format!("自动驾驶已激活，目标大阶段：{}", target.title),
+            last_action: format!("自动驾驶已激活，目标大阶段：{}", target_title),
             last_action_at: now,
             error_message: String::new(),
         });
@@ -1203,11 +1245,7 @@ fn autopilot_persist_step_state(
     error_msg: &str,
 ) -> Result<(), String> {
     let now = chrono::Utc::now().to_rfc3339();
-    let truncated_error = if error_msg.len() > AUTOPILOT_ERROR_MESSAGE_MAX_LENGTH {
-        format!("{}...", &error_msg[..AUTOPILOT_ERROR_MESSAGE_MAX_LENGTH])
-    } else {
-        error_msg.to_string()
-    };
+    let truncated_error = truncate_autopilot_error(error_msg);
 
     if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
         ap.last_action = action.to_string();
@@ -1320,7 +1358,7 @@ pub struct AutopilotNextStep {
 
 #[tauri::command]
 pub(crate) async fn autopilot_next_step(project_name: String) -> Result<AutopilotNextStep, String> {
-    let proj = crate::load_project(&project_name)?;
+    let mut proj = crate::load_project(&project_name)?;
 
     if !proj.workflow_state.autopilot_active {
         return Ok(AutopilotNextStep {
@@ -1334,14 +1372,27 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
         });
     }
 
-    // Check if autopilot is paused or errored
-    if let Some(ref ap) = proj.workflow_state.autopilot_state {
-        match ap.run_status {
+    // Check if autopilot is paused or errored. Terminal facts are persisted before returning.
+    let persisted_run_state = proj
+        .workflow_state
+        .autopilot_state
+        .as_ref()
+        .map(|ap| (ap.run_status.clone(), ap.error_message.clone()));
+    if let Some((run_status, persisted_error)) = persisted_run_state {
+        match run_status {
             project::AutopilotRunStatus::Paused => {
+                let description = "自动驾驶已暂停，等待手动操作";
+                autopilot_persist_step_state(
+                    &mut proj,
+                    description,
+                    project::AutopilotRunStatus::Paused,
+                    "",
+                )?;
+                crate::save_project(&proj)?;
                 return Ok(AutopilotNextStep {
                     command: String::new(),
                     args: serde_json::json!({}),
-                    description: "自动驾驶已暂停，等待手动操作".to_string(),
+                    description: description.to_string(),
                     at_milestone_boundary: false,
                     is_error: false,
                     error_message: String::new(),
@@ -1349,21 +1400,37 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                 });
             }
             project::AutopilotRunStatus::ErrorStopped => {
+                let description = format!("自动驾驶因错误停止：{}", persisted_error);
+                autopilot_persist_step_state(
+                    &mut proj,
+                    &description,
+                    project::AutopilotRunStatus::ErrorStopped,
+                    &persisted_error,
+                )?;
+                crate::save_project(&proj)?;
                 return Ok(AutopilotNextStep {
                     command: String::new(),
                     args: serde_json::json!({}),
-                    description: format!("自动驾驶因错误停止：{}", ap.error_message),
+                    description,
                     at_milestone_boundary: false,
                     is_error: true,
-                    error_message: ap.error_message.clone(),
+                    error_message: persisted_error,
                     result_kind: project::AutopilotCommandResultKind::NoResult,
                 });
             }
             project::AutopilotRunStatus::WaitingMilestoneReview => {
+                let description = "到达大阶段边界，等待人工 A/B/C 决策";
+                autopilot_persist_step_state(
+                    &mut proj,
+                    description,
+                    project::AutopilotRunStatus::WaitingMilestoneReview,
+                    "",
+                )?;
+                crate::save_project(&proj)?;
                 return Ok(AutopilotNextStep {
                     command: String::new(),
                     args: serde_json::json!({}),
-                    description: "到达大阶段边界，等待人工 A/B/C 决策".to_string(),
+                    description: description.to_string(),
                     at_milestone_boundary: true,
                     is_error: false,
                     error_message: String::new(),
@@ -1374,54 +1441,57 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
         }
     }
 
-    let step = &proj.workflow_state.current_step;
-    let target_ms_id = &proj.workflow_state.autopilot_target_milestone_id;
-
-    // Ensure target milestone exists
-    let target_ms = proj.milestones.iter().find(|m| m.id == *target_ms_id);
-    if target_ms.is_none() {
+    let step = proj.workflow_state.current_step.clone();
+    if step == project::WorkflowStep::MilestoneReview {
+        let description = "到达大阶段边界，等待人工 A/B/C 决策";
+        autopilot_persist_step_state(
+            &mut proj,
+            description,
+            project::AutopilotRunStatus::WaitingMilestoneReview,
+            "",
+        )?;
+        crate::save_project(&proj)?;
         return Ok(AutopilotNextStep {
             command: String::new(),
             args: serde_json::json!({}),
-            description: "目标大阶段不存在".to_string(),
-            at_milestone_boundary: false,
-            is_error: true,
-            error_message: "目标大阶段不存在".to_string(),
+            description: description.to_string(),
+            at_milestone_boundary: true,
+            is_error: false,
+            error_message: String::new(),
             result_kind: project::AutopilotCommandResultKind::NoResult,
         });
     }
-    let target_ms = match target_ms {
+
+    let target_ms_id = proj.workflow_state.autopilot_target_milestone_id.clone();
+
+    // Ensure target milestone exists
+    let target_ms = match proj.milestones.iter().find(|m| m.id == target_ms_id) {
         Some(ms) => ms,
         None => {
+            let description = "目标大阶段不存在";
+            autopilot_persist_step_state(
+                &mut proj,
+                description,
+                project::AutopilotRunStatus::ErrorStopped,
+                description,
+            )?;
+            crate::save_project(&proj)?;
             return Ok(AutopilotNextStep {
                 command: String::new(),
                 args: serde_json::json!({}),
-                description: "目标大阶段不存在".to_string(),
+                description: description.to_string(),
                 at_milestone_boundary: false,
                 is_error: true,
-                error_message: "目标大阶段不存在".to_string(),
+                error_message: description.to_string(),
                 result_kind: project::AutopilotCommandResultKind::NoResult,
-            })
+            });
         }
     };
 
     use project::WorkflowStep::*;
-    let next = match step {
-        // If at MilestoneReview, stop for human A/B/C
-        MilestoneReview => {
-            return Ok(AutopilotNextStep {
-                command: String::new(),
-                args: serde_json::json!({}),
-                description: "到达大阶段边界，等待人工 A/B/C 决策".to_string(),
-                at_milestone_boundary: true,
-                is_error: false,
-                error_message: String::new(),
-                result_kind: project::AutopilotCommandResultKind::NoResult,
-            });
-        }
-
+    let next = match &step {
         // Select target milestone if not selected
-        _ if proj.current_milestone_id.is_empty() || proj.current_milestone_id != *target_ms_id => {
+        _ if proj.current_milestone_id.is_empty() || proj.current_milestone_id != target_ms_id => {
             AutopilotNextStep {
                 command: "select_milestone".to_string(),
                 args: serde_json::json!({
@@ -1691,28 +1761,15 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                         error_message: String::new(),
                         result_kind: project::AutopilotCommandResultKind::ProjectState,
                     },
-                    Err(gate_reason) => {
-                        // 质量失败：持久化 ErrorStopped
-                        let mut save_proj = proj.clone();
-                        let now = chrono::Utc::now().to_rfc3339();
-                        if let Some(ref mut ap) = save_proj.workflow_state.autopilot_state {
-                            ap.run_status = project::AutopilotRunStatus::ErrorStopped;
-                            ap.last_action = format!("质量门禁阻断：{}", gate_reason);
-                            ap.last_action_at = now;
-                            ap.error_message = gate_reason.clone();
-                        }
-                        save_proj.workflow_state.data_revision += 1;
-                        let _ = crate::save_project(&save_proj);
-                        AutopilotNextStep {
-                            command: String::new(),
-                            args: serde_json::json!({}),
-                            description: format!("质量门禁阻断：{}", gate_reason),
-                            at_milestone_boundary: false,
-                            is_error: true,
-                            error_message: gate_reason,
-                            result_kind: project::AutopilotCommandResultKind::NoResult,
-                        }
-                    }
+                    Err(gate_reason) => AutopilotNextStep {
+                        command: String::new(),
+                        args: serde_json::json!({}),
+                        description: format!("质量门禁阻断：{}", gate_reason),
+                        at_milestone_boundary: false,
+                        is_error: true,
+                        error_message: gate_reason,
+                        result_kind: project::AutopilotCommandResultKind::NoResult,
+                    },
                 }
             } else if has_pending {
                 AutopilotNextStep {
@@ -1799,6 +1856,28 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             result_kind: project::AutopilotCommandResultKind::NoResult,
         },
     };
+
+    if next.command.is_empty() {
+        let terminal_status = if next.at_milestone_boundary {
+            project::AutopilotRunStatus::WaitingMilestoneReview
+        } else if next.is_error {
+            project::AutopilotRunStatus::ErrorStopped
+        } else {
+            project::AutopilotRunStatus::Paused
+        };
+        let persisted_error = if next.is_error {
+            next.error_message.as_str()
+        } else {
+            ""
+        };
+        autopilot_persist_step_state(
+            &mut proj,
+            &next.description,
+            terminal_status,
+            persisted_error,
+        )?;
+        crate::save_project(&proj)?;
+    }
 
     Ok(next)
 }
@@ -1889,35 +1968,371 @@ fn reconcile_autopilot_in_migration(proj: &mut crate::project::Project) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    struct ProjectDataGuard {
+        path: PathBuf,
+    }
+
+    impl ProjectDataGuard {
+        fn new(project_name: &str) -> Result<Self, String> {
+            Ok(Self {
+                path: crate::project_data_path(project_name)?,
+            })
+        }
+    }
+
+    impl Drop for ProjectDataGuard {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("清理测试项目 {} 失败：{}", self.path.display(), error);
+                }
+            }
+        }
+    }
+
+    fn unique_project_name(label: &str) -> String {
+        format!("test-{}-{}", label, uuid::Uuid::new_v4())
+    }
+
+    fn test_subtask(status: project::SubtaskStatus) -> project::Subtask {
+        project::Subtask {
+            id: "subtask-1".to_string(),
+            title: "测试小阶段".to_string(),
+            prompt: "执行测试".to_string(),
+            status,
+            test_report: String::new(),
+            execution_result: None,
+            test_result: None,
+            retry_count: 0,
+            auto_tag: None,
+            order: 1,
+            goal: String::new(),
+            allowed_file_paths: vec![],
+            new_file_paths: vec![],
+            evidence_files: vec![],
+            context_summary: String::new(),
+            acceptance_criteria: vec![],
+            stop_rules: vec![],
+            execution_prompt: String::new(),
+            confirmed_by_user: None,
+            confirmed_at: None,
+            confirmation_notes: None,
+        }
+    }
+
+    fn test_mid_stage(status: project::MidStageStatus) -> project::MidStage {
+        project::MidStage {
+            id: "mid-1".to_string(),
+            title: "测试中阶段".to_string(),
+            version: "v0.1.1".to_string(),
+            order: Some(1),
+            status,
+            subtasks: vec![],
+            domain: None,
+            test_log: None,
+            created_at: String::new(),
+            description: String::new(),
+            tech_focus: String::new(),
+            test_report: String::new(),
+            completed_at: None,
+            approved_at: None,
+            git_tag: String::new(),
+            plan_check_result: None,
+            plan_approved_at: None,
+            plan_revision: 0,
+            plan_draft_revision: 0,
+            plan_generated_at: None,
+            plan_regeneration_count: 0,
+        }
+    }
+
+    fn test_milestone(
+        id: &str,
+        title: &str,
+        status: project::MilestoneStatus,
+    ) -> project::Milestone {
+        project::Milestone {
+            id: id.to_string(),
+            version: "v0.1".to_string(),
+            title: title.to_string(),
+            description: String::new(),
+            tech_stack: String::new(),
+            status,
+            mode: project::StageMode::Professional,
+            mid_stages: vec![],
+            subtasks: vec![],
+            qa_result: None,
+            git_commit_hash: String::new(),
+            decomposition_check: None,
+            review_status: None,
+            review_conclusion: None,
+            approved_at: None,
+            goal: String::new(),
+            scope: String::new(),
+            dependencies: vec![],
+            expected_output: String::new(),
+            acceptance_criteria: vec![],
+        }
+    }
+
+    fn activate_autopilot(proj: &mut project::Project, target: &str) {
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_target_milestone_id = target.to_string();
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: target.to_string(),
+            run_status: project::AutopilotRunStatus::Running,
+            last_action: String::new(),
+            last_action_at: String::new(),
+            error_message: String::new(),
+        });
+    }
 
     #[test]
-    fn autopilot_inactive_returns_error_step() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            let mut proj = project::Project::new("test-ap-inactive");
-            proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
-            crate::save_project(&proj).unwrap();
-            autopilot_next_step("test-ap-inactive".to_string()).await
-        });
-        assert!(result.is_ok());
-        let step = result.unwrap();
+    fn autopilot_activation_scope_starts_at_milestone_selection() {
+        let rejected = [
+            project::WorkflowStep::MilestoneGeneration,
+            project::WorkflowStep::MilestoneCheck,
+            project::WorkflowStep::MilestoneApproval,
+            project::WorkflowStep::MilestoneReview,
+        ];
+        assert!(rejected
+            .iter()
+            .all(|step| !autopilot_can_activate_from(step)));
+
+        let accepted = [
+            project::WorkflowStep::MilestoneSelection,
+            project::WorkflowStep::MidStageGeneration,
+            project::WorkflowStep::MidStageCheck,
+            project::WorkflowStep::MidStageApproval,
+            project::WorkflowStep::MidStageSelection,
+            project::WorkflowStep::PlanGeneration,
+            project::WorkflowStep::PlanCheck,
+            project::WorkflowStep::PlanApproving,
+            project::WorkflowStep::Execution,
+        ];
+        assert!(accepted.iter().all(autopilot_can_activate_from));
+    }
+
+    #[test]
+    fn autopilot_error_truncation_preserves_unicode_boundaries() {
+        let long_error = "错".repeat(AUTOPILOT_ERROR_MESSAGE_MAX_LENGTH + 2);
+        let truncated = truncate_autopilot_error(&long_error);
+        assert_eq!(
+            truncated.chars().count(),
+            AUTOPILOT_ERROR_MESSAGE_MAX_LENGTH + 3
+        );
+        assert!(truncated.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn autopilot_inactive_returns_error_step() -> Result<(), String> {
+        let project_name = unique_project_name("ap-inactive");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        crate::save_project(&proj)?;
+
+        let step = autopilot_next_step(project_name).await?;
         assert!(step.is_error);
         assert_eq!(
             step.result_kind,
             project::AutopilotCommandResultKind::NoResult
         );
-        let _ = std::fs::remove_file(crate::project_data_path("test-ap-inactive").unwrap());
+        Ok(())
     }
 
-    #[test]
-    fn toggle_autopilot_requires_console_phase() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(async {
-            let proj = project::Project::new("test-ap-phase");
-            crate::save_project(&proj).unwrap();
-            toggle_autopilot("test-ap-phase".to_string(), true).await
-        });
+    #[tokio::test]
+    async fn toggle_autopilot_requires_console_phase() -> Result<(), String> {
+        let project_name = unique_project_name("ap-phase");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = project::Project::new(&project_name);
+        crate::save_project(&proj)?;
+        let result = toggle_autopilot(project_name, true).await;
         assert!(result.is_err());
-        let _ = std::fs::remove_file(crate::project_data_path("test-ap-phase").unwrap());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn toggle_autopilot_prefers_selected_incomplete_milestone() -> Result<(), String> {
+        let project_name = unique_project_name("ap-target");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
+        proj.current_milestone_id = "milestone-2".to_string();
+        proj.milestones = vec![
+            test_milestone(
+                "milestone-1",
+                "第一个未完成阶段",
+                project::MilestoneStatus::Pending,
+            ),
+            test_milestone(
+                "milestone-2",
+                "用户已选阶段",
+                project::MilestoneStatus::InProgress,
+            ),
+        ];
+        crate::save_project(&proj)?;
+
+        let updated = toggle_autopilot(project_name, true).await?;
+        assert_eq!(
+            updated.workflow_state.autopilot_target_milestone_id,
+            "milestone-2"
+        );
+        let autopilot = updated
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .ok_or("激活后缺少自动驾驶状态".to_string())?;
+        assert_eq!(autopilot.target_milestone_id, "milestone-2");
+        assert_eq!(autopilot.run_status, project::AutopilotRunStatus::Running);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn autopilot_terminal_error_is_persisted() -> Result<(), String> {
+        let project_name = unique_project_name("ap-terminal");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.current_step = project::WorkflowStep::BranchDiscussion;
+        proj.milestones.push(test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::InProgress,
+        ));
+        proj.current_milestone_id = "milestone-1".to_string();
+        activate_autopilot(&mut proj, "milestone-1");
+        crate::save_project(&proj)?;
+
+        let step = autopilot_next_step(project_name.clone()).await?;
+        assert!(step.command.is_empty());
+        assert!(step.is_error);
+        let persisted = crate::load_project(&project_name)?;
+        let autopilot = persisted
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .ok_or("终止结果没有持久化自动驾驶状态".to_string())?;
+        assert_eq!(
+            autopilot.run_status,
+            project::AutopilotRunStatus::ErrorStopped
+        );
+        assert!(!autopilot.error_message.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn autopilot_review_boundary_is_persisted() -> Result<(), String> {
+        let project_name = unique_project_name("ap-review");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneReview;
+        proj.milestones.push(test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::Completed,
+        ));
+        proj.current_milestone_id = "milestone-1".to_string();
+        activate_autopilot(&mut proj, "milestone-1");
+        crate::save_project(&proj)?;
+
+        let step = autopilot_next_step(project_name.clone()).await?;
+        assert!(step.at_milestone_boundary);
+        assert!(!step.is_error);
+        let persisted = crate::load_project(&project_name)?;
+        let autopilot = persisted
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .ok_or("审阅边界没有持久化自动驾驶状态".to_string())?;
+        assert_eq!(
+            autopilot.run_status,
+            project::AutopilotRunStatus::WaitingMilestoneReview
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_target_and_rejected_subtask_persist_error_stopped() -> Result<(), String> {
+        let missing_name = unique_project_name("ap-missing-target");
+        let _missing_guard = ProjectDataGuard::new(&missing_name)?;
+        let mut missing = project::Project::new(&missing_name);
+        missing.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
+        activate_autopilot(&mut missing, "missing-milestone");
+        crate::save_project(&missing)?;
+        let missing_step = autopilot_next_step(missing_name.clone()).await?;
+        assert!(missing_step.is_error);
+        let persisted_missing = crate::load_project(&missing_name)?;
+        assert_eq!(
+            persisted_missing
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .ok_or("缺失目标未持久化自动驾驶状态".to_string())?
+                .run_status,
+            project::AutopilotRunStatus::ErrorStopped
+        );
+
+        let rejected_name = unique_project_name("ap-rejected");
+        let _rejected_guard = ProjectDataGuard::new(&rejected_name)?;
+        let mut rejected = project::Project::new(&rejected_name);
+        rejected.workflow_state.current_step = project::WorkflowStep::Execution;
+        rejected.current_milestone_id = "milestone-1".to_string();
+        rejected.current_mid_stage_id = "mid-1".to_string();
+        let mut mid_stage = test_mid_stage(project::MidStageStatus::InProgress);
+        mid_stage.subtasks = vec![test_subtask(project::SubtaskStatus::Rejected)];
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone.mid_stages = vec![mid_stage];
+        rejected.milestones = vec![milestone];
+        activate_autopilot(&mut rejected, "milestone-1");
+        crate::save_project(&rejected)?;
+        let rejected_step = autopilot_next_step(rejected_name.clone()).await?;
+        assert!(rejected_step.is_error);
+        assert!(rejected_step.error_message.contains("Rejected"));
+        let persisted_rejected = crate::load_project(&rejected_name)?;
+        assert_eq!(
+            persisted_rejected
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .ok_or("驳回任务未持久化自动驾驶状态".to_string())?
+                .run_status,
+            project::AutopilotRunStatus::ErrorStopped
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn long_unicode_error_is_persisted_without_invalid_boundary() -> Result<(), String> {
+        let project_name = unique_project_name("ap-unicode");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        activate_autopilot(&mut proj, "milestone-1");
+        crate::save_project(&proj)?;
+
+        let long_error = "错误详情".repeat(AUTOPILOT_ERROR_MESSAGE_MAX_LENGTH);
+        let updated =
+            autopilot_mark_error(project_name, "自动驾驶失败".to_string(), long_error).await?;
+        let saved_error = &updated
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .ok_or("长错误未持久化自动驾驶状态".to_string())?
+            .error_message;
+        assert_eq!(
+            saved_error.chars().count(),
+            AUTOPILOT_ERROR_MESSAGE_MAX_LENGTH + 3
+        );
+        assert!(saved_error.ends_with("..."));
+        Ok(())
     }
 }

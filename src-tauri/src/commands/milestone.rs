@@ -1504,33 +1504,49 @@ pub(crate) async fn enter_milestone_review(
 ) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
 
-    let milestone_id = &proj.current_milestone_id;
+    let milestone_id = proj.current_milestone_id.clone();
     if milestone_id.is_empty() {
         return Err("未选择大阶段。".to_string());
     }
 
-    let ms = proj
-        .milestones
-        .iter_mut()
-        .find(|m| m.id == *milestone_id)
-        .ok_or("大阶段不存在。".to_string())?;
+    let milestone_title = {
+        let ms = proj
+            .milestones
+            .iter_mut()
+            .find(|m| m.id == milestone_id)
+            .ok_or("大阶段不存在。".to_string())?;
 
-    // Verify all mid-stages are complete
-    if ms.mid_stages.is_empty() {
-        return Err("当前大阶段没有中阶段。".to_string());
-    }
-    let all_complete = ms
-        .mid_stages
-        .iter()
-        .all(|m| m.status == project::MidStageStatus::Completed);
-    if !all_complete {
-        return Err("大阶段尚有未完成的中阶段，无法进入审阅。".to_string());
-    }
+        if ms.mid_stages.is_empty() {
+            return Err("当前大阶段没有中阶段。".to_string());
+        }
+        let all_complete = ms
+            .mid_stages
+            .iter()
+            .all(|m| m.status == project::MidStageStatus::Completed);
+        if !all_complete {
+            return Err("大阶段尚有未完成的中阶段，无法进入审阅。".to_string());
+        }
 
-    ms.status = project::MilestoneStatus::Completed;
-    ms.review_status = Some("pending_review".to_string());
+        ms.status = project::MilestoneStatus::Completed;
+        ms.review_status = Some("pending_review".to_string());
+        ms.review_conclusion = None;
+        ms.title.clone()
+    };
 
     proj.workflow_state.current_step = project::WorkflowStep::MilestoneReview;
+    proj.workflow_state.review_node_id = milestone_id.clone();
+    if proj.workflow_state.autopilot_active {
+        let autopilot = proj
+            .workflow_state
+            .autopilot_state
+            .get_or_insert_with(project::AutopilotState::default);
+        autopilot.active = true;
+        autopilot.target_milestone_id = milestone_id.clone();
+        autopilot.run_status = project::AutopilotRunStatus::WaitingMilestoneReview;
+        autopilot.last_action = format!("到达大阶段边界：{}，等待人工 A/B/C", milestone_title);
+        autopilot.last_action_at = chrono::Utc::now().to_rfc3339();
+        autopilot.error_message.clear();
+    }
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
@@ -1552,51 +1568,94 @@ pub(crate) async fn approve_milestone_outcome(
         ));
     }
 
-    let milestone_id = &proj.current_milestone_id;
-    let now = chrono::Utc::now().to_rfc3339();
+    if !matches!(branch.as_str(), "A" | "B" | "C") {
+        return Err(format!("未知分支：{}（仅支持 A/B/C）", branch));
+    }
 
-    let ms = proj
+    let milestone_id = proj.current_milestone_id.clone();
+    let now = chrono::Utc::now().to_rfc3339();
+    let current_idx = proj
         .milestones
-        .iter_mut()
-        .find(|m| m.id == *milestone_id)
+        .iter()
+        .position(|milestone| milestone.id == milestone_id)
         .ok_or("大阶段不存在。".to_string())?;
+    let next_target = proj
+        .milestones
+        .iter()
+        .skip(current_idx + 1)
+        .find(|milestone| milestone.status != project::MilestoneStatus::Completed)
+        .map(|milestone| (milestone.id.clone(), milestone.title.clone()));
+
+    {
+        let milestone = proj
+            .milestones
+            .get_mut(current_idx)
+            .ok_or("大阶段不存在。".to_string())?;
+        milestone.review_conclusion = Some(branch.clone());
+        match branch.as_str() {
+            "A" => {
+                milestone.review_status = Some("approved".to_string());
+                milestone.approved_at = Some(now.clone());
+            }
+            "B" => milestone.review_status = Some("needs_fix".to_string()),
+            "C" => milestone.review_status = Some("future_adjusted".to_string()),
+            _ => {}
+        }
+    }
 
     match branch.as_str() {
-        "A" => {
-            ms.review_conclusion = Some("A".to_string());
-            ms.review_status = Some("approved".to_string());
-            ms.approved_at = Some(now.clone());
-
-            // Check if there are subsequent milestones
-            let current_idx = proj
-                .milestones
-                .iter()
-                .position(|m| m.id == *milestone_id)
-                .unwrap_or(0);
-            let has_next = current_idx + 1 < proj.milestones.len();
-
-            if has_next {
+        "A" => match next_target {
+            Some((next_id, next_title)) => {
                 proj.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
-                proj.current_milestone_id.clear();
+                proj.workflow_state.review_node_id.clear();
+                proj.current_milestone_id = next_id.clone();
                 proj.current_mid_stage_id.clear();
-            } else {
+                if proj.workflow_state.autopilot_active {
+                    proj.workflow_state.autopilot_target_milestone_id = next_id.clone();
+                    let autopilot = proj
+                        .workflow_state
+                        .autopilot_state
+                        .get_or_insert_with(project::AutopilotState::default);
+                    autopilot.active = true;
+                    autopilot.target_milestone_id = next_id;
+                    autopilot.run_status = project::AutopilotRunStatus::Running;
+                    autopilot.last_action = format!("大阶段审阅通过，继续：{}", next_title);
+                    autopilot.last_action_at = now.clone();
+                    autopilot.error_message.clear();
+                }
+            }
+            None => {
                 proj.workflow_state.current_step = project::WorkflowStep::Completed;
                 proj.workflow_state.top_level_phase = project::TopLevelPhase::Completed;
+                proj.workflow_state.review_node_id.clear();
+                proj.workflow_state.autopilot_active = false;
+                proj.workflow_state.autopilot_target_milestone_id.clear();
+                proj.workflow_state.autopilot_state = None;
+                proj.current_mid_stage_id.clear();
             }
-        }
+        },
         "B" => {
-            ms.review_conclusion = Some("B".to_string());
             proj.workflow_state.current_step = project::WorkflowStep::BranchDiscussion;
             proj.workflow_state.discussion_scope = project::DiscussionScope::FixPast;
-            proj.workflow_state.data_revision += 1; // extra bump for scope change
         }
         "C" => {
-            ms.review_conclusion = Some("C".to_string());
             proj.workflow_state.current_step = project::WorkflowStep::BranchDiscussion;
             proj.workflow_state.discussion_scope = project::DiscussionScope::AdjustFuture;
-            proj.workflow_state.data_revision += 1;
         }
-        _ => return Err(format!("未知分支：{}（仅支持 A/B/C）", branch)),
+        _ => {}
+    }
+
+    if matches!(branch.as_str(), "B" | "C") && proj.workflow_state.autopilot_active {
+        let autopilot = proj
+            .workflow_state
+            .autopilot_state
+            .get_or_insert_with(project::AutopilotState::default);
+        autopilot.active = true;
+        autopilot.target_milestone_id = milestone_id;
+        autopilot.run_status = project::AutopilotRunStatus::Paused;
+        autopilot.last_action = format!("大阶段审阅选择 {}，等待人工后续流程", branch);
+        autopilot.last_action_at = now.clone();
+        autopilot.error_message.clear();
     }
 
     proj.workflow_state.data_revision += 1;
@@ -2924,4 +2983,260 @@ pub(crate) async fn summarize_milestone(
     .map_err(|e| format!("AI 调用失败: {}", e))?;
 
     Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct ProjectDataGuard {
+        path: PathBuf,
+    }
+
+    impl ProjectDataGuard {
+        fn new(project_name: &str) -> Result<Self, String> {
+            Ok(Self {
+                path: crate::project_data_path(project_name)?,
+            })
+        }
+    }
+
+    impl Drop for ProjectDataGuard {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("清理测试项目 {} 失败：{}", self.path.display(), error);
+                }
+            }
+        }
+    }
+
+    fn unique_project_name(label: &str) -> String {
+        format!("test-{}-{}", label, uuid::Uuid::new_v4())
+    }
+
+    fn completed_mid_stage() -> project::MidStage {
+        project::MidStage {
+            id: "mid-1".to_string(),
+            title: "已完成中阶段".to_string(),
+            version: "v0.1.1".to_string(),
+            order: Some(1),
+            status: project::MidStageStatus::Completed,
+            subtasks: vec![],
+            domain: None,
+            test_log: None,
+            created_at: String::new(),
+            description: String::new(),
+            tech_focus: String::new(),
+            test_report: String::new(),
+            completed_at: Some("2026-07-20T00:00:00Z".to_string()),
+            approved_at: None,
+            git_tag: String::new(),
+            plan_check_result: None,
+            plan_approved_at: None,
+            plan_revision: 0,
+            plan_draft_revision: 0,
+            plan_generated_at: None,
+            plan_regeneration_count: 0,
+        }
+    }
+
+    fn test_milestone(
+        id: &str,
+        title: &str,
+        status: project::MilestoneStatus,
+    ) -> project::Milestone {
+        project::Milestone {
+            id: id.to_string(),
+            version: "v0.1".to_string(),
+            title: title.to_string(),
+            description: String::new(),
+            tech_stack: String::new(),
+            status,
+            mode: project::StageMode::Professional,
+            mid_stages: vec![completed_mid_stage()],
+            subtasks: vec![],
+            qa_result: None,
+            git_commit_hash: String::new(),
+            decomposition_check: None,
+            review_status: None,
+            review_conclusion: None,
+            approved_at: None,
+            goal: String::new(),
+            scope: String::new(),
+            dependencies: vec![],
+            expected_output: String::new(),
+            acceptance_criteria: vec![],
+        }
+    }
+
+    fn review_project(project_name: &str, with_next: bool) -> project::Project {
+        let mut proj = project::Project::new(project_name);
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneReview;
+        proj.workflow_state.review_node_id = "milestone-1".to_string();
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_target_milestone_id = "milestone-1".to_string();
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::WaitingMilestoneReview,
+            last_action: String::new(),
+            last_action_at: String::new(),
+            error_message: String::new(),
+        });
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id = "mid-1".to_string();
+        let mut current = test_milestone(
+            "milestone-1",
+            "当前大阶段",
+            project::MilestoneStatus::Completed,
+        );
+        current.review_status = Some("pending_review".to_string());
+        proj.milestones.push(current);
+        if with_next {
+            proj.milestones.push(test_milestone(
+                "milestone-2",
+                "下一大阶段",
+                project::MilestoneStatus::Pending,
+            ));
+        }
+        proj
+    }
+
+    #[tokio::test]
+    async fn entering_review_persists_milestone_and_autopilot_boundary() -> Result<(), String> {
+        let project_name = unique_project_name("enter-review");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = review_project(&project_name, false);
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        proj.workflow_state.review_node_id.clear();
+        if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+            autopilot.run_status = project::AutopilotRunStatus::Running;
+        }
+        crate::save_project(&proj)?;
+
+        let updated = enter_milestone_review(project_name).await?;
+        assert_eq!(
+            updated.workflow_state.current_step,
+            project::WorkflowStep::MilestoneReview
+        );
+        assert_eq!(updated.workflow_state.review_node_id, "milestone-1");
+        let milestone = updated
+            .milestones
+            .first()
+            .ok_or("进入审阅后大阶段缺失".to_string())?;
+        assert_eq!(milestone.status, project::MilestoneStatus::Completed);
+        assert_eq!(milestone.review_status.as_deref(), Some("pending_review"));
+        assert!(milestone.review_conclusion.is_none());
+        assert_eq!(
+            updated
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .ok_or("进入审阅后自动驾驶状态缺失".to_string())?
+                .run_status,
+            project::AutopilotRunStatus::WaitingMilestoneReview
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branch_a_selects_next_target_and_resumes_autopilot() -> Result<(), String> {
+        let project_name = unique_project_name("review-a-next");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        crate::save_project(&review_project(&project_name, true))?;
+
+        let updated = approve_milestone_outcome(project_name, "A".to_string()).await?;
+        assert_eq!(
+            updated.workflow_state.current_step,
+            project::WorkflowStep::MilestoneSelection
+        );
+        assert_eq!(updated.current_milestone_id, "milestone-2");
+        assert!(updated.current_mid_stage_id.is_empty());
+        assert_eq!(
+            updated.workflow_state.autopilot_target_milestone_id,
+            "milestone-2"
+        );
+        let autopilot = updated
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .ok_or("A 分支继续后自动驾驶状态缺失".to_string())?;
+        assert_eq!(autopilot.target_milestone_id, "milestone-2");
+        assert_eq!(autopilot.run_status, project::AutopilotRunStatus::Running);
+        assert_eq!(
+            updated.milestones[0].review_status.as_deref(),
+            Some("approved")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn final_branch_a_completes_project_and_closes_autopilot() -> Result<(), String> {
+        let project_name = unique_project_name("review-a-final");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        crate::save_project(&review_project(&project_name, false))?;
+
+        let updated = approve_milestone_outcome(project_name, "A".to_string()).await?;
+        assert_eq!(
+            updated.workflow_state.current_step,
+            project::WorkflowStep::Completed
+        );
+        assert_eq!(
+            updated.workflow_state.top_level_phase,
+            project::TopLevelPhase::Completed
+        );
+        assert!(!updated.workflow_state.autopilot_active);
+        assert!(updated.workflow_state.autopilot_state.is_none());
+        assert!(updated
+            .workflow_state
+            .autopilot_target_milestone_id
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn branches_b_and_c_pause_autopilot_and_reject_duplicate_submit() -> Result<(), String> {
+        let cases = [
+            ("B", "needs_fix", project::DiscussionScope::FixPast),
+            (
+                "C",
+                "future_adjusted",
+                project::DiscussionScope::AdjustFuture,
+            ),
+        ];
+
+        for (branch, review_status, scope) in cases {
+            let project_name = unique_project_name(&format!("review-{}", branch));
+            let _guard = ProjectDataGuard::new(&project_name)?;
+            crate::save_project(&review_project(&project_name, true))?;
+
+            let updated =
+                approve_milestone_outcome(project_name.clone(), branch.to_string()).await?;
+            assert_eq!(
+                updated.workflow_state.current_step,
+                project::WorkflowStep::BranchDiscussion
+            );
+            assert_eq!(updated.workflow_state.discussion_scope, scope);
+            assert_eq!(
+                updated.milestones[0].review_status.as_deref(),
+                Some(review_status)
+            );
+            assert_eq!(
+                updated
+                    .workflow_state
+                    .autopilot_state
+                    .as_ref()
+                    .ok_or("B/C 分支后自动驾驶状态缺失".to_string())?
+                    .run_status,
+                project::AutopilotRunStatus::Paused
+            );
+
+            let duplicate = approve_milestone_outcome(project_name, branch.to_string()).await;
+            assert!(duplicate.is_err());
+        }
+        Ok(())
+    }
 }

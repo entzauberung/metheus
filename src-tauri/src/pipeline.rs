@@ -36,6 +36,9 @@ const MAX_LOG_HISTORY: usize = 200;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineState {
+    /// 单次后台执行的唯一标识；用于拒绝旧任务回写
+    #[serde(default)]
+    pub execution_id: String,
     pub mid_stage_id: String,
     pub status: PipelineStatus,
     pub current_subtask_index: usize,
@@ -83,18 +86,16 @@ fn append_log(state: &mut PipelineState, level: &str, text: String) {
     state.current_log = text;
 }
 
-/// 写入持久化执行历史到 Project 磁盘文件。
-/// 返回 Result 确保写入失败能被上层感知和处理。
+/// 向调用方持有的项目事实追加执行历史；持久化由调用方在事务边界统一完成。
 fn write_execution_history(
-    project_name: &str,
+    proj: &mut project::Project,
     level: &str,
     event_type: project::ExecutionEventType,
     text: String,
     milestone_id: Option<&str>,
     mid_stage_id: Option<&str>,
     subtask_id: Option<&str>,
-) -> Result<(), String> {
-    let mut proj = crate::load_project(project_name)?;
+) {
     let entry = project::ExecutionHistoryEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         level: level.to_string(),
@@ -110,7 +111,23 @@ fn write_execution_history(
         let excess = proj.execution_history.len() - project::MAX_EXECUTION_HISTORY;
         proj.execution_history.drain(0..excess);
     }
-    crate::save_project(&proj)
+}
+
+/// Acquire the pipeline lock for a new execution while rejecting an existing
+/// running session. Keeping this check and the subsequent state reservation
+/// under one guard prevents two callers from launching the same subtask.
+async fn acquire_pipeline_start<'a>(
+    pipeline_state: &'a std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+) -> Result<tokio::sync::MutexGuard<'a, Option<PipelineState>>, String> {
+    let guard = pipeline_state.lock().await;
+    if guard
+        .as_ref()
+        .map(|pipeline| pipeline.status == PipelineStatus::Running)
+        .unwrap_or(false)
+    {
+        return Err("已有小阶段正在执行，请等待当前任务结束。".to_string());
+    }
+    Ok(guard)
 }
 
 #[tauri::command]
@@ -155,11 +172,23 @@ pub(crate) async fn execute_current_subtask(
     state: tauri::State<'_, AppState>,
     project_name: String,
 ) -> Result<PipelineState, String> {
-    let proj = crate::load_project(&project_name)?;
+    // 以全局流水线锁串行化“校验 + Running 落盘 + 内存状态建立”，阻止重复启动。
+    let mut pipeline_guard = acquire_pipeline_start(&state.pipeline_state).await?;
+
+    let mut proj = crate::load_project(&project_name)?;
     let project_path = proj.project_path.clone();
 
-    let milestone_id = &proj.current_milestone_id;
-    let mid_stage_id = &proj.current_mid_stage_id;
+    if proj
+        .execution_session
+        .as_ref()
+        .map(|session| session.active && session.status == "executing")
+        .unwrap_or(false)
+    {
+        return Err("项目已有活跃执行会话，请先同步或处理恢复状态。".to_string());
+    }
+
+    let milestone_id = proj.current_milestone_id.clone();
+    let mid_stage_id = proj.current_mid_stage_id.clone();
     if milestone_id.is_empty() || mid_stage_id.is_empty() {
         return Err("请先选择大阶段和中阶段。".to_string());
     }
@@ -167,12 +196,12 @@ pub(crate) async fn execute_current_subtask(
     let ms = proj
         .milestones
         .iter()
-        .find(|m| m.id == *milestone_id)
+        .find(|m| m.id == milestone_id)
         .ok_or("大阶段不存在。")?;
     let mid = ms
         .mid_stages
         .iter()
-        .find(|m| m.id == *mid_stage_id)
+        .find(|m| m.id == mid_stage_id)
         .ok_or("中阶段不存在。")?;
 
     // Verify plan is approved
@@ -203,11 +232,32 @@ pub(crate) async fn execute_current_subtask(
     };
 
     let total = mid.subtasks.len();
+    let plan_revision = mid.plan_revision;
+    let execution_id = format!(
+        "execution-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let subtask_statuses = mid
+        .subtasks
+        .iter()
+        .map(|s| SubtaskStatusItem {
+            subtask_id: s.id.clone(),
+            title: s.title.clone(),
+            status: if s.id == subtask_id {
+                "executing".to_string()
+            } else {
+                "waiting".to_string()
+            },
+            test_result: None,
+            retry_count: 0,
+        })
+        .collect();
     let now = chrono::Utc::now().to_rfc3339();
 
-    // Write execution history: user clicked execute
+    // 执行事实和启动历史使用同一个项目对象并在同一事务边界保存。
     write_execution_history(
-        &project_name,
+        &mut proj,
         "info",
         project::ExecutionEventType::UserExecute,
         format!(
@@ -216,46 +266,46 @@ pub(crate) async fn execute_current_subtask(
             total,
             subtask_title
         ),
-        Some(milestone_id),
-        Some(mid_stage_id),
+        Some(&milestone_id),
+        Some(&mid_stage_id),
         Some(&subtask_id),
-    )?;
+    );
 
     // === 阶段一关键修复：执行前先持久化 "Executing" 到磁盘 ===
     // 这样刷新后前端能从磁盘 Project 中知道当前正在执行，
     // 而不是错误地显示"点击执行"。
     {
-        let mut proj = crate::load_project(&project_name)?;
         let ms = proj
             .milestones
             .iter_mut()
-            .find(|m| m.id == *milestone_id)
+            .find(|m| m.id == milestone_id)
             .ok_or("大阶段不存在。")?;
         let mid = ms
             .mid_stages
             .iter_mut()
-            .find(|m| m.id == *mid_stage_id)
+            .find(|m| m.id == mid_stage_id)
             .ok_or("中阶段不存在。")?;
         if let Some(st) = mid.subtasks.get_mut(next_idx) {
             st.status = project::SubtaskStatus::Executing;
         }
-        // 读取当前 Git HEAD 作为执行基线
-        let base_commit = std::process::Command::new("git")
+        // 读取当前 Git HEAD 作为执行基线；失败时不得启动后台执行。
+        let base_commit_output = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(&project_path)
             .output()
-            .ok()
-            .and_then(|o| {
-                if o.status.success() {
-                    String::from_utf8(o.stdout)
-                        .ok()
-                        .map(|s| s.trim().to_string())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_default();
+            .map_err(|error| format!("读取执行基线失败：{}", error))?;
+        if !base_commit_output.status.success() {
+            return Err(format!(
+                "读取执行基线失败：{}",
+                String::from_utf8_lossy(&base_commit_output.stderr).trim()
+            ));
+        }
+        let base_commit = String::from_utf8(base_commit_output.stdout)
+            .map_err(|error| format!("执行基线不是有效 UTF-8：{}", error))?
+            .trim()
+            .to_string();
         proj.execution_session = Some(project::ExecutionSession {
+            execution_id: execution_id.clone(),
             active: true,
             milestone_id: milestone_id.clone(),
             mid_stage_id: mid_stage_id.clone(),
@@ -265,130 +315,136 @@ pub(crate) async fn execute_current_subtask(
             base_commit,
             started_at: now.clone(),
             state_entered_at: now.clone(),
-            plan_revision: mid.plan_revision,
+            plan_revision,
             subtask_index: next_idx,
             total_subtasks: total,
         });
-        crate::save_project(&proj)?;
     }
 
-    // Write execution history: execution started
     write_execution_history(
-        &project_name,
+        &mut proj,
         "info",
         project::ExecutionEventType::SubtaskExecuting,
         format!("▶ 开始执行 ({}/{})：{}", next_idx + 1, total, subtask_title),
-        Some(milestone_id),
-        Some(mid_stage_id),
+        Some(&milestone_id),
+        Some(&mid_stage_id),
         Some(&subtask_id),
-    )?;
+    );
+    crate::save_project(&proj)?;
 
-    // Initialize pipeline state (V1: single subtask context)
+    // Initialize pipeline state, then return immediately after scheduling the background task.
     let pipeline_state = state.pipeline_state.clone();
-    {
-        let mut guard = pipeline_state.lock().await;
-        *guard = Some(PipelineState {
-            mid_stage_id: mid_stage_id.clone(),
-            status: PipelineStatus::Running,
-            current_subtask_index: next_idx,
-            total_subtasks: total,
-            subtask_statuses: mid
-                .subtasks
-                .iter()
-                .map(|s| SubtaskStatusItem {
-                    subtask_id: s.id.clone(),
-                    title: s.title.clone(),
-                    status: if s.id == subtask_id {
-                        "executing".to_string()
-                    } else {
-                        "waiting".to_string()
-                    },
-                    test_result: None,
-                    retry_count: 0,
-                })
-                .collect(),
-            current_log: format!("▶ 执行中 ({}/{})：{}", next_idx + 1, total, subtask_title),
-            last_error: None,
-            child_pid: None,
-            project_name: project_name.clone(),
-            milestone_id: milestone_id.clone(),
-            plan_revision: mid.plan_revision,
-            current_subtask_id: subtask_id.clone(),
-            awaiting_confirmation: false,
-            log_history: vec![LogEntry {
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                level: "info".to_string(),
-                text: format!("▶ 执行中 ({}/{})：{}", next_idx + 1, total, subtask_title),
-            }],
-        });
-    }
+    let initial_state = PipelineState {
+        execution_id: execution_id.clone(),
+        mid_stage_id: mid_stage_id.clone(),
+        status: PipelineStatus::Running,
+        current_subtask_index: next_idx,
+        total_subtasks: total,
+        subtask_statuses,
+        current_log: format!("▶ 执行中 ({}/{})：{}", next_idx + 1, total, subtask_title),
+        last_error: None,
+        child_pid: None,
+        project_name: project_name.clone(),
+        milestone_id: milestone_id.clone(),
+        plan_revision,
+        current_subtask_id: subtask_id.clone(),
+        awaiting_confirmation: false,
+        log_history: vec![LogEntry {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            level: "info".to_string(),
+            text: format!("▶ 执行中 ({}/{})：{}", next_idx + 1, total, subtask_title),
+        }],
+    };
+    *pipeline_guard = Some(initial_state.clone());
+    drop(pipeline_guard);
 
-    // Execute the approved prompt
+    let background_pipeline_state = pipeline_state.clone();
+    let failure_project_name = project_name.clone();
+    let failure_milestone_id = milestone_id.clone();
+    let failure_mid_stage_id = mid_stage_id.clone();
+    let failure_subtask_id = subtask_id.clone();
+    let failure_subtask_title = subtask_title.clone();
+    let failure_execution_id = execution_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = execute_current_subtask_background(
+            project_name,
+            project_path,
+            milestone_id,
+            mid_stage_id,
+            subtask_id,
+            subtask_title,
+            approved_prompt,
+            next_idx,
+            total,
+            execution_id,
+            background_pipeline_state.clone(),
+        )
+        .await;
+        if let Err(error) = result {
+            if let Err(persist_error) = finalize_background_execution_failure(
+                &failure_project_name,
+                &failure_milestone_id,
+                &failure_mid_stage_id,
+                &failure_subtask_id,
+                &failure_subtask_title,
+                next_idx,
+                total,
+                &failure_execution_id,
+                &error,
+                background_pipeline_state.clone(),
+            )
+            .await
+            {
+                let mut guard = background_pipeline_state.lock().await;
+                if let Some(pipeline) = guard.as_mut() {
+                    if pipeline.execution_id == failure_execution_id {
+                        pipeline.status = PipelineStatus::Failed;
+                        pipeline.last_error =
+                            Some(format!("{}；失败状态持久化失败：{}", error, persist_error));
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(initial_state)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_current_subtask_background(
+    project_name: String,
+    project_path: String,
+    milestone_id: String,
+    mid_stage_id: String,
+    subtask_id: String,
+    subtask_title: String,
+    approved_prompt: String,
+    subtask_idx: usize,
+    total: usize,
+    execution_id: String,
+    pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+) -> Result<(), String> {
     let exec_result = match crate::executor::execute_subtask_inner(
         &project_path,
         &approved_prompt,
         &subtask_id,
+        &execution_id,
         pipeline_state.clone(),
     )
     .await
     {
         Ok(result) => result,
-        Err(e) => {
-            let error_msg = match &e {
-                project::SubTaskError::UserPaused => "用户暂停".to_string(),
-                project::SubTaskError::ExecutionFailed { message } => message.clone(),
-                project::SubTaskError::Timeout => "执行超时".to_string(),
-            };
-            // 执行器异常：修正磁盘任务、会话、流水线和自动驾驶状态
-            let mut proj = crate::load_project(&project_name)?;
-            let mut ps_guard = pipeline_state.lock().await;
-            finalize_execution_failure(&mut proj, &mut *ps_guard, next_idx, &error_msg);
-            crate::save_project(&proj)?;
-            write_execution_history(
-                &project_name,
-                "error",
-                project::ExecutionEventType::ExecutionFailed,
-                format!(
-                    "❌ 执行失败 ({}/{})：{} — {}",
-                    next_idx + 1,
-                    total,
-                    subtask_title,
-                    error_msg
-                ),
-                Some(milestone_id),
-                Some(mid_stage_id),
-                Some(&subtask_id),
-            )?;
-            return Err(format!(
-                "执行器异常：{}。任务已恢复为 Pending，可重试。",
-                error_msg
-            ));
-        }
+        Err(project::SubTaskError::UserPaused) => return Ok(()),
+        Err(project::SubTaskError::ExecutionFailed { message }) => return Err(message),
+        Err(project::SubTaskError::Timeout) => return Err("执行超时".to_string()),
     };
 
-    // Write execution history: executor complete
-    write_execution_history(
-        &project_name,
-        "info",
-        project::ExecutionEventType::ExecutorComplete,
-        format!(
-            "✅ 执行完成 ({}/{})：{}",
-            next_idx + 1,
-            total,
-            subtask_title
-        ),
-        Some(milestone_id),
-        Some(mid_stage_id),
-        Some(&subtask_id),
-    )?;
-
-    // Run test
     let test = crate::test_runner::check_subtask(
         &project_path,
         &approved_prompt,
         &subtask_id,
         &subtask_title,
-        mid_stage_id,
+        &mid_stage_id,
     )
     .await
     .unwrap_or(project::TestResult {
@@ -398,110 +454,201 @@ pub(crate) async fn execute_current_subtask(
         warnings: vec![],
     });
 
-    // Write execution history: test complete
-    write_execution_history(
-        &project_name,
-        if test.passed { "success" } else { "error" },
-        project::ExecutionEventType::TestComplete,
-        if test.passed {
-            format!(
-                "🔍 测试通过 ({}/{})：{}",
-                next_idx + 1,
-                total,
-                subtask_title
-            )
-        } else {
-            format!(
-                "🔍 测试未通过 ({}/{})：{} — {}",
-                next_idx + 1,
-                total,
-                subtask_title,
-                test.suggestion
-            )
-        },
-        Some(milestone_id),
-        Some(mid_stage_id),
-        Some(&subtask_id),
-    )?;
-
-    // Write results back to disk (with execution session update)
-    let mut proj = crate::load_project(&project_name)?;
-    let ms = proj
-        .milestones
-        .iter_mut()
-        .find(|m| m.id == *milestone_id)
-        .ok_or("大阶段不存在。")?;
-    let mid = ms
-        .mid_stages
-        .iter_mut()
-        .find(|m| m.id == *mid_stage_id)
-        .ok_or("中阶段不存在。")?;
-    if let Some(st) = mid.subtasks.get_mut(next_idx) {
-        st.execution_result = Some(exec_result.clone());
-        st.test_result = Some(test.clone());
-        st.status = project::SubtaskStatus::AwaitingConfirmation;
-    }
-    // Update execution session to awaiting_confirmation (preserve base_commit)
-    let now_await = chrono::Utc::now().to_rfc3339();
-    let old_base = proj
-        .execution_session
+    // 与暂停命令共用流水线锁，保证 execution_id 校验到项目保存之间不被旧任务穿透。
+    let mut pipeline_guard = pipeline_state.lock().await;
+    let pipeline_matches = pipeline_guard
         .as_ref()
-        .map(|s| s.base_commit.clone())
-        .unwrap_or_default();
+        .map(|pipeline| {
+            pipeline.execution_id == execution_id && pipeline.status == PipelineStatus::Running
+        })
+        .unwrap_or(false);
+    if !pipeline_matches {
+        return Ok(());
+    }
+
+    let mut proj = crate::load_project(&project_name)?;
+    let session = match proj.execution_session.as_ref() {
+        Some(session)
+            if session.active
+                && session.status == "executing"
+                && session.execution_id == execution_id =>
+        {
+            session.clone()
+        }
+        _ => return Ok(()),
+    };
+    if proj.workflow_state.current_step == project::WorkflowStep::PauseDecision {
+        return Ok(());
+    }
+
+    {
+        let ms = proj
+            .milestones
+            .iter_mut()
+            .find(|milestone| milestone.id == milestone_id)
+            .ok_or("大阶段不存在。")?;
+        let mid = ms
+            .mid_stages
+            .iter_mut()
+            .find(|mid_stage| mid_stage.id == mid_stage_id)
+            .ok_or("中阶段不存在。")?;
+        let subtask = mid
+            .subtasks
+            .get_mut(subtask_idx)
+            .ok_or("小阶段索引已失效。")?;
+        if subtask.id != subtask_id || subtask.status != project::SubtaskStatus::Executing {
+            return Ok(());
+        }
+        subtask.execution_result = Some(exec_result);
+        subtask.test_result = Some(test.clone());
+        subtask.status = project::SubtaskStatus::AwaitingConfirmation;
+    }
+
+    let now_await = chrono::Utc::now().to_rfc3339();
     proj.execution_session = Some(project::ExecutionSession {
+        execution_id: execution_id.clone(),
         active: true,
         milestone_id: milestone_id.clone(),
         mid_stage_id: mid_stage_id.clone(),
         subtask_id: subtask_id.clone(),
         subtask_title: subtask_title.clone(),
         status: "awaiting_confirmation".to_string(),
-        base_commit: old_base,
-        started_at: proj
-            .execution_session
-            .as_ref()
-            .map(|s| s.started_at.clone())
-            .unwrap_or_else(|| now_await.clone()),
-        state_entered_at: now_await.clone(),
-        plan_revision: mid.plan_revision,
-        subtask_index: next_idx,
+        base_commit: session.base_commit,
+        started_at: session.started_at,
+        state_entered_at: now_await,
+        plan_revision: session.plan_revision,
+        subtask_index: subtask_idx,
         total_subtasks: total,
     });
-    crate::save_project(&proj)?;
-
-    // Write execution history: awaiting confirmation
     write_execution_history(
-        &project_name,
+        &mut proj,
+        "info",
+        project::ExecutionEventType::ExecutorComplete,
+        format!(
+            "✅ 执行完成 ({}/{})：{}",
+            subtask_idx + 1,
+            total,
+            subtask_title
+        ),
+        Some(&milestone_id),
+        Some(&mid_stage_id),
+        Some(&subtask_id),
+    );
+    write_execution_history(
+        &mut proj,
+        if test.passed { "success" } else { "error" },
+        project::ExecutionEventType::TestComplete,
+        if test.passed {
+            format!(
+                "🔍 测试通过 ({}/{})：{}",
+                subtask_idx + 1,
+                total,
+                subtask_title
+            )
+        } else {
+            format!(
+                "🔍 测试未通过 ({}/{})：{} — {}",
+                subtask_idx + 1,
+                total,
+                subtask_title,
+                test.suggestion
+            )
+        },
+        Some(&milestone_id),
+        Some(&mid_stage_id),
+        Some(&subtask_id),
+    );
+    write_execution_history(
+        &mut proj,
         "info",
         project::ExecutionEventType::AwaitingConfirmation,
-        format!("⏳ 待确认 ({}/{})：{}", next_idx + 1, total, subtask_title),
-        Some(milestone_id),
-        Some(mid_stage_id),
+        format!(
+            "⏳ 待确认 ({}/{})：{}",
+            subtask_idx + 1,
+            total,
+            subtask_title
+        ),
+        Some(&milestone_id),
+        Some(&mid_stage_id),
         Some(&subtask_id),
-    )?;
+    );
+    crate::save_project(&proj)?;
 
-    // Update pipeline state to awaiting confirmation
-    let result_state;
-    {
-        let mut guard = pipeline_state.lock().await;
-        if let Some(s) = guard.as_mut() {
-            s.status = PipelineStatus::Paused;
+    if let Some(pipeline) = pipeline_guard.as_mut() {
+        if pipeline.execution_id == execution_id {
+            pipeline.status = PipelineStatus::Paused;
             append_log(
-                s,
+                pipeline,
                 "info",
-                format!("⏳ 待确认 ({}/{})：{}", next_idx + 1, total, subtask_title),
+                format!(
+                    "⏳ 待确认 ({}/{})：{}",
+                    subtask_idx + 1,
+                    total,
+                    subtask_title
+                ),
             );
-            s.awaiting_confirmation = true;
-            if let Some(stat) = s.subtask_statuses.get_mut(next_idx) {
-                stat.status = "testing".to_string();
-                stat.test_result = Some(test);
+            pipeline.awaiting_confirmation = true;
+            if let Some(status) = pipeline.subtask_statuses.get_mut(subtask_idx) {
+                status.status = "testing".to_string();
+                status.test_result = Some(test);
             }
-            result_state = s.clone();
-        } else {
-            return Err("流水线状态丢失".to_string());
         }
     }
+    Ok(())
+}
 
-    Ok(result_state)
+#[allow(clippy::too_many_arguments)]
+async fn finalize_background_execution_failure(
+    project_name: &str,
+    milestone_id: &str,
+    mid_stage_id: &str,
+    subtask_id: &str,
+    subtask_title: &str,
+    subtask_idx: usize,
+    total: usize,
+    execution_id: &str,
+    error_message: &str,
+    pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+) -> Result<(), String> {
+    let mut pipeline_guard = pipeline_state.lock().await;
+    let pipeline_matches = pipeline_guard
+        .as_ref()
+        .map(|pipeline| {
+            pipeline.execution_id == execution_id && pipeline.status == PipelineStatus::Running
+        })
+        .unwrap_or(false);
+    if !pipeline_matches {
+        return Ok(());
+    }
+
+    let mut proj = crate::load_project(project_name)?;
+    let session_matches = proj
+        .execution_session
+        .as_ref()
+        .map(|session| session.active && session.execution_id == execution_id)
+        .unwrap_or(false);
+    if !session_matches || proj.workflow_state.current_step == project::WorkflowStep::PauseDecision
+    {
+        return Ok(());
+    }
+
+    finalize_execution_failure(&mut proj, &mut *pipeline_guard, subtask_idx, error_message);
+    write_execution_history(
+        &mut proj,
+        "error",
+        project::ExecutionEventType::ExecutionFailed,
+        format!(
+            "❌ 执行失败 ({}/{}): {} - {}",
+            subtask_idx + 1,
+            total,
+            subtask_title,
+            error_message
+        ),
+        Some(milestone_id),
+        Some(mid_stage_id),
+        Some(subtask_id),
+    );
+    crate::save_project(&proj)
 }
 
 /// 质量门禁：校验执行结果、测试结果和证据完整性。
@@ -621,10 +768,12 @@ fn finalize_execution_failure(
             ap.run_status = project::AutopilotRunStatus::ErrorStopped;
             ap.last_action = format!("执行器失败：{}", error_message);
             ap.last_action_at = now.clone();
-            let truncated = if error_message.len() > 2048 {
-                format!("{}...", &error_message[..2048])
+            let mut error_chars = error_message.chars();
+            let truncated_body: String = error_chars.by_ref().take(2048).collect();
+            let truncated = if error_chars.next().is_some() {
+                format!("{}...", truncated_body)
             } else {
-                error_message.to_string()
+                truncated_body
             };
             ap.error_message = truncated;
         }
@@ -662,14 +811,14 @@ pub(crate) async fn confirm_subtask_result(
     // 质量门禁：在创建 Git 标签之前校验执行/测试/证据完整性
     if let Err(gate_reason) = validate_subtask_quality_gate(&proj) {
         write_execution_history(
-            &project_name,
+            &mut proj,
             "error",
             project::ExecutionEventType::QualityGateBlocked,
             format!("🚫 质量门禁阻断：{}", gate_reason),
             Some(&milestone_id),
             Some(&mid_stage_id),
             None,
-        )?;
+        );
         // 如果自动驾驶活跃，进入 ErrorStopped
         if proj.workflow_state.autopilot_active {
             if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
@@ -679,8 +828,8 @@ pub(crate) async fn confirm_subtask_result(
                 ap.last_action_at = now;
                 ap.error_message = gate_reason.clone();
             }
-            crate::save_project(&proj)?;
         }
+        crate::save_project(&proj)?;
         return Err(gate_reason);
     }
 
@@ -694,10 +843,17 @@ pub(crate) async fn confirm_subtask_result(
         .iter_mut()
         .find(|m| m.id == mid_stage_id)
         .ok_or("中阶段不存在。")?;
+    let milestone_title = ms.title.clone();
 
     // Verify Git workspace is still available before tagging
     let ws = get_execution_workspace_status_inner(&project_path)?;
-    if !ws.ready {
+    let git_metadata_ready = ws.path_exists
+        && ws.is_directory
+        && ws.is_git_repo
+        && ws.has_commits
+        && ws.git_user_available
+        && ws.git_email_available;
+    if !git_metadata_ready {
         return Err(format!(
             "Git 工作区不可用，无法标记确认：{}",
             ws.status_message
@@ -788,56 +944,34 @@ pub(crate) async fn confirm_subtask_result(
         mid.status = project::MidStageStatus::Completed;
         mid.completed_at = Some(now.clone());
 
-        // Write execution history: mid_stage complete
-        write_execution_history(
-            &project_name,
-            "success",
-            project::ExecutionEventType::MidStageComplete,
-            format!("✅ 中阶段完成：{} (v{})", mid.title, mid.version),
-            Some(&milestone_id),
-            Some(&mid_stage_id),
-            None,
-        )?;
-
         // 使用预先收集的状态：当前大阶段其他中阶段是否均已完成
         let all_mid_stages_done = other_mid_stages_all_completed;
 
         if all_mid_stages_done {
             // 大阶段全部中阶段完成 → 进入大阶段审阅
+            ms.status = project::MilestoneStatus::Completed;
+            ms.review_status = Some("pending_review".to_string());
+            ms.review_conclusion = None;
             proj.workflow_state.current_step = project::WorkflowStep::MilestoneReview;
             proj.workflow_state.review_node_id = milestone_id.clone();
 
             // Autopilot awareness: signal milestone review boundary
             if proj.workflow_state.autopilot_active {
-                if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
-                    ap.run_status = project::AutopilotRunStatus::WaitingMilestoneReview;
-                    ap.last_action = format!("到达大阶段边界：{}，等待人工 A/B/C", ms.title);
-                    ap.last_action_at = now.clone();
-                }
+                let ap = proj
+                    .workflow_state
+                    .autopilot_state
+                    .get_or_insert_with(project::AutopilotState::default);
+                ap.active = true;
+                ap.target_milestone_id = milestone_id.clone();
+                ap.run_status = project::AutopilotRunStatus::WaitingMilestoneReview;
+                ap.last_action = format!("到达大阶段边界：{}，等待人工 A/B/C", milestone_title);
+                ap.last_action_at = now.clone();
+                ap.error_message.clear();
             }
-
-            write_execution_history(
-                &project_name,
-                "success",
-                project::ExecutionEventType::AdvanceMilestoneReview,
-                format!("📋 推进到大阶段审阅：{}", ms.title),
-                Some(&milestone_id),
-                None,
-                None,
-            )?;
         } else {
             // 大阶段仍有未完成中阶段 → 进入中阶段选择
             proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
             proj.current_mid_stage_id = String::new();
-            write_execution_history(
-                &project_name,
-                "success",
-                project::ExecutionEventType::AdvanceNextMidStage,
-                "➡ 推进到下一中阶段选择".to_string(),
-                Some(&milestone_id),
-                None,
-                None,
-            )?;
         }
 
         proj.workflow_state.data_revision += 1;
@@ -848,6 +982,42 @@ pub(crate) async fn confirm_subtask_result(
     let mid_version_for_node_tag = mid.version.clone();
     let mid_title_for_node_tag = mid.title.clone();
     let mid_stage_id_for_node_tag = mid_stage_id.clone();
+
+    if all_subtasks_passed {
+        write_execution_history(
+            &mut proj,
+            "success",
+            project::ExecutionEventType::MidStageComplete,
+            format!(
+                "✅ 中阶段完成：{} (v{})",
+                mid_title_for_node_tag, mid_version_for_node_tag
+            ),
+            Some(&milestone_id),
+            Some(&mid_stage_id),
+            None,
+        );
+        if other_mid_stages_all_completed {
+            write_execution_history(
+                &mut proj,
+                "success",
+                project::ExecutionEventType::AdvanceMilestoneReview,
+                format!("📋 推进到大阶段审阅：{}", milestone_title),
+                Some(&milestone_id),
+                None,
+                None,
+            );
+        } else {
+            write_execution_history(
+                &mut proj,
+                "success",
+                project::ExecutionEventType::AdvanceNextMidStage,
+                "➡ 推进到下一中阶段选择".to_string(),
+                Some(&milestone_id),
+                None,
+                None,
+            );
+        }
+    }
 
     // Update constitution part 2 + record change history entry
     if !project_path.is_empty() {
@@ -895,14 +1065,14 @@ pub(crate) async fn confirm_subtask_result(
 
     // Write execution history: user confirmed
     write_execution_history(
-        &project_name,
+        &mut proj,
         "success",
         project::ExecutionEventType::UserConfirm,
         format!("✅ 用户确认通过：{}", subtask_title),
         Some(&milestone_id),
         Some(&mid_stage_id),
         Some(&subtask_id),
-    )?;
+    );
 
     // Clear execution session before saving (小阶段已确认)
     proj.execution_session = None;
@@ -988,18 +1158,18 @@ pub(crate) async fn reject_subtask_result(
 ) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
 
-    let milestone_id = &proj.current_milestone_id;
-    let mid_stage_id = &proj.current_mid_stage_id;
+    let milestone_id = proj.current_milestone_id.clone();
+    let mid_stage_id = proj.current_mid_stage_id.clone();
 
     let ms = proj
         .milestones
         .iter_mut()
-        .find(|m| m.id == *milestone_id)
+        .find(|m| m.id == milestone_id)
         .ok_or("大阶段不存在。")?;
     let mid = ms
         .mid_stages
         .iter_mut()
-        .find(|m| m.id == *mid_stage_id)
+        .find(|m| m.id == mid_stage_id)
         .ok_or("中阶段不存在。")?;
 
     let subtask_idx = mid
@@ -1021,14 +1191,14 @@ pub(crate) async fn reject_subtask_result(
 
     // Write execution history: user rejected
     write_execution_history(
-        &project_name,
+        &mut proj,
         "error",
         project::ExecutionEventType::UserReject,
         format!("❌ 用户驳回：{} — {}", subtask_title, reason),
-        Some(milestone_id),
-        Some(mid_stage_id),
+        Some(&milestone_id),
+        Some(&mid_stage_id),
         Some(&subtask_id),
-    )?;
+    );
 
     // Clear execution session
     proj.execution_session = None;
@@ -1098,17 +1268,20 @@ pub(crate) async fn retry_current_subtask(
     let subtask_id = subtask.id.clone();
     let subtask_title = subtask.title.clone();
 
-    // 恢复到执行基线：stash 当前修改并恢复到上次稳定标签或 HEAD
-    {
-        let last_passed = find_last_passed_subtask(&proj);
-        if let Some(ref last_st) = last_passed {
-            if let Some(ref tag) = last_st.auto_tag {
-                crate::git_ops::git_stash_and_reset_to_tag(&project_path, tag)
-                    .map_err(|e| format!("Git 基线恢复失败：{}。失败证据已保留。", e))?;
-            }
+    // 优先使用执行会话基线，其次最近通过标签，最后显式恢复当前 HEAD。
+    let session_base = proj.execution_session.as_ref().and_then(|session| {
+        if session.base_commit.is_empty() {
+            None
+        } else {
+            Some(session.base_commit.clone())
         }
-        // 如果没有已通过的标签，恢复到当前 HEAD（即第一个小阶段前的状态）
-    }
+    });
+    let last_passed_tag = find_last_passed_subtask(&proj).and_then(|subtask| subtask.auto_tag);
+    let restore_target = session_base
+        .or(last_passed_tag)
+        .unwrap_or_else(|| "HEAD".to_string());
+    restore_git_execution_baseline(&project_path, &restore_target)
+        .map_err(|error| format!("Git 基线恢复失败：{}。失败证据已保留。", error))?;
 
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -1135,7 +1308,7 @@ pub(crate) async fn retry_current_subtask(
 
     // 记录重试事件
     write_execution_history(
-        &project_name,
+        &mut proj,
         "info",
         project::ExecutionEventType::RetryScheduled,
         format!(
@@ -1145,7 +1318,7 @@ pub(crate) async fn retry_current_subtask(
         Some(&milestone_id),
         Some(&mid_stage_id),
         Some(&subtask_id),
-    )?;
+    );
 
     // 如果自动驾驶处于 ErrorStopped，恢复为 Running
     if proj.workflow_state.autopilot_active {
@@ -1187,99 +1360,12 @@ pub(crate) async fn get_execution_workspace_status(
             has_commits: false,
             git_user_available: false,
             git_email_available: false,
+            working_tree_clean: false,
             ready: false,
             status_message: "项目路径未设置。".to_string(),
         });
     }
-
-    let path_std = std::path::Path::new(path);
-    let path_exists = path_std.exists();
-    let is_directory = path_std.is_dir();
-
-    if !path_exists {
-        return Ok(project::ExecutionWorkspaceStatus {
-            path_exists: false,
-            is_directory: false,
-            is_git_repo: false,
-            has_commits: false,
-            git_user_available: false,
-            git_email_available: false,
-            ready: false,
-            status_message: format!("项目路径 {} 不存在。", path),
-        });
-    }
-    if !is_directory {
-        return Ok(project::ExecutionWorkspaceStatus {
-            path_exists: true,
-            is_directory: false,
-            is_git_repo: false,
-            has_commits: false,
-            git_user_available: false,
-            git_email_available: false,
-            ready: false,
-            status_message: format!("项目路径 {} 不是目录。", path),
-        });
-    }
-
-    let git_path = path_std.join(".git");
-    let is_git_repo = git_path.exists();
-
-    let has_commits = if is_git_repo {
-        std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(path)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    } else {
-        false
-    };
-
-    let git_user_available = std::process::Command::new("git")
-        .args(["config", "user.name"])
-        .current_dir(path)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().len() > 0)
-        .unwrap_or(false);
-
-    let git_email_available = std::process::Command::new("git")
-        .args(["config", "user.email"])
-        .current_dir(path)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().len() > 0)
-        .unwrap_or(false);
-
-    let ready = is_git_repo && has_commits && git_user_available && git_email_available;
-
-    let status_message = if ready {
-        "Git 工作区已就绪，可以执行小阶段。".to_string()
-    } else {
-        let mut missing = Vec::new();
-        if !is_git_repo {
-            missing.push("Git 仓库未初始化");
-        }
-        if is_git_repo && !has_commits {
-            missing.push("尚无首次提交");
-        }
-        if !git_user_available {
-            missing.push("Git user.name 未配置");
-        }
-        if !git_email_available {
-            missing.push("Git user.email 未配置");
-        }
-        format!("Git 工作区未就绪：{}。", missing.join("、"))
-    };
-
-    Ok(project::ExecutionWorkspaceStatus {
-        path_exists,
-        is_directory,
-        is_git_repo,
-        has_commits,
-        git_user_available,
-        git_email_available,
-        ready,
-        status_message,
-    })
+    get_execution_workspace_status_inner(path)
 }
 
 /// 准备执行工作区：初始化 Git 仓库、创建首次提交（仅在 Execution 步骤可调用）
@@ -1287,7 +1373,7 @@ pub(crate) async fn get_execution_workspace_status(
 pub(crate) async fn prepare_execution_workspace(
     project_name: String,
 ) -> Result<project::ExecutionWorkspaceStatus, String> {
-    let proj = crate::load_project(&project_name)?;
+    let mut proj = crate::load_project(&project_name)?;
 
     if proj.workflow_state.current_step != project::WorkflowStep::Execution {
         return Err(format!(
@@ -1298,21 +1384,22 @@ pub(crate) async fn prepare_execution_workspace(
 
     // Write execution history: user requested workspace preparation
     write_execution_history(
-        &project_name,
+        &mut proj,
         "info",
         project::ExecutionEventType::WorkspacePrepare,
         "🔧 用户点击准备执行环境".to_string(),
         None,
         None,
         None,
-    )?;
+    );
+    crate::save_project(&proj)?;
 
-    let path = &proj.project_path;
+    let path = proj.project_path.clone();
     if path.is_empty() {
         return Err("项目路径未设置。".to_string());
     }
 
-    let path_std = std::path::Path::new(path);
+    let path_std = std::path::Path::new(&path);
     if !path_std.exists() {
         return Err(format!("项目路径 {} 不存在。", path));
     }
@@ -1326,7 +1413,7 @@ pub(crate) async fn prepare_execution_workspace(
     if !git_path.exists() {
         let init = std::process::Command::new("git")
             .args(["init"])
-            .current_dir(path)
+            .current_dir(&path)
             .output()
             .map_err(|e| format!("git init 失败：{}", e))?;
         if !init.status.success() {
@@ -1341,21 +1428,21 @@ pub(crate) async fn prepare_execution_workspace(
     // Check git identity
     let user_name = std::process::Command::new("git")
         .args(["config", "user.name"])
-        .current_dir(path)
+        .current_dir(&path)
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
 
     let user_email = std::process::Command::new("git")
         .args(["config", "user.email"])
-        .current_dir(path)
+        .current_dir(&path)
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
 
     if user_name.is_empty() || user_email.is_empty() {
         write_execution_history(
-            &project_name,
+            &mut proj,
             "error",
             project::ExecutionEventType::WorkspacePrepareFailed,
             format!(
@@ -1365,7 +1452,8 @@ pub(crate) async fn prepare_execution_workspace(
             None,
             None,
             None,
-        )?;
+        );
+        crate::save_project(&proj)?;
         return Err(format!(
             "Git 身份未配置（user.name={:?}, user.email={:?}）。请在项目目录下执行 git config user.name 和 git config user.email。",
             user_name, user_email
@@ -1375,7 +1463,7 @@ pub(crate) async fn prepare_execution_workspace(
     // Create initial commit if no commits exist
     let has_commits = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
-        .current_dir(path)
+        .current_dir(&path)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
@@ -1383,7 +1471,7 @@ pub(crate) async fn prepare_execution_workspace(
     if !has_commits {
         std::process::Command::new("git")
             .args(["add", "-A"])
-            .current_dir(path)
+            .current_dir(&path)
             .output()
             .map_err(|e| format!("git add 失败：{}", e))?;
         let commit = std::process::Command::new("git")
@@ -1393,7 +1481,7 @@ pub(crate) async fn prepare_execution_workspace(
                 "-m",
                 "初始提交（由 Metheus 自动创建）",
             ])
-            .current_dir(path)
+            .current_dir(&path)
             .output()
             .map_err(|e| format!("git commit 失败：{}", e))?;
         if !commit.status.success() {
@@ -1407,19 +1495,31 @@ pub(crate) async fn prepare_execution_workspace(
         }
     }
 
-    // Write execution history: workspace ready
-    write_execution_history(
-        &project_name,
-        "success",
-        project::ExecutionEventType::WorkspaceReady,
-        "Git 工作区已就绪，可以执行小阶段。".to_string(),
-        None,
-        None,
-        None,
-    )?;
+    let final_status = get_execution_workspace_status_inner(&path)?;
+    if final_status.ready {
+        write_execution_history(
+            &mut proj,
+            "success",
+            project::ExecutionEventType::WorkspaceReady,
+            "Git 工作区已就绪，可以执行小阶段。".to_string(),
+            None,
+            None,
+            None,
+        );
+    } else {
+        write_execution_history(
+            &mut proj,
+            "error",
+            project::ExecutionEventType::WorkspacePrepareFailed,
+            final_status.status_message.clone(),
+            None,
+            None,
+            None,
+        );
+    }
+    crate::save_project(&proj)?;
 
-    // Re-probe and return status
-    get_execution_workspace_status_inner(path)
+    Ok(final_status)
 }
 
 /// Internal helper: probe workspace status from path
@@ -1438,6 +1538,7 @@ fn get_execution_workspace_status_inner(
             has_commits: false,
             git_user_available: false,
             git_email_available: false,
+            working_tree_clean: false,
             ready: false,
             status_message: if !path_exists {
                 format!("项目路径 {} 不存在。", path)
@@ -1475,7 +1576,30 @@ fn get_execution_workspace_status_inner(
         .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
         .unwrap_or(false);
 
-    let ready = is_git_repo && has_commits && git_user_available && git_email_available;
+    let working_tree_clean = if is_git_repo {
+        let status_output = std::process::Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .current_dir(path)
+            .output()
+            .map_err(|error| format!("git status 失败：{}", error))?;
+        if !status_output.status.success() {
+            return Err(format!(
+                "git status 失败：{}",
+                String::from_utf8_lossy(&status_output.stderr).trim()
+            ));
+        }
+        String::from_utf8_lossy(&status_output.stdout)
+            .trim()
+            .is_empty()
+    } else {
+        false
+    };
+
+    let ready = is_git_repo
+        && has_commits
+        && git_user_available
+        && git_email_available
+        && working_tree_clean;
 
     let status_message = if ready {
         "Git 工作区已就绪，可以执行小阶段。".to_string()
@@ -1493,6 +1617,9 @@ fn get_execution_workspace_status_inner(
         if !git_email_available {
             missing.push("Git user.email 未配置");
         }
+        if is_git_repo && !working_tree_clean {
+            missing.push("工作区存在未提交或未跟踪修改");
+        }
         format!("Git 工作区未就绪：{}。", missing.join("、"))
     };
 
@@ -1503,6 +1630,7 @@ fn get_execution_workspace_status_inner(
         has_commits,
         git_user_available,
         git_email_available,
+        working_tree_clean,
         ready,
         status_message,
     })
@@ -1512,6 +1640,210 @@ fn get_execution_workspace_status_inner(
 // V1 暂停与回退命令
 // ===================================================================
 
+fn restore_git_execution_baseline(project_path: &str, target: &str) -> Result<(), String> {
+    let status_output = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(project_path)
+        .output()
+        .map_err(|error| format!("git status 失败：{}", error))?;
+    if !status_output.status.success() {
+        return Err(format!(
+            "git status 失败：{}",
+            String::from_utf8_lossy(&status_output.stderr).trim()
+        ));
+    }
+    let has_changes = !String::from_utf8_lossy(&status_output.stdout)
+        .trim()
+        .is_empty();
+    if has_changes {
+        let stash_output = std::process::Command::new("git")
+            .args([
+                "stash",
+                "push",
+                "--include-untracked",
+                "-m",
+                "metheus_execution_safety_stash",
+            ])
+            .current_dir(project_path)
+            .output()
+            .map_err(|error| format!("git stash 失败：{}", error))?;
+        if !stash_output.status.success() {
+            return Err(format!(
+                "git stash 失败：{}",
+                String::from_utf8_lossy(&stash_output.stderr).trim()
+            ));
+        }
+    }
+
+    let reset_output = std::process::Command::new("git")
+        .args(["reset", "--hard", target])
+        .current_dir(project_path)
+        .output()
+        .map_err(|error| format!("git reset --hard {} 失败：{}", target, error))?;
+    if !reset_output.status.success() {
+        let reset_error = String::from_utf8_lossy(&reset_output.stderr)
+            .trim()
+            .to_string();
+        if has_changes {
+            let pop_output = std::process::Command::new("git")
+                .args(["stash", "pop"])
+                .current_dir(project_path)
+                .output()
+                .map_err(|error| {
+                    format!(
+                        "回退到 {} 失败：{}；恢复安全暂存也失败：{}",
+                        target, reset_error, error
+                    )
+                })?;
+            if !pop_output.status.success() {
+                return Err(format!(
+                    "回退到 {} 失败：{}；恢复安全暂存也失败：{}",
+                    target,
+                    reset_error,
+                    String::from_utf8_lossy(&pop_output.stderr).trim()
+                ));
+            }
+        }
+        return Err(format!("回退到 {} 失败：{}", target, reset_error));
+    }
+
+    let workspace = get_execution_workspace_status_inner(project_path)?;
+    if !workspace.working_tree_clean {
+        return Err("Git 回退后工作区仍有残留修改，安全基线验证失败。".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unix_process_is_running(pid: u32) -> Result<bool, String> {
+    let output = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map_err(|error| format!("检查进程 {} 状态失败：{}", pid, error))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    // `kill -0` 对尚未被父进程回收的僵尸进程仍返回成功，但僵尸进程已经退出。
+    let process_state = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .map_err(|error| format!("读取进程 {} 状态失败：{}", pid, error))?;
+    if !process_state.status.success() {
+        return Ok(false);
+    }
+    let state = String::from_utf8_lossy(&process_state.stdout);
+    Ok(!state.trim_start().starts_with('Z'))
+}
+
+#[cfg(unix)]
+async fn terminate_execution_process(pid: u32) -> Result<(), String> {
+    if !unix_process_is_running(pid)? {
+        return Ok(());
+    }
+    let terminate = std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output()
+        .map_err(|error| format!("终止进程 {} 失败：{}", pid, error))?;
+    if !terminate.status.success() && unix_process_is_running(pid)? {
+        return Err(format!(
+            "终止进程 {} 失败：{}",
+            pid,
+            String::from_utf8_lossy(&terminate.stderr).trim()
+        ));
+    }
+
+    let graceful_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < graceful_deadline {
+        if !unix_process_is_running(pid)? {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let force = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .output()
+        .map_err(|error| format!("强制终止进程 {} 失败：{}", pid, error))?;
+    if !force.status.success() && unix_process_is_running(pid)? {
+        return Err(format!(
+            "强制终止进程 {} 失败：{}",
+            pid,
+            String::from_utf8_lossy(&force.stderr).trim()
+        ));
+    }
+    let force_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < force_deadline {
+        if !unix_process_is_running(pid)? {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Err(format!("进程 {} 在终止期限内未退出。", pid))
+}
+
+#[cfg(not(unix))]
+async fn terminate_execution_process(pid: u32) -> Result<(), String> {
+    let output = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .output()
+        .map_err(|error| format!("终止进程 {} 失败：{}", pid, error))?;
+    if !output.status.success() {
+        return Err(format!(
+            "终止进程 {} 失败：{}",
+            pid,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+async fn persist_in_stop_failure(
+    pipeline_state: &std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    proj: &mut project::Project,
+    error: &str,
+) -> String {
+    {
+        let mut guard = pipeline_state.lock().await;
+        if let Some(pipeline) = guard.as_mut() {
+            pipeline.status = PipelineStatus::Failed;
+            pipeline.last_error = Some(error.to_string());
+            append_log(pipeline, "error", format!("In Stop 失败：{}", error));
+        }
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(session) = proj.execution_session.as_mut() {
+        session.active = false;
+        session.status = "stop_failed".to_string();
+        session.state_entered_at = now.clone();
+    }
+    if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+        autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
+        autopilot.last_action = format!("In Stop 失败：{}", error);
+        autopilot.last_action_at = now;
+        autopilot.error_message = error.chars().take(2048).collect();
+    }
+    let milestone_id = proj.current_milestone_id.clone();
+    let mid_stage_id = proj.current_mid_stage_id.clone();
+    let subtask_id = proj
+        .execution_session
+        .as_ref()
+        .map(|session| session.subtask_id.clone());
+    write_execution_history(
+        proj,
+        "error",
+        project::ExecutionEventType::UserInStop,
+        format!("In Stop 失败：{}", error),
+        Some(&milestone_id),
+        Some(&mid_stage_id),
+        subtask_id.as_deref(),
+    );
+    match crate::save_project(proj) {
+        Ok(()) => error.to_string(),
+        Err(save_error) => format!("{}；阻断状态保存失败：{}", error, save_error),
+    }
+}
+
 /// V1 In Stop：立即终止当前子进程，回到上一个稳定检查点
 #[tauri::command]
 /// 统一 In Stop 逻辑：杀进程 + 等退出 + Git 回退 + 修状态。
@@ -1520,37 +1852,66 @@ pub(crate) async fn perform_in_stop(
     state: &tauri::State<'_, AppState>,
     proj: &mut project::Project,
 ) -> Result<(), String> {
-    // 1. 标记流水线停止并取子进程 PID
-    let child_pid = {
-        let mut guard = state.pipeline_state.lock().await;
-        if let Some(s) = guard.as_mut() {
-            s.status = PipelineStatus::Failed;
-            append_log(s, "pause", "⏹ In Stop：立即暂停".to_string());
-            let pid = s.child_pid.take();
-            s.child_pid = None;
-            pid
-        } else {
-            None
+    perform_in_stop_with_pipeline_state(state.pipeline_state.clone(), proj).await
+}
+
+/// In Stop implementation that accepts the shared pipeline state directly.
+/// This keeps the command wrapper thin and makes the stop contract testable
+/// without constructing a Tauri runtime state.
+pub(crate) async fn perform_in_stop_with_pipeline_state(
+    pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    proj: &mut project::Project,
+) -> Result<(), String> {
+    let current_attempt = find_current_subtask(proj);
+    let last_passed = find_last_passed_subtask(proj);
+    let execution_id = proj
+        .execution_session
+        .as_ref()
+        .filter(|session| session.active && session.status == "executing")
+        .map(|session| session.execution_id.clone())
+        .filter(|id| !id.is_empty())
+        .ok_or("当前没有真实执行中的小阶段，无法请求 In Stop。")?;
+
+    // 1. 先标记受控暂停，让后台任务停止写入，再等待子进程 PID 出现。
+    {
+        let mut guard = pipeline_state.lock().await;
+        let pipeline = guard
+            .as_mut()
+            .filter(|pipeline| {
+                pipeline.execution_id == execution_id && pipeline.status == PipelineStatus::Running
+            })
+            .ok_or("内存执行状态与项目会话不一致，无法安全暂停。")?;
+        pipeline.status = PipelineStatus::Paused;
+        append_log(pipeline, "pause", "⏹ In Stop：正在受控暂停".to_string());
+    }
+
+    let pid_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let child_pid = loop {
+        let pid = {
+            let mut guard = pipeline_state.lock().await;
+            guard.as_mut().and_then(|pipeline| {
+                if pipeline.execution_id == execution_id {
+                    pipeline.child_pid.take()
+                } else {
+                    None
+                }
+            })
+        };
+        if pid.is_some() || std::time::Instant::now() >= pid_deadline {
+            break pid;
         }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     };
 
-    // 2. 终止子进程
+    // 2. 终止子进程并确认已退出。
     if let Some(pid) = child_pid {
-        #[cfg(unix)]
-        {
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .output();
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/PID", &pid.to_string()])
-                .output();
+        if let Err(error) = terminate_execution_process(pid).await {
+            let persisted_error = persist_in_stop_failure(&pipeline_state, proj, &error).await;
+            return Err(persisted_error);
         }
     }
 
-    // 3. 回退代码到执行前基线或最后稳定标签
+    // 3. 回退到会话基线，其次最近通过标签，最后显式使用当前 HEAD。
     let base_commit = proj.execution_session.as_ref().and_then(|s| {
         if s.base_commit.is_empty() {
             None
@@ -1558,18 +1919,20 @@ pub(crate) async fn perform_in_stop(
             Some(s.base_commit.clone())
         }
     });
-    if let Some(ref commit) = base_commit {
-        let _ = crate::git_ops::git_stash_and_reset_to_tag(&proj.project_path, commit);
+    let restore_target = if let Some(commit) = base_commit {
+        commit
     } else {
         let last_passed = find_last_passed_subtask(proj);
-        if let Some(ref last) = last_passed {
-            if let Some(ref tag) = last.auto_tag {
-                let _ = crate::git_ops::git_stash_and_reset_to_tag(&proj.project_path, tag);
-            }
-        }
+        last_passed
+            .and_then(|last| last.auto_tag)
+            .unwrap_or_else(|| "HEAD".to_string())
+    };
+    if let Err(error) = restore_git_execution_baseline(&proj.project_path, &restore_target) {
+        let persisted_error = persist_in_stop_failure(&pipeline_state, proj, &error).await;
+        return Err(persisted_error);
     }
 
-    // 4. 修正项目状态：重置当前任务为 Pending，清空执行会话
+    // 4. 只有进程退出且 Git 基线验证通过后，才进入暂停决策。
     let now = chrono::Utc::now().to_rfc3339();
     if let Some(ms) = proj
         .milestones
@@ -1596,7 +1959,27 @@ pub(crate) async fn perform_in_stop(
 
     proj.workflow_state.current_step = project::WorkflowStep::PauseDecision;
     proj.workflow_state.data_revision += 1;
-    proj.workflow_state.last_transition_at = now;
+    proj.workflow_state.last_transition_at = now.clone();
+    proj.pause_context = Some(project::PauseContext {
+        pause_type: "in_stop".to_string(),
+        current_subtask_id: current_attempt
+            .as_ref()
+            .map(|subtask| subtask.id.clone())
+            .unwrap_or_default(),
+        last_passed_subtask_id: last_passed
+            .as_ref()
+            .map(|subtask| subtask.id.clone())
+            .unwrap_or_default(),
+        stable_tag: last_passed
+            .as_ref()
+            .and_then(|subtask| subtask.auto_tag.clone())
+            .unwrap_or_default(),
+        paused_at: now,
+        discussion_start_revision: proj.discussion_revision,
+        pending_action: String::new(),
+        resume_step: None,
+        autopilot_was_active: proj.workflow_state.autopilot_active,
+    });
 
     Ok(())
 }
@@ -1608,12 +1991,23 @@ pub(crate) async fn request_in_stop(
 ) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
 
+    request_in_stop_with_pipeline_state(state.pipeline_state.clone(), &mut proj).await?;
+
+    crate::save_and_reload_project(&proj)
+}
+
+/// Complete In Stop transition and append its user-facing history entry.
+/// Persistence remains the command wrapper's responsibility.
+pub(crate) async fn request_in_stop_with_pipeline_state(
+    pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    proj: &mut project::Project,
+) -> Result<(), String> {
     // Find current subtask for history/logging
-    let current_attempt = find_current_subtask(&proj);
-    let last_passed = find_last_passed_subtask(&proj);
+    let current_attempt = find_current_subtask(proj);
+    let last_passed = find_last_passed_subtask(proj);
 
     // Delegate to unified stop logic
-    perform_in_stop(&state, &mut proj).await?;
+    perform_in_stop_with_pipeline_state(pipeline_state, proj).await?;
 
     // Save PauseContext
     let now = chrono::Utc::now().to_rfc3339();
@@ -1639,22 +2033,22 @@ pub(crate) async fn request_in_stop(
     });
 
     // Write execution history
+    let history_milestone_id = current_attempt
+        .as_ref()
+        .map(|_| proj.current_milestone_id.clone());
+    let history_mid_stage_id = proj.current_mid_stage_id.clone();
+    let history_subtask_id = current_attempt.as_ref().map(|s| s.id.clone());
     write_execution_history(
-        &project_name,
+        proj,
         "pause",
         project::ExecutionEventType::UserInStop,
         "⏹ 用户请求立即暂停 (In Stop)".to_string(),
-        current_attempt.as_ref().and_then(|_| {
-            proj.milestones
-                .iter()
-                .find(|m| m.id == proj.current_milestone_id)
-                .map(|m| m.id.as_str())
-        }),
-        Some(&proj.current_mid_stage_id),
-        current_attempt.as_ref().map(|s| s.id.as_str()),
-    )?;
+        history_milestone_id.as_deref(),
+        Some(&history_mid_stage_id),
+        history_subtask_id.as_deref(),
+    );
 
-    crate::save_and_reload_project(&proj)
+    Ok(())
 }
 
 /// V1 ED Stop：当前任务完成后暂停（标记请求，执行器完成后检查）
@@ -1665,38 +2059,51 @@ pub(crate) async fn request_ed_stop(
 ) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
 
-    // Set ED Stop flag in pipeline state
-    {
-        let mut guard = state.pipeline_state.lock().await;
-        if let Some(s) = guard.as_mut() {
-            append_log(s, "pause", "⏸ ED Stop：当前任务完成后将暂停".to_string());
-        }
-    }
+    request_ed_stop_with_pipeline_state(state.pipeline_state.clone(), &mut proj).await?;
 
-    // Write execution history
-    write_execution_history(
-        &project_name,
-        "pause",
-        project::ExecutionEventType::UserEdStop,
-        "⏸ 用户请求完成后暂停 (ED Stop)".to_string(),
-        Some(&proj.current_milestone_id),
-        Some(&proj.current_mid_stage_id),
-        None,
-    )?;
+    crate::save_and_reload_project(&proj)
+}
 
-    // Guard: 重复请求返回当前项目，不重复写历史
+/// Mark the currently executing task for an end-of-task pause.
+/// Repeated requests are idempotent and do not append duplicate history.
+pub(crate) async fn request_ed_stop_with_pipeline_state(
+    pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    proj: &mut project::Project,
+) -> Result<(), String> {
+    let mut pipeline_guard = pipeline_state.lock().await;
+
+    // 重复请求是幂等操作，必须在修改日志和历史之前返回。
     if proj
         .pause_context
         .as_ref()
         .map(|pc| pc.pending_action.as_str())
         == Some("ed_stop_requested")
     {
-        return Ok(proj);
+        return Ok(());
     }
+
+    let execution_id = proj
+        .execution_session
+        .as_ref()
+        .filter(|session| session.active && session.status == "executing")
+        .map(|session| session.execution_id.clone())
+        .filter(|id| !id.is_empty())
+        .ok_or("只有小阶段真实执行中才能请求完成后暂停。")?;
+    let pipeline = pipeline_guard
+        .as_mut()
+        .filter(|pipeline| {
+            pipeline.execution_id == execution_id && pipeline.status == PipelineStatus::Running
+        })
+        .ok_or("内存执行状态与项目会话不一致，无法请求完成后暂停。")?;
+    append_log(
+        pipeline,
+        "pause",
+        "⏸ ED Stop：当前任务完成后将暂停".to_string(),
+    );
 
     // Save pending action in PauseContext
     let now = chrono::Utc::now().to_rfc3339();
-    let current = find_current_subtask(&proj);
+    let current = find_current_subtask(proj);
     proj.pause_context = Some(project::PauseContext {
         pause_type: "ed_stop".to_string(),
         current_subtask_id: current.as_ref().map(|s| s.id.clone()).unwrap_or_default(),
@@ -1711,7 +2118,19 @@ pub(crate) async fn request_ed_stop(
 
     proj.workflow_state.pause_reason = project::PauseReason::EDStop;
 
-    crate::save_and_reload_project(&proj)
+    let milestone_id = proj.current_milestone_id.clone();
+    let mid_stage_id = proj.current_mid_stage_id.clone();
+    write_execution_history(
+        proj,
+        "pause",
+        project::ExecutionEventType::UserEdStop,
+        "⏸ 用户请求完成后暂停 (ED Stop)".to_string(),
+        Some(&milestone_id),
+        Some(&mid_stage_id),
+        None,
+    );
+
+    Ok(())
 }
 
 /// V1 暂停决策：继续 / 调整 / 回退
@@ -1759,14 +2178,14 @@ pub(crate) async fn resolve_pause_decision(
             }
 
             write_execution_history(
-                &project_name,
+                &mut proj,
                 "info",
                 project::ExecutionEventType::UserContinue,
                 "▶ 用户选择继续执行".to_string(),
                 None,
                 None,
                 None,
-            )?;
+            );
         }
         "adjust" => {
             // Enter Discussion with PauseAdjustment scope
@@ -1774,27 +2193,27 @@ pub(crate) async fn resolve_pause_decision(
             proj.workflow_state.discussion_scope = project::DiscussionScope::PauseAdjustment;
             // Keep pause_context for reference
             write_execution_history(
-                &project_name,
+                &mut proj,
                 "info",
                 project::ExecutionEventType::UserAdjust,
                 "🔧 用户选择调整后续方案".to_string(),
                 None,
                 None,
                 None,
-            )?;
+            );
         }
         "rollback" => {
             // Enter RollbackPreview
             proj.workflow_state.current_step = project::WorkflowStep::RollbackPreview;
             write_execution_history(
-                &project_name,
+                &mut proj,
                 "pause",
                 project::ExecutionEventType::UserRollback,
                 "↩ 用户选择回退到更早稳定点".to_string(),
                 None,
                 None,
                 None,
-            )?;
+            );
         }
         _ => return Err(format!("未知暂停动作：{}", action)),
     }
@@ -2023,6 +2442,8 @@ pub(crate) fn find_last_passed_subtask(proj: &project::Project) -> Option<projec
 /// 执行状态对账结果
 #[derive(Debug, Clone)]
 pub enum ExecutionReconciliation {
+    /// 正常停留在 Execution，当前没有活跃会话，等待启动下一个小阶段
+    IdleAtExecution,
     /// 真执行中：磁盘 session 为 executing，内存 PipelineState 为 Running
     Executing,
     /// 待确认：磁盘 session 为 awaiting_confirmation
@@ -2042,8 +2463,8 @@ pub enum ExecutionReconciliation {
 /// - AwaitingConfirmation: 磁盘 session=awaiting_confirmation → 恢复确认界面
 /// - SessionLost: 磁盘 session=executing 且内存有状态但非 Running → 进程已死
 /// - SessionInvalid: active=false 或字段缺失 → 清理 session
+/// - IdleAtExecution: Execution 步骤中无会话，属于两个任务之间的正常空闲态
 /// - DataConflict: 与当前 milestone/mid_stage 不匹配 → cleanup
-/// - StartupRecoverable: 磁盘 session 存在但内存 PipelineState 尚未建立 → 保留等待恢复
 pub fn reconcile_execution_state(
     proj: &project::Project,
     pipeline_status: Option<&PipelineState>,
@@ -2051,9 +2472,8 @@ pub fn reconcile_execution_state(
     let session = match proj.execution_session.as_ref() {
         Some(s) => s,
         None => {
-            // No session at all — check if we're still in Execution step
             if proj.workflow_state.current_step == project::WorkflowStep::Execution {
-                return ExecutionReconciliation::SessionInvalid;
+                return ExecutionReconciliation::IdleAtExecution;
             }
             return ExecutionReconciliation::SessionInvalid;
         }
@@ -2089,7 +2509,11 @@ pub fn reconcile_execution_state(
         "executing" => {
             match pipeline_status {
                 // 内存 PipelineState 存在且正在运行 → 真执行中
-                Some(ps) if ps.status == PipelineStatus::Running => {
+                Some(ps)
+                    if ps.status == PipelineStatus::Running
+                        && (session.execution_id.is_empty()
+                            || ps.execution_id == session.execution_id) =>
+                {
                     ExecutionReconciliation::Executing
                 }
                 // 内存 PipelineState 存在但不在运行 → 进程已死
@@ -2112,7 +2536,9 @@ pub fn apply_execution_reconciliation(
     reconciliation: &ExecutionReconciliation,
 ) -> bool {
     match reconciliation {
-        ExecutionReconciliation::Executing | ExecutionReconciliation::AwaitingConfirmation => {
+        ExecutionReconciliation::IdleAtExecution
+        | ExecutionReconciliation::Executing
+        | ExecutionReconciliation::AwaitingConfirmation => {
             // Valid states — keep session, don't modify
             false
         }
@@ -2251,12 +2677,643 @@ fn find_current_subtask(proj: &project::Project) -> Option<project::Subtask> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    struct ProjectDataGuard {
+        path: PathBuf,
+    }
+
+    impl ProjectDataGuard {
+        fn new(project_name: &str) -> Result<Self, String> {
+            Ok(Self {
+                path: crate::project_data_path(project_name)?,
+            })
+        }
+    }
+
+    impl Drop for ProjectDataGuard {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("清理测试项目 {} 失败：{}", self.path.display(), error);
+                }
+            }
+        }
+    }
+
+    struct TempGitRepo {
+        path: PathBuf,
+    }
+
+    impl TempGitRepo {
+        fn new(label: &str) -> Result<Self, String> {
+            let path =
+                std::env::temp_dir().join(format!("metheus-{}-{}", label, uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path)
+                .map_err(|error| format!("创建临时 Git 目录失败：{}", error))?;
+            let repo = Self { path };
+            repo.git(&["init", "--quiet"])?;
+            repo.git(&["config", "user.name", "Metheus Test"])?;
+            repo.git(&["config", "user.email", "metheus-test@example.invalid"])?;
+            std::fs::write(repo.path.join("tracked.txt"), "baseline\n")
+                .map_err(|error| format!("写入 Git 测试基线失败：{}", error))?;
+            repo.git(&["add", "tracked.txt"])?;
+            repo.git(&["commit", "--quiet", "-m", "baseline"])?;
+            Ok(repo)
+        }
+
+        fn git(&self, args: &[&str]) -> Result<String, String> {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&self.path)
+                .output()
+                .map_err(|error| format!("运行 git {:?} 失败：{}", args, error))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "git {:?} 失败：{}",
+                    args,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+
+        fn path_string(&self) -> String {
+            self.path.to_string_lossy().to_string()
+        }
+
+        fn head(&self) -> Result<String, String> {
+            self.git(&["rev-parse", "HEAD"])
+        }
+    }
+
+    impl Drop for TempGitRepo {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!("清理临时 Git 目录 {} 失败：{}", self.path.display(), error);
+                }
+            }
+        }
+    }
+
+    fn unique_project_name(label: &str) -> String {
+        format!("test-{}-{}", label, uuid::Uuid::new_v4())
+    }
+
+    fn test_subtask(status: project::SubtaskStatus) -> project::Subtask {
+        project::Subtask {
+            id: "subtask-1".to_string(),
+            title: "测试小阶段".to_string(),
+            prompt: "执行测试".to_string(),
+            status,
+            test_report: String::new(),
+            execution_result: None,
+            test_result: None,
+            retry_count: 0,
+            auto_tag: None,
+            order: 1,
+            goal: String::new(),
+            allowed_file_paths: vec![],
+            new_file_paths: vec![],
+            evidence_files: vec![],
+            context_summary: String::new(),
+            acceptance_criteria: vec![],
+            stop_rules: vec![],
+            execution_prompt: String::new(),
+            confirmed_by_user: None,
+            confirmed_at: None,
+            confirmation_notes: None,
+        }
+    }
+
+    fn test_mid_stage(status: project::SubtaskStatus) -> project::MidStage {
+        project::MidStage {
+            id: "mid-1".to_string(),
+            title: "测试中阶段".to_string(),
+            version: "v0.1.1".to_string(),
+            order: Some(1),
+            status: project::MidStageStatus::InProgress,
+            subtasks: vec![test_subtask(status)],
+            domain: None,
+            test_log: None,
+            created_at: String::new(),
+            description: String::new(),
+            tech_focus: String::new(),
+            test_report: String::new(),
+            completed_at: None,
+            approved_at: None,
+            git_tag: String::new(),
+            plan_check_result: None,
+            plan_approved_at: Some("2026-07-20T00:00:00Z".to_string()),
+            plan_revision: 1,
+            plan_draft_revision: 1,
+            plan_generated_at: Some("2026-07-20T00:00:00Z".to_string()),
+            plan_regeneration_count: 0,
+        }
+    }
+
+    fn test_milestone(subtask_status: project::SubtaskStatus) -> project::Milestone {
+        project::Milestone {
+            id: "milestone-1".to_string(),
+            version: "v0.1".to_string(),
+            title: "测试大阶段".to_string(),
+            description: String::new(),
+            tech_stack: String::new(),
+            status: project::MilestoneStatus::InProgress,
+            mode: project::StageMode::Professional,
+            mid_stages: vec![test_mid_stage(subtask_status)],
+            subtasks: vec![],
+            qa_result: None,
+            git_commit_hash: String::new(),
+            decomposition_check: None,
+            review_status: None,
+            review_conclusion: None,
+            approved_at: None,
+            goal: String::new(),
+            scope: String::new(),
+            dependencies: vec![],
+            expected_output: String::new(),
+            acceptance_criteria: vec![],
+        }
+    }
+
+    fn execution_session(
+        status: &str,
+        execution_id: &str,
+        base_commit: &str,
+    ) -> project::ExecutionSession {
+        project::ExecutionSession {
+            execution_id: execution_id.to_string(),
+            active: true,
+            milestone_id: "milestone-1".to_string(),
+            mid_stage_id: "mid-1".to_string(),
+            subtask_id: "subtask-1".to_string(),
+            subtask_title: "测试小阶段".to_string(),
+            status: status.to_string(),
+            base_commit: base_commit.to_string(),
+            started_at: "2026-07-20T00:00:00Z".to_string(),
+            state_entered_at: "2026-07-20T00:00:00Z".to_string(),
+            plan_revision: 1,
+            subtask_index: 0,
+            total_subtasks: 1,
+        }
+    }
+
+    fn execution_project(
+        project_name: &str,
+        project_path: &Path,
+        subtask_status: project::SubtaskStatus,
+        session: Option<project::ExecutionSession>,
+    ) -> project::Project {
+        let mut proj = project::Project::new(project_name);
+        proj.project_path = project_path.to_string_lossy().to_string();
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id = "mid-1".to_string();
+        proj.milestones = vec![test_milestone(subtask_status)];
+        proj.execution_session = session;
+        proj
+    }
+
+    fn pipeline_state(execution_id: &str, status: PipelineStatus) -> PipelineState {
+        PipelineState {
+            execution_id: execution_id.to_string(),
+            mid_stage_id: "mid-1".to_string(),
+            status,
+            current_subtask_index: 0,
+            total_subtasks: 1,
+            subtask_statuses: vec![],
+            current_log: String::new(),
+            last_error: None,
+            child_pid: None,
+            project_name: String::new(),
+            milestone_id: "milestone-1".to_string(),
+            plan_revision: 1,
+            current_subtask_id: "subtask-1".to_string(),
+            awaiting_confirmation: false,
+            log_history: vec![],
+        }
+    }
 
     #[test]
     fn validate_quality_gate_requires_session() {
         let proj = crate::project::Project::new("test-qg");
         let result = validate_subtask_quality_gate(&proj);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("没有活跃的执行会话"));
+        assert!(result
+            .err()
+            .is_some_and(|error| error.contains("没有活跃的执行会话")));
+    }
+
+    #[test]
+    fn execution_history_is_appended_in_order_and_survives_reload() -> Result<(), String> {
+        let project_name = unique_project_name("history");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        write_execution_history(
+            &mut proj,
+            "info",
+            project::ExecutionEventType::UserExecute,
+            "first".to_string(),
+            None,
+            None,
+            None,
+        );
+        write_execution_history(
+            &mut proj,
+            "pause",
+            project::ExecutionEventType::UserEdStop,
+            "second".to_string(),
+            None,
+            None,
+            None,
+        );
+        write_execution_history(
+            &mut proj,
+            "error",
+            project::ExecutionEventType::QualityGateBlocked,
+            "third".to_string(),
+            None,
+            None,
+            None,
+        );
+        crate::save_project(&proj)?;
+        let reloaded = crate::load_project(&project_name)?;
+        let texts: Vec<&str> = reloaded
+            .execution_history
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["first", "second", "third"]);
+        Ok(())
+    }
+
+    #[test]
+    fn old_pipeline_state_without_execution_id_defaults_to_empty() -> Result<(), String> {
+        let mut value = serde_json::to_value(pipeline_state("execution-1", PipelineStatus::Idle))
+            .map_err(|error| format!("序列化流水线状态失败：{}", error))?;
+        let object = value
+            .as_object_mut()
+            .ok_or("流水线状态未序列化为对象".to_string())?;
+        object.remove("execution_id");
+        let restored: PipelineState = serde_json::from_value(value)
+            .map_err(|error| format!("反序列化旧流水线状态失败：{}", error))?;
+        assert!(restored.execution_id.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn execution_reconciliation_covers_idle_matching_and_lost_sessions() {
+        let empty_path = Path::new("");
+        let idle = execution_project("idle", empty_path, project::SubtaskStatus::Pending, None);
+        let idle_result = reconcile_execution_state(&idle, None);
+        assert!(matches!(
+            idle_result,
+            ExecutionReconciliation::IdleAtExecution
+        ));
+        let mut idle_copy = idle.clone();
+        assert!(!apply_execution_reconciliation(
+            &mut idle_copy,
+            &idle_result
+        ));
+        assert_eq!(
+            idle_copy.workflow_state.current_step,
+            project::WorkflowStep::Execution
+        );
+
+        let running_session = execution_session("executing", "execution-1", "HEAD");
+        let running = execution_project(
+            "running",
+            empty_path,
+            project::SubtaskStatus::Executing,
+            Some(running_session),
+        );
+        let matching_pipeline = pipeline_state("execution-1", PipelineStatus::Running);
+        assert!(matches!(
+            reconcile_execution_state(&running, Some(&matching_pipeline)),
+            ExecutionReconciliation::Executing
+        ));
+
+        let stale_pipeline = pipeline_state("execution-stale", PipelineStatus::Running);
+        assert!(matches!(
+            reconcile_execution_state(&running, Some(&stale_pipeline)),
+            ExecutionReconciliation::SessionLost
+        ));
+        let mut lost = running.clone();
+        let lost_result = reconcile_execution_state(&lost, None);
+        assert!(apply_execution_reconciliation(&mut lost, &lost_result));
+        assert_eq!(
+            lost.execution_session
+                .as_ref()
+                .map(|session| session.status.as_str()),
+            Some("session_lost")
+        );
+        assert_eq!(
+            lost.milestones[0].mid_stages[0].subtasks[0].status,
+            project::SubtaskStatus::Pending
+        );
+
+        let awaiting = execution_project(
+            "awaiting",
+            empty_path,
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(execution_session(
+                "awaiting_confirmation",
+                "execution-2",
+                "HEAD",
+            )),
+        );
+        assert!(matches!(
+            reconcile_execution_state(&awaiting, None),
+            ExecutionReconciliation::AwaitingConfirmation
+        ));
+    }
+
+    #[test]
+    fn dirty_git_workspace_is_not_ready() -> Result<(), String> {
+        let repo = TempGitRepo::new("workspace")?;
+        let clean = get_execution_workspace_status_inner(&repo.path_string())?;
+        assert!(clean.working_tree_clean);
+        assert!(clean.ready);
+
+        std::fs::write(repo.path.join("tracked.txt"), "dirty\n")
+            .map_err(|error| format!("写入脏工作区失败：{}", error))?;
+        let dirty = get_execution_workspace_status_inner(&repo.path_string())?;
+        assert!(!dirty.working_tree_clean);
+        assert!(!dirty.ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_background_execution_id_cannot_overwrite_current_session() -> Result<(), String>
+    {
+        let project_name = unique_project_name("stale-background");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = execution_project(
+            &project_name,
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(execution_session("executing", "execution-current", "HEAD")),
+        );
+        crate::save_project(&proj)?;
+        let pipeline = Arc::new(Mutex::new(Some(pipeline_state(
+            "execution-stale",
+            PipelineStatus::Running,
+        ))));
+
+        finalize_background_execution_failure(
+            &project_name,
+            "milestone-1",
+            "mid-1",
+            "subtask-1",
+            "测试小阶段",
+            0,
+            1,
+            "execution-stale",
+            "旧后台任务失败",
+            pipeline,
+        )
+        .await?;
+
+        let persisted = crate::load_project(&project_name)?;
+        assert_eq!(
+            persisted
+                .execution_session
+                .as_ref()
+                .map(|session| session.execution_id.as_str()),
+            Some("execution-current")
+        );
+        assert_eq!(
+            persisted.milestones[0].mid_stages[0].subtasks[0].status,
+            project::SubtaskStatus::Executing
+        );
+        assert!(persisted.execution_history.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_prefers_session_baseline_and_falls_back_to_head() -> Result<(), String> {
+        let repo = TempGitRepo::new("retry-session")?;
+        let baseline = repo.head()?;
+        std::fs::write(repo.path.join("tracked.txt"), "second commit\n")
+            .map_err(|error| format!("写入第二次提交失败：{}", error))?;
+        repo.git(&["add", "tracked.txt"])?;
+        repo.git(&["commit", "--quiet", "-m", "second"])?;
+        assert_ne!(repo.head()?, baseline);
+
+        let project_name = unique_project_name("retry-session");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::Rejected,
+            Some(execution_session(
+                "execution_failed",
+                "execution-retry",
+                &baseline,
+            )),
+        );
+        crate::save_project(&proj)?;
+        let updated = retry_current_subtask(project_name).await?;
+        assert_eq!(repo.head()?, baseline);
+        assert_eq!(
+            updated.milestones[0].mid_stages[0].subtasks[0].status,
+            project::SubtaskStatus::Pending
+        );
+        assert_eq!(
+            updated.milestones[0].mid_stages[0].subtasks[0].retry_count,
+            1
+        );
+        assert!(updated.execution_session.is_none());
+        assert!(updated
+            .execution_history
+            .iter()
+            .any(|entry| entry.event_type == project::ExecutionEventType::RetryScheduled));
+
+        let head_repo = TempGitRepo::new("retry-head")?;
+        std::fs::write(head_repo.path.join("tracked.txt"), "dirty tracked\n")
+            .map_err(|error| format!("写入 HEAD 回退测试修改失败：{}", error))?;
+        std::fs::write(head_repo.path.join("untracked.txt"), "dirty untracked\n")
+            .map_err(|error| format!("写入 HEAD 回退测试新文件失败：{}", error))?;
+        let head_project_name = unique_project_name("retry-head");
+        let _head_guard = ProjectDataGuard::new(&head_project_name)?;
+        let head_project = execution_project(
+            &head_project_name,
+            &head_repo.path,
+            project::SubtaskStatus::Rejected,
+            None,
+        );
+        crate::save_project(&head_project)?;
+        retry_current_subtask(head_project_name).await?;
+        let workspace = get_execution_workspace_status_inner(&head_repo.path_string())?;
+        assert!(workspace.working_tree_clean);
+        assert!(workspace.ready);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_stop_primitives_terminate_process_and_restore_clean_git() -> Result<(), String> {
+        let repo = TempGitRepo::new("in-stop")?;
+        let baseline = repo.head()?;
+        std::fs::write(repo.path.join("tracked.txt"), "execution change\n")
+            .map_err(|error| format!("写入 In Stop 测试修改失败：{}", error))?;
+        std::fs::write(repo.path.join("untracked.txt"), "execution output\n")
+            .map_err(|error| format!("写入 In Stop 测试新文件失败：{}", error))?;
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .map_err(|error| format!("启动 In Stop 测试进程失败：{}", error))?;
+        terminate_execution_process(child.id()).await?;
+        child
+            .wait()
+            .map_err(|error| format!("等待 In Stop 测试进程退出失败：{}", error))?;
+
+        restore_git_execution_baseline(&repo.path_string(), &baseline)?;
+        assert_eq!(repo.head()?, baseline);
+        let workspace = get_execution_workspace_status_inner(&repo.path_string())?;
+        assert!(workspace.working_tree_clean);
+        assert!(workspace.ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_execution_start_is_rejected_before_launch() -> Result<(), String> {
+        let pipeline = Arc::new(Mutex::new(Some(pipeline_state(
+            "execution-active",
+            PipelineStatus::Running,
+        ))));
+
+        let result = acquire_pipeline_start(&pipeline).await;
+        assert!(result.is_err());
+        assert!(result
+            .err()
+            .is_some_and(|error| error.contains("已有小阶段正在执行")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn in_stop_transition_restores_project_and_persists_history() -> Result<(), String> {
+        let repo = TempGitRepo::new("in-stop-transition")?;
+        let baseline = repo.head()?;
+        std::fs::write(repo.path.join("tracked.txt"), "execution change\n")
+            .map_err(|error| format!("写入 In Stop 跟踪修改失败：{}", error))?;
+        std::fs::write(repo.path.join("untracked.txt"), "execution output\n")
+            .map_err(|error| format!("写入 In Stop 未跟踪文件失败：{}", error))?;
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .map_err(|error| format!("启动 In Stop 测试进程失败：{}", error))?;
+        let project_name = unique_project_name("in-stop-transition");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::Executing,
+            Some(execution_session("executing", "execution-stop", &baseline)),
+        );
+        let mut pipeline_value = pipeline_state("execution-stop", PipelineStatus::Running);
+        pipeline_value.child_pid = Some(child.id());
+        let pipeline = Arc::new(Mutex::new(Some(pipeline_value)));
+
+        request_in_stop_with_pipeline_state(pipeline.clone(), &mut proj).await?;
+        child
+            .wait()
+            .map_err(|error| format!("等待 In Stop 测试进程退出失败：{}", error))?;
+
+        assert_eq!(
+            proj.workflow_state.current_step,
+            project::WorkflowStep::PauseDecision
+        );
+        assert!(proj.execution_session.is_none());
+        assert_eq!(
+            proj.milestones[0].mid_stages[0].subtasks[0].status,
+            project::SubtaskStatus::Pending
+        );
+        assert_eq!(
+            proj.pause_context
+                .as_ref()
+                .map(|context| context.pause_type.as_str()),
+            Some("in_stop")
+        );
+        assert!(proj
+            .execution_history
+            .iter()
+            .any(|entry| entry.event_type == project::ExecutionEventType::UserInStop));
+
+        let pipeline_after = pipeline.lock().await;
+        assert_eq!(
+            pipeline_after.as_ref().map(|state| &state.status),
+            Some(&PipelineStatus::Paused)
+        );
+        drop(pipeline_after);
+
+        crate::save_project(&proj)?;
+        let reloaded = crate::load_project(&project_name)?;
+        assert_eq!(
+            reloaded.workflow_state.current_step,
+            project::WorkflowStep::PauseDecision
+        );
+        assert!(reloaded
+            .execution_history
+            .iter()
+            .any(|entry| entry.event_type == project::ExecutionEventType::UserInStop));
+        assert_eq!(repo.head()?, baseline);
+        let workspace = get_execution_workspace_status_inner(&repo.path_string())?;
+        assert!(workspace.working_tree_clean);
+        assert!(workspace.ready);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ed_stop_requires_running_session_and_is_idempotent() -> Result<(), String> {
+        let mut executing = execution_project(
+            "ed-stop",
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(execution_session("executing", "execution-ed", "HEAD")),
+        );
+        let pipeline = Arc::new(Mutex::new(Some(pipeline_state(
+            "execution-ed",
+            PipelineStatus::Running,
+        ))));
+
+        request_ed_stop_with_pipeline_state(pipeline.clone(), &mut executing).await?;
+        assert_eq!(
+            executing
+                .pause_context
+                .as_ref()
+                .map(|context| context.pending_action.as_str()),
+            Some("ed_stop_requested")
+        );
+        assert_eq!(executing.execution_history.len(), 1);
+        assert_eq!(
+            executing.workflow_state.pause_reason,
+            project::PauseReason::EDStop
+        );
+
+        request_ed_stop_with_pipeline_state(pipeline, &mut executing).await?;
+        assert_eq!(executing.execution_history.len(), 1);
+
+        let mut planning = execution_project(
+            "ed-stop-planning",
+            Path::new(""),
+            project::SubtaskStatus::Pending,
+            None,
+        );
+        let planning_pipeline = Arc::new(Mutex::new(None));
+        let result = request_ed_stop_with_pipeline_state(planning_pipeline, &mut planning).await;
+        assert!(result.is_err());
+        assert!(planning.execution_history.is_empty());
+        assert!(planning.pause_context.is_none());
+        Ok(())
     }
 }

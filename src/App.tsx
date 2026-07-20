@@ -201,6 +201,19 @@ function App() {
   // === 决策层统一提交锁（同一时间只能执行一个关键动作） ===
   const [decisionAction, setDecisionAction] = useState<string | null>(null);
   const isDecisionSubmitting = decisionAction !== null;
+  const [consoleAction, setConsoleAction] = useState<string | null>(null);
+  const consoleActionRef = useRef<string | null>(null);
+  const beginConsoleAction = useCallback((action: string) => {
+    if (consoleActionRef.current !== null) return false;
+    consoleActionRef.current = action;
+    setConsoleAction(action);
+    return true;
+  }, []);
+  const endConsoleAction = useCallback(() => {
+    consoleActionRef.current = null;
+    setConsoleAction(null);
+  }, []);
+  const isConsoleBusy = consoleAction !== null;
 
   const [testLogs, setTestLogs] = useState<TestLog[]>([]);
   // === 执行工作区状态（供 V1ExecutionPanel 和 TaskConsole 共用） ===
@@ -284,6 +297,7 @@ function App() {
             // subtask_statuses/log_history are lost (only in memory), but UI can still
             // show the confirmation prompt from session data.
             setExecutionStatus({
+              execution_id: session.execution_id,
               mid_stage_id: session.mid_stage_id,
               status: "Paused",
               current_subtask_index: session.subtask_index,
@@ -305,6 +319,7 @@ function App() {
         .catch(() => {
           // Can't reach backend — minimal fallback
           setExecutionStatus({
+            execution_id: session.execution_id,
             mid_stage_id: session.mid_stage_id,
             status: "Paused",
             current_subtask_index: session.subtask_index,
@@ -355,6 +370,7 @@ function App() {
   const executionPollFailuresRef = useRef(0);
   // 执行状态轮询定时器
   const executionPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const executionPollingActiveRef = useRef(false);
 
   // === 托管层驱动循环 ===
   // 覆盖范围：ThreeChecks → PlanApproval → Console → MilestoneGeneration → MilestoneCheck → MilestoneApproval
@@ -401,6 +417,30 @@ function App() {
 
       // 代次失效检查
       if (autopilotGenerationRef.current !== generation) return;
+
+      // 终止字段是后端强制契约，必须先于 result_kind 处理。
+      if (next.is_error || !next.command) {
+        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+        if (autopilotGenerationRef.current !== generation) return;
+        handleChatComplete(latest);
+        if (next.is_error) {
+          setFeedbackMsg({
+            type: "error",
+            message: next.error_message || next.description || "自动驾驶已因未知错误停止。",
+          });
+        } else if (next.at_milestone_boundary) {
+          setFeedbackMsg({
+            type: "warning",
+            message: next.description || "已到达大阶段边界，请完成人工审阅。",
+          });
+        } else {
+          setFeedbackMsg({
+            type: "info",
+            message: next.description || "自动驾驶已暂停。",
+          });
+        }
+        return;
+      }
 
       switch (next.result_kind) {
         case "ProjectState": {
@@ -506,6 +546,7 @@ function App() {
           errorDetail: errorMsg.slice(0, 2048),
         });
         handleChatComplete(updated);
+        setFeedbackMsg({ type: "error", message: `自动驾驶已停止：${errorMsg}` });
       } catch (markError) {
         console.error("[autopilot] Failed to persist error state:", markError);
         // 无法持久化时仍尝试同步，但标记警告
@@ -520,29 +561,71 @@ function App() {
     }
   }, []);
 
-  /** 执行状态轮询：在执行命令发出后持续监控流水线状态 */
-  const startExecutionPolling = useCallback(async (projectName: string, generation: number) => {
+  /** 手动执行和自动驾驶共用的唯一执行状态轮询入口。 */
+  const startExecutionPolling = useCallback(async (projectName: string, generation?: number) => {
+    if (executionPollingActiveRef.current) return;
+    executionPollingActiveRef.current = true;
     executionPollFailuresRef.current = 0;
 
     const poll = async () => {
-      if (autopilotGenerationRef.current !== generation) return;
+      if (generation !== undefined && autopilotGenerationRef.current !== generation) {
+        executionPollingActiveRef.current = false;
+        return;
+      }
       try {
-        const status = await invokeWithTimeout<PipelineState>("get_execution_status", {});
-        if (autopilotGenerationRef.current !== generation) return;
+        const status = await invokeWithTimeout<PipelineState | null>("get_execution_status", {});
+        if (generation !== undefined && autopilotGenerationRef.current !== generation) {
+          executionPollingActiveRef.current = false;
+          return;
+        }
+        if (!status) {
+          executionPollingActiveRef.current = false;
+          setIsExecuting(false);
+          setFeedbackMsg({
+            type: "error",
+            message: "执行状态已丢失。请同步项目状态后重试，避免重复启动任务。",
+          });
+          return;
+        }
 
         executionPollFailuresRef.current = 0; // 重置失败计数
         setExecutionStatus(status);
         setIsExecuting(status.status === "Running");
 
+        const newLogs: TestLog[] = [];
+        for (const item of status.subtask_statuses ?? []) {
+          if (processedSubtaskIdsRef.current.has(item.subtask_id)) continue;
+          if (item.test_result && (item.status === "passed" || item.status === "retrying")) {
+            processedSubtaskIdsRef.current.add(item.subtask_id);
+            const testResult = item.test_result;
+            const reason = testResult.passed
+              ? ((testResult.issues ?? []).join("\n") || "通过测试")
+              : `不通过: ${testResult.suggestion || "未提供建议"}`;
+            newLogs.push({
+              subtask_title: item.title,
+              status: item.status === "retrying" ? "retried" : "passed",
+              reason,
+              full_report: testResult.suggestion || undefined,
+            });
+          }
+        }
+        if (newLogs.length > 0) setTestLogs((previous) => [...previous, ...newLogs]);
+
         if (status.status === "Running") {
-          // 继续轮询
           executionPollTimerRef.current = setTimeout(poll, EXECUTION_POLL_INTERVAL_MS);
         } else {
-          // 执行结束，读取磁盘项目事实
+          executionPollingActiveRef.current = false;
+          executionPollTimerRef.current = null;
           const latest = await invokeWithTimeout<Project>("get_project", { projectName });
           handleChatComplete(latest);
-          // 如果自动驾驶仍活跃，继续驱动
+          if (status.status === "Failed") {
+            setFeedbackMsg({
+              type: "error",
+              message: status.last_error || "后台执行失败，请查看阶段日志后重试。",
+            });
+          }
           if (
+            generation !== undefined &&
             autopilotGenerationRef.current === generation &&
             autopilotActiveRef.current &&
             latest.workflow_state.autopilot_active &&
@@ -553,24 +636,37 @@ function App() {
             }, AUTOPILOT_STEP_DELAY_MS);
           }
         }
-      } catch (_) {
+      } catch (error) {
         executionPollFailuresRef.current += 1;
         if (executionPollFailuresRef.current >= EXECUTION_POLL_MAX_FAILURES) {
-          console.error("[autopilot] Execution polling exceeded max failures, stopping.");
-          // 同步磁盘项目并禁止自动发送下一动作
+          executionPollingActiveRef.current = false;
+          executionPollTimerRef.current = null;
+          setIsExecuting(false);
+          const pollError = error instanceof Error ? error.message : String(error);
+          setFeedbackMsg({
+            type: "error",
+            message: `执行状态连续同步失败：${pollError}。请检查后端连接并手动同步项目。`,
+          });
           try {
             const latest = await invokeWithTimeout<Project>("get_project", { projectName });
             handleChatComplete(latest);
-          } catch (_) {}
+          } catch (syncError) {
+            console.error("执行轮询失败后同步项目失败:", syncError);
+          }
           return;
         }
-        // 继续尝试
         executionPollTimerRef.current = setTimeout(poll, EXECUTION_POLL_INTERVAL_MS);
       }
     };
 
     poll();
   }, []);
+
+  // 启动恢复只需恢复 isExecuting，此 effect 会接入同一轮询入口。
+  useEffect(() => {
+    if (!isExecuting || !project || executionPollingActiveRef.current) return;
+    startExecutionPolling(project.name);
+  }, [isExecuting, project?.name, startExecutionPolling]);
 
   // === 托管层驱动循环 ===
   // 调用 managed_next_step 获取下一步建议，执行返回的原子命令，循环推进
@@ -760,112 +856,6 @@ function App() {
     // takeSnapshot 通过闭包读取最新 state，不放入 deps 以避免循环
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project, viewMode.phase, sidebarWidth]);
-
-  // === 阶段一关键修复：执行状态轮询 ===
-  // 覆盖 V1 恢复场景（刷新时后端仍在执行）和旧流水线场景。
-  // 轮询条件：isExecuting 为真（由恢复 effect 或旧流水线设置）。
-  // 轮询内部额外检查当前工作流步骤，非 Execution 时停止。
-  useEffect(() => {
-    if (!isExecuting) return;
-
-    const interval = setInterval(async () => {
-      try {
-        // 若工作流步骤已离开 Execution，停止轮询
-        const current = projectRef.current;
-        if (current && current.workflow_state.current_step !== "Execution") {
-          setIsExecuting(false);
-          return;
-        }
-
-        const status = await invokeWithTimeout<PipelineState | null>("get_execution_status");
-        if (!status) {
-          // No memory state — if we're polling from recovery, the backend may have exited.
-          // Keep polling for a bit; the recovery effect handles the fallback.
-          return;
-        }
-        setExecutionStatus(status);
-
-        // 执行中定期刷新快照，确保 running_pid（孤儿进程保护用）保持最新
-        takeSnapshot();
-
-        // 从执行状态中提取测试日志（去重）
-        if (status.subtask_statuses) {
-          const newLogs: TestLog[] = [];
-          for (const item of status.subtask_statuses) {
-            if (processedSubtaskIdsRef.current.has(item.subtask_id)) continue;
-            if (item.test_result && (item.status === "passed" || item.status === "retrying")) {
-              processedSubtaskIdsRef.current.add(item.subtask_id);
-              const tr = item.test_result;
-              let reason: string;
-              if (tr.passed && (!tr.issues || tr.issues.length === 0)) {
-                reason = "通过测试";
-              } else if (!tr.passed) {
-                reason = "不通过: " + (tr.suggestion || "未提供建议");
-              } else {
-                reason = (tr.issues || []).join("\n");
-              }
-              newLogs.push({
-                subtask_title: item.title,
-                status: item.status === "retrying" ? "retried" : "passed",
-                reason,
-                full_report: tr.suggestion || undefined,
-              });
-            }
-          }
-          if (newLogs.length > 0) {
-            setTestLogs((prev) => [...prev, ...newLogs]);
-          }
-        }
-
-        // V1: awaiting_confirmation — stop polling, let V1ExecutionPanel handle it
-        if (status.awaiting_confirmation) {
-          setIsExecuting(false);
-          // Refresh project to get latest disk state
-          if (project) {
-            invokeWithTimeout<Project>("get_project", { projectName: project.name })
-              .then((updatedProject) => {
-                handleChatComplete(updatedProject);
-              })
-              .catch((err) => {
-                console.error("刷新项目数据失败:", err);
-              });
-          }
-          clearInterval(interval);
-          return;
-        }
-
-        if (status.status === "Paused") {
-          // Old pipeline pause — switch to discussion
-          setIsExecuting(false);
-          handleAddMessage({
-            id: `sys-${Date.now()}`,
-            role: 'system',
-            content: '⏸️ 执行已暂停。讨论修改方向后，点击恢复执行继续。',
-            timestamp: Date.now(),
-          });
-          enterDiscussionMode('paused');
-          clearInterval(interval);
-        } else if (status.status === "Completed") {
-          setIsExecuting(false);
-          clearInterval(interval);
-          invokeWithTimeout<Project>("get_project", { projectName: project?.name ?? "" })
-            .then((updatedProject) => {
-              handleChatComplete(updatedProject);
-            })
-            .catch((err) => {
-              console.error("刷新项目数据失败:", err);
-            });
-        } else if (status.status === "Failed") {
-          setIsExecuting(false);
-          clearInterval(interval);
-        }
-      } catch (e) {
-        console.error("轮询状态失败:", e);
-      }
-    }, 2000);
-
-    return () => clearInterval(interval);
-  }, [isExecuting, project, enterDiscussionMode, handleAddMessage, handleChatComplete, takeSnapshot]);
 
   // 大阶段完成检测：当所有中阶段执行完成后，自动插入总结消息
   useEffect(() => {
@@ -1260,31 +1250,37 @@ function App() {
 
   // === V1 暂停：In Stop ===
   const handleInStop = async () => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("in_stop")) return;
     try {
       const updated = await invokeWithTimeout<Project>("request_in_stop", { projectName: project.name });
       handleChatComplete(updated);
       setIsExecuting(false);
       setExecutionStatus(null);
+      setFeedbackMsg({ type: "warning", message: "执行已暂停并恢复到安全基线。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "暂停失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   // === V1 暂停：ED Stop ===
   const handleEdStop = async () => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("ed_stop")) return;
     try {
       const updated = await invokeWithTimeout<Project>("request_ed_stop", { projectName: project.name });
       handleChatComplete(updated);
+      setFeedbackMsg({ type: "info", message: "将在当前任务完成并确认后暂停。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "ED Stop 请求失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   // === V1 暂停决策：继续/调整/回退 ===
   const handleResolvePause = async (action: string) => {
-    if (!project) return;
+    if (!project || !beginConsoleAction(`pause_${action}`)) return;
     try {
       const updated = await invokeWithTimeout<Project>("resolve_pause_decision", {
         projectName: project.name,
@@ -1296,12 +1292,14 @@ function App() {
       }
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "决策失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   // === V1 回退预览 ===
   const handlePreviewRollback = async (checkpointSubtaskId: string): Promise<RollbackImpact | null> => {
-    if (!project) return null;
+    if (!project || !beginConsoleAction("rollback_preview")) return null;
     try {
       const impact = await invokeWithTimeout<RollbackImpact>("preview_rollback_impact", {
         projectName: project.name,
@@ -1311,12 +1309,14 @@ function App() {
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "预览失败：" + String(err) });
       return null;
+    } finally {
+      endConsoleAction();
     }
   };
 
   // === V1 确认回退 ===
   const handleConfirmRollback = async (checkpointSubtaskId: string) => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("rollback_confirm")) return;
     try {
       const updated = await invokeWithTimeout<Project>("confirm_rollback", {
         projectName: project.name,
@@ -1326,33 +1326,55 @@ function App() {
       setFeedbackMsg({ type: "success", message: "回退已完成。请重新生成执行计划。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "回退失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   // V1: 回退后不自动触发生成。pendingRollbackGenerate 已移除。
 
+  const handlePrepareExecutionWorkspace = async () => {
+    if (!project || !beginConsoleAction("prepare_workspace")) return;
+    try {
+      const status = await invokeWithTimeout<ExecutionWorkspaceStatus>("prepare_execution_workspace", {
+        projectName: project.name,
+      });
+      setWorkspaceStatus(status);
+      setFeedbackMsg({
+        type: status.ready ? "success" : "warning",
+        message: status.status_message,
+      });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "准备执行工作区失败：" + String(err) });
+    } finally {
+      endConsoleAction();
+    }
+  };
+
   // === V1 人工执行：执行当前小阶段 ===
   const handleExecuteCurrentSubtask = async () => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("execute_subtask")) return;
     try {
       const status = await invokeWithTimeout<PipelineState>("execute_current_subtask", {
         projectName: project.name,
       });
       setExecutionStatus(status);
-      if (status.awaiting_confirmation) {
-        // Refresh project to get updated subtask status
-        const updated = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
-        handleChatComplete(updated);
+      setIsExecuting(status.status === "Running");
+      if (status.status === "Running") {
+        startExecutionPolling(project.name);
       }
+      setFeedbackMsg({ type: "info", message: "小阶段已启动，正在后台执行。" });
     } catch (err) {
       console.error("执行失败:", err);
       setFeedbackMsg({ type: "error", message: "执行失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   // === V1 人工执行：确认通过 ===
   const handleConfirmSubtask = async () => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("confirm_subtask")) return;
     try {
       const updated = await invokeWithTimeout<Project>("confirm_subtask_result", {
         projectName: project.name,
@@ -1362,12 +1384,14 @@ function App() {
       setFeedbackMsg({ type: "success", message: "小阶段已确认通过，Git 标签已创建。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "确认失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   // === V1 人工执行：驳回 ===
   const handleRejectSubtask = async (reason: string) => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("reject_subtask")) return;
     try {
       const updated = await invokeWithTimeout<Project>("reject_subtask_result", {
         projectName: project.name,
@@ -1378,12 +1402,14 @@ function App() {
       setFeedbackMsg({ type: "warning", message: "小阶段已驳回：" + reason });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "驳回失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   // === V1 人工执行：恢复基线并重试 ===
   const handleRetryCurrentSubtask = async () => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("retry_subtask")) return;
     try {
       const updated = await invokeWithTimeout<Project>("retry_current_subtask", {
         projectName: project.name,
@@ -1393,12 +1419,14 @@ function App() {
       setFeedbackMsg({ type: "info", message: "已恢复执行基线，可重新执行小阶段。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "重试失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   // === 自动驾驶控制 ===
   const handleToggleAutopilot = async (active: boolean) => {
-    if (!project) return;
+    if (!project || !beginConsoleAction(active ? "autopilot_start" : "autopilot_stop")) return;
     try {
       const updated = await invokeWithTimeout<Project>("toggle_autopilot", {
         projectName: project.name,
@@ -1411,11 +1439,13 @@ function App() {
       });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "切换自动驾驶失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   const handleAutopilotPauseNow = async () => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("autopilot_pause")) return;
     try {
       const updated = await invokeWithTimeout<Project>("autopilot_pause", {
         projectName: project.name,
@@ -1424,11 +1454,13 @@ function App() {
       setFeedbackMsg({ type: "info", message: "自动驾驶已暂停。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "暂停失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   const handleAutopilotPauseAfterCurrent = async () => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("autopilot_ed_stop")) return;
     try {
       const updated = await invokeWithTimeout<Project>("request_ed_stop", {
         projectName: project.name,
@@ -1437,11 +1469,13 @@ function App() {
       setFeedbackMsg({ type: "info", message: "将在当前任务完成后暂停。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "ED Stop 失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   const handleAutopilotResume = async () => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("autopilot_resume")) return;
     try {
       const updated = await invokeWithTimeout<Project>("autopilot_resume", {
         projectName: project.name,
@@ -1450,12 +1484,14 @@ function App() {
       setFeedbackMsg({ type: "info", message: "自动驾驶已恢复。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "恢复失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   // === 启动恢复确认：用户看到中断提示后清理恢复标记 ===
   const handleAcknowledgeExecutionRecovery = async () => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("acknowledge_recovery")) return;
     try {
       const updated = await invokeWithTimeout<Project>("acknowledge_execution_recovery", {
         projectName: project.name,
@@ -1464,12 +1500,14 @@ function App() {
       setFeedbackMsg({ type: "info", message: "执行恢复状态已确认。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "确认失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   // === V1 手动同步项目状态（不依赖浏览器 reload） ===
   const handleSyncProject = async () => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("sync_project")) return;
     try {
       const updated = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
       handleChatComplete(updated);
@@ -1484,6 +1522,8 @@ function App() {
       setFeedbackMsg({ type: "info", message: "项目状态已同步。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "同步项目状态失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
@@ -1491,39 +1531,50 @@ function App() {
   // V1: enter_milestone_review is called via invokeWithTimeout directly when needed
 
   const handleApproveMilestoneOutcome = async (branch: string) => {
-    if (!project) return;
+    if (!project || !beginConsoleAction(`milestone_review_${branch}`)) return;
     try {
       const updated = await invokeWithTimeout<Project>("approve_milestone_outcome", {
         projectName: project.name,
         branch,
       });
       handleChatComplete(updated);
-      if (branch === "A") {
-        setFeedbackMsg({ type: "success", message: "大阶段已批准。" });
-      }
+      const messages: Record<string, string> = {
+        A: updated.workflow_state.current_step === "Completed"
+          ? "最后一个大阶段已批准，项目流程已完成。"
+          : "大阶段已批准，已进入下一大阶段。",
+        B: "已进入修正过去流程，自动驾驶保持暂停。",
+        C: "已进入调整未来流程，自动驾驶保持暂停。",
+      };
+      setFeedbackMsg({ type: "success", message: messages[branch] ?? "大阶段审阅决策已提交。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "决策失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   const handleSuggestRollback = async () => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("suggest_rollback")) return;
     try {
       const suggestion = await invokeWithTimeout<string>("suggest_rollback_checkpoint", { projectName: project.name });
       handleAddMessage({ id: `sys-${Date.now()}`, role: "assistant", content: suggestion, timestamp: Date.now() });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "建议生成失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
   const handleGenerateFutureMilestones = async () => {
-    if (!project) return;
+    if (!project || !beginConsoleAction("generate_future_milestones")) return;
     try {
       const updated = await invokeWithTimeout<Project>("generate_future_milestone_draft", { projectName: project.name });
       handleChatComplete(updated);
       setFeedbackMsg({ type: "success", message: "未来大阶段草稿已生成，请在 Console 中检查和批准。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "生成失败：" + String(err) });
+    } finally {
+      endConsoleAction();
     }
   };
 
@@ -1718,7 +1769,7 @@ function App() {
               <AutopilotControlBar
                 project={project}
                 executionStatus={executionStatus}
-                busy={false}
+                busy={isConsoleBusy}
                 onToggle={handleToggleAutopilot}
                 onPauseNow={handleAutopilotPauseNow}
                 onPauseAfterCurrent={handleAutopilotPauseAfterCurrent}
@@ -1727,6 +1778,13 @@ function App() {
                 onRetryCurrent={handleRetryCurrentSubtask}
                 onAcknowledgeRecovery={handleAcknowledgeExecutionRecovery}
               />
+              {feedbackMsg && (
+                <FeedbackBanner
+                  type={feedbackMsg.type}
+                  message={feedbackMsg.message}
+                  style={{ marginBottom: "16px", flexShrink: 0 }}
+                />
+              )}
               {/* V1 Console 规划闭环：大阶段 → 中阶段 → 执行计划 */}
               {(step === "MilestoneGeneration" || step === "MilestoneCheck" ||
                 step === "MilestoneApproval" || step === "MilestoneSelection" ||
@@ -1736,6 +1794,10 @@ function App() {
                 <ConsoleWorkflowPanel
                   project={project}
                   onProjectUpdated={handleChatComplete}
+                  externalBusy={isConsoleBusy}
+                  onActionStart={beginConsoleAction}
+                  onActionEnd={endConsoleAction}
+                  onFeedback={setFeedbackMsg}
                 />
               )}
               {/* V1 执行阶段 UI — 仅在 Execution 步骤渲染 */}
@@ -1745,7 +1807,8 @@ function App() {
                     project={project}
                     executionStatus={executionStatus}
                     workspaceStatus={workspaceStatus}
-                    onWorkspaceStatusChange={setWorkspaceStatus}
+                    busy={isConsoleBusy}
+                    onPrepareWorkspace={handlePrepareExecutionWorkspace}
                     onExecute={handleExecuteCurrentSubtask}
                     onConfirm={handleConfirmSubtask}
                     onReject={handleRejectSubtask}
@@ -1771,6 +1834,7 @@ function App() {
                   onContinue={() => handleResolvePause("continue")}
                   onAdjustOnly={() => handleResolvePause("adjust")}
                   onRollback={() => handleResolvePause("rollback")}
+                  busy={isConsoleBusy}
                 />
               )}
               {/* V1 回退预览 */}
@@ -1788,6 +1852,7 @@ function App() {
                   onContinue={() => handleApproveMilestoneOutcome("A")}
                   onFixPast={() => handleApproveMilestoneOutcome("B")}
                   onAdjustFuture={() => handleApproveMilestoneOutcome("C")}
+                  busy={isConsoleBusy}
                 />
               )}
               {/* V1 分支讨论 (B/C) */}
@@ -1805,6 +1870,10 @@ function App() {
                 <ConsoleWorkflowPanel
                   project={project}
                   onProjectUpdated={handleChatComplete}
+                  externalBusy={isConsoleBusy}
+                  onActionStart={beginConsoleAction}
+                  onActionEnd={endConsoleAction}
+                  onFeedback={setFeedbackMsg}
                 />
               )}
               {/* 未识别步骤只显示错误，不回退到旧业务控制台。 */}
@@ -1850,11 +1919,13 @@ function App() {
 // V1 执行面板：单小阶段执行 + 人工确认
 // ============================================================
 function V1ExecutionPanel({
-  project, executionStatus, workspaceStatus, onWorkspaceStatusChange, onExecute, onConfirm, onReject, onRetry, onInStop, onEdStop, onSyncProject,
+  project, executionStatus, workspaceStatus, busy: externalBusy,
+  onPrepareWorkspace, onExecute, onConfirm, onReject, onRetry, onInStop, onEdStop, onSyncProject,
 }: {
   project: Project; executionStatus: PipelineState | null;
   workspaceStatus: ExecutionWorkspaceStatus | null;
-  onWorkspaceStatusChange: (status: ExecutionWorkspaceStatus) => void;
+  busy: boolean;
+  onPrepareWorkspace: () => Promise<void>;
   onExecute: () => Promise<void>; onConfirm: () => Promise<void>;
   onReject: (reason: string) => Promise<void>;
   onRetry: () => Promise<void>;
@@ -1862,8 +1933,9 @@ function V1ExecutionPanel({
   onSyncProject: () => Promise<void>;
 }) {
   const [rejectReason, setRejectReason] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [localBusy, setLocalBusy] = useState(false);
   const [showReject, setShowReject] = useState(false);
+  const busy = externalBusy || localBusy;
 
   const ms = project.milestones.find(m => m.id === project.current_milestone_id);
   const mid = ms?.mid_stages.find(m => m.id === project.current_mid_stage_id);
@@ -1879,36 +1951,33 @@ function V1ExecutionPanel({
 
   const handlePrepareWorkspace = async () => {
     if (!project || busy) return;
-    setBusy(true);
+    setLocalBusy(true);
     try {
-      const status = await invokeWithTimeout<ExecutionWorkspaceStatus>("prepare_execution_workspace", { projectName: project.name });
-      onWorkspaceStatusChange(status);
-    } catch (err) {
-      console.error("准备执行工作区失败:", err);
+      await onPrepareWorkspace();
     } finally {
-      setBusy(false);
+      setLocalBusy(false);
     }
   };
 
   const handleConfirm = async () => {
-    setBusy(true);
+    setLocalBusy(true);
     await onConfirm();
-    setBusy(false);
+    setLocalBusy(false);
   };
 
   const handleReject = async () => {
     if (!rejectReason.trim()) return;
-    setBusy(true);
+    setLocalBusy(true);
     await onReject(rejectReason.trim());
     setRejectReason("");
     setShowReject(false);
-    setBusy(false);
+    setLocalBusy(false);
   };
 
   const handleRetry = async () => {
-    setBusy(true);
+    setLocalBusy(true);
     await onRetry();
-    setBusy(false);
+    setLocalBusy(false);
   };
 
   // 质量判定：判断当前待确认任务是否可以确认通过
@@ -2006,7 +2075,7 @@ function V1ExecutionPanel({
             </div>
           </div>
           <ActionButton icon={<Play size={16} />} loading={busy || isExecuting} loadingLabel={isExecuting ? "执行中" : "启动中"}
-            onClick={async () => { setBusy(true); await onExecute(); setBusy(false); }}>执行当前小阶段</ActionButton>
+            onClick={async () => { setLocalBusy(true); await onExecute(); setLocalBusy(false); }}>执行当前小阶段</ActionButton>
           <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
             一次只执行一个已批准小阶段。执行完成后需要人工确认结果。
           </p>
@@ -2028,7 +2097,7 @@ function V1ExecutionPanel({
                 icon={<Square size={16} />}
                 variant="danger"
                 disabled={busy}
-                onClick={async () => { setBusy(true); await onInStop(); setBusy(false); }}
+                onClick={async () => { setLocalBusy(true); await onInStop(); setLocalBusy(false); }}
                 fullWidth
               >
                 立即暂停 (In Stop)
@@ -2042,7 +2111,7 @@ function V1ExecutionPanel({
                 icon={<Pause size={16} />}
                 variant="secondary"
                 disabled={busy}
-                onClick={async () => { setBusy(true); await onEdStop(); setBusy(false); }}
+                onClick={async () => { setLocalBusy(true); await onEdStop(); setLocalBusy(false); }}
                 fullWidth
               >
                 完成后暂停 (ED Stop)

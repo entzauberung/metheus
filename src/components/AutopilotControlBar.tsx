@@ -25,6 +25,18 @@ export function AutopilotControlBar({
   const apState = project.workflow_state.autopilot_state;
   const mfActive = project.workflow_state.managed_flow_state?.active === true;
   const isExecuting = executionStatus?.status === "Running";
+  const activationSteps = new Set([
+    "MilestoneSelection", "MidStageGeneration", "MidStageCheck", "MidStageApproval",
+    "MidStageSelection", "PlanGeneration", "PlanCheck", "PlanApproving", "Execution",
+  ]);
+  const canActivate = activationSteps.has(project.workflow_state.current_step);
+  const currentMilestone = project.milestones.find(m => m.id === project.current_milestone_id);
+  const currentMidStage = currentMilestone?.mid_stages.find(m => m.id === project.current_mid_stage_id);
+  const canRetryCurrent = currentMidStage?.subtasks.some(subtask =>
+    subtask.status === "Rejected"
+      || subtask.status === "AwaitingConfirmation"
+      || (subtask.status === "Pending" && (subtask.retry_count ?? 0) > 0)
+  ) === true;
 
   const runStatus = apState?.run_status;
   const lastAction = apState?.last_action;
@@ -50,9 +62,11 @@ export function AutopilotControlBar({
     return (
       <div className="autopilot-control-bar">
         <span className="ap-bar-status">
-          <Play size={16} /> 自动驾驶未激活
+          <Play size={16} /> {canActivate ? "自动驾驶未激活" : "请先完成大阶段批准"}
         </span>
-        <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={() => onToggle(true)}>
+        <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy || !canActivate}
+          title={canActivate ? "激活自动驾驶" : "自动驾驶只能从大阶段选择及后续步骤激活"}
+          onClick={() => onToggle(true)}>
           <WandSparkles size={14} /> 激活自动驾驶
         </button>
       </div>
@@ -95,8 +109,8 @@ export function AutopilotControlBar({
           <RotateCcw size={14} /> 同步
         </button>
 
-        {/* 执行中：立即暂停 + 完成后暂停 */}
-        {(isExecuting || runStatus === "Running") && (
+        {/* 真实执行中：In Stop + 完成后暂停 */}
+        {isExecuting && (
           <>
             <button className="ap-bar-btn ap-bar-btn-danger" disabled={busy} onClick={onPauseNow}>
               <Square size={14} /> 立即暂停
@@ -105,6 +119,13 @@ export function AutopilotControlBar({
               <Pause size={14} /> 完成后暂停
             </button>
           </>
+        )}
+
+        {/* 规划推进中只提供普通暂停，不触发 Git 回退。 */}
+        {!isExecuting && runStatus === "Running" && (
+          <button className="ap-bar-btn" disabled={busy} onClick={onPauseNow}>
+            <Pause size={14} /> 暂停自动驾驶
+          </button>
         )}
 
         {/* 暂停或可恢复错误：恢复 + 关闭 */}
@@ -132,7 +153,7 @@ export function AutopilotControlBar({
         )}
 
         {/* 错误恢复操作 */}
-        {runStatus === "ErrorStopped" && onRetryCurrent && (
+        {runStatus === "ErrorStopped" && canRetryCurrent && onRetryCurrent && (
           <button className="ap-bar-btn" disabled={busy} onClick={onRetryCurrent}>
             <RotateCcw size={14} /> 重试当前任务
           </button>

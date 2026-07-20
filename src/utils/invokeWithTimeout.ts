@@ -77,7 +77,7 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   regenerate_execution_plan: 180,
 
   // V1 新增命令 - 执行控制（autopilot 也需要这些）
-  execute_current_subtask: 720,
+  execute_current_subtask: 15,
   confirm_subtask_result: 30,
   reject_subtask_result: 15,
   get_execution_workspace_status: 15,

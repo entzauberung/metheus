@@ -5,10 +5,12 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-async fn clear_child_pid(state: &Arc<Mutex<Option<PipelineState>>>) {
+async fn clear_child_pid(state: &Arc<Mutex<Option<PipelineState>>>, execution_id: &str) {
     let mut guard = state.lock().await;
     if let Some(pipeline) = guard.as_mut() {
-        pipeline.child_pid = None;
+        if execution_id.is_empty() || pipeline.execution_id == execution_id {
+            pipeline.child_pid = None;
+        }
     }
 }
 
@@ -20,11 +22,35 @@ async fn collect_pipe(reader: JoinHandle<std::io::Result<Vec<u8>>>, name: &str) 
     }
 }
 
+async fn terminate_child_process(
+    child: &mut tokio::process::Child,
+    context: &str,
+) -> Result<(), project::SubTaskError> {
+    if let Err(kill_error) = child.start_kill() {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) | Err(_) => {
+                return Err(project::SubTaskError::ExecutionFailed {
+                    message: format!("{}时终止 Claude Code 失败：{}", context, kill_error),
+                });
+            }
+        }
+    }
+    child
+        .wait()
+        .await
+        .map_err(|error| project::SubTaskError::ExecutionFailed {
+            message: format!("{}时等待 Claude Code 退出失败：{}", context, error),
+        })?;
+    Ok(())
+}
+
 /// 执行子任务的内部实现（可被暂停中断）
 pub(crate) async fn execute_subtask_inner(
     project_path: &str,
     prompt: &str,
     subtask_id: &str,
+    execution_id: &str,
     state: Arc<Mutex<Option<PipelineState>>>,
 ) -> Result<project::ExecutionResult, project::SubTaskError> {
     // 1. 执行前记录文件内容指纹
@@ -102,20 +128,40 @@ pub(crate) async fn execute_subtask_inner(
         let child_pid = child.id();
         let mut guard = state.lock().await;
         if let Some(s) = guard.as_mut() {
-            s.child_pid = child_pid;
+            if execution_id.is_empty() || s.execution_id == execution_id {
+                s.child_pid = child_pid;
+            }
         }
     }
     // 5. 自动应答：信任确认 + 文件写入确认（异步写入 stdin）
     if let Some(mut stdin) = child.stdin.take() {
         use tokio::io::AsyncWriteExt;
-        stdin.write_all(b"1\n").await.ok();
+        if let Err(error) = stdin.write_all(b"1\n").await {
+            let termination = terminate_child_process(&mut child, "写入执行确认失败").await;
+            let _stdout = collect_pipe(stdout_reader, "stdout").await;
+            let _stderr = collect_pipe(stderr_reader, "stderr").await;
+            clear_child_pid(&state, execution_id).await;
+            termination?;
+            return Err(project::SubTaskError::ExecutionFailed {
+                message: format!("写入 Claude Code 执行确认失败：{}", error),
+            });
+        }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         /* 安全上限：最大自动应答次数。Claude Code 通常只会在开始前询问 1-3 次确认，
         此处设 20 为兜底。后续可改为动态检测 stdout 中是否包含 "?" 或 "确认" 等
         提示语来决定是否需要继续应答。 */
         const MAX_AUTO_CONFIRM: u32 = 20;
         for _ in 0..MAX_AUTO_CONFIRM {
-            stdin.write_all(b"yes\n").await.ok();
+            if let Err(error) = stdin.write_all(b"yes\n").await {
+                let termination = terminate_child_process(&mut child, "写入自动确认失败").await;
+                let _stdout = collect_pipe(stdout_reader, "stdout").await;
+                let _stderr = collect_pipe(stderr_reader, "stderr").await;
+                clear_child_pid(&state, execution_id).await;
+                termination?;
+                return Err(project::SubTaskError::ExecutionFailed {
+                    message: format!("写入 Claude Code 自动确认失败：{}", error),
+                });
+            }
         }
         // stdin 在这里 drop，关闭管道
     }
@@ -126,7 +172,7 @@ pub(crate) async fn execute_subtask_inner(
             Ok(Some(status)) => {
                 let stdout = collect_pipe(stdout_reader, "stdout").await;
                 let stderr = collect_pipe(stderr_reader, "stderr").await;
-                clear_child_pid(&state).await;
+                clear_child_pid(&state, execution_id).await;
                 let stdout = String::from_utf8_lossy(&stdout).to_string();
                 let stderr = String::from_utf8_lossy(&stderr).to_string();
                 let success = status.success();
@@ -161,23 +207,26 @@ pub(crate) async fn execute_subtask_inner(
                 // 进程还在运行 → 检查暂停/停止标志
                 let (should_stop, is_failed) = {
                     let guard = state.lock().await;
-                    guard.as_ref().map_or((false, false), |s| {
-                        if s.status == PipelineStatus::Failed {
-                            (true, true)
-                        } else if s.status == PipelineStatus::Paused {
-                            (true, false)
-                        } else {
-                            (false, false)
-                        }
-                    })
+                    guard
+                        .as_ref()
+                        .map_or((!execution_id.is_empty(), false), |s| {
+                            if !execution_id.is_empty() && s.execution_id != execution_id {
+                                (true, false)
+                            } else if s.status == PipelineStatus::Failed {
+                                (true, true)
+                            } else if s.status == PipelineStatus::Paused {
+                                (true, false)
+                            } else {
+                                (false, false)
+                            }
+                        })
                 };
                 if should_stop {
-                    // 用户点了暂停或停止 → 强制终止 Claude Code
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    let _ = stdout_reader.await;
-                    let _ = stderr_reader.await;
-                    clear_child_pid(&state).await;
+                    let termination = terminate_child_process(&mut child, "受控暂停").await;
+                    let _stdout = collect_pipe(stdout_reader, "stdout").await;
+                    let _stderr = collect_pipe(stderr_reader, "stderr").await;
+                    clear_child_pid(&state, execution_id).await;
+                    termination?;
                     if is_failed {
                         return Err(project::SubTaskError::ExecutionFailed {
                             message: "用户停止执行".to_string(),
@@ -195,22 +244,34 @@ pub(crate) async fn execute_subtask_inner(
                         start_time.elapsed().as_secs(),
                         crate::constants::CLAUDE_CODE_TIMEOUT_SECS
                     );
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    let _ = stdout_reader.await;
-                    let _ = stderr_reader.await;
-                    clear_child_pid(&state).await;
+                    let termination = terminate_child_process(&mut child, "执行超时").await;
+                    let _stdout = collect_pipe(stdout_reader, "stdout").await;
+                    let _stderr = collect_pipe(stderr_reader, "stderr").await;
+                    clear_child_pid(&state, execution_id).await;
+                    termination?;
                     return Err(project::SubTaskError::Timeout);
                 }
                 // 没暂停也没超时 → 等 500ms 再检查
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             Err(e) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                let _ = stdout_reader.await;
-                let _ = stderr_reader.await;
-                clear_child_pid(&state).await;
+                let termination = terminate_child_process(&mut child, "进程状态检查失败").await;
+                let _stdout = collect_pipe(stdout_reader, "stdout").await;
+                let _stderr = collect_pipe(stderr_reader, "stderr").await;
+                clear_child_pid(&state, execution_id).await;
+                if let Err(termination_error) = termination {
+                    return Err(project::SubTaskError::ExecutionFailed {
+                        message: format!(
+                            "Claude Code 进程异常: {}；{}",
+                            e,
+                            match termination_error {
+                                project::SubTaskError::ExecutionFailed { message } => message,
+                                project::SubTaskError::UserPaused => "用户暂停".to_string(),
+                                project::SubTaskError::Timeout => "执行超时".to_string(),
+                            }
+                        ),
+                    });
+                }
                 return Err(project::SubTaskError::ExecutionFailed {
                     message: format!("Claude Code 进程异常: {}", e),
                 });
@@ -231,7 +292,7 @@ pub(crate) async fn execute_subtask(
 ) -> Result<project::ExecutionResult, String> {
     // 前端直接调用时，没有流水线上下文，传空 state
     let dummy_state = Arc::new(Mutex::new(None));
-    execute_subtask_inner(&project_path, &prompt, &subtask_id, dummy_state)
+    execute_subtask_inner(&project_path, &prompt, &subtask_id, "", dummy_state)
         .await
         .map_err(|e| match e {
             project::SubTaskError::UserPaused => "用户暂停".to_string(),
