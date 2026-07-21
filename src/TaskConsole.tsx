@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { CheckCircle2, FileDiff, FileText, History, Layers, Milestone, Tags } from "lucide-react";
+import { ArrowDown, CheckCircle2, FileDiff, FileText, History, Layers, Milestone, Tags } from "lucide-react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import type { ChangeHistoryEntry, ConstitutionChangeHistory, ExecutionHistoryEntry, GitTagTree, PipelineState, TestLog } from "./types";
+import type { ChangeHistoryEntry, ConstitutionChangeHistory, ExecutionHistoryEntry, GitTagTree, LogEntry, PipelineState, TestLog } from "./types";
 
 const LOG_LEVEL_ICON: Record<string, string> = {
   info: "ℹ",
@@ -66,6 +66,7 @@ export default function TaskConsole({
   const [constitutionHistory, setConstitutionHistory] = useState<ConstitutionChangeHistory | null>(null);
   const [gitTagTree, setGitTagTree] = useState<GitTagTree | null>(null);
   const [loading, setLoading] = useState(false);
+  const [stickToBottom, setStickToBottom] = useState(true);
   const logRef = useRef<HTMLDivElement>(null);
 
   const loadTab = useCallback(async () => {
@@ -102,9 +103,31 @@ export default function TaskConsole({
     loadTab();
   }, [loadTab]);
 
+  const handleLogScroll = () => {
+    const el = logRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setStickToBottom(distanceFromBottom < 48);
+  };
+
   useEffect(() => {
-    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
-  }, [executionStatus?.log_history?.length, executionStatus?.current_log]);
+    if (stickToBottom && logRef.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight;
+    }
+  }, [executionStatus?.log_history?.length, executionStatus?.current_log, executionHistory?.length, stickToBottom]);
+
+  // 合并持久化历史与本次运行日志；过滤与历史重复的启动记录
+  const historyTexts = new Set((executionHistory ?? []).map((e) => e.text));
+  const runtimeLogs: LogEntry[] = (executionStatus?.log_history ?? []).filter((entry) => {
+    if (historyTexts.has(entry.text) && entry.text.startsWith("▶ 执行中")) {
+      return false;
+    }
+    return true;
+  });
+  const hasAnyLog =
+    (executionHistory && executionHistory.length > 0)
+    || runtimeLogs.length > 0
+    || !!executionStatus?.current_log;
 
   return (
     <div className="task-console task-console-readonly">
@@ -117,37 +140,54 @@ export default function TaskConsole({
         </Tabs.List>
 
         <Tabs.Content className="task-tab-content" value="logs">
-          <div ref={logRef} className="execution-log-list">
-            {/* 持久化执行历史（主视图，刷新不丢） */}
-            {executionHistory && executionHistory.length > 0 ? (
-              executionHistory.map((entry, i) => (
-                <div key={`${entry.timestamp}-${i}`} className={`execution-log-entry log-${entry.level}`}>
+          <div className="execution-log-panel">
+            <div
+              ref={logRef}
+              className="execution-log-list"
+              onScroll={handleLogScroll}
+            >
+              {/* 持久化执行历史（主视图，刷新不丢） */}
+              {executionHistory && executionHistory.length > 0 && executionHistory.map((entry, i) => (
+                <div key={`hist-${entry.timestamp}-${i}`} className={`execution-log-entry log-${entry.level}`}>
                   <span className="execution-log-time">{formatLogTime(entry.timestamp)}</span>
                   <span className="execution-log-level">{LOG_LEVEL_ICON[entry.level] || ""}</span>
                   <span className="execution-log-text">{entry.text}</span>
                 </div>
-              ))
-            ) : executionStatus?.log_history?.length ? (
-              // 回退：旧项目没有持久化历史时，使用内存日志
-              executionStatus.log_history.map((entry, i) => (
-                <div key={`${entry.timestamp}-${i}`} className={`execution-log-entry log-${entry.level}`}>
+              ))}
+              {/* 本次运行实时日志（含流式 stdout/stderr） */}
+              {runtimeLogs.map((entry, i) => (
+                <div key={`rt-${entry.timestamp}-${i}`} className={`execution-log-entry log-${entry.level} log-runtime`}>
                   <span className="execution-log-time">{formatLogTime(entry.timestamp)}</span>
-                  <span className="execution-log-level">{LOG_LEVEL_ICON[entry.level] || ""}</span>
+                  <span className="execution-log-level">{LOG_LEVEL_ICON[entry.level] || "⚡"}</span>
                   <span className="execution-log-text">{entry.text}</span>
                 </div>
-              ))
-            ) : executionStatus?.current_log ? (
-              <pre>{executionStatus.current_log}</pre>
-            ) : (
-              <p className="execution-log-empty">暂无执行日志。执行操作后将在此显示历史记录。</p>
-            )}
-            {/* 当前实时状态（如果正在执行中） */}
-            {executionStatus?.status === "Running" && executionStatus.current_log && (
-              <div className="execution-log-entry log-live">
-                <span className="execution-log-time">现在</span>
-                <span className="execution-log-level">⚡</span>
-                <span className="execution-log-text">{executionStatus.current_log}</span>
-              </div>
+              ))}
+              {!hasAnyLog && (
+                <p className="execution-log-empty">暂无执行日志。执行操作后将在此显示历史记录。</p>
+              )}
+              {/* 当前阶段状态（执行中 / 测试中） */}
+              {executionStatus?.status === "Running" && executionStatus.current_log && (
+                <div className="execution-log-entry log-live">
+                  <span className="execution-log-time">现在</span>
+                  <span className="execution-log-level">⚡</span>
+                  <span className="execution-log-text">{executionStatus.current_log}</span>
+                </div>
+              )}
+            </div>
+            {!stickToBottom && (
+              <button
+                type="button"
+                className="execution-log-jump-latest"
+                title="回到最新日志"
+                onClick={() => {
+                  setStickToBottom(true);
+                  if (logRef.current) {
+                    logRef.current.scrollTop = logRef.current.scrollHeight;
+                  }
+                }}
+              >
+                <ArrowDown size={14} /> 最新
+              </button>
             )}
           </div>
         </Tabs.Content>

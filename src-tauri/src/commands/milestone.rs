@@ -3085,6 +3085,7 @@ mod tests {
             last_action: String::new(),
             last_action_at: String::new(),
             error_message: String::new(),
+            recovery_action: project::AutopilotRecoveryAction::None,
         });
         proj.current_milestone_id = "milestone-1".to_string();
         proj.current_mid_stage_id = "mid-1".to_string();

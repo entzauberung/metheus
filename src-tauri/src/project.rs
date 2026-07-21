@@ -196,6 +196,22 @@ impl Default for AutopilotRunStatus {
     }
 }
 
+/// 自动驾驶恢复动作 — 由后端按失败上下文显式写入，前端不得靠错误文本猜测
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum AutopilotRecoveryAction {
+    /// 无需恢复
+    #[default]
+    None,
+    /// 恢复执行基线（执行失败 / SessionLost / StopFailed）
+    RestoreExecutionBaseline,
+    /// 重新尝试自动推进（规划推进类错误）
+    RetryAutopilotAdvance,
+    /// 仅同步关闭
+    SyncAndClose,
+    /// 等待人工决策
+    WaitHumanDecision,
+}
+
 /// autopilot 持久化状态（写入 WorkflowState，用于刷新恢复）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutopilotState {
@@ -211,6 +227,9 @@ pub struct AutopilotState {
     pub last_action_at: String,
     /// 出错时的错误信息
     pub error_message: String,
+    /// 出错后的恢复动作分类；旧项目默认无需恢复
+    #[serde(default)]
+    pub recovery_action: AutopilotRecoveryAction,
 }
 
 impl Default for AutopilotState {
@@ -222,6 +241,7 @@ impl Default for AutopilotState {
             last_action: String::new(),
             last_action_at: String::new(),
             error_message: String::new(),
+            recovery_action: AutopilotRecoveryAction::None,
         }
     }
 }
@@ -1374,7 +1394,7 @@ pub struct ConstitutionChangeHistory {
     pub needs_compaction: bool,
 }
 
-/// 执行会话状态 — 明确区分四类持久化会话状态
+/// 执行会话状态 — 明确区分持久化会话状态（执行失败不得映射为质量门禁）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ExecutionSessionStatus {
     /// 执行中
@@ -1385,6 +1405,10 @@ pub enum ExecutionSessionStatus {
     QualityBlocked,
     /// 进程失联（应用重启后发现进程已死）
     SessionLost,
+    /// 执行器失败 / 超时（可恢复执行基线）
+    ExecutionFailed,
+    /// 暂停失败（In Stop 杀进程或 Git 回退失败）
+    StopFailed,
 }
 
 /// 执行会话 — 记录当前正在执行或待确认的小阶段，用于刷新恢复
@@ -1408,6 +1432,9 @@ pub struct ExecutionSession {
     /// 执行开始前的 Git commit 标识，用于回退基线
     #[serde(default)]
     pub base_commit: String,
+    /// 失败原因；旧项目默认空
+    #[serde(default)]
+    pub failure_message: String,
     /// 会话开始时间（ISO 8601）
     pub started_at: String,
     /// 进入当前状态的时间
@@ -1430,7 +1457,8 @@ impl ExecutionSession {
             }
             "quality_blocked" | "QualityBlocked" => ExecutionSessionStatus::QualityBlocked,
             "session_lost" | "SessionLost" => ExecutionSessionStatus::SessionLost,
-            "execution_failed" | "ExecutionFailed" => ExecutionSessionStatus::QualityBlocked,
+            "execution_failed" | "ExecutionFailed" => ExecutionSessionStatus::ExecutionFailed,
+            "stop_failed" | "StopFailed" => ExecutionSessionStatus::StopFailed,
             _ => {
                 // 未知状态：根据 active 标志推断
                 if self.active {
@@ -1440,6 +1468,16 @@ impl ExecutionSession {
                 }
             }
         }
+    }
+
+    /// 是否为可恢复的执行失败会话（首次失败不依赖 retry_count）
+    pub fn is_recoverable_failure(&self) -> bool {
+        matches!(
+            self.parsed_status(),
+            ExecutionSessionStatus::ExecutionFailed
+                | ExecutionSessionStatus::SessionLost
+                | ExecutionSessionStatus::StopFailed
+        )
     }
 }
 
@@ -1454,6 +1492,7 @@ impl Default for ExecutionSession {
             subtask_title: String::new(),
             status: String::new(),
             base_commit: String::new(),
+            failure_message: String::new(),
             started_at: String::new(),
             state_entered_at: String::new(),
             plan_revision: 0,
@@ -1657,6 +1696,74 @@ mod tests {
             .map_err(|error| format!("反序列化旧执行会话失败：{}", error))?;
         assert!(restored.execution_id.is_empty());
         assert_eq!(restored.status, "executing");
+        Ok(())
+    }
+
+    #[test]
+    fn execution_session_parsed_status_execution_failed_not_quality_blocked() {
+        let session = ExecutionSession {
+            active: false,
+            status: "execution_failed".to_string(),
+            failure_message: "timeout".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            session.parsed_status(),
+            ExecutionSessionStatus::ExecutionFailed
+        );
+        assert!(session.is_recoverable_failure());
+    }
+
+    #[test]
+    fn execution_session_parsed_status_stop_failed() {
+        let session = ExecutionSession {
+            active: false,
+            status: "stop_failed".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(session.parsed_status(), ExecutionSessionStatus::StopFailed);
+        assert!(session.is_recoverable_failure());
+    }
+
+    #[test]
+    fn old_project_missing_failure_message_and_recovery_action_defaults() -> Result<(), String> {
+        let session = ExecutionSession {
+            active: true,
+            status: "executing".to_string(),
+            subtask_id: "subtask-1".to_string(),
+            ..Default::default()
+        };
+        let mut session_value = serde_json::to_value(session)
+            .map_err(|error| format!("序列化执行会话失败：{}", error))?;
+        session_value
+            .as_object_mut()
+            .ok_or("执行会话未序列化为对象".to_string())?
+            .remove("failure_message");
+        let restored_session: ExecutionSession = serde_json::from_value(session_value)
+            .map_err(|error| format!("反序列化旧执行会话失败：{}", error))?;
+        assert!(restored_session.failure_message.is_empty());
+
+        let ap = AutopilotState {
+            active: true,
+            target_milestone_id: "ms-1".to_string(),
+            run_status: AutopilotRunStatus::ErrorStopped,
+            last_action: "fail".to_string(),
+            last_action_at: "2026-07-20T00:00:00Z".to_string(),
+            error_message: "err".to_string(),
+            recovery_action: AutopilotRecoveryAction::RestoreExecutionBaseline,
+        };
+        let mut ap_value = serde_json::to_value(ap)
+            .map_err(|error| format!("序列化自动驾驶状态失败：{}", error))?;
+        ap_value
+            .as_object_mut()
+            .ok_or("自动驾驶状态未序列化为对象".to_string())?
+            .remove("recovery_action");
+        let restored_ap: AutopilotState = serde_json::from_value(ap_value)
+            .map_err(|error| format!("反序列化旧自动驾驶状态失败：{}", error))?;
+        assert_eq!(
+            restored_ap.recovery_action,
+            AutopilotRecoveryAction::None
+        );
         Ok(())
     }
 }

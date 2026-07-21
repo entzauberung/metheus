@@ -34,6 +34,14 @@ export type PauseReason = "None" | "InStop" | "EDStop";
 
 export type AutopilotRunStatus = "Running" | "Paused" | "WaitingMilestoneReview" | "ErrorStopped";
 
+/** 自动驾驶恢复动作 — 与 Rust AutopilotRecoveryAction 一一对应 */
+export type AutopilotRecoveryAction =
+  | "None"
+  | "RestoreExecutionBaseline"
+  | "RetryAutopilotAdvance"
+  | "SyncAndClose"
+  | "WaitHumanDecision";
+
 /** 自动驾驶命令返回类别 */
 export type AutopilotCommandResultKind = "ProjectState" | "PipelineState" | "WorkspaceState" | "NoResult";
 
@@ -44,6 +52,8 @@ export interface AutopilotState {
   last_action: string;
   last_action_at: string;
   error_message: string;
+  /** 出错后的恢复动作；旧项目默认 None */
+  recovery_action?: AutopilotRecoveryAction;
 }
 
 export interface AutopilotNextStep {
@@ -428,7 +438,13 @@ export interface Project {
   project_path: string;
 }
 
-export type ExecutionSessionStatus = "Executing" | "AwaitingConfirmation" | "QualityBlocked" | "SessionLost";
+export type ExecutionSessionStatus =
+  | "Executing"
+  | "AwaitingConfirmation"
+  | "QualityBlocked"
+  | "SessionLost"
+  | "ExecutionFailed"
+  | "StopFailed";
 
 /** 执行会话 — 记录当前正在执行或待确认的小阶段 */
 export interface ExecutionSession {
@@ -438,8 +454,10 @@ export interface ExecutionSession {
   mid_stage_id: string;
   subtask_id: string;
   subtask_title: string;
-  status: string;        // "executing" | "awaiting_confirmation"（兼容旧项目小写文本）
+  status: string;        // "executing" | "awaiting_confirmation" | "execution_failed" | ...
   base_commit: string;   // 执行前的 Git commit，用于回退基线
+  /** 失败原因；旧项目默认空 */
+  failure_message?: string;
   started_at: string;
   state_entered_at: string;
   plan_revision: number;

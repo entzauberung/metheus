@@ -337,15 +337,17 @@ function App() {
           });
           setIsExecuting(false);
         });
-    } else if (session.status === "session_lost") {
-      // Previous execution was interrupted (process died).
-      // Load fresh project from disk — the backend reconciled the state.
-      invokeWithTimeout<Project>("get_project", { projectName: project.name })
-        .then((p) => handleChatComplete(p))
-        .catch(() => {});
+    } else if (
+      session.status === "session_lost"
+      || session.status === "execution_failed"
+      || session.status === "stop_failed"
+    ) {
+      // 失败/失联会话：仅提示需要恢复基线，不得谎称已恢复到安全状态
+      setExecutionStatus(null);
+      setIsExecuting(false);
       setFeedbackMsg({
         type: "warning",
-        message: `上次执行中断 (${session.subtask_title})，已恢复到安全状态。`,
+        message: `执行中断 (${session.subtask_title})：${session.failure_message || "请先恢复执行基线后再继续。"}`,
       });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -412,6 +414,20 @@ function App() {
       if (autopilotState.run_status === "ErrorStopped") return;
     }
 
+    const reschedule = (nextProj: Project) => {
+      if (
+        autopilotGenerationRef.current === generation &&
+        autopilotActiveRef.current &&
+        nextProj.workflow_state.autopilot_active &&
+        nextProj.workflow_state.autopilot_state?.run_status === "Running" &&
+        nextProj.workflow_state.top_level_phase === "Console"
+      ) {
+        autopilotLoopRef.current = setTimeout(() => {
+          runAutopilotCycle(nextProj, generation);
+        }, AUTOPILOT_STEP_DELAY_MS);
+      }
+    };
+
     try {
       const next = await invokeWithTimeout<AutopilotNextStep>("autopilot_next_step", { projectName: proj.name });
 
@@ -442,102 +458,91 @@ function App() {
         return;
       }
 
-      switch (next.result_kind) {
-        case "ProjectState": {
-          // 状态转换命令 — 返回完整项目
-          if (!next.command) {
-            // NoResult 伪装成了 ProjectState（MilestoneReview 等边界）
+      // 与人工确认/执行/驳回共用 consoleAction 在途锁，禁止并发提交
+      if (!beginConsoleAction(`autopilot:${next.command}`)) {
+        reschedule(proj);
+        return;
+      }
+
+      try {
+        switch (next.result_kind) {
+          case "ProjectState": {
+            if (!next.command) {
+              const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+              handleChatComplete(latest);
+              return;
+            }
+            const updated = await invokeWithTimeout<Project>(next.command, {
+              ...next.args,
+              projectName: proj.name,
+            });
+            if (autopilotGenerationRef.current !== generation) return;
+            if (updated.workflow_state.data_revision >= (proj.workflow_state.data_revision ?? 0)) {
+              handleChatComplete(updated);
+            } else {
+              const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+              handleChatComplete(latest);
+            }
+            break;
+          }
+
+          case "PipelineState": {
+            if (!next.command) return;
+            const pipelineState = await invokeWithTimeout<PipelineState>(next.command, {
+              ...next.args,
+              projectName: proj.name,
+            });
+            setExecutionStatus(pipelineState);
+            setIsExecuting(pipelineState.status === "Running");
+            if (pipelineState.status === "Running" && autopilotGenerationRef.current === generation) {
+              startExecutionPolling(proj.name, generation);
+            }
+            if (pipelineState.status !== "Running") {
+              const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+              handleChatComplete(latest);
+            }
+            break;
+          }
+
+          case "WorkspaceState": {
+            if (!next.command) return;
+            const wsStatus = await invokeWithTimeout<ExecutionWorkspaceStatus>(next.command, {
+              ...next.args,
+              projectName: proj.name,
+            });
+            setWorkspaceStatus(wsStatus);
+            const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+            handleChatComplete(latest);
+            break;
+          }
+
+          case "NoResult": {
             const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
             handleChatComplete(latest);
             return;
           }
-          const updated = await invokeWithTimeout<Project>(next.command, {
-            ...next.args,
-            projectName: proj.name,
-          });
-          // 检查代次和数据修订号，防止旧结果覆盖新项目
-          if (autopilotGenerationRef.current !== generation) return;
-          if (updated.workflow_state.data_revision >= (proj.workflow_state.data_revision ?? 0)) {
-            handleChatComplete(updated);
-          } else {
-            // 项目被其他操作更新了，重新读取
-            const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-            handleChatComplete(latest);
-          }
-          break;
         }
 
-        case "PipelineState": {
-          // 执行命令 — 返回流水线状态
-          if (!next.command) return;
-          const pipelineState = await invokeWithTimeout<PipelineState>(next.command, {
-            ...next.args,
-            projectName: proj.name,
-          });
-          // 立即更新执行状态，不通过 handleChatComplete
-          setExecutionStatus(pipelineState);
-          setIsExecuting(pipelineState.status === "Running");
-          // 启动轮询（如果还在运行）
-          if (pipelineState.status === "Running" && autopilotGenerationRef.current === generation) {
-            startExecutionPolling(proj.name, generation);
-          }
-          // 执行结束后读取磁盘项目事实
-          if (pipelineState.status !== "Running") {
-            const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-            handleChatComplete(latest);
-          }
-          break;
-        }
-
-        case "WorkspaceState": {
-          // 工作区准备命令
-          if (!next.command) return;
-          const wsStatus = await invokeWithTimeout<ExecutionWorkspaceStatus>(next.command, {
-            ...next.args,
-            projectName: proj.name,
-          });
-          setWorkspaceStatus(wsStatus);
-          if (!wsStatus.ready) {
-            // 工作区未就绪，同步项目并停止
-            const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-            handleChatComplete(latest);
-          } else {
-            // 工作区就绪，继续循环
-            const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-            handleChatComplete(latest);
-          }
-          break;
-        }
-
-        case "NoResult": {
-          // 无返回数据：暂停、边界、错误停止等
-          const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-          handleChatComplete(latest);
-          return; // 不继续循环
-        }
-      }
-
-      // 调度下一循环
-      if (
-        autopilotGenerationRef.current === generation &&
-        autopilotActiveRef.current
-      ) {
-        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
         if (
-          latest.workflow_state.autopilot_active &&
-          latest.workflow_state.autopilot_state?.run_status === "Running" &&
-          latest.workflow_state.top_level_phase === "Console"
+          autopilotGenerationRef.current === generation &&
+          autopilotActiveRef.current
         ) {
-          autopilotLoopRef.current = setTimeout(() => {
-            runAutopilotCycle(latest, generation);
-          }, AUTOPILOT_STEP_DELAY_MS);
-        } else {
-          handleChatComplete(latest);
+          const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+          if (
+            latest.workflow_state.autopilot_active &&
+            latest.workflow_state.autopilot_state?.run_status === "Running" &&
+            latest.workflow_state.top_level_phase === "Console"
+          ) {
+            reschedule(latest);
+          } else {
+            handleChatComplete(latest);
+          }
         }
+      } finally {
+        endConsoleAction();
       }
     } catch (error) {
       console.warn("[autopilot] Cycle error:", error);
-      // 持久化错误，不静默吞错
       const errorMsg = error instanceof Error ? error.message : String(error);
       try {
         const updated = await invokeWithTimeout<Project>("autopilot_mark_error", {
@@ -549,7 +554,6 @@ function App() {
         setFeedbackMsg({ type: "error", message: `自动驾驶已停止：${errorMsg}` });
       } catch (markError) {
         console.error("[autopilot] Failed to persist error state:", markError);
-        // 无法持久化时仍尝试同步，但标记警告
         try {
           const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
           handleChatComplete(latest);
@@ -559,7 +563,7 @@ function App() {
         }
       }
     }
-  }, []);
+  }, [beginConsoleAction, endConsoleAction]);
 
   /** 手动执行和自动驾驶共用的唯一执行状态轮询入口。 */
   const startExecutionPolling = useCallback(async (projectName: string, generation?: number) => {
@@ -1416,6 +1420,15 @@ function App() {
       });
       handleChatComplete(updated);
       setExecutionStatus(null);
+      // 只有后端返回后才刷新工作区；失败时不在前端清空失败状态
+      try {
+        const ws = await invokeWithTimeout<ExecutionWorkspaceStatus>("get_execution_workspace_status", {
+          projectName: project.name,
+        });
+        setWorkspaceStatus(ws);
+      } catch {
+        /* 工作区探测失败不掩盖重试成功 */
+      }
       setFeedbackMsg({ type: "info", message: "已恢复执行基线，可重新执行小阶段。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "重试失败：" + String(err) });
@@ -1489,7 +1502,7 @@ function App() {
     }
   };
 
-  // === 启动恢复确认：用户看到中断提示后清理恢复标记 ===
+  // === 恢复执行基线：实际 Git 回退；失败时保留恢复面板与后端原始错误 ===
   const handleAcknowledgeExecutionRecovery = async () => {
     if (!project || !beginConsoleAction("acknowledge_recovery")) return;
     try {
@@ -1497,9 +1510,24 @@ function App() {
         projectName: project.name,
       });
       handleChatComplete(updated);
-      setFeedbackMsg({ type: "info", message: "执行恢复状态已确认。" });
+      setExecutionStatus(null);
+      setIsExecuting(false);
+      try {
+        const ws = await invokeWithTimeout<ExecutionWorkspaceStatus>("get_execution_workspace_status", {
+          projectName: project.name,
+        });
+        setWorkspaceStatus(ws);
+        if (ws.working_tree_clean) {
+          setFeedbackMsg({ type: "info", message: "执行基线已恢复，工作区干净，可重新执行。" });
+        } else {
+          setFeedbackMsg({ type: "warning", message: "基线命令已完成，但工作区仍有残留，请同步后检查。" });
+        }
+      } catch {
+        setFeedbackMsg({ type: "info", message: "执行基线已恢复。" });
+      }
     } catch (err) {
-      setFeedbackMsg({ type: "error", message: "确认失败：" + String(err) });
+      // 不得先在前端清空失败状态；保持恢复面板并显示后端原始错误
+      setFeedbackMsg({ type: "error", message: "恢复失败：" + String(err) });
     } finally {
       endConsoleAction();
     }
@@ -1807,7 +1835,11 @@ function App() {
                     project={project}
                     executionStatus={executionStatus}
                     workspaceStatus={workspaceStatus}
-                    busy={isConsoleBusy}
+                    busy={
+                      isConsoleBusy
+                      || (project.workflow_state.autopilot_active === true
+                        && project.workflow_state.autopilot_state?.run_status === "Running")
+                    }
                     onPrepareWorkspace={handlePrepareExecutionWorkspace}
                     onExecute={handleExecuteCurrentSubtask}
                     onConfirm={handleConfirmSubtask}
@@ -1816,6 +1848,7 @@ function App() {
                     onInStop={handleInStop}
                     onEdStop={handleEdStop}
                     onSyncProject={handleSyncProject}
+                    onAcknowledgeRecovery={handleAcknowledgeExecutionRecovery}
                   />
                   <TaskConsole
                     projectPath={projectPath}
@@ -1921,6 +1954,7 @@ function App() {
 function V1ExecutionPanel({
   project, executionStatus, workspaceStatus, busy: externalBusy,
   onPrepareWorkspace, onExecute, onConfirm, onReject, onRetry, onInStop, onEdStop, onSyncProject,
+  onAcknowledgeRecovery,
 }: {
   project: Project; executionStatus: PipelineState | null;
   workspaceStatus: ExecutionWorkspaceStatus | null;
@@ -1931,6 +1965,7 @@ function V1ExecutionPanel({
   onRetry: () => Promise<void>;
   onInStop: () => Promise<void>; onEdStop: () => Promise<void>;
   onSyncProject: () => Promise<void>;
+  onAcknowledgeRecovery?: () => Promise<void>;
 }) {
   const [rejectReason, setRejectReason] = useState("");
   const [localBusy, setLocalBusy] = useState(false);
@@ -1948,6 +1983,14 @@ function V1ExecutionPanel({
 
   const isAwaiting = executionStatus?.awaiting_confirmation === true || awaitingSubtask != null;
   const isExecuting = executionStatus?.status === "Running";
+
+  // 精确失败会话：优先显示失败面板，暂时隐藏普通执行和准备环境
+  const failedSession = project.execution_session;
+  const failedStatus = (failedSession?.status ?? "").toLowerCase();
+  const hasExecutionFailure =
+    failedStatus === "execution_failed"
+    || failedStatus === "session_lost"
+    || failedStatus === "stop_failed";
 
   const handlePrepareWorkspace = async () => {
     if (!project || busy) return;
@@ -1994,13 +2037,67 @@ function V1ExecutionPanel({
     <div className="v1-execution-panel" style={{ padding: "24px" }}>
       <h2 className="execution-panel-title"><ListTodo size={20} />执行</h2>
 
-      {/* Workspace status banner */}
-      {planApproved && workspaceStatus && !workspaceReady && (
+      {/* 执行失败专用面板：优先显示，隐藏普通执行/准备环境 */}
+      {hasExecutionFailure && failedSession && (
+        <div className="execution-failure-panel" style={{
+          marginBottom: "20px", padding: "16px",
+          background: "#ffebe9", borderRadius: "8px", border: "1px solid #cf222e",
+        }}>
+          <div style={{ fontWeight: 600, fontSize: "14px", marginBottom: "8px", color: "#cf222e" }}>
+            {failedStatus === "session_lost" ? "执行中断（进程失联）"
+              : failedStatus === "stop_failed" ? "暂停失败"
+              : "执行失败"}
+          </div>
+          <div style={{ fontSize: "13px", color: "#24292f", marginBottom: "8px", overflowWrap: "anywhere" }}>
+            <div>受影响任务：{failedSession.subtask_title || failedSession.subtask_id}</div>
+            {failedSession.failure_message && (
+              <div style={{ marginTop: "6px", whiteSpace: "pre-wrap" }}>
+                失败原因：{failedSession.failure_message}
+              </div>
+            )}
+            {failedSession.base_commit && (
+              <div style={{ marginTop: "4px", color: "#656d76", fontFamily: "monospace", fontSize: "12px" }}>
+                基线：{failedSession.base_commit.slice(0, 12)}
+              </div>
+            )}
+          </div>
+          <WorkflowActionBar>
+            <ActionButton
+              icon={<RotateCcw size={16} />}
+              loading={busy}
+              loadingLabel="恢复中"
+              onClick={async () => {
+                setLocalBusy(true);
+                try {
+                  if (onAcknowledgeRecovery) {
+                    await onAcknowledgeRecovery();
+                  } else {
+                    await onRetry();
+                  }
+                } finally {
+                  setLocalBusy(false);
+                }
+              }}
+            >
+              恢复执行基线
+            </ActionButton>
+            <ActionButton icon={<RotateCcw size={16} />} disabled={busy} onClick={onSyncProject}>
+              同步状态
+            </ActionButton>
+          </WorkflowActionBar>
+          <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
+            恢复成功前不会显示“已恢复到安全状态”。请先完成基线恢复，再重新执行。
+          </p>
+        </div>
+      )}
+
+      {/* Workspace status banner — 失败会话期间隐藏准备环境 */}
+      {!hasExecutionFailure && planApproved && workspaceStatus && !workspaceReady && (
         <FeedbackBanner type="warning" message={workspaceStatus.status_message} />
       )}
 
       {/* Workspace preparation */}
-      {planApproved && !workspaceReady && (
+      {!hasExecutionFailure && planApproved && !workspaceReady && (
         <div style={{ marginBottom: "20px" }}>
           <ActionButton icon={<GitBranch size={16} />} loading={busy} loadingLabel="准备中"
             onClick={handlePrepareWorkspace}>准备执行环境</ActionButton>
@@ -2011,7 +2108,7 @@ function V1ExecutionPanel({
       )}
 
       {/* Awaiting confirmation */}
-      {isAwaiting && awaitingSubtask && (
+      {!hasExecutionFailure && isAwaiting && awaitingSubtask && (
         <div style={{ marginBottom: "20px" }}>
           <div style={{ padding: "14px", background: "#ddf4ff", borderRadius: "8px", border: "1px solid #0969da", marginBottom: "16px" }}>
             <strong>待确认：{awaitingSubtask.title}</strong>
@@ -2058,8 +2155,8 @@ function V1ExecutionPanel({
         </div>
       )}
 
-      {/* Next pending subtask — only when workspace is ready */}
-      {!isAwaiting && planApproved && workspaceReady && nextSubtask && (
+      {/* Next pending subtask — only when workspace is ready and no failure session */}
+      {!hasExecutionFailure && !isAwaiting && planApproved && workspaceReady && nextSubtask && (
         <div style={{ marginBottom: "20px" }}>
           <div style={subtaskCardStyle}>
             <strong>下一个任务：{nextSubtask.title}</strong>

@@ -3223,10 +3223,51 @@ button.tree-node:not(:disabled) {
 }
 
 /* -- 执行日志历史列表 -- */
-.execution-log-list {
-  overflow-y: auto;
+.execution-log-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
   flex: 1;
   min-height: 0;
+}
+
+.execution-log-list {
+  overflow-y: auto;
+  overflow-x: hidden;
+  flex: 1;
+  min-height: 0;
+}
+
+.execution-log-entry.log-runtime {
+  color: #0969da;
+}
+
+.execution-log-entry.log-live {
+  background: #ddf4ff;
+  color: #0969da;
+  font-weight: 500;
+}
+
+.execution-log-jump-latest {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px;
+  border: 1px solid #0969da;
+  border-radius: 16px;
+  background: #ffffff;
+  color: #0969da;
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  z-index: 2;
+}
+
+.execution-log-jump-latest:hover {
+  background: #ddf4ff;
 }
 
 /* Isolated scrolling for tab internal views */
@@ -3930,6 +3971,17 @@ button.tree-node:not(:disabled) {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-wrap: wrap;
+}
+
+.execution-failure-panel {
+  overflow-wrap: anywhere;
+}
+
+.execution-failure-panel .workflow-action-bar,
+.v1-execution-panel .workflow-action-bar {
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 @media (max-width: 720px) {
@@ -3937,8 +3989,9 @@ button.tree-node:not(:disabled) {
     flex-direction: column;
     align-items: flex-start;
   }
+  .ap-bar-left,
   .ap-bar-right {
-    width: auto;
+    width: 100%;
     flex-wrap: wrap;
   }
   .ap-bar-target,
@@ -3954,5 +4007,8 @@ button.tree-node:not(:disabled) {
     max-width: 100%;
     white-space: normal;
     text-align: left;
+  }
+  .execution-failure-panel {
+    padding: 12px !important;
   }
 }

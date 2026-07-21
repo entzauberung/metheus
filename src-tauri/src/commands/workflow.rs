@@ -210,6 +210,7 @@ pub(crate) async fn migrate_project_workflow(
                 last_action: "从旧版本迁移恢复".to_string(),
                 last_action_at: chrono::Utc::now().to_rfc3339(),
                 error_message: String::new(),
+                recovery_action: project::AutopilotRecoveryAction::None,
             });
         } else {
             // 所有大阶段已完成 — 关闭 autopilot
@@ -1178,6 +1179,7 @@ pub(crate) async fn toggle_autopilot(
             last_action: format!("自动驾驶已激活，目标大阶段：{}", target_title),
             last_action_at: now,
             error_message: String::new(),
+            recovery_action: project::AutopilotRecoveryAction::None,
         });
     } else {
         proj.workflow_state.autopilot_active = false;
@@ -1237,12 +1239,13 @@ pub(crate) async fn autopilot_pause(
     crate::save_and_reload_project(&proj)
 }
 
-/// 持久化自动驾驶步骤状态：写入 last_action、last_action_at、run_status 和 error_message
+/// 持久化自动驾驶步骤状态：写入 last_action、last_action_at、run_status、error_message 和 recovery_action
 fn autopilot_persist_step_state(
     proj: &mut project::Project,
     action: &str,
     status: project::AutopilotRunStatus,
     error_msg: &str,
+    recovery_action: project::AutopilotRecoveryAction,
 ) -> Result<(), String> {
     let now = chrono::Utc::now().to_rfc3339();
     let truncated_error = truncate_autopilot_error(error_msg);
@@ -1252,6 +1255,7 @@ fn autopilot_persist_step_state(
         ap.last_action_at = now.clone();
         ap.run_status = status;
         ap.error_message = truncated_error;
+        ap.recovery_action = recovery_action;
     }
 
     proj.workflow_state.data_revision += 1;
@@ -1277,6 +1281,7 @@ pub(crate) async fn autopilot_mark_error(
         &action_description,
         project::AutopilotRunStatus::ErrorStopped,
         &error_detail,
+        project::AutopilotRecoveryAction::WaitHumanDecision,
     )?;
 
     crate::save_and_reload_project(&proj)
@@ -1296,13 +1301,27 @@ pub(crate) async fn autopilot_resume(project_name: String) -> Result<project::Pr
         Some(ap) => match ap.run_status {
             project::AutopilotRunStatus::Paused => true,
             project::AutopilotRunStatus::ErrorStopped => {
+                // 执行恢复动作未完成时禁止通用“恢复自动驾驶”，避免恢复后立即再次失败
+                if let Some(ap) = proj.workflow_state.autopilot_state.as_ref() {
+                    if ap.recovery_action
+                        == project::AutopilotRecoveryAction::RestoreExecutionBaseline
+                    {
+                        return Err(
+                            "存在执行失败需要先恢复执行基线，请先完成基线恢复后再恢复自动驾驶。"
+                                .to_string(),
+                        );
+                    }
+                }
                 // ErrorStopped can only resume if there's no unresolved quality failure
-                // Check: if execution step with awaiting subtask that failed quality, block
                 if proj.workflow_state.current_step == project::WorkflowStep::Execution {
                     if let Some(ref session) = proj.execution_session {
-                        if session.status == "awaiting_confirmation" {
+                        if session.status == "awaiting_confirmation"
+                            || session.status == "quality_blocked"
+                            || session.is_recoverable_failure()
+                        {
                             return Err(
-                                "存在待确认的任务，请先处理质量结果后再恢复自动驾驶。".to_string()
+                                "存在未处理的执行会话，请先恢复基线或处理质量结果后再恢复自动驾驶。"
+                                    .to_string(),
                             );
                         }
                     }
@@ -1329,6 +1348,7 @@ pub(crate) async fn autopilot_resume(project_name: String) -> Result<project::Pr
         ap.last_action = "自动驾驶已恢复".to_string();
         ap.last_action_at = now.clone();
         ap.error_message = String::new();
+        ap.recovery_action = project::AutopilotRecoveryAction::None;
     }
 
     proj.workflow_state.data_revision += 1;
@@ -1387,6 +1407,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                     description,
                     project::AutopilotRunStatus::Paused,
                     "",
+                    project::AutopilotRecoveryAction::None,
                 )?;
                 crate::save_project(&proj)?;
                 return Ok(AutopilotNextStep {
@@ -1401,11 +1422,18 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             }
             project::AutopilotRunStatus::ErrorStopped => {
                 let description = format!("自动驾驶因错误停止：{}", persisted_error);
+                let existing_recovery = proj
+                    .workflow_state
+                    .autopilot_state
+                    .as_ref()
+                    .map(|ap| ap.recovery_action.clone())
+                    .unwrap_or(project::AutopilotRecoveryAction::WaitHumanDecision);
                 autopilot_persist_step_state(
                     &mut proj,
                     &description,
                     project::AutopilotRunStatus::ErrorStopped,
                     &persisted_error,
+                    existing_recovery,
                 )?;
                 crate::save_project(&proj)?;
                 return Ok(AutopilotNextStep {
@@ -1425,6 +1453,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                     description,
                     project::AutopilotRunStatus::WaitingMilestoneReview,
                     "",
+                    project::AutopilotRecoveryAction::WaitHumanDecision,
                 )?;
                 crate::save_project(&proj)?;
                 return Ok(AutopilotNextStep {
@@ -1449,6 +1478,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             description,
             project::AutopilotRunStatus::WaitingMilestoneReview,
             "",
+            project::AutopilotRecoveryAction::WaitHumanDecision,
         )?;
         crate::save_project(&proj)?;
         return Ok(AutopilotNextStep {
@@ -1474,6 +1504,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                 description,
                 project::AutopilotRunStatus::ErrorStopped,
                 description,
+                project::AutopilotRecoveryAction::WaitHumanDecision,
             )?;
             crate::save_project(&proj)?;
             return Ok(AutopilotNextStep {
@@ -1870,11 +1901,21 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
         } else {
             ""
         };
+        // 空命令终止态的恢复动作必须按语义精确写入：
+        // - 大阶段边界 / 质量门禁 / 驳回 / 需人工步骤 → WaitHumanDecision
+        // - 不得把“必然重复失败”的错误写成 RetryAutopilotAdvance
+        // 可重试的瞬时规划失败走 autopilot_mark_error 或其它显式路径，不在此一刀切。
+        let recovery = if next.at_milestone_boundary || next.is_error {
+            project::AutopilotRecoveryAction::WaitHumanDecision
+        } else {
+            project::AutopilotRecoveryAction::None
+        };
         autopilot_persist_step_state(
             &mut proj,
             &next.description,
             terminal_status,
             persisted_error,
+            recovery,
         )?;
         crate::save_project(&proj)?;
     }
@@ -2088,6 +2129,7 @@ mod tests {
             last_action: String::new(),
             last_action_at: String::new(),
             error_message: String::new(),
+            recovery_action: project::AutopilotRecoveryAction::None,
         });
     }
 
@@ -2298,14 +2340,39 @@ mod tests {
         assert!(rejected_step.is_error);
         assert!(rejected_step.error_message.contains("Rejected"));
         let persisted_rejected = crate::load_project(&rejected_name)?;
+        let rejected_ap = persisted_rejected
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .ok_or("驳回任务未持久化自动驾驶状态".to_string())?;
         assert_eq!(
-            persisted_rejected
+            rejected_ap.run_status,
+            project::AutopilotRunStatus::ErrorStopped
+        );
+        assert_eq!(
+            rejected_ap.recovery_action,
+            project::AutopilotRecoveryAction::WaitHumanDecision,
+            "驳回任务不得提供必然失败的重新推进"
+        );
+
+        // 人工介入步骤 → WaitHumanDecision，不得 RetryAutopilotAdvance
+        let human_name = unique_project_name("ap-human-step");
+        let _human_guard = ProjectDataGuard::new(&human_name)?;
+        let mut human = project::Project::new(&human_name);
+        human.workflow_state.current_step = project::WorkflowStep::Discussion;
+        activate_autopilot(&mut human, "milestone-1");
+        crate::save_project(&human)?;
+        let human_step = autopilot_next_step(human_name.clone()).await?;
+        assert!(human_step.is_error);
+        let persisted_human = crate::load_project(&human_name)?;
+        assert_eq!(
+            persisted_human
                 .workflow_state
                 .autopilot_state
                 .as_ref()
-                .ok_or("驳回任务未持久化自动驾驶状态".to_string())?
-                .run_status,
-            project::AutopilotRunStatus::ErrorStopped
+                .ok_or("人工步骤未持久化自动驾驶状态".to_string())?
+                .recovery_action,
+            project::AutopilotRecoveryAction::WaitHumanDecision
         );
         Ok(())
     }

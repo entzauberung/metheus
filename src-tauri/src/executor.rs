@@ -1,9 +1,14 @@
-use crate::pipeline::{PipelineState, PipelineStatus};
+use crate::pipeline::{PipelineState, PipelineStatus, append_runtime_log};
 use crate::project;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+
+/// 单条实时日志字符上限（界面展示）
+const MAX_RUNTIME_LOG_CHARS: usize = 2_000;
+/// 单个输出流累计字节上限（最终 stdout / stderr）
+const MAX_STREAM_BYTES: usize = 256 * 1024;
 
 async fn clear_child_pid(state: &Arc<Mutex<Option<PipelineState>>>, execution_id: &str) {
     let mut guard = state.lock().await;
@@ -14,12 +19,109 @@ async fn clear_child_pid(state: &Arc<Mutex<Option<PipelineState>>>, execution_id
     }
 }
 
-async fn collect_pipe(reader: JoinHandle<std::io::Result<Vec<u8>>>, name: &str) -> Vec<u8> {
+async fn collect_pipe(reader: JoinHandle<Vec<u8>>, name: &str) -> Vec<u8> {
     match reader.await {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(error)) => format!("[读取 Claude Code {} 失败: {}]", name, error).into_bytes(),
+        Ok(bytes) => bytes,
         Err(error) => format!("[读取 Claude Code {} 任务失败: {}]", name, error).into_bytes(),
     }
+}
+
+/// 并行分段读取子进程输出流，校验 execution_id 后追加到 PipelineState。
+/// 超限时截断并追加明确标记；读取失败记录可见错误但不堵塞管道。
+async fn stream_process_pipe(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    stream_name: &str,
+    execution_id: String,
+    state: Arc<Mutex<Option<PipelineState>>>,
+) -> Vec<u8> {
+    let mut collected = Vec::new();
+    let mut truncated = false;
+    let mut buf = [0u8; 4_096];
+
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = &buf[..n];
+                if !truncated && collected.len() < MAX_STREAM_BYTES {
+                    let remaining = MAX_STREAM_BYTES.saturating_sub(collected.len());
+                    if chunk.len() > remaining {
+                        collected.extend_from_slice(&chunk[..remaining]);
+                        truncated = true;
+                    } else {
+                        collected.extend_from_slice(chunk);
+                    }
+                } else if !truncated {
+                    truncated = true;
+                }
+
+                // 界面日志：容错解码，限制单条长度，校验 execution_id
+                let text = String::from_utf8_lossy(chunk);
+                let display: String = text.chars().take(MAX_RUNTIME_LOG_CHARS).collect();
+                let display = if text.chars().count() > MAX_RUNTIME_LOG_CHARS {
+                    format!("{}…[截断]", display)
+                } else {
+                    display
+                };
+                let trimmed = display.trim();
+                if !trimmed.is_empty() {
+                    let mut guard = state.lock().await;
+                    if let Some(pipeline) = guard.as_mut() {
+                        // In Stop / 会话切换后不得继续追加旧进程输出
+                        if pipeline.status == PipelineStatus::Paused
+                            || pipeline.status == PipelineStatus::Failed
+                        {
+                            // 仍继续读管道防堵塞，但不追加日志
+                        } else if execution_id.is_empty()
+                            || pipeline.execution_id == execution_id
+                        {
+                            append_runtime_log(
+                                pipeline,
+                                "info",
+                                format!("[{}] {}", stream_name, trimmed),
+                            );
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                let msg = format!("[读取 Claude Code {} 失败: {}]", stream_name, error);
+                let mut guard = state.lock().await;
+                if let Some(pipeline) = guard.as_mut() {
+                    if execution_id.is_empty() || pipeline.execution_id == execution_id {
+                        append_runtime_log(pipeline, "error", msg.clone());
+                    }
+                }
+                if collected.len() < MAX_STREAM_BYTES {
+                    collected.extend_from_slice(msg.as_bytes());
+                }
+                break;
+            }
+        }
+    }
+
+    if truncated {
+        let marker = format!(
+            "\n…[输出已截断，累计超过 {} 字节上限]",
+            MAX_STREAM_BYTES
+        );
+        collected.extend_from_slice(marker.as_bytes());
+        let mut guard = state.lock().await;
+        if let Some(pipeline) = guard.as_mut() {
+            if execution_id.is_empty() || pipeline.execution_id == execution_id {
+                append_runtime_log(
+                    pipeline,
+                    "error",
+                    format!(
+                        "[{}] 输出已截断，累计超过 {} 字节上限",
+                        stream_name, MAX_STREAM_BYTES
+                    ),
+                );
+            }
+        }
+    }
+
+    collected
 }
 
 async fn terminate_child_process(
@@ -101,7 +203,7 @@ pub(crate) async fn execute_subtask_inner(
             ),
         })?;
 
-    // Drain output concurrently so verbose CLI output cannot fill an OS pipe and stall execution.
+    // 并行流式读取 stdout/stderr，运行期间持续追加到 PipelineState
     let mut stdout = child
         .stdout
         .take()
@@ -114,13 +216,15 @@ pub(crate) async fn execute_subtask_inner(
         .ok_or_else(|| project::SubTaskError::ExecutionFailed {
             message: "无法捕获 Claude Code stderr".to_string(),
         })?;
+    let stdout_state = state.clone();
+    let stderr_state = state.clone();
+    let stdout_execution_id = execution_id.to_string();
+    let stderr_execution_id = execution_id.to_string();
     let stdout_reader = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+        stream_process_pipe(&mut stdout, "stdout", stdout_execution_id, stdout_state).await
     });
     let stderr_reader = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+        stream_process_pipe(&mut stderr, "stderr", stderr_execution_id, stderr_state).await
     });
 
     // 存储子进程 PID 到 PipelineState，供 stop_execution 快速终止使用
@@ -192,6 +296,7 @@ pub(crate) async fn execute_subtask_inner(
                         stderr
                     )
                 };
+                // 完整提示词写入结果输出，但不得作为实时日志刷屏
                 let combined_output = format!(
                     "=== 执行日志 ===\n小阶段 ID：{}\n\n=== 提示词 ===\n{}\n\n=== stdout ===\n{}\n=== stderr ===\n{}",
                     subtask_id, full_prompt, stdout, stderr
@@ -299,4 +404,101 @@ pub(crate) async fn execute_subtask(
             project::SubTaskError::ExecutionFailed { message } => message,
             project::SubTaskError::Timeout => "执行超时".to_string(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::{PipelineState, PipelineStatus};
+    use std::io::Cursor;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn test_pipeline(execution_id: &str) -> PipelineState {
+        PipelineState {
+            execution_id: execution_id.to_string(),
+            mid_stage_id: "mid-1".to_string(),
+            status: PipelineStatus::Running,
+            current_subtask_index: 0,
+            total_subtasks: 1,
+            subtask_statuses: vec![],
+            current_log: String::new(),
+            last_error: None,
+            child_pid: None,
+            project_name: String::new(),
+            milestone_id: "ms-1".to_string(),
+            plan_revision: 1,
+            current_subtask_id: "st-1".to_string(),
+            awaiting_confirmation: false,
+            log_history: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_process_pipe_appends_live_output() {
+        let state = Arc::new(Mutex::new(Some(test_pipeline("exec-1"))));
+        let data = b"hello from claude\nline two\n";
+        let collected = stream_process_pipe(
+            Cursor::new(data.as_slice()),
+            "stdout",
+            "exec-1".to_string(),
+            state.clone(),
+        )
+        .await;
+        assert!(collected.starts_with(b"hello"));
+        let guard = state.lock().await;
+        let logs = &guard.as_ref().unwrap().log_history;
+        assert!(!logs.is_empty());
+        assert!(logs.iter().any(|e| e.text.contains("hello")));
+    }
+
+    #[tokio::test]
+    async fn stream_process_pipe_drops_stale_execution_id() {
+        let state = Arc::new(Mutex::new(Some(test_pipeline("exec-current"))));
+        let data = b"stale output should not appear\n";
+        let _ = stream_process_pipe(
+            Cursor::new(data.as_slice()),
+            "stdout",
+            "exec-stale".to_string(),
+            state.clone(),
+        )
+        .await;
+        let guard = state.lock().await;
+        assert!(guard.as_ref().unwrap().log_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_process_pipe_stops_append_when_paused() {
+        let mut pipeline = test_pipeline("exec-1");
+        pipeline.status = PipelineStatus::Paused;
+        let state = Arc::new(Mutex::new(Some(pipeline)));
+        let data = b"after stop output\n";
+        let collected = stream_process_pipe(
+            Cursor::new(data.as_slice()),
+            "stdout",
+            "exec-1".to_string(),
+            state.clone(),
+        )
+        .await;
+        // 管道仍被排空
+        assert!(!collected.is_empty());
+        let guard = state.lock().await;
+        assert!(guard.as_ref().unwrap().log_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_process_pipe_truncates_oversized_output() {
+        let state = Arc::new(Mutex::new(Some(test_pipeline("exec-1"))));
+        let oversized = vec![b'x'; MAX_STREAM_BYTES + 100];
+        let collected = stream_process_pipe(
+            Cursor::new(oversized),
+            "stdout",
+            "exec-1".to_string(),
+            state.clone(),
+        )
+        .await;
+        assert!(collected.len() <= MAX_STREAM_BYTES + 200);
+        let text = String::from_utf8_lossy(&collected);
+        assert!(text.contains("输出已截断"));
+    }
 }

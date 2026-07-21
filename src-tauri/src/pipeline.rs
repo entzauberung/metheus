@@ -71,7 +71,7 @@ pub struct PipelineState {
 }
 
 /// 追加日志条目到 PipelineState，同时更新 current_log 并限制历史上限
-fn append_log(state: &mut PipelineState, level: &str, text: String) {
+pub(crate) fn append_log(state: &mut PipelineState, level: &str, text: String) {
     let entry = LogEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         level: level.to_string(),
@@ -84,6 +84,11 @@ fn append_log(state: &mut PipelineState, level: &str, text: String) {
         state.log_history.drain(0..excess);
     }
     state.current_log = text;
+}
+
+/// 运行期实时日志：与 append_log 相同容量上限，供执行器流式写入
+pub(crate) fn append_runtime_log(state: &mut PipelineState, level: &str, text: String) {
+    append_log(state, level, text);
 }
 
 /// 向调用方持有的项目事实追加执行历史；持久化由调用方在事务边界统一完成。
@@ -313,6 +318,7 @@ pub(crate) async fn execute_current_subtask(
             subtask_title: subtask_title.clone(),
             status: "executing".to_string(),
             base_commit,
+            failure_message: String::new(),
             started_at: now.clone(),
             state_entered_at: now.clone(),
             plan_revision,
@@ -439,6 +445,28 @@ async fn execute_current_subtask_background(
         Err(project::SubTaskError::Timeout) => return Err("执行超时".to_string()),
     };
 
+    // 执行器结束后立即进入测试阶段，便于前端区分执行/测试
+    {
+        let mut guard = pipeline_state.lock().await;
+        if let Some(pipeline) = guard.as_mut() {
+            if pipeline.execution_id == execution_id && pipeline.status == PipelineStatus::Running {
+                append_log(
+                    pipeline,
+                    "info",
+                    format!(
+                        "🧪 执行完成，正在测试 ({}/{})：{}",
+                        subtask_idx + 1,
+                        total,
+                        subtask_title
+                    ),
+                );
+                if let Some(status) = pipeline.subtask_statuses.get_mut(subtask_idx) {
+                    status.status = "testing".to_string();
+                }
+            }
+        }
+    }
+
     let test = crate::test_runner::check_subtask(
         &project_path,
         &approved_prompt,
@@ -514,6 +542,7 @@ async fn execute_current_subtask_background(
         subtask_title: subtask_title.clone(),
         status: "awaiting_confirmation".to_string(),
         base_commit: session.base_commit,
+        failure_message: String::new(),
         started_at: session.started_at,
         state_entered_at: now_await,
         plan_revision: session.plan_revision,
@@ -654,12 +683,37 @@ async fn finalize_background_execution_failure(
 /// 质量门禁：校验执行结果、测试结果和证据完整性。
 /// 任一条件不满足都返回具体阻断原因。
 pub(crate) fn validate_subtask_quality_gate(proj: &project::Project) -> Result<(), String> {
+    validate_subtask_quality_gate_with_session_statuses(
+        proj,
+        &["awaiting_confirmation", "AwaitingConfirmation"],
+    )
+}
+
+/// 确认路径在 CAS 认领后 session 为 `confirming`，仍按子任务证据做质量门禁。
+fn validate_subtask_quality_gate_allowing_claim(proj: &project::Project) -> Result<(), String> {
+    validate_subtask_quality_gate_with_session_statuses(
+        proj,
+        &[
+            "awaiting_confirmation",
+            "AwaitingConfirmation",
+            "confirming",
+        ],
+    )
+}
+
+fn validate_subtask_quality_gate_with_session_statuses(
+    proj: &project::Project,
+    allowed_session_statuses: &[&str],
+) -> Result<(), String> {
     let session = proj
         .execution_session
         .as_ref()
         .ok_or("没有活跃的执行会话。".to_string())?;
 
-    if session.status != "awaiting_confirmation" {
+    if !allowed_session_statuses
+        .iter()
+        .any(|status| session.status.eq_ignore_ascii_case(status))
+    {
         return Err(format!(
             "任务未处于待确认状态（当前：{}），无法确认。",
             session.status
@@ -728,15 +782,23 @@ fn finalize_execution_failure(
     error_message: &str,
 ) {
     let now = chrono::Utc::now().to_rfc3339();
+    let mut error_chars = error_message.chars();
+    let truncated_body: String = error_chars.by_ref().take(2048).collect();
+    let truncated = if error_chars.next().is_some() {
+        format!("{}...", truncated_body)
+    } else {
+        truncated_body
+    };
 
-    // 修正执行会话
+    // 修正执行会话：保留 execution_id / subtask_id / base_commit 与失败原因
     if let Some(ref mut session) = proj.execution_session {
         session.active = false;
         session.status = "execution_failed".to_string();
+        session.failure_message = truncated.clone();
         session.state_entered_at = now.clone();
     }
 
-    // 修正小阶段状态
+    // 修正小阶段状态：回到 Pending，但可由会话状态定位为可恢复（不依赖 retry_count）
     if let Some(ms) = proj
         .milestones
         .iter_mut()
@@ -760,22 +822,68 @@ fn finalize_execution_failure(
         ps.status = PipelineStatus::Failed;
         ps.last_error = Some(error_message.to_string());
         ps.awaiting_confirmation = false;
+        append_log(ps, "error", format!("❌ 执行失败：{}", truncated));
     }
 
-    // 如果自动驾驶活跃，标记错误
+    // 自动驾驶活跃时标记错误，并显式写入恢复动作（不靠错误文本猜测）
     if proj.workflow_state.autopilot_active {
         if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
             ap.run_status = project::AutopilotRunStatus::ErrorStopped;
             ap.last_action = format!("执行器失败：{}", error_message);
             ap.last_action_at = now.clone();
-            let mut error_chars = error_message.chars();
-            let truncated_body: String = error_chars.by_ref().take(2048).collect();
-            let truncated = if error_chars.next().is_some() {
-                format!("{}...", truncated_body)
-            } else {
-                truncated_body
-            };
             ap.error_message = truncated;
+            ap.recovery_action = project::AutopilotRecoveryAction::RestoreExecutionBaseline;
+        }
+    }
+}
+
+/// 在流水线锁内认领待确认会话，防止自动确认与人工确认并发双提交。
+///
+/// 成功时把 session 标为 `claim_status`（`confirming` / `rejecting`）并落盘。
+/// 调用方在失败路径必须调用 [`release_confirmation_claim`] 恢复 `awaiting_confirmation`。
+fn claim_awaiting_confirmation_under_lock(
+    proj: &mut project::Project,
+    claim_status: &str,
+) -> Result<(), String> {
+    let has_awaiting = proj.milestones.iter().any(|ms| {
+        ms.mid_stages.iter().any(|mid| {
+            mid.subtasks
+                .iter()
+                .any(|st| st.status == project::SubtaskStatus::AwaitingConfirmation)
+        })
+    });
+    if !has_awaiting {
+        return Err("没有待确认的小阶段。".to_string());
+    }
+    let session = proj
+        .execution_session
+        .as_mut()
+        .ok_or_else(|| "没有活跃的执行会话。".to_string())?;
+    let status = session.status.as_str();
+    if status == "confirming" || status == "rejecting" {
+        return Err("确认或驳回操作正在进行中，请勿重复提交。".to_string());
+    }
+    // 仅允许从待确认或质量阻断进入认领
+    let allowed = status.eq_ignore_ascii_case("awaiting_confirmation")
+        || status.eq_ignore_ascii_case("quality_blocked");
+    if !allowed {
+        return Err(format!(
+            "任务未处于可确认状态（当前：{}），无法提交。",
+            status
+        ));
+    }
+    session.status = claim_status.to_string();
+    session.state_entered_at = chrono::Utc::now().to_rfc3339();
+    session.active = true;
+    crate::save_project(proj)?;
+    Ok(())
+}
+
+fn release_confirmation_claim(proj: &mut project::Project, restore_status: &str) {
+    if let Some(ref mut session) = proj.execution_session {
+        if session.status == "confirming" || session.status == "rejecting" {
+            session.status = restore_status.to_string();
+            session.state_entered_at = chrono::Utc::now().to_rfc3339();
         }
     }
 }
@@ -786,12 +894,21 @@ pub(crate) async fn confirm_subtask_result(
     state: tauri::State<'_, AppState>,
     project_name: String,
 ) -> Result<project::Project, String> {
+    // 与后台完成/启动对账共用流水线锁做 CAS 认领，关闭自动确认与人工确认的并发窗口。
+    {
+        let _guard = state.pipeline_state.lock().await;
+        let mut claim_proj = crate::load_project(&project_name)?;
+        claim_awaiting_confirmation_under_lock(&mut claim_proj, "confirming")?;
+    }
+
     let mut proj = crate::load_project(&project_name)?;
     let project_path = proj.project_path.clone();
 
     let milestone_id = proj.current_milestone_id.clone();
     let mid_stage_id = proj.current_mid_stage_id.clone();
     if milestone_id.is_empty() || mid_stage_id.is_empty() {
+        release_confirmation_claim(&mut proj, "awaiting_confirmation");
+        let _ = crate::save_project(&proj);
         return Err("请先选择大阶段和中阶段。".to_string());
     }
 
@@ -809,7 +926,8 @@ pub(crate) async fn confirm_subtask_result(
     };
 
     // 质量门禁：在创建 Git 标签之前校验执行/测试/证据完整性
-    if let Err(gate_reason) = validate_subtask_quality_gate(&proj) {
+    // 认领后 session 为 confirming，质量门禁仍按子任务状态判定
+    if let Err(gate_reason) = validate_subtask_quality_gate_allowing_claim(&proj) {
         write_execution_history(
             &mut proj,
             "error",
@@ -819,7 +937,7 @@ pub(crate) async fn confirm_subtask_result(
             Some(&mid_stage_id),
             None,
         );
-        // 如果自动驾驶活跃，进入 ErrorStopped
+        // 质量门禁需人工处理（确认面板提供驳回/重试）；不得伪装成“重新推进”或强制恢复基线
         if proj.workflow_state.autopilot_active {
             if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
                 let now = chrono::Utc::now().to_rfc3339();
@@ -827,26 +945,65 @@ pub(crate) async fn confirm_subtask_result(
                 ap.last_action = format!("质量门禁阻断：{}", gate_reason);
                 ap.last_action_at = now;
                 ap.error_message = gate_reason.clone();
+                ap.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
             }
+        }
+        if let Some(ref mut session) = proj.execution_session {
+            session.status = "quality_blocked".to_string();
+            session.failure_message = gate_reason.clone();
+            session.state_entered_at = chrono::Utc::now().to_rfc3339();
         }
         crate::save_project(&proj)?;
         return Err(gate_reason);
     }
 
-    let ms = proj
-        .milestones
-        .iter_mut()
-        .find(|m| m.id == milestone_id)
-        .ok_or("大阶段不存在。")?;
-    let mid = ms
-        .mid_stages
-        .iter_mut()
-        .find(|m| m.id == mid_stage_id)
-        .ok_or("中阶段不存在。")?;
-    let milestone_title = ms.title.clone();
+    let precheck = (|| {
+        let ms = proj
+            .milestones
+            .iter()
+            .find(|m| m.id == milestone_id)
+            .ok_or_else(|| "大阶段不存在。".to_string())?;
+        let mid = ms
+            .mid_stages
+            .iter()
+            .find(|m| m.id == mid_stage_id)
+            .ok_or_else(|| "中阶段不存在。".to_string())?;
+        let milestone_title = ms.title.clone();
+        let mid_version = mid.version.clone();
+        let subtask_idx = mid
+            .subtasks
+            .iter()
+            .position(|s| s.status == project::SubtaskStatus::AwaitingConfirmation)
+            .ok_or_else(|| "没有待确认的小阶段。".to_string())?;
+        let subtask_id = mid.subtasks[subtask_idx].id.clone();
+        let subtask_title = mid.subtasks[subtask_idx].title.clone();
+        Ok::<_, String>((
+            milestone_title,
+            mid_version,
+            subtask_idx,
+            subtask_id,
+            subtask_title,
+        ))
+    })();
+
+    let (milestone_title, mid_version, subtask_idx, subtask_id, subtask_title) = match precheck {
+        Ok(v) => v,
+        Err(msg) => {
+            release_confirmation_claim(&mut proj, "awaiting_confirmation");
+            let _ = crate::save_project(&proj);
+            return Err(msg);
+        }
+    };
 
     // Verify Git workspace is still available before tagging
-    let ws = get_execution_workspace_status_inner(&project_path)?;
+    let ws = match get_execution_workspace_status_inner(&project_path) {
+        Ok(ws) => ws,
+        Err(e) => {
+            release_confirmation_claim(&mut proj, "awaiting_confirmation");
+            let _ = crate::save_project(&proj);
+            return Err(e);
+        }
+    };
     let git_metadata_ready = ws.path_exists
         && ws.is_directory
         && ws.is_git_repo
@@ -854,28 +1011,13 @@ pub(crate) async fn confirm_subtask_result(
         && ws.git_user_available
         && ws.git_email_available;
     if !git_metadata_ready {
+        release_confirmation_claim(&mut proj, "awaiting_confirmation");
+        let _ = crate::save_project(&proj);
         return Err(format!(
             "Git 工作区不可用，无法标记确认：{}",
             ws.status_message
         ));
     }
-
-    // Collect subtask data before mutation
-    let subtask_id = {
-        let st = mid
-            .subtasks
-            .iter()
-            .find(|s| s.status == project::SubtaskStatus::AwaitingConfirmation)
-            .ok_or("没有待确认的小阶段。".to_string())?;
-        st.id.clone()
-    };
-    let subtask_idx = mid
-        .subtasks
-        .iter()
-        .position(|s| s.id == subtask_id)
-        .unwrap_or(0);
-    let subtask_title = mid.subtasks[subtask_idx].title.clone();
-    let mid_version = mid.version.clone();
 
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -890,13 +1032,21 @@ pub(crate) async fn confirm_subtask_result(
 
     match tag_result {
         Ok(tag_name) => {
-            let st = &mut mid.subtasks[subtask_idx];
-            st.status = project::SubtaskStatus::Passed;
-            st.confirmed_by_user = Some(true);
-            st.confirmed_at = Some(now.clone());
-            st.auto_tag = Some(tag_name);
+            if let Some(ms) = proj.milestones.iter_mut().find(|m| m.id == milestone_id) {
+                if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == mid_stage_id) {
+                    if let Some(st) = mid.subtasks.get_mut(subtask_idx) {
+                        st.status = project::SubtaskStatus::Passed;
+                        st.confirmed_by_user = Some(true);
+                        st.confirmed_at = Some(now.clone());
+                        st.auto_tag = Some(tag_name);
+                    }
+                }
+            }
         }
         Err(e) => {
+            // Git 失败：释放 confirming 认领，恢复待确认，允许重试
+            release_confirmation_claim(&mut proj, "awaiting_confirmation");
+            let _ = crate::save_project(&proj);
             return Err(format!("Git 标签创建失败：{}。任务未标记为通过。", e));
         }
     }
@@ -933,29 +1083,43 @@ pub(crate) async fn confirm_subtask_result(
     }
 
     // === 中阶段完成检测与工作流推进 ===
-    // 检查当前中阶段是否所有小阶段均已通过
-    let all_subtasks_passed = mid
-        .subtasks
+    let all_subtasks_passed = proj
+        .milestones
         .iter()
-        .all(|s| s.status == project::SubtaskStatus::Passed);
+        .find(|m| m.id == milestone_id)
+        .and_then(|ms| ms.mid_stages.iter().find(|m| m.id == mid_stage_id))
+        .map(|mid| {
+            mid.subtasks
+                .iter()
+                .all(|s| s.status == project::SubtaskStatus::Passed)
+        })
+        .unwrap_or(false);
+
+    let mid_title_for_node_tag = proj
+        .milestones
+        .iter()
+        .find(|m| m.id == milestone_id)
+        .and_then(|ms| ms.mid_stages.iter().find(|m| m.id == mid_stage_id))
+        .map(|mid| mid.title.clone())
+        .unwrap_or_default();
+    let mid_version_for_node_tag = mid_version.clone();
+    let mid_stage_id_for_node_tag = mid_stage_id.clone();
 
     if all_subtasks_passed {
-        // 标记中阶段完成
-        mid.status = project::MidStageStatus::Completed;
-        mid.completed_at = Some(now.clone());
-
-        // 使用预先收集的状态：当前大阶段其他中阶段是否均已完成
-        let all_mid_stages_done = other_mid_stages_all_completed;
-
-        if all_mid_stages_done {
-            // 大阶段全部中阶段完成 → 进入大阶段审阅
-            ms.status = project::MilestoneStatus::Completed;
-            ms.review_status = Some("pending_review".to_string());
-            ms.review_conclusion = None;
+        if let Some(ms) = proj.milestones.iter_mut().find(|m| m.id == milestone_id) {
+            if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == mid_stage_id) {
+                mid.status = project::MidStageStatus::Completed;
+                mid.completed_at = Some(now.clone());
+            }
+            if other_mid_stages_all_completed {
+                ms.status = project::MilestoneStatus::Completed;
+                ms.review_status = Some("pending_review".to_string());
+                ms.review_conclusion = None;
+            }
+        }
+        if other_mid_stages_all_completed {
             proj.workflow_state.current_step = project::WorkflowStep::MilestoneReview;
             proj.workflow_state.review_node_id = milestone_id.clone();
-
-            // Autopilot awareness: signal milestone review boundary
             if proj.workflow_state.autopilot_active {
                 let ap = proj
                     .workflow_state
@@ -969,19 +1133,12 @@ pub(crate) async fn confirm_subtask_result(
                 ap.error_message.clear();
             }
         } else {
-            // 大阶段仍有未完成中阶段 → 进入中阶段选择
             proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
             proj.current_mid_stage_id = String::new();
         }
-
         proj.workflow_state.data_revision += 1;
         proj.workflow_state.last_transition_at = now.clone();
     }
-
-    // 提取中阶段节点标签所需数据（在 save_project 释放可变借用前克隆）
-    let mid_version_for_node_tag = mid.version.clone();
-    let mid_title_for_node_tag = mid.title.clone();
-    let mid_stage_id_for_node_tag = mid_stage_id.clone();
 
     if all_subtasks_passed {
         write_execution_history(
@@ -1156,40 +1313,56 @@ pub(crate) async fn reject_subtask_result(
     project_name: String,
     reason: String,
 ) -> Result<project::Project, String> {
+    // 与确认共用认领：全程持流水线锁完成驳回，杜绝与自动确认并发。
+    let mut guard = state.pipeline_state.lock().await;
     let mut proj = crate::load_project(&project_name)?;
+    claim_awaiting_confirmation_under_lock(&mut proj, "rejecting")?;
 
     let milestone_id = proj.current_milestone_id.clone();
     let mid_stage_id = proj.current_mid_stage_id.clone();
 
-    let ms = proj
-        .milestones
-        .iter_mut()
-        .find(|m| m.id == milestone_id)
-        .ok_or("大阶段不存在。")?;
-    let mid = ms
-        .mid_stages
-        .iter_mut()
-        .find(|m| m.id == mid_stage_id)
-        .ok_or("中阶段不存在。")?;
+    let locate = (|| {
+        let ms = proj
+            .milestones
+            .iter()
+            .find(|m| m.id == milestone_id)
+            .ok_or("大阶段不存在。")?;
+        let mid = ms
+            .mid_stages
+            .iter()
+            .find(|m| m.id == mid_stage_id)
+            .ok_or("中阶段不存在。")?;
+        let subtask_idx = mid
+            .subtasks
+            .iter()
+            .position(|s| s.status == project::SubtaskStatus::AwaitingConfirmation)
+            .ok_or("没有待确认的小阶段。")?;
+        let subtask_id = mid.subtasks[subtask_idx].id.clone();
+        let subtask_title = mid.subtasks[subtask_idx].title.clone();
+        Ok::<_, &str>((subtask_idx, subtask_id, subtask_title))
+    })();
 
-    let subtask_idx = mid
-        .subtasks
-        .iter()
-        .position(|s| s.status == project::SubtaskStatus::AwaitingConfirmation)
-        .ok_or("没有待确认的小阶段。".to_string())?;
-
-    // Capture data before mutation
-    let subtask_id = mid.subtasks[subtask_idx].id.clone();
-    let subtask_title = mid.subtasks[subtask_idx].title.clone();
+    let (subtask_idx, subtask_id, subtask_title) = match locate {
+        Ok(v) => v,
+        Err(msg) => {
+            release_confirmation_claim(&mut proj, "awaiting_confirmation");
+            let _ = crate::save_project(&proj);
+            return Err(msg.to_string());
+        }
+    };
 
     let now = chrono::Utc::now().to_rfc3339();
-    let st = &mut mid.subtasks[subtask_idx];
-    st.status = project::SubtaskStatus::Rejected;
-    st.confirmed_by_user = Some(false);
-    st.confirmed_at = Some(now.clone());
-    st.confirmation_notes = Some(reason.clone());
+    if let Some(ms) = proj.milestones.iter_mut().find(|m| m.id == milestone_id) {
+        if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == mid_stage_id) {
+            if let Some(st) = mid.subtasks.get_mut(subtask_idx) {
+                st.status = project::SubtaskStatus::Rejected;
+                st.confirmed_by_user = Some(false);
+                st.confirmed_at = Some(now.clone());
+                st.confirmation_notes = Some(reason.clone());
+            }
+        }
+    }
 
-    // Write execution history: user rejected
     write_execution_history(
         &mut proj,
         "error",
@@ -1200,25 +1373,20 @@ pub(crate) async fn reject_subtask_result(
         Some(&subtask_id),
     );
 
-    // Clear execution session
     proj.execution_session = None;
+    crate::save_project(&proj)?;
 
-    let proj = crate::save_and_reload_project(&proj)?;
-
-    // Clear pipeline state
-    {
-        let mut guard = state.pipeline_state.lock().await;
-        if let Some(s) = guard.as_mut() {
-            s.status = PipelineStatus::Idle;
-            s.awaiting_confirmation = false;
-            append_log(s, "error", format!("❌ 已驳回: {}", reason));
-        }
+    if let Some(s) = guard.as_mut() {
+        s.status = PipelineStatus::Idle;
+        s.awaiting_confirmation = false;
+        append_log(s, "error", format!("❌ 已驳回: {}", reason));
     }
+    drop(guard);
 
-    Ok(proj)
+    crate::load_project(&project_name)
 }
 
-/// V1 重试当前小阶段：恢复到执行基线后重新执行
+/// V1 重试当前小阶段：先恢复基线并验证干净，成功后才清除失败会话并增加重试次数
 #[tauri::command]
 pub(crate) async fn retry_current_subtask(
     project_name: String,
@@ -1232,7 +1400,13 @@ pub(crate) async fn retry_current_subtask(
         return Err("请先选择大阶段和中阶段。".to_string());
     }
 
-    // 找到当前任务（只接受执行失败、测试失败、人工驳回或恢复中断的任务）
+    // 可由会话状态直接定位可恢复任务，不得依赖 retry_count > 0
+    let recoverable_subtask_id = proj
+        .execution_session
+        .as_ref()
+        .filter(|session| session.is_recoverable_failure())
+        .map(|session| session.subtask_id.clone());
+
     let ms = proj
         .milestones
         .iter()
@@ -1251,7 +1425,11 @@ pub(crate) async fn retry_current_subtask(
             matches!(
                 st.status,
                 project::SubtaskStatus::Rejected | project::SubtaskStatus::AwaitingConfirmation
-            ) || (st.status == project::SubtaskStatus::Pending && st.retry_count > 0)
+            ) || (st.status == project::SubtaskStatus::Pending
+                && recoverable_subtask_id
+                    .as_ref()
+                    .is_some_and(|id| id == &st.id))
+                || (st.status == project::SubtaskStatus::Pending && st.retry_count > 0)
         })
         .ok_or(
             "没有可重试的小阶段。只有测试失败、执行失败、人工驳回或恢复中断的任务可以重试。"
@@ -1269,6 +1447,7 @@ pub(crate) async fn retry_current_subtask(
     let subtask_title = subtask.title.clone();
 
     // 优先使用执行会话基线，其次最近通过标签，最后显式恢复当前 HEAD。
+    // Git 恢复失败时保留失败会话、基线和错误证据。
     let session_base = proj.execution_session.as_ref().and_then(|session| {
         if session.base_commit.is_empty() {
             None
@@ -1285,7 +1464,7 @@ pub(crate) async fn retry_current_subtask(
 
     let now = chrono::Utc::now().to_rfc3339();
 
-    // 清理旧结果并递增重试次数
+    // 基线恢复成功后才清理旧结果并递增重试次数（每次人工确认只 +1）
     let ms = proj
         .milestones
         .iter_mut()
@@ -1303,7 +1482,7 @@ pub(crate) async fn retry_current_subtask(
     st.test_result = None;
     st.retry_count = new_retry_count;
 
-    // 清除执行会话
+    // 清除失败会话
     proj.execution_session = None;
 
     // 记录重试事件
@@ -1320,7 +1499,7 @@ pub(crate) async fn retry_current_subtask(
         Some(&subtask_id),
     );
 
-    // 如果自动驾驶处于 ErrorStopped，恢复为 Running
+    // 如果自动驾驶处于 ErrorStopped，恢复为 Running 并清除恢复动作
     if proj.workflow_state.autopilot_active {
         if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
             if ap.run_status == project::AutopilotRunStatus::ErrorStopped {
@@ -1329,13 +1508,10 @@ pub(crate) async fn retry_current_subtask(
                     format!("重试小阶段（第 {} 次）：{}", new_retry_count, subtask_title);
                 ap.last_action_at = now.clone();
                 ap.error_message = String::new();
+                ap.recovery_action = project::AutopilotRecoveryAction::None;
             }
         }
     }
-
-    // 清理流水线状态
-    // Note: retry_current_subtask doesn't take AppState, so pipeline state is preserved
-    // The next execute_current_subtask call will reset it
 
     crate::save_and_reload_project(&proj).map_err(|e| format!("重试状态保存失败：{}", e))
 }
@@ -1812,16 +1988,20 @@ async fn persist_in_stop_failure(
         }
     }
     let now = chrono::Utc::now().to_rfc3339();
+    let truncated: String = error.chars().take(2048).collect();
     if let Some(session) = proj.execution_session.as_mut() {
         session.active = false;
         session.status = "stop_failed".to_string();
+        session.failure_message = truncated.clone();
         session.state_entered_at = now.clone();
     }
     if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
         autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
         autopilot.last_action = format!("In Stop 失败：{}", error);
         autopilot.last_action_at = now;
-        autopilot.error_message = error.chars().take(2048).collect();
+        autopilot.error_message = truncated;
+        autopilot.recovery_action =
+            project::AutopilotRecoveryAction::RestoreExecutionBaseline;
     }
     let milestone_id = proj.current_milestone_id.clone();
     let mid_stage_id = proj.current_mid_stage_id.clone();
@@ -2051,27 +2231,39 @@ pub(crate) async fn request_in_stop_with_pipeline_state(
     Ok(())
 }
 
-/// V1 ED Stop：当前任务完成后暂停（标记请求，执行器完成后检查）
+/// V1 ED Stop：先取得流水线互斥权，再加载最新项目，在同一互斥周期内写盘后返回。
 #[tauri::command]
 pub(crate) async fn request_ed_stop(
     state: tauri::State<'_, AppState>,
     project_name: String,
 ) -> Result<project::Project, String> {
+    let pipeline_state = state.pipeline_state.clone();
+    let mut pipeline_guard = pipeline_state.lock().await;
     let mut proj = crate::load_project(&project_name)?;
 
-    request_ed_stop_with_pipeline_state(state.pipeline_state.clone(), &mut proj).await?;
-
-    crate::save_and_reload_project(&proj)
+    request_ed_stop_under_lock(&mut pipeline_guard, &mut proj)?;
+    crate::save_project(&proj)?;
+    drop(pipeline_guard);
+    crate::load_project(&project_name)
 }
 
-/// Mark the currently executing task for an end-of-task pause.
-/// Repeated requests are idempotent and do not append duplicate history.
+/// 测试与内部入口：取得流水线互斥权后，再加载/修改调用方提供的项目事实。
+/// 注意：生产路径由 `request_ed_stop` 在锁内加载最新磁盘项目；本函数假定调用方已在锁内
+/// 持有最新事实，或仅用于单线程测试。
 pub(crate) async fn request_ed_stop_with_pipeline_state(
     pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
     proj: &mut project::Project,
 ) -> Result<(), String> {
     let mut pipeline_guard = pipeline_state.lock().await;
+    request_ed_stop_under_lock(&mut pipeline_guard, proj)
+}
 
+/// 在调用方已经取得流水线互斥权后修改最新项目事实（不自行取锁、不自行保存）。
+/// 暂停请求写入失败时由调用方决定是否保存；本函数失败时不得只保留内存日志。
+fn request_ed_stop_under_lock(
+    pipeline_guard: &mut Option<PipelineState>,
+    proj: &mut project::Project,
+) -> Result<(), String> {
     // 重复请求是幂等操作，必须在修改日志和历史之前返回。
     if proj
         .pause_context
@@ -2089,19 +2281,34 @@ pub(crate) async fn request_ed_stop_with_pipeline_state(
         .map(|session| session.execution_id.clone())
         .filter(|id| !id.is_empty())
         .ok_or("只有小阶段真实执行中才能请求完成后暂停。")?;
-    let pipeline = pipeline_guard
-        .as_mut()
-        .filter(|pipeline| {
-            pipeline.execution_id == execution_id && pipeline.status == PipelineStatus::Running
-        })
-        .ok_or("内存执行状态与项目会话不一致，无法请求完成后暂停。")?;
+
+    let pipeline = match pipeline_guard.as_mut() {
+        Some(pipeline)
+            if pipeline.execution_id == execution_id
+                && pipeline.status == PipelineStatus::Running =>
+        {
+            pipeline
+        }
+        Some(pipeline)
+            if pipeline.execution_id == execution_id
+                && (pipeline.status == PipelineStatus::Paused
+                    || pipeline.status == PipelineStatus::Completed
+                    || pipeline.awaiting_confirmation) =>
+        {
+            return Err("任务已经完成，无法登记完成后暂停".to_string());
+        }
+        _ => {
+            return Err(
+                "内存执行状态与项目会话不一致，无法请求完成后暂停。".to_string(),
+            );
+        }
+    };
     append_log(
         pipeline,
         "pause",
         "⏸ ED Stop：当前任务完成后将暂停".to_string(),
     );
 
-    // Save pending action in PauseContext
     let now = chrono::Utc::now().to_rfc3339();
     let current = find_current_subtask(proj);
     proj.pause_context = Some(project::PauseContext {
@@ -2117,6 +2324,8 @@ pub(crate) async fn request_ed_stop_with_pipeline_state(
     });
 
     proj.workflow_state.pause_reason = project::PauseReason::EDStop;
+    proj.workflow_state.data_revision += 1;
+    proj.workflow_state.last_transition_at = now;
 
     let milestone_id = proj.current_milestone_id.clone();
     let mid_stage_id = proj.current_mid_stage_id.clone();
@@ -2479,6 +2688,19 @@ pub fn reconcile_execution_state(
         }
     };
 
+    // 已落盘的可恢复失败会话：即使 active=false 也必须保留证据
+    if session.is_recoverable_failure()
+        || matches!(
+            session.status.as_str(),
+            "quality_blocked" | "QualityBlocked"
+        )
+    {
+        if session.subtask_id.is_empty() {
+            return ExecutionReconciliation::SessionInvalid;
+        }
+        return ExecutionReconciliation::AwaitingConfirmation;
+    }
+
     // Check session validity
     if !session.active || session.subtask_id.is_empty() {
         return ExecutionReconciliation::SessionInvalid;
@@ -2523,7 +2745,10 @@ pub fn reconcile_execution_state(
                 None => ExecutionReconciliation::SessionLost,
             }
         }
-        "awaiting_confirmation" => ExecutionReconciliation::AwaitingConfirmation,
+        // confirming/rejecting：进程崩溃后的半途认领，按待确认恢复，允许人工重试
+        "awaiting_confirmation" | "confirming" | "rejecting" => {
+            ExecutionReconciliation::AwaitingConfirmation
+        }
         _ => ExecutionReconciliation::SessionInvalid,
     }
 }
@@ -2544,8 +2769,18 @@ pub fn apply_execution_reconciliation(
         }
         ExecutionReconciliation::SessionLost => {
             // Process died — mark session as lost and reset the stuck subtask
+            let now = chrono::Utc::now().to_rfc3339();
             if let Some(ref mut session) = proj.execution_session {
-                session.status = "session_lost".to_string();
+                // 已是 session_lost 时不重复清空证据
+                if session.status != "session_lost" {
+                    session.status = "session_lost".to_string();
+                    session.active = false;
+                    if session.failure_message.is_empty() {
+                        session.failure_message =
+                            "执行进程失联，工作区可能残留未提交修改。".to_string();
+                    }
+                    session.state_entered_at = now.clone();
+                }
                 // Reset the Executing/Awaiting subtask to Pending
                 if let Some(ms) = proj
                     .milestones
@@ -2572,6 +2807,20 @@ pub fn apply_execution_reconciliation(
                             }
                         }
                     }
+                }
+            }
+            // 自动驾驶显式标记恢复动作，不得靠错误文本猜测
+            if proj.workflow_state.autopilot_active {
+                if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
+                    ap.run_status = project::AutopilotRunStatus::ErrorStopped;
+                    ap.last_action = "执行会话失联，需要恢复执行基线".to_string();
+                    ap.last_action_at = now;
+                    if ap.error_message.is_empty() {
+                        ap.error_message =
+                            "执行进程失联，请先恢复执行基线后再继续。".to_string();
+                    }
+                    ap.recovery_action =
+                        project::AutopilotRecoveryAction::RestoreExecutionBaseline;
                 }
             }
             proj.workflow_state.data_revision += 1;
@@ -2603,45 +2852,136 @@ pub fn apply_execution_reconciliation(
     }
 }
 
-/// 启动时对账执行状态：加载项目 → reconcile → apply → 保存 → 返回磁盘最终 Project。
+/// 在调用方已持有流水线互斥权时，对最新项目快照做执行对账并可选写盘。
+///
+/// 必须在持有 `pipeline_state` 锁期间调用：先取锁、再 load、再对账/保存，
+/// 避免“先读旧盘 → 后台完成写盘 → 用旧快照覆盖”的窗口（与 ED Stop 同构）。
+pub(crate) fn reconcile_loaded_project_under_pipeline_lock(
+    proj: &mut project::Project,
+    pipeline_status: Option<&PipelineState>,
+) -> bool {
+    let reconciliation = reconcile_execution_state(proj, pipeline_status);
+    apply_execution_reconciliation(proj, &reconciliation)
+}
+
+/// 启动时对账执行状态：取流水线锁 → 加载最新项目 → reconcile → apply → 保存。
 ///
 /// 与独立函数 `reconcile_execution_state` + `apply_execution_reconciliation` 的区别：
 /// 本命令是一个完整的持久化流程，返回对账并保存后的磁盘事实，供前端启动恢复使用。
+/// 全程与后台完成路径共用 `pipeline_state` 互斥，禁止在取锁前缓存项目快照。
 #[tauri::command]
 pub(crate) async fn reconcile_on_startup(
     state: tauri::State<'_, AppState>,
     project_name: String,
 ) -> Result<project::Project, String> {
+    // 先取锁，再 load：与后台完成/ED Stop 同一互斥周期，杜绝旧快照覆盖新结果。
+    let guard = state.pipeline_state.lock().await;
     let mut proj = crate::load_project(&project_name)?;
-
-    // 获取当前内存中的 PipelineState（可能为 None）
-    let pipeline_status = {
-        let guard = state.pipeline_state.lock().await;
-        guard.clone()
-    };
-
-    let reconciliation = reconcile_execution_state(&proj, pipeline_status.as_ref());
-    let modified = apply_execution_reconciliation(&mut proj, &reconciliation);
+    let modified =
+        reconcile_loaded_project_under_pipeline_lock(&mut proj, guard.as_ref());
 
     if modified {
-        crate::save_and_reload_project(&proj)
+        crate::save_project(&proj)?;
+        // 仍在锁内重读，保证返回值与磁盘最终事实一致
+        let reloaded = crate::load_project(&project_name)?;
+        drop(guard);
+        Ok(reloaded)
     } else {
+        drop(guard);
         Ok(proj)
     }
 }
 
-/// 应用启动恢复确认：用户看到中断提示后清理恢复标记
+/// 应用启动恢复确认：实际恢复 Git 基线；失败时保留会话与证据，禁止谎称已恢复
 #[tauri::command]
 pub(crate) async fn acknowledge_execution_recovery(
     project_name: String,
 ) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
-    if let Some(ref mut session) = proj.execution_session {
-        if session.status == "session_lost" {
-            session.active = false;
-            session.status = String::new();
+    let project_path = proj.project_path.clone();
+
+    let session = proj
+        .execution_session
+        .as_ref()
+        .filter(|session| {
+            matches!(
+                session.parsed_status(),
+                project::ExecutionSessionStatus::SessionLost
+                    | project::ExecutionSessionStatus::StopFailed
+                    | project::ExecutionSessionStatus::ExecutionFailed
+            )
+        })
+        .ok_or("当前没有需要恢复的执行失败会话。".to_string())?;
+
+    let base_commit = session.base_commit.clone();
+    let subtask_id = session.subtask_id.clone();
+    let subtask_title = session.subtask_title.clone();
+    let milestone_id = session.milestone_id.clone();
+    let mid_stage_id = session.mid_stage_id.clone();
+
+    let restore_target = if base_commit.is_empty() {
+        find_last_passed_subtask(&proj)
+            .and_then(|st| st.auto_tag)
+            .unwrap_or_else(|| "HEAD".to_string())
+    } else {
+        base_commit
+    };
+
+    // Git 恢复失败：保留失败会话、基线和错误证据，自动驾驶保持 ErrorStopped
+    restore_git_execution_baseline(&project_path, &restore_target).map_err(|error| {
+        format!(
+            "Git 基线恢复失败：{}。失败证据已保留，请勿认为已恢复到安全状态。",
+            error
+        )
+    })?;
+
+    // 基线恢复成功后才清除会话
+    proj.execution_session = None;
+
+    // 确保受影响任务为 Pending，可再次执行
+    if let Some(ms) = proj
+        .milestones
+        .iter_mut()
+        .find(|m| m.id == milestone_id)
+    {
+        if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == mid_stage_id) {
+            if let Some(st) = mid.subtasks.iter_mut().find(|st| st.id == subtask_id) {
+                if st.status != project::SubtaskStatus::Passed {
+                    st.status = project::SubtaskStatus::Pending;
+                    st.execution_result = None;
+                    st.test_result = None;
+                }
+            }
         }
     }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    write_execution_history(
+        &mut proj,
+        "info",
+        project::ExecutionEventType::RetryScheduled,
+        format!("🔧 已恢复执行基线：{}", subtask_title),
+        Some(&milestone_id),
+        Some(&mid_stage_id),
+        Some(&subtask_id),
+    );
+
+    if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
+        if ap.recovery_action == project::AutopilotRecoveryAction::RestoreExecutionBaseline {
+            ap.recovery_action = project::AutopilotRecoveryAction::None;
+            ap.error_message = String::new();
+            ap.last_action = format!("已恢复执行基线：{}", subtask_title);
+            ap.last_action_at = now.clone();
+            // 基线已恢复，但不自动继续推进；留给用户确认后恢复自动驾驶
+            if ap.run_status == project::AutopilotRunStatus::ErrorStopped {
+                ap.run_status = project::AutopilotRunStatus::Paused;
+            }
+        }
+    }
+
+    proj.workflow_state.data_revision += 1;
+    proj.workflow_state.last_transition_at = now;
+
     crate::save_and_reload_project(&proj)
 }
 
@@ -2855,6 +3195,7 @@ mod tests {
             subtask_title: "测试小阶段".to_string(),
             status: status.to_string(),
             base_commit: base_commit.to_string(),
+            failure_message: String::new(),
             started_at: "2026-07-20T00:00:00Z".to_string(),
             state_entered_at: "2026-07-20T00:00:00Z".to_string(),
             plan_revision: 1,
@@ -3299,9 +3640,11 @@ mod tests {
             executing.workflow_state.pause_reason,
             project::PauseReason::EDStop
         );
+        assert_eq!(executing.workflow_state.data_revision, 1);
 
         request_ed_stop_with_pipeline_state(pipeline, &mut executing).await?;
         assert_eq!(executing.execution_history.len(), 1);
+        assert_eq!(executing.workflow_state.data_revision, 1);
 
         let mut planning = execution_project(
             "ed-stop-planning",
@@ -3314,6 +3657,423 @@ mod tests {
         assert!(result.is_err());
         assert!(planning.execution_history.is_empty());
         assert!(planning.pause_context.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn first_execution_failure_is_retryable_without_retry_count() -> Result<(), String> {
+        let repo = TempGitRepo::new("first-fail")?;
+        let baseline = repo.head()?;
+        std::fs::write(repo.path.join("tracked.txt"), "dirty after fail\n")
+            .map_err(|error| format!("写入失败残留失败：{}", error))?;
+        std::fs::write(repo.path.join("untracked.txt"), "untracked residue\n")
+            .map_err(|error| format!("写入未跟踪残留失败：{}", error))?;
+
+        let project_name = unique_project_name("first-fail");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut session = execution_session("execution_failed", "execution-first", &baseline);
+        session.active = false;
+        session.failure_message = "执行超时".to_string();
+        let mut proj = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::Pending,
+            Some(session),
+        );
+        // 首次失败：retry_count 必须为 0 仍可恢复
+        proj.milestones[0].mid_stages[0].subtasks[0].retry_count = 0;
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::ErrorStopped,
+            last_action: "执行超时".to_string(),
+            last_action_at: "2026-07-20T00:00:00Z".to_string(),
+            error_message: "执行超时".to_string(),
+            recovery_action: project::AutopilotRecoveryAction::RestoreExecutionBaseline,
+        });
+        crate::save_project(&proj)?;
+
+        let updated = retry_current_subtask(project_name.clone()).await?;
+        assert_eq!(repo.head()?, baseline);
+        assert_eq!(
+            updated.milestones[0].mid_stages[0].subtasks[0].retry_count,
+            1
+        );
+        assert!(updated.execution_session.is_none());
+        assert_eq!(
+            updated
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|ap| &ap.run_status),
+            Some(&project::AutopilotRunStatus::Running)
+        );
+        assert_eq!(
+            updated
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|ap| &ap.recovery_action),
+            Some(&project::AutopilotRecoveryAction::None)
+        );
+        let workspace = get_execution_workspace_status_inner(&repo.path_string())?;
+        assert!(workspace.working_tree_clean);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_lost_acknowledge_restores_baseline() -> Result<(), String> {
+        let repo = TempGitRepo::new("session-lost-ack")?;
+        let baseline = repo.head()?;
+        std::fs::write(repo.path.join("tracked.txt"), "interrupted change\n")
+            .map_err(|error| format!("写入失联残留失败：{}", error))?;
+
+        let project_name = unique_project_name("session-lost-ack");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut session = execution_session("session_lost", "execution-lost", &baseline);
+        session.active = false;
+        session.failure_message = "执行进程失联".to_string();
+        let mut proj = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::Pending,
+            Some(session),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::ErrorStopped,
+            last_action: "session lost".to_string(),
+            last_action_at: "2026-07-20T00:00:00Z".to_string(),
+            error_message: "失联".to_string(),
+            recovery_action: project::AutopilotRecoveryAction::RestoreExecutionBaseline,
+        });
+        crate::save_project(&proj)?;
+
+        let updated = acknowledge_execution_recovery(project_name).await?;
+        assert!(updated.execution_session.is_none());
+        assert_eq!(repo.head()?, baseline);
+        let workspace = get_execution_workspace_status_inner(&repo.path_string())?;
+        assert!(workspace.working_tree_clean);
+        assert_eq!(
+            updated
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|ap| &ap.run_status),
+            Some(&project::AutopilotRunStatus::Paused)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restore_failure_keeps_session_and_evidence() -> Result<(), String> {
+        let project_name = unique_project_name("restore-fail");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut session = execution_session(
+            "execution_failed",
+            "execution-bad-base",
+            "not-a-real-commit-hash",
+        );
+        session.active = false;
+        session.failure_message = "original failure".to_string();
+        // 无真实 git 仓库：恢复必然失败
+        let proj = execution_project(
+            &project_name,
+            Path::new("/tmp/metheus-nonexistent-git-repo-for-test"),
+            project::SubtaskStatus::Pending,
+            Some(session),
+        );
+        crate::save_project(&proj)?;
+
+        let result = retry_current_subtask(project_name.clone()).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap_or_default();
+        assert!(err.contains("失败证据已保留"));
+
+        let persisted = crate::load_project(&project_name)?;
+        assert_eq!(
+            persisted
+                .execution_session
+                .as_ref()
+                .map(|s| s.status.as_str()),
+            Some("execution_failed")
+        );
+        assert_eq!(
+            persisted
+                .execution_session
+                .as_ref()
+                .map(|s| s.failure_message.as_str()),
+            Some("original failure")
+        );
+        assert_eq!(
+            persisted
+                .execution_session
+                .as_ref()
+                .map(|s| s.base_commit.as_str()),
+            Some("not-a-real-commit-hash")
+        );
+        assert_eq!(
+            persisted.milestones[0].mid_stages[0].subtasks[0].retry_count,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ed_stop_completed_pipeline_rejects_without_overwrite() -> Result<(), String> {
+        let mut executing = execution_project(
+            "ed-stop-done",
+            Path::new(""),
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(execution_session(
+                "awaiting_confirmation",
+                "execution-done",
+                "HEAD",
+            )),
+        );
+        // 会话仍标记 executing 模拟竞态边界；流水线已完成
+        if let Some(ref mut session) = executing.execution_session {
+            session.status = "executing".to_string();
+            session.active = true;
+        }
+        let mut done_pipeline = pipeline_state("execution-done", PipelineStatus::Paused);
+        done_pipeline.awaiting_confirmation = true;
+        let pipeline = Arc::new(Mutex::new(Some(done_pipeline)));
+
+        let result = request_ed_stop_with_pipeline_state(pipeline, &mut executing).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap_or_default();
+        assert!(err.contains("任务已经完成"));
+        assert!(executing.pause_context.is_none());
+        assert!(executing.execution_history.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_execution_failure_sets_recoverable_session() {
+        let mut proj = execution_project(
+            "finalize-fail",
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(execution_session("executing", "execution-x", "abc123")),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::Running,
+            last_action: String::new(),
+            last_action_at: String::new(),
+            error_message: String::new(),
+            recovery_action: project::AutopilotRecoveryAction::None,
+        });
+        let mut pipeline = Some(pipeline_state("execution-x", PipelineStatus::Running));
+        finalize_execution_failure(&mut proj, &mut pipeline, 0, "timeout");
+
+        let session = proj.execution_session.as_ref().expect("session kept");
+        assert_eq!(session.status, "execution_failed");
+        assert!(!session.active);
+        assert_eq!(session.base_commit, "abc123");
+        assert!(session.failure_message.contains("timeout"));
+        assert_eq!(
+            session.parsed_status(),
+            project::ExecutionSessionStatus::ExecutionFailed
+        );
+        assert_eq!(
+            proj.milestones[0].mid_stages[0].subtasks[0].status,
+            project::SubtaskStatus::Pending
+        );
+        assert_eq!(
+            proj.workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|ap| &ap.recovery_action),
+            Some(&project::AutopilotRecoveryAction::RestoreExecutionBaseline)
+        );
+        // 首次失败 retry_count 仍为 0，但会话可定位恢复
+        assert_eq!(
+            proj.milestones[0].mid_stages[0].subtasks[0].retry_count,
+            0
+        );
+    }
+
+    #[test]
+    fn failed_session_survives_reconcile_without_clearing() {
+        let mut session = execution_session("execution_failed", "execution-keep", "HEAD");
+        session.active = false;
+        session.failure_message = "kept".to_string();
+        let proj = execution_project(
+            "keep-failed",
+            Path::new(""),
+            project::SubtaskStatus::Pending,
+            Some(session),
+        );
+        let result = reconcile_execution_state(&proj, None);
+        // keep 路径：不得清理失败会话
+        assert!(matches!(
+            result,
+            ExecutionReconciliation::AwaitingConfirmation
+        ));
+        let mut copy = proj.clone();
+        assert!(!apply_execution_reconciliation(&mut copy, &result));
+        assert_eq!(
+            copy.execution_session
+                .as_ref()
+                .map(|s| s.failure_message.as_str()),
+            Some("kept")
+        );
+    }
+
+    /// 模拟“取锁后再 load”的正确对账：后台已写入 awaiting_confirmation 时，
+    /// 不得用启动前缓存的 executing 旧快照判 SessionLost 并覆盖。
+    #[tokio::test]
+    async fn reconcile_under_lock_after_completion_keeps_awaiting_results() -> Result<(), String> {
+        let project_name = unique_project_name("reconcile-race");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+
+        // 磁盘初始为 executing（模拟启动对账若过早 load 会拿到的旧快照）
+        let executing = execution_project(
+            &project_name,
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(execution_session("executing", "execution-race", "HEAD")),
+        );
+        crate::save_project(&executing)?;
+
+        let pipeline = Arc::new(Mutex::new(Some(pipeline_state(
+            "execution-race",
+            PipelineStatus::Running,
+        ))));
+
+        // 后台完成：持锁写 awaiting_confirmation + 测试结果，流水线改 Paused
+        {
+            let mut guard = pipeline.lock().await;
+            let mut done = crate::load_project(&project_name)?;
+            done.milestones[0].mid_stages[0].subtasks[0].status =
+                project::SubtaskStatus::AwaitingConfirmation;
+            done.milestones[0].mid_stages[0].subtasks[0].execution_result =
+                Some(project::ExecutionResult {
+                    success: true,
+                    output: "ok".to_string(),
+                    error_log: String::new(),
+                    file_changes: vec!["tracked.txt".to_string()],
+                });
+            done.milestones[0].mid_stages[0].subtasks[0].test_result =
+                Some(project::TestResult {
+                    passed: true,
+                    issues: vec![],
+                    suggestion: String::new(),
+                    warnings: vec![],
+                });
+            if let Some(ref mut session) = done.execution_session {
+                session.status = "awaiting_confirmation".to_string();
+                session.state_entered_at = chrono::Utc::now().to_rfc3339();
+            }
+            crate::save_project(&done)?;
+            if let Some(ref mut ps) = *guard {
+                ps.status = PipelineStatus::Paused;
+                ps.awaiting_confirmation = true;
+            }
+        }
+
+        // 错误路径反例：若仍用启动前的旧 executing 快照 + 完成后的 Paused 内存态，会误判 SessionLost
+        let stale = executing.clone();
+        let paused = pipeline_state("execution-race", PipelineStatus::Paused);
+        assert!(matches!(
+            reconcile_execution_state(&stale, Some(&paused)),
+            ExecutionReconciliation::SessionLost
+        ));
+
+        // 正确路径：持锁后重新 load，再对账 → 保留待确认与执行证据
+        {
+            let guard = pipeline.lock().await;
+            let mut fresh = crate::load_project(&project_name)?;
+            let modified =
+                reconcile_loaded_project_under_pipeline_lock(&mut fresh, guard.as_ref());
+            assert!(!modified, "待确认事实不得被对账改写");
+            assert_eq!(
+                fresh
+                    .execution_session
+                    .as_ref()
+                    .map(|s| s.status.as_str()),
+                Some("awaiting_confirmation")
+            );
+            assert_eq!(
+                fresh.milestones[0].mid_stages[0].subtasks[0].status,
+                project::SubtaskStatus::AwaitingConfirmation
+            );
+            assert!(
+                fresh.milestones[0].mid_stages[0].subtasks[0]
+                    .execution_result
+                    .as_ref()
+                    .is_some_and(|r| r.success)
+            );
+            assert!(
+                fresh.milestones[0].mid_stages[0].subtasks[0]
+                    .test_result
+                    .as_ref()
+                    .is_some_and(|r| r.passed)
+            );
+            if modified {
+                crate::save_project(&fresh)?;
+            }
+        }
+
+        let final_proj = crate::load_project(&project_name)?;
+        assert_eq!(
+            final_proj
+                .execution_session
+                .as_ref()
+                .map(|s| s.status.as_str()),
+            Some("awaiting_confirmation")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_confirmation_claim_reconciles_as_awaiting() {
+        let proj = execution_project(
+            "claim-crash",
+            Path::new(""),
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(execution_session("confirming", "execution-claim", "HEAD")),
+        );
+        assert!(matches!(
+            reconcile_execution_state(&proj, None),
+            ExecutionReconciliation::AwaitingConfirmation
+        ));
+    }
+
+    #[test]
+    fn claim_confirmation_is_exclusive() -> Result<(), String> {
+        let project_name = unique_project_name("claim-excl");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = execution_project(
+            &project_name,
+            Path::new(""),
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(execution_session(
+                "awaiting_confirmation",
+                "execution-claim",
+                "HEAD",
+            )),
+        );
+        crate::save_project(&proj)?;
+
+        claim_awaiting_confirmation_under_lock(&mut proj, "confirming")?;
+        assert_eq!(
+            proj.execution_session.as_ref().map(|s| s.status.as_str()),
+            Some("confirming")
+        );
+
+        let mut second = crate::load_project(&project_name)?;
+        let err = claim_awaiting_confirmation_under_lock(&mut second, "confirming")
+            .err()
+            .ok_or("第二次认领应失败".to_string())?;
+        assert!(err.contains("正在进行中") || err.contains("重复"));
         Ok(())
     }
 }
