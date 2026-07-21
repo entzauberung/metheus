@@ -157,6 +157,9 @@ pub struct WorkflowState {
     /// 托管层状态（ThreeChecks 后到大阶段批准，独立于 autopilot）
     #[serde(default)]
     pub managed_flow_state: Option<ManagedFlowState>,
+    /// 当前错误恢复编排状态；旧项目默认无恢复任务
+    #[serde(default)]
+    pub recovery_state: Option<RecoveryState>,
 }
 
 impl Default for WorkflowState {
@@ -173,6 +176,7 @@ impl Default for WorkflowState {
             autopilot_target_milestone_id: String::new(),
             autopilot_state: None,
             managed_flow_state: None,
+            recovery_state: None,
         }
     }
 }
@@ -216,6 +220,8 @@ pub enum AutopilotRecoveryAction {
     PrepareExecutionWorkspace,
     /// 用户在应用外处理工作区变更后刷新
     ResolveWorkspaceChanges,
+    /// 运行受限的自动诊断、修复和复测循环
+    RunAutomaticRecovery,
 }
 
 /// autopilot 持久化状态（写入 WorkflowState，用于刷新恢复）
@@ -248,6 +254,77 @@ impl Default for AutopilotState {
             last_action_at: String::new(),
             error_message: String::new(),
             recovery_action: AutopilotRecoveryAction::None,
+        }
+    }
+}
+
+/// 错误恢复分类。分类由后端依据结构化执行事实产生，前端不得解析错误文本。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum RecoveryErrorKind {
+    WorkspaceError,
+    TransientError,
+    ExecutionError,
+    ScopeViolation,
+    TestFailure,
+    ReviewFailure,
+    TestUnavailable,
+    StateConflict,
+    #[default]
+    HumanRequired,
+}
+
+/// 错误恢复阶段，持久化后可在刷新应用后继续展示真实进度。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum RecoveryPhase {
+    #[default]
+    Diagnosing,
+    Repairing,
+    Retesting,
+    Recovered,
+    WaitingHuman,
+}
+
+/// 当前小阶段的有限恢复循环状态。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryState {
+    pub error_kind: RecoveryErrorKind,
+    pub phase: RecoveryPhase,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub error_signature: String,
+    #[serde(default)]
+    pub repeated_signature_count: u32,
+    pub subtask_id: String,
+    pub execution_id: String,
+    #[serde(default)]
+    pub baseline_commit: String,
+    #[serde(default)]
+    pub last_diagnosis: String,
+    #[serde(default)]
+    pub last_repair_summary: String,
+    #[serde(default)]
+    pub original_test_failure: String,
+    pub started_at: String,
+    pub updated_at: String,
+}
+
+impl Default for RecoveryState {
+    fn default() -> Self {
+        Self {
+            error_kind: RecoveryErrorKind::HumanRequired,
+            phase: RecoveryPhase::Diagnosing,
+            attempt: 0,
+            max_attempts: 2,
+            error_signature: String::new(),
+            repeated_signature_count: 1,
+            subtask_id: String::new(),
+            execution_id: String::new(),
+            baseline_commit: String::new(),
+            last_diagnosis: String::new(),
+            last_repair_summary: String::new(),
+            original_test_failure: String::new(),
+            started_at: String::new(),
+            updated_at: String::new(),
         }
     }
 }
@@ -475,6 +552,9 @@ pub struct Subtask {
     /// 确认备注
     #[serde(default)]
     pub confirmation_notes: Option<String>,
+    /// 人工核验是独立事实，不得篡改真实测试结果为通过。
+    #[serde(default)]
+    pub human_verification: Option<HumanVerification>,
 }
 ///中阶段（域负责人拆解的技术实现模块）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -550,6 +630,51 @@ pub struct TestResult {
     /// 诊断/警告信息（非阻塞），用于向后端调用方和前端传递非致命的诊断信息
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// 实际运行的测试命令；代码审查模式为空。
+    #[serde(default)]
+    pub test_command: String,
+    /// 实际测试退出码；测试未配置或不可用时为空。
+    #[serde(default)]
+    pub test_exit_code: Option<i32>,
+    /// 已压缩的测试输出，供错误恢复诊断使用。
+    #[serde(default)]
+    pub test_output_summary: String,
+    /// 自动化测试运行事实，不与 AI 代码审查结论混淆。
+    #[serde(default)]
+    pub automated_test_status: AutomatedTestStatus,
+    /// AI 代码审查本身是否通过。
+    #[serde(default)]
+    pub review_passed: bool,
+    /// 本次结果采用的核验通道。
+    #[serde(default)]
+    pub verification_kind: VerificationKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum AutomatedTestStatus {
+    #[default]
+    Unknown,
+    Passed,
+    Failed,
+    NotConfigured,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum VerificationKind {
+    #[default]
+    Legacy,
+    AutomatedTestAndReview,
+    CodeReviewOnly,
+    HumanOverride,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HumanVerification {
+    pub verification_kind: VerificationKind,
+    pub verification_reason: String,
+    pub verified_at: String,
+    pub original_test_failure: String,
 }
 ///开发工程师动态生成下一个小阶段
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1580,6 +1705,14 @@ pub enum ExecutionEventType {
     RetryScheduled,
     /// 执行器失败并完成状态收尾
     ExecutionFailed,
+    RecoveryStarted,
+    ErrorDiagnosed,
+    RepairAttemptStarted,
+    RepairAttemptCompleted,
+    RetestCompleted,
+    RecoverySucceeded,
+    RecoveryExhausted,
+    HumanVerificationAccepted,
 }
 
 impl Default for ExecutionEventType {
@@ -1792,6 +1925,44 @@ mod tests {
         let restored_ap: AutopilotState = serde_json::from_value(ap_value)
             .map_err(|error| format!("反序列化旧自动驾驶状态失败：{}", error))?;
         assert_eq!(restored_ap.recovery_action, AutopilotRecoveryAction::None);
+
+        let mut workflow_value = serde_json::to_value(WorkflowState::default())
+            .map_err(|error| format!("序列化工作流状态失败：{}", error))?;
+        workflow_value
+            .as_object_mut()
+            .ok_or("工作流状态未序列化为对象".to_string())?
+            .remove("recovery_state");
+        let restored_workflow: WorkflowState = serde_json::from_value(workflow_value)
+            .map_err(|error| format!("反序列化旧工作流状态失败：{}", error))?;
+        assert!(restored_workflow.recovery_state.is_none());
+
+        let mut test_value = serde_json::to_value(TestResult {
+            passed: false,
+            issues: vec![],
+            suggestion: String::new(),
+            warnings: vec![],
+            ..Default::default()
+        })
+        .map_err(|error| format!("序列化测试结果失败：{}", error))?;
+        for field in [
+            "test_command",
+            "test_exit_code",
+            "test_output_summary",
+            "automated_test_status",
+            "review_passed",
+            "verification_kind",
+        ] {
+            test_value
+                .as_object_mut()
+                .ok_or("测试结果未序列化为对象".to_string())?
+                .remove(field);
+        }
+        let restored_test: TestResult = serde_json::from_value(test_value)
+            .map_err(|error| format!("反序列化旧测试结果失败：{}", error))?;
+        assert_eq!(
+            restored_test.automated_test_status,
+            AutomatedTestStatus::Unknown
+        );
         Ok(())
     }
 }

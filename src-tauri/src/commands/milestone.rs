@@ -1183,6 +1183,7 @@ async fn parse_execution_plan_tasks(reply: &str) -> Result<Vec<project::Subtask>
                 confirmed_by_user: None,
                 confirmed_at: None,
                 confirmation_notes: None,
+                human_verification: None,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -2902,6 +2903,7 @@ pub(crate) async fn regenerate_plan_from_checkpoint(
             confirmed_by_user: None,
             confirmed_at: None,
             confirmation_notes: None,
+            human_verification: None,
         });
     }
 

@@ -43,7 +43,38 @@ export type AutopilotRecoveryAction =
   | "WaitHumanDecision"
   | "RegenerateExecutionPlan"
   | "PrepareExecutionWorkspace"
-  | "ResolveWorkspaceChanges";
+  | "ResolveWorkspaceChanges"
+  | "RunAutomaticRecovery";
+
+export type RecoveryErrorKind =
+  | "WorkspaceError"
+  | "TransientError"
+  | "ExecutionError"
+  | "ScopeViolation"
+  | "TestFailure"
+  | "ReviewFailure"
+  | "TestUnavailable"
+  | "StateConflict"
+  | "HumanRequired";
+
+export type RecoveryPhase = "Diagnosing" | "Repairing" | "Retesting" | "Recovered" | "WaitingHuman";
+
+export interface RecoveryState {
+  error_kind: RecoveryErrorKind;
+  phase: RecoveryPhase;
+  attempt: number;
+  max_attempts: number;
+  error_signature: string;
+  repeated_signature_count: number;
+  subtask_id: string;
+  execution_id: string;
+  baseline_commit: string;
+  last_diagnosis: string;
+  last_repair_summary: string;
+  original_test_failure: string;
+  started_at: string;
+  updated_at: string;
+}
 
 /** 自动驾驶命令返回类别 */
 export type AutopilotCommandResultKind = "ProjectState" | "PipelineState" | "WorkspaceState" | "NoResult";
@@ -99,6 +130,7 @@ export interface WorkflowState {
   autopilot_target_milestone_id: string;
   autopilot_state?: AutopilotState;
   managed_flow_state?: ManagedFlowState;
+  recovery_state?: RecoveryState;
 }
 
 // ========== 项目来源 ==========
@@ -294,6 +326,19 @@ export interface TestResult {
   issues: string[];
   suggestion: string;
   warnings?: string[];
+  test_command?: string;
+  test_exit_code?: number;
+  test_output_summary?: string;
+  automated_test_status?: "Unknown" | "Passed" | "Failed" | "NotConfigured" | "Unavailable";
+  review_passed?: boolean;
+  verification_kind?: "Legacy" | "AutomatedTestAndReview" | "CodeReviewOnly" | "HumanOverride";
+}
+
+export interface HumanVerification {
+  verification_kind: "HumanOverride";
+  verification_reason: string;
+  verified_at: string;
+  original_test_failure: string;
 }
 
 export interface GeneratedSubtask {
@@ -324,6 +369,7 @@ export interface Subtask {
   confirmed_by_user?: boolean;
   confirmed_at?: string;
   confirmation_notes?: string;
+  human_verification?: HumanVerification;
 }
 
 export type MidStageStatus = "Pending" | "Ready" | "InProgress" | "Completed" | "Rejected" | "Approved" | "RolledBack";
@@ -512,7 +558,15 @@ export type ExecutionEventType =
   | "SystemAdvance"
   | "QualityGateBlocked"
   | "RetryScheduled"
-  | "ExecutionFailed";
+  | "ExecutionFailed"
+  | "RecoveryStarted"
+  | "ErrorDiagnosed"
+  | "RepairAttemptStarted"
+  | "RepairAttemptCompleted"
+  | "RetestCompleted"
+  | "RecoverySucceeded"
+  | "RecoveryExhausted"
+  | "HumanVerificationAccepted";
 
 /** 执行历史条目 — 持久化到 Project 中，刷新不丢 */
 export interface ExecutionHistoryEntry {
@@ -541,7 +595,7 @@ export type PipelineStatus = "Idle" | "Running" | "Paused" | "Completed" | "Fail
 export interface SubtaskStatusItem {
   subtask_id: string;
   title: string;
-  status: "waiting" | "executing" | "testing" | "passed" | "retrying";
+  status: "waiting" | "executing" | "repairing" | "testing" | "passed" | "retrying";
   test_result?: TestResult;
   retry_count: number;
 }

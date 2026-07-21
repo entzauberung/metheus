@@ -31,7 +31,8 @@ export function getAutopilotErrorActions(
       && recoveryAction !== "SyncAndClose"
       && recoveryAction !== "RegenerateExecutionPlan"
       && recoveryAction !== "PrepareExecutionWorkspace"
-      && recoveryAction !== "ResolveWorkspaceChanges",
+      && recoveryAction !== "ResolveWorkspaceChanges"
+      && recoveryAction !== "RunAutomaticRecovery",
     canRetryAdvance:
       runStatus === "ErrorStopped" && recoveryAction === "RetryAutopilotAdvance",
     canRegeneratePlan:

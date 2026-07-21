@@ -19,6 +19,7 @@ mod pipeline;
 mod plan_contract;
 mod project;
 mod prompts;
+mod recovery;
 mod snapshot;
 mod test_runner;
 use crate::pipeline::PipelineState;
@@ -164,6 +165,7 @@ pub fn run() {
             crate::pipeline::reject_subtask_result,
             crate::pipeline::retry_current_subtask,
             crate::pipeline::get_execution_workspace_status,
+            crate::pipeline::refresh_execution_workspace,
             crate::pipeline::prepare_execution_workspace,
             crate::pipeline::get_execution_status,
             crate::pipeline::request_in_stop,
@@ -173,6 +175,8 @@ pub fn run() {
             crate::pipeline::confirm_rollback,
             crate::pipeline::reconcile_on_startup,
             crate::pipeline::acknowledge_execution_recovery,
+            crate::recovery::run_error_recovery,
+            crate::recovery::resolve_human_recovery,
             crate::commands::project_ops::approve_mid_stage,
             crate::commands::project_ops::reject_mid_stage,
             crate::constitution::update_constitution,

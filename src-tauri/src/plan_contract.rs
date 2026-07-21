@@ -199,6 +199,7 @@ mod tests {
             confirmed_by_user: None,
             confirmed_at: None,
             confirmation_notes: None,
+            human_verification: None,
         }
     }
 

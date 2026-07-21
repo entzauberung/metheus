@@ -1,6 +1,6 @@
 // src/components/AutopilotControlBar.tsx — 全局自动驾驶控制条
 // 在所有 Console 页面顶部显示自动驾驶状态与操作入口
-import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle, GitBranch } from "lucide-react";
+import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle, GitBranch, CheckCircle } from "lucide-react";
 import type { Project, PipelineState, AutopilotRecoveryAction } from "../types";
 import { getAutopilotErrorActions } from "../autopilotPolicy";
 
@@ -17,6 +17,8 @@ export interface AutopilotControlBarProps {
   onAcknowledgeRecovery?: () => Promise<void>;
   onRegeneratePlan?: () => Promise<void>;
   onPrepareWorkspace?: () => Promise<void>;
+  onRefreshWorkspace?: () => Promise<void>;
+  onResolveHumanRecovery?: (resolution: "retest" | "restore_and_retry" | "regenerate_plan" | "human_override") => Promise<void>;
 }
 
 function sessionStatusKey(status: string | undefined): string {
@@ -36,6 +38,7 @@ export function AutopilotControlBar({
   project, executionStatus, busy,
   onToggle, onPauseNow, onPauseAfterCurrent, onResume, onSync,
   onRetryCurrent, onAcknowledgeRecovery, onRegeneratePlan, onPrepareWorkspace,
+  onRefreshWorkspace, onResolveHumanRecovery,
 }: AutopilotControlBarProps) {
   const apActive = project.workflow_state.autopilot_active === true;
   const apState = project.workflow_state.autopilot_state;
@@ -51,6 +54,7 @@ export function AutopilotControlBar({
   const lastAction = apState?.last_action;
   const errorMessage = apState?.error_message;
   const recoveryAction: AutopilotRecoveryAction = apState?.recovery_action ?? "None";
+  const recovery = project.workflow_state.recovery_state;
   const targetMs = project.milestones.find(m => m.id === project.workflow_state.autopilot_target_milestone_id);
   const targetLabel = targetMs?.title ?? project.workflow_state.autopilot_target_milestone_id;
 
@@ -60,7 +64,7 @@ export function AutopilotControlBar({
   const sessionLost = sessionKey === "session_lost";
   const stopFailed = sessionKey === "stop_failed";
   const needsBaselineRecovery =
-    recoveryAction === "RestoreExecutionBaseline" || isRecoverableSession(project);
+    recoveryAction === "RestoreExecutionBaseline" || (!recovery && isRecoverableSession(project));
 
   // 恢复入口条（手动 / 自动驾驶共用）
   const recoveryBar = needsBaselineRecovery && (onAcknowledgeRecovery || onRetryCurrent) ? (
@@ -90,7 +94,7 @@ export function AutopilotControlBar({
         </button>
         {onAcknowledgeRecovery && (
           <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onAcknowledgeRecovery}>
-            <RotateCcw size={14} /> 恢复执行基线
+            <RotateCcw size={14} /> 恢复基线并继续
           </button>
         )}
         {!onAcknowledgeRecovery && onRetryCurrent && (
@@ -143,6 +147,13 @@ export function AutopilotControlBar({
   );
   const showGenericResume = errorActions.canResume;
   const showRetryAdvance = errorActions.canRetryAdvance;
+  const recoveryStatus = recovery ? {
+    Diagnosing: "正在诊断错误",
+    Repairing: `正在执行第 ${recovery.attempt}/${recovery.max_attempts} 次修复`,
+    Retesting: "正在重新测试",
+    Recovered: "自动修复成功，继续执行",
+    WaitingHuman: "自动修复失败，等待人工处理",
+  }[recovery.phase] : "";
 
   return (
     <div className={`autopilot-control-bar ${runStatus === "Running" || isExecuting ? "ap-running" : ""} ${runStatus === "ErrorStopped" ? "ap-error" : ""}`}>
@@ -164,7 +175,11 @@ export function AutopilotControlBar({
            "未知"}
         </span>
         {targetLabel && <span className="ap-bar-target">目标：{targetLabel}</span>}
-        {lastAction && <span className="ap-bar-action" title={lastAction}>{lastAction}</span>}
+        {(recoveryStatus || lastAction) && (
+          <span className="ap-bar-action" title={recoveryStatus || lastAction}>
+            {recoveryStatus || lastAction}
+          </span>
+        )}
         {errorMessage && runStatus === "ErrorStopped" && (
           <span className="ap-bar-error" title={errorMessage}>{errorMessage.slice(0, 80)}{errorMessage.length > 80 ? "…" : ""}</span>
         )}
@@ -221,10 +236,31 @@ export function AutopilotControlBar({
           </button>
         )}
 
-        {errorActions.canRefreshWorkspace && onPrepareWorkspace && (
-          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onPrepareWorkspace}>
+        {errorActions.canRefreshWorkspace && onRefreshWorkspace && (
+          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onRefreshWorkspace}>
             <RotateCcw size={14} /> 刷新工作区
           </button>
+        )}
+
+        {recovery?.phase === "WaitingHuman" && onResolveHumanRecovery && (
+          <>
+            <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy}
+              onClick={() => onResolveHumanRecovery("retest")}>
+              <RotateCcw size={14} /> 手动修复后复测
+            </button>
+            <button className="ap-bar-btn" disabled={busy}
+              onClick={() => onResolveHumanRecovery("restore_and_retry")}>
+              <GitBranch size={14} /> 恢复基线并重试
+            </button>
+            <button className="ap-bar-btn" disabled={busy}
+              onClick={() => onResolveHumanRecovery("regenerate_plan")}>
+              <RotateCcw size={14} /> 重新生成计划
+            </button>
+            <button className="ap-bar-btn" disabled={busy}
+              onClick={() => onResolveHumanRecovery("human_override")}>
+              <CheckCircle size={14} /> 人工核验通过
+            </button>
+          </>
         )}
 
         {errorActions.canClose && (
@@ -234,7 +270,7 @@ export function AutopilotControlBar({
         )}
 
         {/* 大阶段审阅 / 等待人工：只能提示，不显示无效重试 */}
-        {(runStatus === "WaitingMilestoneReview" || recoveryAction === "WaitHumanDecision") && !showGenericResume && !showRetryAdvance && (
+        {(runStatus === "WaitingMilestoneReview" || (recoveryAction === "WaitHumanDecision" && !recovery)) && !showGenericResume && !showRetryAdvance && (
           <span className="ap-bar-hint">请完成人工决策</span>
         )}
       </div>

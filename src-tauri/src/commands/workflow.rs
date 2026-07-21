@@ -1411,6 +1411,9 @@ pub(crate) async fn autopilot_resume(project_name: String) -> Result<project::Pr
                     project::AutopilotRecoveryAction::ResolveWorkspaceChanges => {
                         return Err("请先处理工作区变更并刷新状态。".to_string());
                     }
+                    project::AutopilotRecoveryAction::RunAutomaticRecovery => {
+                        return Err("自动错误恢复正在进行，不能手动跳过。".to_string());
+                    }
                     project::AutopilotRecoveryAction::None
                     | project::AutopilotRecoveryAction::RetryAutopilotAdvance => {}
                 }
@@ -1576,6 +1579,54 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                 });
             }
             _ => {} // Running — continue
+        }
+    }
+
+    if let Some(recovery) = proj.workflow_state.recovery_state.as_ref() {
+        if matches!(
+            recovery.phase,
+            project::RecoveryPhase::Diagnosing
+                | project::RecoveryPhase::Repairing
+                | project::RecoveryPhase::Retesting
+        ) {
+            let recovery_is_running = proj.execution_session.as_ref().is_some_and(|session| {
+                session.active
+                    && session.status.eq_ignore_ascii_case("recovering")
+                    && session.execution_id == recovery.execution_id
+            });
+            if recovery_is_running
+                && matches!(
+                    recovery.phase,
+                    project::RecoveryPhase::Repairing | project::RecoveryPhase::Retesting
+                )
+            {
+                return Ok(AutopilotNextStep {
+                    command: String::new(),
+                    args: serde_json::json!({}),
+                    description: "错误恢复任务仍在运行，等待当前修复完成".to_string(),
+                    at_milestone_boundary: false,
+                    is_error: false,
+                    error_message: String::new(),
+                    result_kind: project::AutopilotCommandResultKind::NoResult,
+                    waiting_for_execution: true,
+                });
+            }
+            return Ok(AutopilotNextStep {
+                command: "run_error_recovery".to_string(),
+                args: serde_json::json!({ "projectName": project_name }),
+                description: match recovery.phase {
+                    project::RecoveryPhase::Diagnosing => "正在诊断错误",
+                    project::RecoveryPhase::Repairing => "正在继续受限修复",
+                    project::RecoveryPhase::Retesting => "正在重新测试",
+                    _ => "正在恢复",
+                }
+                .to_string(),
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
+                result_kind: project::AutopilotCommandResultKind::ProjectState,
+                waiting_for_execution: false,
+            });
         }
     }
 
@@ -2025,16 +2076,34 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                         result_kind: project::AutopilotCommandResultKind::ProjectState,
                         waiting_for_execution: false,
                     },
-                    Err(gate_reason) => AutopilotNextStep {
-                        command: String::new(),
-                        args: serde_json::json!({}),
-                        description: format!("质量门禁阻断：{}", gate_reason),
-                        at_milestone_boundary: false,
-                        is_error: true,
-                        error_message: gate_reason,
-                        result_kind: project::AutopilotCommandResultKind::NoResult,
-                        waiting_for_execution: false,
-                    },
+                    Err(gate_reason) => {
+                        let automatic =
+                            crate::recovery::ensure_quality_recovery(&mut proj, &gate_reason)?;
+                        crate::save_project(&proj)?;
+                        if automatic {
+                            AutopilotNextStep {
+                                command: "run_error_recovery".to_string(),
+                                args: serde_json::json!({ "projectName": project_name }),
+                                description: "质量门禁未通过，开始受限自动修复".to_string(),
+                                at_milestone_boundary: false,
+                                is_error: false,
+                                error_message: String::new(),
+                                result_kind: project::AutopilotCommandResultKind::ProjectState,
+                                waiting_for_execution: false,
+                            }
+                        } else {
+                            AutopilotNextStep {
+                                command: String::new(),
+                                args: serde_json::json!({}),
+                                description: format!("质量门禁阻断：{}", gate_reason),
+                                at_milestone_boundary: false,
+                                is_error: true,
+                                error_message: gate_reason,
+                                result_kind: project::AutopilotCommandResultKind::NoResult,
+                                waiting_for_execution: false,
+                            }
+                        }
+                    }
                 }
             } else if has_pending {
                 AutopilotNextStep {
@@ -2385,6 +2454,7 @@ mod tests {
             confirmed_by_user: None,
             confirmed_at: None,
             confirmation_notes: None,
+            human_verification: None,
         }
     }
 
@@ -2508,6 +2578,37 @@ mod tests {
         assert_eq!(
             step.result_kind,
             project::AutopilotCommandResultKind::NoResult
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_recovery_routes_to_recovery_command() -> Result<(), String> {
+        let project_name = unique_project_name("ap-recovery-route");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        activate_autopilot(&mut proj, "milestone-1");
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::TestFailure,
+            phase: project::RecoveryPhase::Diagnosing,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "execution-1".to_string(),
+            ..Default::default()
+        });
+        crate::save_project(&proj)?;
+
+        let step = autopilot_next_step(project_name.clone()).await?;
+        assert_eq!(step.command, "run_error_recovery");
+        assert_eq!(
+            step.args,
+            serde_json::json!({ "projectName": project_name })
+        );
+        assert!(!step.is_error);
+        assert!(!step.waiting_for_execution);
+        assert_eq!(
+            step.result_kind,
+            project::AutopilotCommandResultKind::ProjectState
         );
         Ok(())
     }
@@ -2808,6 +2909,7 @@ mod tests {
             project::AutopilotRecoveryAction::RegenerateExecutionPlan,
             project::AutopilotRecoveryAction::PrepareExecutionWorkspace,
             project::AutopilotRecoveryAction::ResolveWorkspaceChanges,
+            project::AutopilotRecoveryAction::RunAutomaticRecovery,
         ] {
             let project_name = unique_project_name("ap-resume-blocked");
             let _guard = ProjectDataGuard::new(&project_name)?;

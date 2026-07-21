@@ -29,7 +29,8 @@ pub(crate) fn detect_changes(
 
 #[cfg(test)]
 mod change_detection_tests {
-    use super::{detect_changes, FileSnapshot};
+    use super::{detect_changes, git_changed_files, FileSnapshot};
+    use std::process::Command;
 
     #[test]
     fn detects_added_modified_and_deleted_files() {
@@ -48,6 +49,44 @@ mod change_detection_tests {
             detect_changes(&before, &after, "/project"),
             vec!["added.rs", "deleted.rs", "modified.rs"]
         );
+    }
+
+    #[test]
+    fn git_changed_files_includes_tracked_and_untracked_evidence() -> Result<(), String> {
+        let path =
+            std::env::temp_dir().join(format!("metheus-test-evidence-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).map_err(|error| format!("创建测试目录失败：{}", error))?;
+        let git = |args: &[&str]| -> Result<(), String> {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&path)
+                .output()
+                .map_err(|error| format!("运行 git 失败：{}", error))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).to_string())
+            }
+        };
+        git(&["init", "--quiet"])?;
+        git(&["config", "user.name", "Metheus Test"])?;
+        git(&["config", "user.email", "metheus-test@example.invalid"])?;
+        std::fs::write(path.join("tracked.rs"), "fn before() {}\n")
+            .map_err(|error| error.to_string())?;
+        git(&["add", "tracked.rs"])?;
+        git(&["commit", "--quiet", "-m", "baseline"])?;
+        std::fs::write(path.join("tracked.rs"), "fn after() {}\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(path.join("new.rs"), "fn new_file() {}\n")
+            .map_err(|error| error.to_string())?;
+
+        let project_path = path.to_string_lossy().to_string();
+        assert_eq!(
+            git_changed_files(&project_path),
+            vec!["new.rs".to_string(), "tracked.rs".to_string()]
+        );
+        std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+        Ok(())
     }
 }
 /// 调用方（如 check_subtask）
@@ -100,6 +139,31 @@ pub(crate) fn get_file_snapshot(project_path: &str) -> FileSnapshot {
             (path, hasher.finish())
         })
         .collect()
+}
+
+fn git_changed_files(project_path: &str) -> Vec<String> {
+    let mut files = BTreeSet::new();
+    for args in [
+        vec!["diff", "--name-only", "-z", "HEAD"],
+        vec!["ls-files", "--others", "--exclude-standard", "-z"],
+    ] {
+        if let Ok(output) = std::process::Command::new("git")
+            .args(args)
+            .current_dir(project_path)
+            .output()
+        {
+            if output.status.success() {
+                files.extend(
+                    output
+                        .stdout
+                        .split(|byte| *byte == 0)
+                        .filter(|path| !path.is_empty())
+                        .map(|path| String::from_utf8_lossy(path).to_string()),
+                );
+            }
+        }
+    }
+    files.into_iter().collect()
 }
 /// 执行测试命令，带超时控制（spawn + try_wait 轮询）
 /// 返回: (exit_code, stdout, stderr)
@@ -287,6 +351,51 @@ pub(crate) fn is_test_not_configured(stderr: &str, stdout: &str) -> bool {
         || combined.contains("No test files found")
 }
 
+#[derive(Debug, Clone)]
+struct AutomatedTestEvidence {
+    rendered: Option<String>,
+    command: String,
+    exit_code: Option<i32>,
+    output_summary: String,
+    status: project::AutomatedTestStatus,
+}
+
+impl AutomatedTestEvidence {
+    fn not_configured(rendered: Option<String>) -> Self {
+        Self {
+            rendered,
+            command: String::new(),
+            exit_code: None,
+            output_summary: String::new(),
+            status: project::AutomatedTestStatus::NotConfigured,
+        }
+    }
+
+    fn completed(command: &str, code: i32, summary: String, rendered: String) -> Self {
+        Self {
+            rendered: Some(rendered),
+            command: command.to_string(),
+            exit_code: Some(code),
+            output_summary: summary,
+            status: if code == 0 {
+                project::AutomatedTestStatus::Passed
+            } else {
+                project::AutomatedTestStatus::Failed
+            },
+        }
+    }
+
+    fn unavailable(command: &str, message: String) -> Self {
+        Self {
+            rendered: Some(message.clone()),
+            command: command.to_string(),
+            exit_code: None,
+            output_summary: message,
+            status: project::AutomatedTestStatus::Unavailable,
+        }
+    }
+}
+
 /// 测试
 #[tauri::command]
 pub(crate) async fn check_subtask(
@@ -297,33 +406,7 @@ pub(crate) async fn check_subtask(
     _mid_stage_id: &str,
 ) -> Result<project::TestResult, String> {
     // 1.尝试 git diff --name-only 获取改动文件
-    let files: Vec<String> = {
-        let git_result = std::process::Command::new("git")
-            .args(["diff", "--name-only"])
-            .current_dir(&project_path)
-            .output();
-
-        match git_result {
-            Ok(output) if output.status.success() => {
-                // git 命令成功，解析 stdout
-                let changed = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .map(|s| s.to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<String>>();
-                if !changed.is_empty() {
-                    changed
-                } else {
-                    // git diff 成功但无变更（工作区干净），降级走文件系统
-                    vec![]
-                }
-            }
-            _ => {
-                // git 命令失败（非仓库/未安装git/其他错误），降级走文件系统
-                vec![]
-            }
-        }
-    };
+    let files = git_changed_files(project_path);
 
     // 2.如果 git diff 没能拿到文件列表，降级：扫描项目目录中的源文件
     let files = if files.is_empty() {
@@ -370,7 +453,7 @@ pub(crate) async fn check_subtask(
         file_contents.push_str(&format!("\n=== {} ===\n{}\n", file, truncated));
     }
     // ===== 真测试：检测项目类型，执行对应的测试命令 =====
-    let test_output: Option<String> = {
+    let test_evidence = {
         let project_root = std::path::Path::new(project_path);
 
         // 优先检测自定义测试命令文件 .metheus-test
@@ -381,7 +464,7 @@ pub(crate) async fn check_subtask(
                     let cmd_line = contents.trim().to_string();
                     if cmd_line.is_empty() || cmd_line.starts_with('#') {
                         eprintln!("[check_subtask] .metheus-test 为空或注释，跳过");
-                        None
+                        AutomatedTestEvidence::not_configured(None)
                     } else {
                         let parts: Vec<&str> = cmd_line.split_whitespace().collect();
                         let cmd = parts[0];
@@ -390,15 +473,23 @@ pub(crate) async fn check_subtask(
                         match run_test_command(cmd, cmd_args, project_path, 300) {
                             Ok((code, stdout, stderr)) => {
                                 let summary = summarize_test_output(code, &stdout, &stderr);
-                                Some(format_test_result("自定义测试", &cmd_line, code, &summary))
+                                let rendered =
+                                    format_test_result("自定义测试", &cmd_line, code, &summary);
+                                AutomatedTestEvidence::completed(&cmd_line, code, summary, rendered)
                             }
-                            Err(e) => Some(format!("自定义测试执行失败：{}", e)),
+                            Err(e) => AutomatedTestEvidence::unavailable(
+                                &cmd_line,
+                                format!("自定义测试执行失败：{}", e),
+                            ),
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("[check_subtask] 读取 .metheus-test 失败: {}", e);
-                    None
+                    AutomatedTestEvidence::unavailable(
+                        ".metheus-test",
+                        format!("读取 .metheus-test 失败：{}", e),
+                    )
                 }
             }
         } else if project_root.join("package.json").exists() {
@@ -415,44 +506,52 @@ pub(crate) async fn check_subtask(
                 Ok((code, stdout, stderr)) => {
                     if code != 0 && is_test_not_configured(&stderr, &stdout) {
                         let stderr_preview: String = stderr.chars().take(200).collect();
-                        Some(format!(
+                        AutomatedTestEvidence {
+                            rendered: Some(format!(
                             "测试命令: {}\n状态: ⚠️ 未配置测试用例（{} 返回：{}）\n\n该项目未配置测试用例，请仅基于代码审查判定，不要将此视为测试失败。",
                             label, pm, stderr_preview
-                        ))
+                            )),
+                            command: label,
+                            exit_code: Some(code),
+                            output_summary: stderr_preview,
+                            status: project::AutomatedTestStatus::NotConfigured,
+                        }
                     } else {
                         let summary = summarize_test_output(code, &stdout, &stderr);
-                        Some(format_test_result(&label, &label, code, &summary))
+                        let rendered = format_test_result(&label, &label, code, &summary);
+                        AutomatedTestEvidence::completed(&label, code, summary, rendered)
                     }
                 }
-                Err(e) => Some(format!("{} test 执行失败（测试环境未配置）：{}", pm, e)),
+                Err(e) => AutomatedTestEvidence::unavailable(
+                    &label,
+                    format!("{} test 执行失败（测试环境不可用）：{}", pm, e),
+                ),
             }
         } else if project_root.join("Cargo.toml").exists() {
             // Rust 项目
             match run_test_command("cargo", &["test"], project_path, 600) {
                 Ok((code, stdout, stderr)) => {
                     let summary = summarize_test_output(code, &stdout, &stderr);
-                    Some(format_test_result(
-                        "cargo test",
-                        "cargo test",
-                        code,
-                        &summary,
-                    ))
+                    let rendered = format_test_result("cargo test", "cargo test", code, &summary);
+                    AutomatedTestEvidence::completed("cargo test", code, summary, rendered)
                 }
-                Err(e) => Some(format!("cargo test 执行失败：{}", e)),
+                Err(e) => AutomatedTestEvidence::unavailable(
+                    "cargo test",
+                    format!("cargo test 执行失败：{}", e),
+                ),
             }
         } else if project_root.join("go.mod").exists() {
             // Go 项目
             match run_test_command("go", &["test", "./..."], project_path, 300) {
                 Ok((code, stdout, stderr)) => {
                     let summary = summarize_test_output(code, &stdout, &stderr);
-                    Some(format_test_result(
-                        "go test",
-                        "go test ./...",
-                        code,
-                        &summary,
-                    ))
+                    let rendered = format_test_result("go test", "go test ./...", code, &summary);
+                    AutomatedTestEvidence::completed("go test ./...", code, summary, rendered)
                 }
-                Err(e) => Some(format!("go test 执行失败：{}", e)),
+                Err(e) => AutomatedTestEvidence::unavailable(
+                    "go test ./...",
+                    format!("go test 执行失败：{}", e),
+                ),
             }
         } else if project_root.join("pyproject.toml").exists()
             || project_root.join("setup.py").exists()
@@ -481,27 +580,38 @@ pub(crate) async fn check_subtask(
             match run_test_command(cmd, &args_slice, project_path, 300) {
                 Ok((code, stdout, stderr)) => {
                     let summary = summarize_test_output(code, &stdout, &stderr);
-                    Some(format_test_result(label, &full_cmd, code, &summary))
+                    let rendered = format_test_result(label, &full_cmd, code, &summary);
+                    AutomatedTestEvidence::completed(&full_cmd, code, summary, rendered)
                 }
-                Err(e) => Some(format!("{} 执行失败：{}", label, e)),
+                Err(e) => AutomatedTestEvidence::unavailable(
+                    &full_cmd,
+                    format!("{} 执行失败：{}", label, e),
+                ),
             }
         } else if project_root.join("CMakeLists.txt").exists() {
             // C++ 项目
             match run_test_command("ctest", &[], project_path, 300) {
                 Ok((code, stdout, stderr)) => {
                     let summary = summarize_test_output(code, &stdout, &stderr);
-                    Some(format_test_result("ctest", "ctest", code, &summary))
+                    let rendered = format_test_result("ctest", "ctest", code, &summary);
+                    AutomatedTestEvidence::completed("ctest", code, summary, rendered)
                 }
-                Err(e) => Some(format!("ctest 执行失败：{}", e)),
+                Err(e) => {
+                    AutomatedTestEvidence::unavailable("ctest", format!("ctest 执行失败：{}", e))
+                }
             }
         } else if project_root.join("pom.xml").exists() {
             // Java Maven
             match run_test_command("mvn", &["test"], project_path, 600) {
                 Ok((code, stdout, stderr)) => {
                     let summary = summarize_test_output(code, &stdout, &stderr);
-                    Some(format_test_result("mvn test", "mvn test", code, &summary))
+                    let rendered = format_test_result("mvn test", "mvn test", code, &summary);
+                    AutomatedTestEvidence::completed("mvn test", code, summary, rendered)
                 }
-                Err(e) => Some(format!("mvn test 执行失败：{}", e)),
+                Err(e) => AutomatedTestEvidence::unavailable(
+                    "mvn test",
+                    format!("mvn test 执行失败：{}", e),
+                ),
             }
         } else if project_root.join("build.gradle").exists()
             || project_root.join("build.gradle.kts").exists()
@@ -515,18 +625,17 @@ pub(crate) async fn check_subtask(
             match run_test_command(gradle_cmd, &["test"], project_path, 600) {
                 Ok((code, stdout, stderr)) => {
                     let summary = summarize_test_output(code, &stdout, &stderr);
-                    Some(format_test_result(
-                        "gradle test",
-                        "gradle test",
-                        code,
-                        &summary,
-                    ))
+                    let rendered = format_test_result("gradle test", "gradle test", code, &summary);
+                    AutomatedTestEvidence::completed("gradle test", code, summary, rendered)
                 }
-                Err(e) => Some(format!("gradle test 执行失败：{}", e)),
+                Err(e) => AutomatedTestEvidence::unavailable(
+                    "gradle test",
+                    format!("gradle test 执行失败：{}", e),
+                ),
             }
         } else {
             eprintln!("[check_subtask] 未检测到已知测试框架，跳过真测试");
-            None
+            AutomatedTestEvidence::not_configured(None)
         }
     };
     // Mock 版本 -> 3.4.1c改动
@@ -548,7 +657,7 @@ pub(crate) async fn check_subtask(
             truncated, suffix
         )
     };
-    let user_message = if let Some(ref test_result) = test_output {
+    let user_message = if let Some(ref test_result) = test_evidence.rendered {
         format!(
             "{}请检查以下代码改动。\n\n## 自动化测试结果\n项目自动化测试已执行，结果如下：\n\n{}\n\n---\n\n## 改动文件列表（共 {} 个文件）\n{}\n\n## 改动文件内容\n{}",
             goal_section,
@@ -578,7 +687,7 @@ pub(crate) async fn check_subtask(
                 .to_string()
         });
     // 解析 JSON 响应（带兜底）
-    let test_result: project::TestResult =
+    let mut test_result: project::TestResult =
         match crate::json_utils::parse_json_with_retry::<project::TestResult>(&raw_reply).await {
             Ok(mut result) => {
                 result.warnings.extend(diagnosis_warnings);
@@ -602,8 +711,49 @@ pub(crate) async fn check_subtask(
                     )],
                     suggestion: "AI 返回格式异常，请人工审查".to_string(),
                     warnings: diagnosis_warnings,
+                    ..Default::default()
                 }
             }
         };
+    let review_passed = test_result.passed;
+    test_result.review_passed = review_passed;
+    test_result.test_command = test_evidence.command;
+    test_result.test_exit_code = test_evidence.exit_code;
+    test_result.test_output_summary = test_evidence.output_summary;
+    test_result.automated_test_status = test_evidence.status.clone();
+    test_result.verification_kind = match test_evidence.status {
+        project::AutomatedTestStatus::Passed | project::AutomatedTestStatus::Failed => {
+            project::VerificationKind::AutomatedTestAndReview
+        }
+        project::AutomatedTestStatus::NotConfigured | project::AutomatedTestStatus::Unknown => {
+            project::VerificationKind::CodeReviewOnly
+        }
+        project::AutomatedTestStatus::Unavailable => project::VerificationKind::Legacy,
+    };
+
+    match test_evidence.status {
+        project::AutomatedTestStatus::Failed => {
+            test_result.passed = false;
+            if !test_result
+                .issues
+                .iter()
+                .any(|issue| issue.contains("自动化测试失败"))
+            {
+                test_result.issues.push("自动化测试失败".to_string());
+            }
+        }
+        project::AutomatedTestStatus::Unavailable => {
+            test_result.passed = false;
+            if !test_result
+                .issues
+                .iter()
+                .any(|issue| issue.contains("测试环境不可用"))
+            {
+                test_result.issues.push("测试环境不可用".to_string());
+            }
+        }
+        _ => {}
+    }
+
     Ok(test_result)
 }

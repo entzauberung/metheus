@@ -9,7 +9,7 @@ import { invokeWithTimeout } from "./utils/invokeWithTimeout";
 import { executionPollingOwnsNextAdvance } from "./autopilotPolicy";
 import { getWorkspaceAction } from "./workspacePolicy";
 import "./App.css";
-import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, AutopilotNextStep } from "./types";
+import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, AutopilotNextStep, TestResult } from "./types";
 import { ProjectEntry } from "./ProjectEntry";
 import { ExistingBaselinePanel } from "./ExistingBaselinePanel";
 import { PreflightPanel } from "./PreflightPanel";
@@ -53,6 +53,19 @@ const EXECUTION_POLL_INTERVAL_MS = 1500;
 
 /** 连续轮询失败最大次数，防止界面无限静默等待 */
 const EXECUTION_POLL_MAX_FAILURES = 10;
+
+function verificationLabel(result: TestResult): string {
+  if (result.automated_test_status === "NotConfigured") {
+    return result.passed ? "未配置自动化测试，代码审查通过" : "未配置自动化测试，代码审查未通过";
+  }
+  if (result.automated_test_status === "Unavailable") {
+    return "测试环境不可用";
+  }
+  if (result.verification_kind === "CodeReviewOnly") {
+    return result.passed ? "仅代码审查通过" : "代码审查未通过";
+  }
+  return result.passed ? "自动化测试与代码审查通过" : "未通过";
+}
 
 // ============================================================
 // App.tsx — 「弥」的前端总指挥
@@ -243,7 +256,7 @@ function App() {
     }
 
     // Recover based on disk session status
-    if (session.status === "executing") {
+    if (session.status === "executing" || session.status === "recovering") {
       // Was executing when page was closed/refreshed.
       // Check if backend memory still has the pipeline running.
       invokeWithTimeout<PipelineState | null>("get_execution_status")
@@ -473,6 +486,9 @@ function App() {
       }
 
       try {
+        if (next.command === "run_error_recovery") {
+          setFeedbackMsg({ type: "info", message: next.description || "正在执行自动修复。" });
+        }
         switch (next.result_kind) {
           case "ProjectState": {
             if (!next.command) {
@@ -615,7 +631,7 @@ function App() {
             processedSubtaskIdsRef.current.add(item.subtask_id);
             const testResult = item.test_result;
             const reason = testResult.passed
-              ? ((testResult.issues ?? []).join("\n") || "通过测试")
+              ? ((testResult.issues ?? []).join("\n") || verificationLabel(testResult))
               : `不通过: ${testResult.suggestion || "未提供建议"}`;
             newLogs.push({
               subtask_title: item.title,
@@ -1349,21 +1365,57 @@ function App() {
 
   // V1: 回退后不自动触发生成。pendingRollbackGenerate 已移除。
 
+  const refreshExecutionContext = async (projectName: string) => {
+    const [projectResult, workspaceResult, pipelineResult] = await Promise.allSettled([
+      invokeWithTimeout<Project>("get_project", { projectName }),
+      invokeWithTimeout<ExecutionWorkspaceStatus>("get_execution_workspace_status", { projectName }),
+      invokeWithTimeout<PipelineState | null>("get_execution_status", {}),
+    ]);
+    if (projectResult.status === "rejected") throw projectResult.reason;
+    handleChatComplete(projectResult.value);
+    if (workspaceResult.status === "fulfilled") setWorkspaceStatus(workspaceResult.value);
+    if (pipelineResult.status === "fulfilled") {
+      setExecutionStatus(pipelineResult.value);
+      setIsExecuting(pipelineResult.value?.status === "Running");
+    }
+    return {
+      project: projectResult.value,
+      workspace: workspaceResult.status === "fulfilled" ? workspaceResult.value : null,
+      pipeline: pipelineResult.status === "fulfilled" ? pipelineResult.value : null,
+    };
+  };
+
   const handlePrepareExecutionWorkspace = async () => {
     if (!project || !beginConsoleAction("prepare_workspace")) return;
     try {
       const status = await invokeWithTimeout<ExecutionWorkspaceStatus>("prepare_execution_workspace", {
         projectName: project.name,
       });
-      setWorkspaceStatus(status);
+      await refreshExecutionContext(project.name);
       setFeedbackMsg({
         type: status.ready ? "success" : "warning",
         message: status.status_message,
       });
-      const latest = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
-      handleChatComplete(latest);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "准备执行工作区失败：" + String(err) });
+    } finally {
+      endConsoleAction();
+    }
+  };
+
+  const handleRefreshExecutionWorkspace = async () => {
+    if (!project || !beginConsoleAction("refresh_workspace")) return;
+    try {
+      const status = await invokeWithTimeout<ExecutionWorkspaceStatus>("refresh_execution_workspace", {
+        projectName: project.name,
+      });
+      await refreshExecutionContext(project.name);
+      setFeedbackMsg({
+        type: status.ready ? "success" : "warning",
+        message: status.status_message,
+      });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "刷新执行工作区失败：" + String(err) });
     } finally {
       endConsoleAction();
     }
@@ -1549,24 +1601,52 @@ function App() {
         projectName: project.name,
       });
       handleChatComplete(updated);
-      setExecutionStatus(null);
-      setIsExecuting(false);
-      try {
-        const ws = await invokeWithTimeout<ExecutionWorkspaceStatus>("get_execution_workspace_status", {
-          projectName: project.name,
-        });
-        setWorkspaceStatus(ws);
-        if (ws.working_tree_clean) {
-          setFeedbackMsg({ type: "info", message: "执行基线已恢复，工作区干净，可重新执行。" });
-        } else {
-          setFeedbackMsg({ type: "warning", message: "基线命令已完成，但工作区仍有残留，请同步后检查。" });
-        }
-      } catch {
-        setFeedbackMsg({ type: "info", message: "执行基线已恢复。" });
-      }
+      const refreshed = await refreshExecutionContext(project.name);
+      setFeedbackMsg({
+        type: refreshed.workspace?.working_tree_clean ? "success" : "warning",
+        message: refreshed.workspace?.working_tree_clean
+          ? "执行基线已恢复，自动驾驶将继续执行。"
+          : "基线已恢复，但工作区仍有残留，请检查后再继续。",
+      });
     } catch (err) {
       // 不得先在前端清空失败状态；保持恢复面板并显示后端原始错误
       setFeedbackMsg({ type: "error", message: "恢复失败：" + String(err) });
+    } finally {
+      endConsoleAction();
+    }
+  };
+
+  const handleResolveHumanRecovery = async (
+    resolution: "retest" | "restore_and_retry" | "regenerate_plan" | "human_override",
+  ) => {
+    if (!project || !beginConsoleAction(`human_recovery:${resolution}`)) return;
+    try {
+      let reason = "";
+      if (resolution === "human_override") {
+        reason = window.prompt("请填写人工核验通过的依据")?.trim() ?? "";
+        if (!reason) return;
+      }
+      const updated = await invokeWithTimeout<Project>("resolve_human_recovery", {
+        projectName: project.name,
+        resolution,
+        reason,
+      });
+      handleChatComplete(updated);
+      await refreshExecutionContext(project.name);
+      const messages = {
+        retest: updated.workflow_state.recovery_state
+          ? "重新测试仍未通过，继续等待人工处理。"
+          : "重新测试通过，自动驾驶将继续执行。",
+        restore_and_retry: "已恢复执行基线，将重新执行当前小阶段。",
+        regenerate_plan: "已恢复基线，将重新生成当前执行计划。",
+        human_override: "人工核验已单独记录，自动驾驶将继续执行。",
+      };
+      setFeedbackMsg({
+        type: updated.workflow_state.recovery_state ? "warning" : "success",
+        message: messages[resolution],
+      });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "人工恢复失败：" + String(err) });
     } finally {
       endConsoleAction();
     }
@@ -1852,6 +1932,8 @@ function App() {
                 onAcknowledgeRecovery={handleAcknowledgeExecutionRecovery}
                 onRegeneratePlan={handleRegenerateInvalidPlan}
                 onPrepareWorkspace={handlePrepareExecutionWorkspace}
+                onRefreshWorkspace={handleRefreshExecutionWorkspace}
+                onResolveHumanRecovery={handleResolveHumanRecovery}
               />
               {feedbackMsg && (
                 <FeedbackBanner
@@ -2078,10 +2160,12 @@ function V1ExecutionPanel({
 
   // 质量判定：判断当前待确认任务是否可以确认通过
   const execOk = awaitingSubtask?.execution_result?.success === true;
-  const testOk = awaitingSubtask?.test_result?.passed === true;
+  const humanOverride = awaitingSubtask?.human_verification?.verification_kind === "HumanOverride"
+    && Boolean(awaitingSubtask.human_verification.verification_reason.trim());
+  const testOk = awaitingSubtask?.test_result?.passed === true || humanOverride;
   const canConfirm = execOk && testOk && isAwaiting;
   const failureReason = !canConfirm && isAwaiting
-    ? (!execOk ? "执行未成功" : !testOk ? "测试未通过" : null)
+    ? (!execOk ? "执行未成功" : !testOk ? "核验未通过" : null)
     : null;
 
   const workspaceReady = workspaceStatus?.ready === true;
@@ -2200,8 +2284,13 @@ function V1ExecutionPanel({
               )}
               {awaitingSubtask.test_result && (
                 <div style={{ marginTop: "4px", color: awaitingSubtask.test_result.passed ? "#1a7f37" : "#cf222e" }}>
-                  测试：{awaitingSubtask.test_result.passed ? "通过" : "未通过"}
+                  核验：{verificationLabel(awaitingSubtask.test_result)}
                   {awaitingSubtask.test_result.suggestion && ` — ${awaitingSubtask.test_result.suggestion}`}
+                </div>
+              )}
+              {awaitingSubtask.human_verification && (
+                <div style={{ marginTop: "4px", color: "#1a7f37" }}>
+                  人工核验：{awaitingSubtask.human_verification.verification_reason}
                 </div>
               )}
               <div style={{ marginTop: "4px" }}>验收标准：{awaitingSubtask.acceptance_criteria?.join("；") || "（无）"}</div>

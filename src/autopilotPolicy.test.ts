@@ -37,9 +37,18 @@ describe("autopilot scheduling policy", () => {
       "RegenerateExecutionPlan",
       "PrepareExecutionWorkspace",
       "ResolveWorkspaceChanges",
+      "RunAutomaticRecovery",
     ] as const) {
       expect(getAutopilotErrorActions("ErrorStopped", recovery).canClose).toBe(true);
     }
+  });
+
+  it("does not expose a manual resume while automatic recovery owns the next action", () => {
+    expect(getAutopilotErrorActions("ErrorStopped", "RunAutomaticRecovery")).toMatchObject({
+      canResume: false,
+      canRetryAdvance: false,
+      canClose: true,
+    });
   });
 
   it("only exposes retry advance for retryable infrastructure errors", () => {

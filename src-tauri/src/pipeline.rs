@@ -92,7 +92,7 @@ pub(crate) fn append_runtime_log(state: &mut PipelineState, level: &str, text: S
 }
 
 /// 向调用方持有的项目事实追加执行历史；持久化由调用方在事务边界统一完成。
-fn write_execution_history(
+pub(crate) fn write_execution_history(
     proj: &mut project::Project,
     level: &str,
     event_type: project::ExecutionEventType,
@@ -412,8 +412,10 @@ pub(crate) async fn execute_current_subtask(
                 if let Some(pipeline) = guard.as_mut() {
                     if pipeline.execution_id == failure_execution_id {
                         pipeline.status = PipelineStatus::Failed;
-                        pipeline.last_error =
-                            Some(format!("{}；失败状态持久化失败：{}", error, persist_error));
+                        pipeline.last_error = Some(format!(
+                            "{}；失败状态持久化失败：{}",
+                            error.message, persist_error
+                        ));
                     }
                 }
             }
@@ -437,7 +439,7 @@ async fn execute_current_subtask_background(
     total: usize,
     execution_id: String,
     pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
-) -> Result<(), String> {
+) -> Result<(), BackgroundExecutionFailure> {
     let exec_result = match crate::executor::execute_subtask_inner(
         &project_path,
         &approved_prompt,
@@ -450,16 +452,40 @@ async fn execute_current_subtask_background(
     {
         Ok(result) => result,
         Err(project::SubTaskError::UserPaused) => return Ok(()),
-        Err(project::SubTaskError::ExecutionFailed { message }) => return Err(message),
-        Err(project::SubTaskError::Timeout) => return Err("执行超时".to_string()),
+        Err(project::SubTaskError::ExecutionFailed { message }) => {
+            return Err(BackgroundExecutionFailure::new(
+                project::RecoveryErrorKind::ExecutionError,
+                message,
+            ))
+        }
+        Err(project::SubTaskError::Timeout) => {
+            return Err(BackgroundExecutionFailure::new(
+                project::RecoveryErrorKind::ExecutionError,
+                "执行超时".to_string(),
+            ))
+        }
     };
+
+    if !exec_result.success {
+        return Err(BackgroundExecutionFailure::new(
+            project::RecoveryErrorKind::ExecutionError,
+            if exec_result.error_log.is_empty() {
+                "Claude Code 非零退出".to_string()
+            } else {
+                exec_result.error_log.clone()
+            },
+        ));
+    }
 
     let out_of_scope =
         crate::plan_contract::out_of_scope_changes(&exec_result.file_changes, &authorized_paths);
     if !out_of_scope.is_empty() {
-        return Err(format!(
-            "执行修改了计划范围外文件：{}。必须恢复执行基线后重新规划或重试。",
-            out_of_scope.join("、")
+        return Err(BackgroundExecutionFailure::new(
+            project::RecoveryErrorKind::ScopeViolation,
+            format!(
+                "执行修改了计划范围外文件：{}。必须恢复执行基线后重新规划或重试。",
+                out_of_scope.join("、")
+            ),
         ));
     }
 
@@ -498,6 +524,8 @@ async fn execute_current_subtask_background(
         issues: vec!["测试服务不可用".to_string()],
         suggestion: "请手动检查".to_string(),
         warnings: vec![],
+        automated_test_status: project::AutomatedTestStatus::Unavailable,
+        ..Default::default()
     });
 
     // 与暂停命令共用流水线锁，保证 execution_id 校验到项目保存之间不被旧任务穿透。
@@ -512,7 +540,9 @@ async fn execute_current_subtask_background(
         return Ok(());
     }
 
-    let mut proj = crate::load_project(&project_name)?;
+    let mut proj = crate::load_project(&project_name).map_err(|error| {
+        BackgroundExecutionFailure::new(project::RecoveryErrorKind::StateConflict, error)
+    })?;
     let session = match proj.execution_session.as_ref() {
         Some(session)
             if session.active
@@ -532,16 +562,16 @@ async fn execute_current_subtask_background(
             .milestones
             .iter_mut()
             .find(|milestone| milestone.id == milestone_id)
-            .ok_or("大阶段不存在。")?;
+            .ok_or_else(|| BackgroundExecutionFailure::state_conflict("大阶段不存在。"))?;
         let mid = ms
             .mid_stages
             .iter_mut()
             .find(|mid_stage| mid_stage.id == mid_stage_id)
-            .ok_or("中阶段不存在。")?;
+            .ok_or_else(|| BackgroundExecutionFailure::state_conflict("中阶段不存在。"))?;
         let subtask = mid
             .subtasks
             .get_mut(subtask_idx)
-            .ok_or("小阶段索引已失效。")?;
+            .ok_or_else(|| BackgroundExecutionFailure::state_conflict("小阶段索引已失效。"))?;
         if subtask.id != subtask_id || subtask.status != project::SubtaskStatus::Executing {
             return Ok(());
         }
@@ -619,7 +649,9 @@ async fn execute_current_subtask_background(
         Some(&mid_stage_id),
         Some(&subtask_id),
     );
-    crate::save_project(&proj)?;
+    crate::save_project(&proj).map_err(|error| {
+        BackgroundExecutionFailure::new(project::RecoveryErrorKind::StateConflict, error)
+    })?;
 
     if let Some(pipeline) = pipeline_guard.as_mut() {
         if pipeline.execution_id == execution_id {
@@ -644,6 +676,25 @@ async fn execute_current_subtask_background(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct BackgroundExecutionFailure {
+    kind: project::RecoveryErrorKind,
+    message: String,
+}
+
+impl BackgroundExecutionFailure {
+    fn new(kind: project::RecoveryErrorKind, message: String) -> Self {
+        Self { kind, message }
+    }
+
+    fn state_conflict(message: &str) -> Self {
+        Self::new(
+            project::RecoveryErrorKind::StateConflict,
+            message.to_string(),
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn finalize_background_execution_failure(
     project_name: &str,
@@ -654,7 +705,7 @@ async fn finalize_background_execution_failure(
     subtask_idx: usize,
     total: usize,
     execution_id: &str,
-    error_message: &str,
+    failure: &BackgroundExecutionFailure,
     pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
 ) -> Result<(), String> {
     let mut pipeline_guard = pipeline_state.lock().await;
@@ -679,7 +730,18 @@ async fn finalize_background_execution_failure(
         return Ok(());
     }
 
-    finalize_execution_failure(&mut proj, &mut *pipeline_guard, subtask_idx, error_message);
+    finalize_execution_failure(
+        &mut proj,
+        &mut *pipeline_guard,
+        subtask_idx,
+        &failure.message,
+    );
+    crate::recovery::begin_execution_recovery(
+        &mut proj,
+        failure.kind.clone(),
+        execution_id,
+        &failure.message,
+    );
     write_execution_history(
         &mut proj,
         "error",
@@ -689,7 +751,7 @@ async fn finalize_background_execution_failure(
             subtask_idx + 1,
             total,
             subtask_title,
-            error_message
+            failure.message
         ),
         Some(milestone_id),
         Some(mid_stage_id),
@@ -769,6 +831,19 @@ fn validate_subtask_quality_gate_with_session_statuses(
                 &exec_result.error_log
             }
         ));
+    }
+
+    let human_override = subtask
+        .human_verification
+        .as_ref()
+        .is_some_and(|verification| {
+            verification.verification_kind == project::VerificationKind::HumanOverride
+                && !verification.verification_reason.trim().is_empty()
+        });
+
+    // 人工核验是独立的通过通道；真实测试结果保持原值。
+    if human_override {
+        return Ok(());
     }
 
     // 校验测试结果存在
@@ -1447,7 +1522,11 @@ pub(crate) async fn reject_subtask_result(
         Some(&subtask_id),
     );
 
-    proj.execution_session = None;
+    if proj.workflow_state.autopilot_active {
+        crate::recovery::begin_rejected_recovery(&mut proj, &reason)?;
+    } else {
+        proj.execution_session = None;
+    }
     crate::save_project(&proj)?;
 
     if let Some(s) = guard.as_mut() {
@@ -1558,6 +1637,7 @@ pub(crate) async fn retry_current_subtask(
 
     // 清除失败会话
     proj.execution_session = None;
+    proj.workflow_state.recovery_state = None;
 
     // 记录重试事件
     write_execution_history(
@@ -1778,7 +1858,7 @@ pub(crate) async fn prepare_execution_workspace(
                 autopilot.last_action = "Git 工作区已准备完成".to_string();
                 autopilot.last_action_at = chrono::Utc::now().to_rfc3339();
                 if autopilot.run_status == project::AutopilotRunStatus::ErrorStopped {
-                    autopilot.run_status = project::AutopilotRunStatus::Paused;
+                    autopilot.run_status = project::AutopilotRunStatus::Running;
                 }
             }
         }
@@ -1798,6 +1878,36 @@ pub(crate) async fn prepare_execution_workspace(
     crate::save_project(&proj)?;
 
     Ok(final_status)
+}
+
+/// 用户在应用外处理完 Git 变更后只刷新事实，不执行 git init/add/commit。
+#[tauri::command]
+pub(crate) async fn refresh_execution_workspace(
+    project_name: String,
+) -> Result<project::ExecutionWorkspaceStatus, String> {
+    let mut proj = crate::load_project(&project_name)?;
+    let status = get_execution_workspace_status_inner(&proj.project_path)?;
+    if status.ready {
+        let mut resumed = false;
+        if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+            if autopilot.recovery_action
+                == project::AutopilotRecoveryAction::ResolveWorkspaceChanges
+            {
+                autopilot.recovery_action = project::AutopilotRecoveryAction::None;
+                autopilot.run_status = project::AutopilotRunStatus::Running;
+                autopilot.error_message.clear();
+                autopilot.last_action = "工作区状态已刷新，继续自动驾驶".to_string();
+                autopilot.last_action_at = chrono::Utc::now().to_rfc3339();
+                resumed = true;
+            }
+        }
+        if resumed {
+            proj.workflow_state.data_revision = proj.workflow_state.data_revision.saturating_add(1);
+            proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+            crate::save_project(&proj)?;
+        }
+    }
+    Ok(status)
 }
 
 /// Internal helper: probe workspace status from path
@@ -1979,7 +2089,10 @@ pub(crate) fn get_execution_workspace_status_inner(
 // V1 暂停与回退命令
 // ===================================================================
 
-fn restore_git_execution_baseline(project_path: &str, target: &str) -> Result<(), String> {
+pub(crate) fn restore_git_execution_baseline(
+    project_path: &str,
+    target: &str,
+) -> Result<(), String> {
     let status_output = std::process::Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(project_path)
@@ -2887,7 +3000,7 @@ pub fn reconcile_execution_state(
     }
 
     match session.status.as_str() {
-        "executing" => {
+        "executing" | "recovering" => {
             match pipeline_status {
                 // 内存 PipelineState 存在且正在运行 → 真执行中
                 Some(ps)
@@ -2971,14 +3084,33 @@ pub fn apply_execution_reconciliation(
             // 自动驾驶显式标记恢复动作，不得靠错误文本猜测
             if proj.workflow_state.autopilot_active {
                 if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
-                    ap.run_status = project::AutopilotRunStatus::ErrorStopped;
-                    ap.last_action = "执行会话失联，需要恢复执行基线".to_string();
+                    let interrupted_recovery = proj.workflow_state.recovery_state.is_some();
+                    ap.run_status = if interrupted_recovery {
+                        project::AutopilotRunStatus::Running
+                    } else {
+                        project::AutopilotRunStatus::ErrorStopped
+                    };
+                    ap.last_action = if interrupted_recovery {
+                        "自动修复进程失联，准备从基线重新执行".to_string()
+                    } else {
+                        "执行会话失联，需要恢复执行基线".to_string()
+                    };
                     ap.last_action_at = now;
                     if ap.error_message.is_empty() {
                         ap.error_message = "执行进程失联，请先恢复执行基线后再继续。".to_string();
                     }
-                    ap.recovery_action = project::AutopilotRecoveryAction::RestoreExecutionBaseline;
+                    ap.recovery_action = if interrupted_recovery {
+                        project::AutopilotRecoveryAction::RunAutomaticRecovery
+                    } else {
+                        project::AutopilotRecoveryAction::RestoreExecutionBaseline
+                    };
                 }
+            }
+            if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
+                recovery.error_kind = project::RecoveryErrorKind::ExecutionError;
+                recovery.phase = project::RecoveryPhase::Diagnosing;
+                recovery.last_repair_summary = "恢复进程中断；下次尝试将先恢复执行基线".to_string();
+                recovery.updated_at = chrono::Utc::now().to_rfc3339();
             }
             proj.workflow_state.data_revision += 1;
             true
@@ -3093,6 +3225,7 @@ pub(crate) async fn acknowledge_execution_recovery(
 
     // 基线恢复成功后才清除会话
     proj.execution_session = None;
+    proj.workflow_state.recovery_state = None;
 
     // 确保受影响任务为 Pending，可再次执行
     if let Some(ms) = proj.milestones.iter_mut().find(|m| m.id == milestone_id) {
@@ -3124,9 +3257,9 @@ pub(crate) async fn acknowledge_execution_recovery(
             ap.error_message = String::new();
             ap.last_action = format!("已恢复执行基线：{}", subtask_title);
             ap.last_action_at = now.clone();
-            // 基线已恢复，但不自动继续推进；留给用户确认后恢复自动驾驶
+            // 基线恢复是完整恢复命令，成功后直接回到自动推进。
             if ap.run_status == project::AutopilotRunStatus::ErrorStopped {
-                ap.run_status = project::AutopilotRunStatus::Paused;
+                ap.run_status = project::AutopilotRunStatus::Running;
             }
         }
     }
@@ -3279,6 +3412,7 @@ mod tests {
             confirmed_by_user: None,
             confirmed_at: None,
             confirmation_notes: None,
+            human_verification: None,
         }
     }
 
@@ -3596,6 +3730,10 @@ mod tests {
             PipelineStatus::Running,
         ))));
 
+        let failure = BackgroundExecutionFailure::new(
+            project::RecoveryErrorKind::ExecutionError,
+            "旧后台任务失败".to_string(),
+        );
         finalize_background_execution_failure(
             &project_name,
             "milestone-1",
@@ -3605,7 +3743,7 @@ mod tests {
             0,
             1,
             "execution-stale",
-            "旧后台任务失败",
+            &failure,
             pipeline,
         )
         .await?;
@@ -3952,9 +4090,333 @@ mod tests {
                 .autopilot_state
                 .as_ref()
                 .map(|ap| &ap.run_status),
-            Some(&project::AutopilotRunStatus::Paused)
+            Some(&project::AutopilotRunStatus::Running)
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_refresh_resumes_without_preparing_git_again() -> Result<(), String> {
+        let repo = TempGitRepo::new("workspace-refresh")?;
+        let project_name = unique_project_name("workspace-refresh");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::Pending,
+            None,
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::ErrorStopped,
+            last_action: "dirty".to_string(),
+            last_action_at: String::new(),
+            error_message: "dirty".to_string(),
+            recovery_action: project::AutopilotRecoveryAction::ResolveWorkspaceChanges,
+        });
+        crate::save_project(&proj)?;
+
+        let status = refresh_execution_workspace(project_name.clone()).await?;
+        assert!(status.ready);
+        let updated = crate::load_project(&project_name)?;
+        let autopilot = updated.workflow_state.autopilot_state.unwrap();
+        assert_eq!(autopilot.run_status, project::AutopilotRunStatus::Running);
+        assert_eq!(
+            autopilot.recovery_action,
+            project::AutopilotRecoveryAction::None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_refresh_is_read_only_for_non_git_directory() -> Result<(), String> {
+        let path = std::env::temp_dir().join(format!(
+            "metheus-refresh-read-only-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path)
+            .map_err(|error| format!("创建刷新测试目录失败：{}", error))?;
+        let project_name = unique_project_name("workspace-refresh-read-only");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.project_path = path.to_string_lossy().to_string();
+        crate::save_project(&proj)?;
+
+        let status = refresh_execution_workspace(project_name).await?;
+        assert!(!status.is_git_repo);
+        assert!(!path.join(".git").exists());
+        std::fs::remove_dir_all(&path)
+            .map_err(|error| format!("清理刷新测试目录失败：{}", error))?;
+        Ok(())
+    }
+
+    #[test]
+    fn structured_test_failure_enters_automatic_recovery() -> Result<(), String> {
+        let mut proj = execution_project(
+            "quality-recovery",
+            Path::new(""),
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(execution_session(
+                "awaiting_confirmation",
+                "execution-quality",
+                "abc123",
+            )),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::Running,
+            last_action: String::new(),
+            last_action_at: String::new(),
+            error_message: String::new(),
+            recovery_action: project::AutopilotRecoveryAction::None,
+        });
+        let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+        subtask.execution_result = Some(project::ExecutionResult {
+            success: true,
+            output: String::new(),
+            error_log: String::new(),
+            file_changes: vec!["tracked.txt".to_string()],
+        });
+        subtask.test_result = Some(project::TestResult {
+            passed: false,
+            issues: vec!["assertion failed".to_string()],
+            automated_test_status: project::AutomatedTestStatus::Failed,
+            ..Default::default()
+        });
+
+        assert!(crate::recovery::ensure_quality_recovery(
+            &mut proj,
+            "test failed"
+        )?);
+        let recovery = proj.workflow_state.recovery_state.as_ref().unwrap();
+        assert_eq!(recovery.error_kind, project::RecoveryErrorKind::TestFailure);
+        assert_eq!(recovery.phase, project::RecoveryPhase::Diagnosing);
+        assert_eq!(recovery.max_attempts, 2);
+        assert_eq!(
+            proj.workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|state| &state.recovery_action),
+            Some(&project::AutopilotRecoveryAction::RunAutomaticRecovery)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unavailable_test_enters_human_block() -> Result<(), String> {
+        let mut proj = execution_project(
+            "quality-unavailable",
+            Path::new(""),
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(execution_session(
+                "awaiting_confirmation",
+                "execution-unavailable",
+                "abc123",
+            )),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::Running,
+            last_action: String::new(),
+            last_action_at: String::new(),
+            error_message: String::new(),
+            recovery_action: project::AutopilotRecoveryAction::None,
+        });
+        let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+        subtask.execution_result = Some(project::ExecutionResult {
+            success: true,
+            output: String::new(),
+            error_log: String::new(),
+            file_changes: vec!["tracked.txt".to_string()],
+        });
+        subtask.test_result = Some(project::TestResult {
+            passed: false,
+            issues: vec!["environment unavailable".to_string()],
+            automated_test_status: project::AutomatedTestStatus::Unavailable,
+            ..Default::default()
+        });
+
+        assert!(!crate::recovery::ensure_quality_recovery(
+            &mut proj,
+            "test unavailable"
+        )?);
+        assert_eq!(
+            proj.workflow_state
+                .recovery_state
+                .as_ref()
+                .map(|state| &state.phase),
+            Some(&project::RecoveryPhase::WaitingHuman)
+        );
+        assert_eq!(
+            proj.workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|state| &state.recovery_action),
+            Some(&project::AutopilotRecoveryAction::WaitHumanDecision)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn successful_retest_clears_recovery_and_returns_to_autopilot() -> Result<(), String> {
+        let session = execution_session("recovering", "recovery-success", "abc123");
+        let mut proj = execution_project(
+            "recovery-success",
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(session.clone()),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::Running,
+            last_action: "retesting".to_string(),
+            last_action_at: String::new(),
+            error_message: String::new(),
+            recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+        });
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::TestFailure,
+            phase: project::RecoveryPhase::Retesting,
+            attempt: 1,
+            max_attempts: 2,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "recovery-success".to_string(),
+            baseline_commit: "abc123".to_string(),
+            ..Default::default()
+        });
+        proj.milestones[0].mid_stages[0].subtasks[0].execution_result =
+            Some(project::ExecutionResult {
+                success: true,
+                output: "fixed".to_string(),
+                error_log: String::new(),
+                file_changes: vec!["tracked.txt".to_string()],
+            });
+        let test = project::TestResult {
+            passed: true,
+            review_passed: true,
+            automated_test_status: project::AutomatedTestStatus::Passed,
+            verification_kind: project::VerificationKind::AutomatedTestAndReview,
+            ..Default::default()
+        };
+
+        crate::recovery::finish_retest(&mut proj, &session, "recovery-success", test)?;
+        assert!(proj.workflow_state.recovery_state.is_none());
+        assert_eq!(
+            proj.milestones[0].mid_stages[0].subtasks[0].status,
+            project::SubtaskStatus::AwaitingConfirmation
+        );
+        assert_eq!(
+            proj.workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|state| &state.recovery_action),
+            Some(&project::AutopilotRecoveryAction::None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_retest_cannot_overwrite_current_recovery_session() -> Result<(), String> {
+        let session = execution_session("recovering", "recovery-current", "abc123");
+        let mut proj = execution_project(
+            "recovery-stale",
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(session.clone()),
+        );
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::TestFailure,
+            phase: project::RecoveryPhase::Retesting,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "recovery-current".to_string(),
+            ..Default::default()
+        });
+        let original = proj.clone();
+
+        let result = crate::recovery::finish_retest(
+            &mut proj,
+            &session,
+            "recovery-stale",
+            project::TestResult {
+                passed: true,
+                ..Default::default()
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            serde_json::to_value(&proj).map_err(|error| error.to_string())?,
+            serde_json::to_value(&original).map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn human_override_passes_gate_without_mutating_failed_test() {
+        let mut proj = execution_project(
+            "human-override",
+            Path::new(""),
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(execution_session(
+                "awaiting_confirmation",
+                "execution-human",
+                "abc123",
+            )),
+        );
+        let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+        subtask.execution_result = Some(project::ExecutionResult {
+            success: true,
+            output: String::new(),
+            error_log: String::new(),
+            file_changes: vec!["tracked.txt".to_string()],
+        });
+        subtask.test_result = Some(project::TestResult {
+            passed: false,
+            automated_test_status: project::AutomatedTestStatus::Unavailable,
+            ..Default::default()
+        });
+        subtask.human_verification = Some(project::HumanVerification {
+            verification_kind: project::VerificationKind::HumanOverride,
+            verification_reason: "manual smoke test".to_string(),
+            verified_at: "2026-07-21T00:00:00Z".to_string(),
+            original_test_failure: "runner unavailable".to_string(),
+        });
+
+        assert!(validate_subtask_quality_gate(&proj).is_ok());
+        assert_eq!(
+            proj.milestones[0].mid_stages[0].subtasks[0]
+                .test_result
+                .as_ref()
+                .map(|test| test.passed),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn running_recovery_session_survives_startup_reconciliation() {
+        let proj = execution_project(
+            "recovering-session",
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(execution_session(
+                "recovering",
+                "recovery-current",
+                "abc123",
+            )),
+        );
+        let pipeline = pipeline_state("recovery-current", PipelineStatus::Running);
+        assert!(matches!(
+            reconcile_execution_state(&proj, Some(&pipeline)),
+            ExecutionReconciliation::Executing
+        ));
     }
 
     #[tokio::test]
@@ -4086,6 +4548,67 @@ mod tests {
         assert_eq!(proj.milestones[0].mid_stages[0].subtasks[0].retry_count, 0);
     }
 
+    #[tokio::test]
+    async fn background_execution_failure_starts_automatic_recovery() -> Result<(), String> {
+        let project_name = unique_project_name("background-auto-recovery");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = execution_project(
+            &project_name,
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(execution_session("executing", "execution-auto", "abc123")),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::Running,
+            last_action: String::new(),
+            last_action_at: String::new(),
+            error_message: String::new(),
+            recovery_action: project::AutopilotRecoveryAction::None,
+        });
+        crate::save_project(&proj)?;
+        let pipeline = Arc::new(Mutex::new(Some(pipeline_state(
+            "execution-auto",
+            PipelineStatus::Running,
+        ))));
+        let failure = BackgroundExecutionFailure::new(
+            project::RecoveryErrorKind::ExecutionError,
+            "process lost".to_string(),
+        );
+
+        finalize_background_execution_failure(
+            &project_name,
+            "milestone-1",
+            "mid-1",
+            "subtask-1",
+            "测试小阶段",
+            0,
+            1,
+            "execution-auto",
+            &failure,
+            pipeline,
+        )
+        .await?;
+
+        let updated = crate::load_project(&project_name)?;
+        let recovery = updated.workflow_state.recovery_state.as_ref().unwrap();
+        assert_eq!(
+            recovery.error_kind,
+            project::RecoveryErrorKind::ExecutionError
+        );
+        assert_eq!(recovery.phase, project::RecoveryPhase::Diagnosing);
+        assert_eq!(recovery.baseline_commit, "abc123");
+        let autopilot = updated.workflow_state.autopilot_state.as_ref().unwrap();
+        assert_eq!(autopilot.run_status, project::AutopilotRunStatus::Running);
+        assert_eq!(
+            autopilot.recovery_action,
+            project::AutopilotRecoveryAction::RunAutomaticRecovery
+        );
+        Ok(())
+    }
+
     #[test]
     fn failed_session_survives_reconcile_without_clearing() {
         let mut session = execution_session("execution_failed", "execution-keep", "HEAD");
@@ -4152,6 +4675,7 @@ mod tests {
                 issues: vec![],
                 suggestion: String::new(),
                 warnings: vec![],
+                ..Default::default()
             });
             if let Some(ref mut session) = done.execution_session {
                 session.status = "awaiting_confirmation".to_string();
