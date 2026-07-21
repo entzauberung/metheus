@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Project } from "./types";
+import { ExecutionWorkspaceStatus, Project } from "./types";
 import { invokeWithTimeout, isInvokeTimeoutError } from "./utils/invokeWithTimeout";
 import { ConsoleFeedback } from "./components/ConsoleStepShell";
 import { MilestonePlanningStep } from "./console/MilestonePlanningStep";
@@ -13,12 +13,16 @@ interface Props {
   onActionStart: (action: string) => boolean;
   onActionEnd: () => void;
   onFeedback: (feedback: ConsoleFeedback | null) => void;
+  workspaceStatus: ExecutionWorkspaceStatus | null;
+  onPrepareWorkspace: () => Promise<void>;
+  onRefreshWorkspace: () => Promise<void>;
 }
 
 type RegenerationSource = "check_failed" | "approval_rejected";
 
 export function ConsoleWorkflowPanel({
   project, onProjectUpdated, externalBusy, onActionStart, onActionEnd, onFeedback,
+  workspaceStatus, onPrepareWorkspace, onRefreshWorkspace,
 }: Props) {
   const step = project.workflow_state.current_step;
   const busy = externalBusy;
@@ -248,6 +252,9 @@ export function ConsoleWorkflowPanel({
       onCheck={() => runProjectCommand("check_stage_plan", { projectName: project.name }, "执行计划检查已完成。")}
       onApprove={() => runProjectCommand("approve_stage_plan", { projectName: project.name }, "执行计划已冻结，已进入执行阶段。")}
       onRegenerate={handleRegeneratePlan}
+      workspaceStatus={workspaceStatus}
+      onPrepareWorkspace={onPrepareWorkspace}
+      onRefreshWorkspace={onRefreshWorkspace}
     /></>;
   }
 

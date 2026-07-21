@@ -153,6 +153,10 @@ pub(crate) async fn migrate_project_workflow(
     // === 0.5. autopilot sanity 检查 ===
     reconcile_autopilot_in_migration(&mut proj);
 
+    // === 0.75. 旧执行计划契约迁移 ===
+    // 无执行事实的旧计划退回检查；已有执行事实只停止自动驾驶，不改写历史。
+    reconcile_plan_contract_in_migration(&mut proj);
+
     // Repair rule: PlanApproving + approved plan → Execution
     // Fixes projects stuck in the old "stay at PlanApproving" state after approval.
     if proj.workflow_state.current_step == project::WorkflowStep::PlanApproving {
@@ -1263,6 +1267,77 @@ fn autopilot_persist_step_state(
     Ok(())
 }
 
+fn workspace_recovery_action(
+    workspace: &project::ExecutionWorkspaceStatus,
+) -> Option<project::AutopilotRecoveryAction> {
+    if workspace.ready {
+        None
+    } else if workspace.has_commits
+        && workspace
+            .issues
+            .contains(&project::ExecutionWorkspaceIssue::DirtyWorkingTree)
+    {
+        Some(project::AutopilotRecoveryAction::ResolveWorkspaceChanges)
+    } else {
+        Some(project::AutopilotRecoveryAction::PrepareExecutionWorkspace)
+    }
+}
+
+fn current_mid_stage<'a>(proj: &'a project::Project) -> Option<&'a project::MidStage> {
+    proj.milestones
+        .iter()
+        .find(|milestone| milestone.id == proj.current_milestone_id)
+        .and_then(|milestone| {
+            milestone
+                .mid_stages
+                .iter()
+                .find(|mid_stage| mid_stage.id == proj.current_mid_stage_id)
+        })
+}
+
+fn classify_autopilot_precondition(
+    proj: &project::Project,
+) -> Result<Option<(String, project::AutopilotRecoveryAction)>, String> {
+    let step = &proj.workflow_state.current_step;
+    let mid_stage = match current_mid_stage(proj) {
+        Some(mid_stage) => mid_stage,
+        None => return Ok(None),
+    };
+
+    if matches!(
+        step,
+        project::WorkflowStep::PlanApproving | project::WorkflowStep::Execution
+    ) {
+        if let Err(error) = crate::plan_contract::validate_subtasks(&mid_stage.subtasks) {
+            return Ok(Some((
+                format!("执行计划契约无效：{}", error),
+                if *step == project::WorkflowStep::PlanApproving {
+                    project::AutopilotRecoveryAction::RegenerateExecutionPlan
+                } else {
+                    project::AutopilotRecoveryAction::WaitHumanDecision
+                },
+            )));
+        }
+    }
+
+    let execution_needs_clean_workspace = *step == project::WorkflowStep::Execution
+        && mid_stage
+            .subtasks
+            .iter()
+            .any(|subtask| subtask.status == project::SubtaskStatus::Pending)
+        && !mid_stage.subtasks.iter().any(|subtask| {
+            subtask.status == project::SubtaskStatus::AwaitingConfirmation
+                || subtask.status == project::SubtaskStatus::Executing
+        });
+    if *step == project::WorkflowStep::PlanApproving || execution_needs_clean_workspace {
+        let workspace = crate::pipeline::get_execution_workspace_status_inner(&proj.project_path)?;
+        if let Some(recovery) = workspace_recovery_action(&workspace) {
+            return Ok(Some((workspace.status_message, recovery)));
+        }
+    }
+    Ok(None)
+}
+
 /// 自动驾驶标记错误：持久化 ErrorStopped 和可读错误，再同步项目
 #[tauri::command]
 pub(crate) async fn autopilot_mark_error(
@@ -1276,12 +1351,25 @@ pub(crate) async fn autopilot_mark_error(
         return Err("自动驾驶未激活。".to_string());
     }
 
+    let existing_recovery = proj
+        .workflow_state
+        .autopilot_state
+        .as_ref()
+        .map(|autopilot| autopilot.recovery_action.clone())
+        .unwrap_or_default();
+    let recovery_action = if existing_recovery != project::AutopilotRecoveryAction::None {
+        existing_recovery
+    } else {
+        classify_autopilot_precondition(&proj)?
+            .map(|(_, recovery)| recovery)
+            .unwrap_or(project::AutopilotRecoveryAction::RetryAutopilotAdvance)
+    };
     autopilot_persist_step_state(
         &mut proj,
         &action_description,
         project::AutopilotRunStatus::ErrorStopped,
         &error_detail,
-        project::AutopilotRecoveryAction::WaitHumanDecision,
+        recovery_action,
     )?;
 
     crate::save_and_reload_project(&proj)
@@ -1301,16 +1389,30 @@ pub(crate) async fn autopilot_resume(project_name: String) -> Result<project::Pr
         Some(ap) => match ap.run_status {
             project::AutopilotRunStatus::Paused => true,
             project::AutopilotRunStatus::ErrorStopped => {
-                // 执行恢复动作未完成时禁止通用“恢复自动驾驶”，避免恢复后立即再次失败
-                if let Some(ap) = proj.workflow_state.autopilot_state.as_ref() {
-                    if ap.recovery_action
-                        == project::AutopilotRecoveryAction::RestoreExecutionBaseline
-                    {
+                match ap.recovery_action {
+                    project::AutopilotRecoveryAction::RestoreExecutionBaseline => {
                         return Err(
                             "存在执行失败需要先恢复执行基线，请先完成基线恢复后再恢复自动驾驶。"
                                 .to_string(),
                         );
                     }
+                    project::AutopilotRecoveryAction::WaitHumanDecision => {
+                        return Err("当前错误需要先完成人工决策。".to_string());
+                    }
+                    project::AutopilotRecoveryAction::SyncAndClose => {
+                        return Err("当前状态只允许同步并关闭自动驾驶。".to_string());
+                    }
+                    project::AutopilotRecoveryAction::RegenerateExecutionPlan => {
+                        return Err("当前执行计划需要先重新生成。".to_string());
+                    }
+                    project::AutopilotRecoveryAction::PrepareExecutionWorkspace => {
+                        return Err("请先准备 Git 执行工作区。".to_string());
+                    }
+                    project::AutopilotRecoveryAction::ResolveWorkspaceChanges => {
+                        return Err("请先处理工作区变更并刷新状态。".to_string());
+                    }
+                    project::AutopilotRecoveryAction::None
+                    | project::AutopilotRecoveryAction::RetryAutopilotAdvance => {}
                 }
                 // ErrorStopped can only resume if there's no unresolved quality failure
                 if proj.workflow_state.current_step == project::WorkflowStep::Execution {
@@ -1374,6 +1476,9 @@ pub struct AutopilotNextStep {
     pub error_message: String,
     /// 命令返回类别（前端按类别分流处理）
     pub result_kind: project::AutopilotCommandResultKind,
+    /// 当前已有匹配的执行会话，调用方只应恢复轮询，不得继续推进
+    #[serde(default)]
+    pub waiting_for_execution: bool,
 }
 
 #[tauri::command]
@@ -1389,6 +1494,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             is_error: true,
             error_message: "自动驾驶未激活".to_string(),
             result_kind: project::AutopilotCommandResultKind::NoResult,
+            waiting_for_execution: false,
         });
     }
 
@@ -1418,6 +1524,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                     is_error: false,
                     error_message: String::new(),
                     result_kind: project::AutopilotCommandResultKind::NoResult,
+                    waiting_for_execution: false,
                 });
             }
             project::AutopilotRunStatus::ErrorStopped => {
@@ -1444,6 +1551,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                     is_error: true,
                     error_message: persisted_error,
                     result_kind: project::AutopilotCommandResultKind::NoResult,
+                    waiting_for_execution: false,
                 });
             }
             project::AutopilotRunStatus::WaitingMilestoneReview => {
@@ -1464,10 +1572,69 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                     is_error: false,
                     error_message: String::new(),
                     result_kind: project::AutopilotCommandResultKind::NoResult,
+                    waiting_for_execution: false,
                 });
             }
             _ => {} // Running — continue
         }
+    }
+
+    // 执行会话是比小阶段状态更强的运行事实。执行中只恢复轮询，不得再启动、确认或切换阶段。
+    if let Some(session) = proj
+        .execution_session
+        .as_ref()
+        .filter(|session| session.active && session.status.eq_ignore_ascii_case("executing"))
+    {
+        let session_matches_workflow = proj.workflow_state.current_step
+            == project::WorkflowStep::Execution
+            && session.milestone_id == proj.current_milestone_id
+            && session.mid_stage_id == proj.current_mid_stage_id
+            && proj.milestones.iter().any(|milestone| {
+                milestone.id == session.milestone_id
+                    && milestone.mid_stages.iter().any(|mid| {
+                        mid.id == session.mid_stage_id
+                            && mid.subtasks.iter().any(|subtask| {
+                                subtask.id == session.subtask_id
+                                    && subtask.status == project::SubtaskStatus::Executing
+                            })
+                    })
+            });
+
+        if session_matches_workflow {
+            return Ok(AutopilotNextStep {
+                command: String::new(),
+                args: serde_json::json!({}),
+                description: format!(
+                    "小阶段「{}」正在执行，等待当前执行完成",
+                    session.subtask_title
+                ),
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
+                result_kind: project::AutopilotCommandResultKind::NoResult,
+                waiting_for_execution: true,
+            });
+        }
+
+        let description = "活动执行会话与当前工作流上下文不一致，请同步后关闭自动驾驶";
+        autopilot_persist_step_state(
+            &mut proj,
+            description,
+            project::AutopilotRunStatus::ErrorStopped,
+            description,
+            project::AutopilotRecoveryAction::SyncAndClose,
+        )?;
+        crate::save_project(&proj)?;
+        return Ok(AutopilotNextStep {
+            command: String::new(),
+            args: serde_json::json!({}),
+            description: description.to_string(),
+            at_milestone_boundary: false,
+            is_error: true,
+            error_message: description.to_string(),
+            result_kind: project::AutopilotCommandResultKind::NoResult,
+            waiting_for_execution: false,
+        });
     }
 
     let step = proj.workflow_state.current_step.clone();
@@ -1489,6 +1656,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             is_error: false,
             error_message: String::new(),
             result_kind: project::AutopilotCommandResultKind::NoResult,
+            waiting_for_execution: false,
         });
     }
 
@@ -1496,7 +1664,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
 
     // Ensure target milestone exists
     let target_ms = match proj.milestones.iter().find(|m| m.id == target_ms_id) {
-        Some(ms) => ms,
+        Some(ms) => ms.clone(),
         None => {
             let description = "目标大阶段不存在";
             autopilot_persist_step_state(
@@ -1515,9 +1683,31 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                 is_error: true,
                 error_message: description.to_string(),
                 result_kind: project::AutopilotCommandResultKind::NoResult,
+                waiting_for_execution: false,
             });
         }
     };
+
+    if let Some((description, recovery)) = classify_autopilot_precondition(&proj)? {
+        autopilot_persist_step_state(
+            &mut proj,
+            &description,
+            project::AutopilotRunStatus::ErrorStopped,
+            &description,
+            recovery,
+        )?;
+        crate::save_project(&proj)?;
+        return Ok(AutopilotNextStep {
+            command: String::new(),
+            args: serde_json::json!({}),
+            description: description.clone(),
+            at_milestone_boundary: false,
+            is_error: true,
+            error_message: description,
+            result_kind: project::AutopilotCommandResultKind::NoResult,
+            waiting_for_execution: false,
+        });
+    }
 
     use project::WorkflowStep::*;
     let next = match &step {
@@ -1534,6 +1724,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                 is_error: false,
                 error_message: String::new(),
                 result_kind: project::AutopilotCommandResultKind::ProjectState,
+                waiting_for_execution: false,
             }
         }
 
@@ -1550,6 +1741,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             is_error: false,
             error_message: String::new(),
             result_kind: project::AutopilotCommandResultKind::ProjectState,
+            waiting_for_execution: false,
         },
 
         // Enter mid-stage generation → generate draft (auto-transitions to MidStageCheck)
@@ -1561,6 +1753,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             is_error: false,
             error_message: String::new(),
             result_kind: project::AutopilotCommandResultKind::ProjectState,
+            waiting_for_execution: false,
         },
 
         // Mid-stage draft generated → check (auto-transitions to MidStageApproval)
@@ -1572,6 +1765,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             is_error: false,
             error_message: String::new(),
             result_kind: project::AutopilotCommandResultKind::ProjectState,
+            waiting_for_execution: false,
         },
 
         // Mid-stage check passed → approve (auto-transitions to MidStageSelection)
@@ -1583,6 +1777,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             is_error: false,
             error_message: String::new(),
             result_kind: project::AutopilotCommandResultKind::ProjectState,
+            waiting_for_execution: false,
         },
 
         // Mid-stages approved and at selection — select first non-completed mid-stage,
@@ -1609,6 +1804,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                 is_error: false,
                 error_message: String::new(),
                 result_kind: project::AutopilotCommandResultKind::ProjectState,
+                waiting_for_execution: false,
             }
         }
 
@@ -1626,6 +1822,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                 is_error: false,
                 error_message: String::new(),
                 result_kind: project::AutopilotCommandResultKind::ProjectState,
+                waiting_for_execution: false,
             }
         }
 
@@ -1647,6 +1844,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                     is_error: false,
                     error_message: String::new(),
                     result_kind: project::AutopilotCommandResultKind::ProjectState,
+                    waiting_for_execution: false,
                 },
                 None => AutopilotNextStep {
                     command: String::new(),
@@ -1656,6 +1854,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                     is_error: true,
                     error_message: "没有未完成的中阶段".to_string(),
                     result_kind: project::AutopilotCommandResultKind::NoResult,
+                    waiting_for_execution: false,
                 },
             }
         }
@@ -1669,18 +1868,47 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             is_error: false,
             error_message: String::new(),
             result_kind: project::AutopilotCommandResultKind::ProjectState,
+            waiting_for_execution: false,
         },
 
         // Plan generated → check (auto-transitions to PlanApproving)
-        PlanCheck => AutopilotNextStep {
-            command: "check_stage_plan".to_string(),
-            args: serde_json::json!({ "projectName": project_name }),
-            description: "检查执行计划".to_string(),
-            at_milestone_boundary: false,
-            is_error: false,
-            error_message: String::new(),
-            result_kind: project::AutopilotCommandResultKind::ProjectState,
-        },
+        PlanCheck => {
+            let current_mid = current_mid_stage(&proj);
+            if let Some(mid_stage) = current_mid.filter(|mid_stage| {
+                mid_stage
+                    .plan_check_result
+                    .as_ref()
+                    .is_some_and(|result| !result.passed)
+            }) {
+                AutopilotNextStep {
+                    command: "regenerate_execution_plan".to_string(),
+                    args: serde_json::json!({
+                        "projectName": project_name,
+                        "expectedDataRevision": proj.workflow_state.data_revision,
+                        "expectedPlanDraftRevision": mid_stage.plan_draft_revision,
+                        "feedback": "",
+                        "source": "check_failed",
+                    }),
+                    description: "按检查结果重新生成执行计划".to_string(),
+                    at_milestone_boundary: false,
+                    is_error: false,
+                    error_message: String::new(),
+                    result_kind: project::AutopilotCommandResultKind::ProjectState,
+                    waiting_for_execution: false,
+                }
+            } else {
+                AutopilotNextStep {
+                    command: "check_stage_plan".to_string(),
+                    args: serde_json::json!({ "projectName": project_name }),
+                    description: "检查执行计划".to_string(),
+                    at_milestone_boundary: false,
+                    is_error: false,
+                    error_message: String::new(),
+                    result_kind: project::AutopilotCommandResultKind::ProjectState,
+                    waiting_for_execution: false,
+                }
+            }
+        }
 
         // Plan check passed → approve (auto-transitions to Execution)
         PlanApproving => AutopilotNextStep {
@@ -1691,6 +1919,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             is_error: false,
             error_message: String::new(),
             result_kind: project::AutopilotCommandResultKind::ProjectState,
+            waiting_for_execution: false,
         },
 
         // In execution — execute next pending or confirm awaiting
@@ -1727,6 +1956,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                                 is_error: false,
                                 error_message: String::new(),
                                 result_kind: project::AutopilotCommandResultKind::ProjectState,
+                                waiting_for_execution: false,
                             });
                         }
                         None => {
@@ -1743,6 +1973,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                                 is_error: false,
                                 error_message: String::new(),
                                 result_kind: project::AutopilotCommandResultKind::ProjectState,
+                                waiting_for_execution: false,
                             });
                         }
                     }
@@ -1779,6 +2010,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                         current_mid.title
                     ),
                     result_kind: project::AutopilotCommandResultKind::NoResult,
+                    waiting_for_execution: false,
                 }
             } else if has_awaiting {
                 // 质量门禁预检：执行结果、测试结果、证据完整性
@@ -1791,6 +2023,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                         is_error: false,
                         error_message: String::new(),
                         result_kind: project::AutopilotCommandResultKind::ProjectState,
+                        waiting_for_execution: false,
                     },
                     Err(gate_reason) => AutopilotNextStep {
                         command: String::new(),
@@ -1800,6 +2033,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                         is_error: true,
                         error_message: gate_reason,
                         result_kind: project::AutopilotCommandResultKind::NoResult,
+                        waiting_for_execution: false,
                     },
                 }
             } else if has_pending {
@@ -1811,6 +2045,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                     is_error: false,
                     error_message: String::new(),
                     result_kind: project::AutopilotCommandResultKind::PipelineState,
+                    waiting_for_execution: false,
                 }
             } else {
                 // 当前中阶段没有 pending/awaiting/rejected → 已完成
@@ -1836,6 +2071,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                         is_error: false,
                         error_message: String::new(),
                         result_kind: project::AutopilotCommandResultKind::ProjectState,
+                        waiting_for_execution: false,
                     },
                     None => AutopilotNextStep {
                         command: "transition_workflow".to_string(),
@@ -1849,6 +2085,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                         is_error: false,
                         error_message: String::new(),
                         result_kind: project::AutopilotCommandResultKind::ProjectState,
+                        waiting_for_execution: false,
                     },
                 }
             }
@@ -1864,6 +2101,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             is_error: true,
             error_message: format!("{:?} 步骤需要人工介入", step),
             result_kind: project::AutopilotCommandResultKind::NoResult,
+            waiting_for_execution: false,
         },
 
         // Milestone generation/check/approval — user should handle these before autopilot
@@ -1875,6 +2113,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             is_error: true,
             error_message: "请先手动完成大阶段生成、检查和批准。".to_string(),
             result_kind: project::AutopilotCommandResultKind::NoResult,
+            waiting_for_execution: false,
         },
 
         _ => AutopilotNextStep {
@@ -1885,6 +2124,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             is_error: true,
             error_message: format!("自动驾驶不支持从 {:?} 自动推进", step),
             result_kind: project::AutopilotCommandResultKind::NoResult,
+            waiting_for_execution: false,
         },
     };
 
@@ -1948,6 +2188,91 @@ fn reconcile_execution_in_migration(proj: &mut crate::project::Project) {
             | crate::pipeline::ExecutionReconciliation::DataConflict
     ) {
         crate::pipeline::apply_execution_reconciliation(proj, &reconciliation);
+    }
+}
+
+fn subtask_has_execution_facts(subtask: &project::Subtask) -> bool {
+    !matches!(
+        subtask.status,
+        project::SubtaskStatus::Pending | project::SubtaskStatus::RolledBack
+    ) || subtask.execution_result.is_some()
+        || subtask.test_result.is_some()
+        || subtask.auto_tag.as_ref().is_some_and(|tag| !tag.is_empty())
+}
+
+fn reconcile_plan_contract_in_migration(proj: &mut project::Project) {
+    let current_milestone_id = proj.current_milestone_id.clone();
+    let current_mid_stage_id = proj.current_mid_stage_id.clone();
+    let mut current_invalid_without_facts: Option<String> = None;
+    let mut current_invalid_with_facts: Option<String> = None;
+
+    for milestone in &mut proj.milestones {
+        for mid_stage in &mut milestone.mid_stages {
+            if mid_stage.subtasks.is_empty()
+                && mid_stage.plan_generated_at.is_none()
+                && mid_stage.plan_revision == 0
+            {
+                continue;
+            }
+            let error = match crate::plan_contract::validate_subtasks(&mid_stage.subtasks) {
+                Ok(()) => continue,
+                Err(error) => error,
+            };
+            let has_facts = matches!(
+                mid_stage.status,
+                project::MidStageStatus::InProgress | project::MidStageStatus::Completed
+            ) || mid_stage.completed_at.is_some()
+                || !mid_stage.git_tag.is_empty()
+                || mid_stage.subtasks.iter().any(subtask_has_execution_facts);
+            let is_current =
+                milestone.id == current_milestone_id && mid_stage.id == current_mid_stage_id;
+
+            if has_facts {
+                if is_current {
+                    current_invalid_with_facts = Some(error);
+                }
+                continue;
+            }
+
+            mid_stage.plan_approved_at = None;
+            mid_stage.plan_revision = 0;
+            mid_stage.plan_check_result = Some(project::StagePlanCheckResult {
+                passed: false,
+                omissions: vec![],
+                out_of_scope: vec![],
+                not_executable: vec![error.clone()],
+                suggestions: vec!["旧执行计划缺少合法文件范围，请重新生成。".to_string()],
+                checked_at: chrono::Utc::now().to_rfc3339(),
+            });
+            if is_current {
+                current_invalid_without_facts = Some(error);
+            }
+        }
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(error) = current_invalid_without_facts {
+        proj.workflow_state.current_step = project::WorkflowStep::PlanCheck;
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+            autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
+            autopilot.last_action = "旧执行计划需要重新生成".to_string();
+            autopilot.last_action_at = now.clone();
+            autopilot.error_message = error;
+            autopilot.recovery_action = project::AutopilotRecoveryAction::RegenerateExecutionPlan;
+        }
+        proj.workflow_state.data_revision += 1;
+        proj.workflow_state.last_transition_at = now;
+    } else if let Some(error) = current_invalid_with_facts {
+        if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+            autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
+            autopilot.last_action = "已执行计划的文件范围无效，需要人工回退".to_string();
+            autopilot.last_action_at = now.clone();
+            autopilot.error_message = error;
+            autopilot.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+        }
+        proj.workflow_state.data_revision += 1;
+        proj.workflow_state.last_transition_at = now;
     }
 }
 
@@ -2050,7 +2375,7 @@ mod tests {
             auto_tag: None,
             order: 1,
             goal: String::new(),
-            allowed_file_paths: vec![],
+            allowed_file_paths: vec!["tracked.txt".to_string()],
             new_file_paths: vec![],
             evidence_files: vec![],
             context_summary: String::new(),
@@ -2378,6 +2703,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_execution_session_only_returns_waiting_fact() -> Result<(), String> {
+        let project_name = unique_project_name("ap-execution-wait");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id = "mid-1".to_string();
+        let mut mid = test_mid_stage(project::MidStageStatus::InProgress);
+        mid.subtasks = vec![test_subtask(project::SubtaskStatus::Executing)];
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone.mid_stages = vec![mid];
+        proj.milestones = vec![milestone];
+        proj.execution_session = Some(project::ExecutionSession {
+            execution_id: "execution-1".to_string(),
+            active: true,
+            milestone_id: "milestone-1".to_string(),
+            mid_stage_id: "mid-1".to_string(),
+            subtask_id: "subtask-1".to_string(),
+            subtask_title: "测试小阶段".to_string(),
+            status: "executing".to_string(),
+            ..project::ExecutionSession::default()
+        });
+        activate_autopilot(&mut proj, "milestone-1");
+        let revision = proj.workflow_state.data_revision;
+        crate::save_project(&proj)?;
+
+        let step = autopilot_next_step(project_name.clone()).await?;
+        assert!(step.waiting_for_execution);
+        assert!(step.command.is_empty());
+        assert!(!step.is_error);
+        let persisted = crate::load_project(&project_name)?;
+        assert_eq!(persisted.workflow_state.data_revision, revision);
+        assert_eq!(
+            persisted
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .ok_or("缺少自动驾驶状态".to_string())?
+                .run_status,
+            project::AutopilotRunStatus::Running
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn conflicting_execution_session_requires_sync_and_close() -> Result<(), String> {
+        let project_name = unique_project_name("ap-execution-conflict");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id = "mid-1".to_string();
+        let mut mid = test_mid_stage(project::MidStageStatus::InProgress);
+        mid.subtasks = vec![test_subtask(project::SubtaskStatus::Executing)];
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone.mid_stages = vec![mid];
+        proj.milestones = vec![milestone];
+        proj.execution_session = Some(project::ExecutionSession {
+            execution_id: "execution-conflict".to_string(),
+            active: true,
+            milestone_id: "milestone-1".to_string(),
+            mid_stage_id: "another-mid".to_string(),
+            subtask_id: "subtask-1".to_string(),
+            status: "executing".to_string(),
+            ..project::ExecutionSession::default()
+        });
+        activate_autopilot(&mut proj, "milestone-1");
+        crate::save_project(&proj)?;
+
+        let step = autopilot_next_step(project_name.clone()).await?;
+        assert!(step.is_error);
+        assert!(!step.waiting_for_execution);
+        let persisted = crate::load_project(&project_name)?;
+        let autopilot = persisted
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .ok_or("缺少自动驾驶状态".to_string())?;
+        assert_eq!(
+            autopilot.run_status,
+            project::AutopilotRunStatus::ErrorStopped
+        );
+        assert_eq!(
+            autopilot.recovery_action,
+            project::AutopilotRecoveryAction::SyncAndClose
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn autopilot_resume_rejects_non_retryable_recovery_actions() -> Result<(), String> {
+        for recovery_action in [
+            project::AutopilotRecoveryAction::WaitHumanDecision,
+            project::AutopilotRecoveryAction::SyncAndClose,
+            project::AutopilotRecoveryAction::RegenerateExecutionPlan,
+            project::AutopilotRecoveryAction::PrepareExecutionWorkspace,
+            project::AutopilotRecoveryAction::ResolveWorkspaceChanges,
+        ] {
+            let project_name = unique_project_name("ap-resume-blocked");
+            let _guard = ProjectDataGuard::new(&project_name)?;
+            let mut proj = project::Project::new(&project_name);
+            proj.workflow_state.current_step = project::WorkflowStep::Execution;
+            activate_autopilot(&mut proj, "milestone-1");
+            if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+                autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
+                autopilot.recovery_action = recovery_action;
+            }
+            crate::save_project(&proj)?;
+
+            assert!(autopilot_resume(project_name).await.is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_without_head_uses_prepare_recovery_even_with_untracked_files() {
+        let workspace = project::ExecutionWorkspaceStatus {
+            path_exists: true,
+            is_directory: true,
+            is_git_repo: true,
+            has_commits: false,
+            git_user_available: true,
+            git_email_available: true,
+            working_tree_clean: false,
+            ready: false,
+            status_message: "尚无首次提交".to_string(),
+            issues: vec![
+                project::ExecutionWorkspaceIssue::NoCommits,
+                project::ExecutionWorkspaceIssue::DirtyWorkingTree,
+            ],
+            changes: vec![],
+        };
+        assert_eq!(
+            workspace_recovery_action(&workspace),
+            Some(project::AutopilotRecoveryAction::PrepareExecutionWorkspace)
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_routes_invalid_unexecuted_plan_back_to_check() -> Result<(), String> {
+        let project_name = unique_project_name("invalid-plan-migration");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.current_step = project::WorkflowStep::PlanApproving;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id = "mid-1".to_string();
+        let mut invalid = test_subtask(project::SubtaskStatus::Pending);
+        invalid.allowed_file_paths.clear();
+        let mut mid = test_mid_stage(project::MidStageStatus::Ready);
+        mid.subtasks = vec![invalid];
+        mid.plan_generated_at = Some("2026-07-21T00:00:00Z".to_string());
+        mid.plan_approved_at = Some("2026-07-21T00:00:00Z".to_string());
+        mid.plan_revision = 1;
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone.mid_stages = vec![mid];
+        proj.milestones = vec![milestone];
+        activate_autopilot(&mut proj, "milestone-1");
+        crate::save_project(&proj)?;
+
+        let migrated = migrate_project_workflow(project_name).await?;
+        let migrated_mid = &migrated.milestones[0].mid_stages[0];
+        assert_eq!(
+            migrated.workflow_state.current_step,
+            project::WorkflowStep::PlanCheck
+        );
+        assert!(migrated_mid.plan_approved_at.is_none());
+        assert_eq!(migrated_mid.plan_revision, 0);
+        assert_eq!(
+            migrated
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .ok_or("迁移后缺少自动驾驶状态".to_string())?
+                .recovery_action,
+            project::AutopilotRecoveryAction::RegenerateExecutionPlan
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_preserves_invalid_plan_with_execution_facts() -> Result<(), String> {
+        let project_name = unique_project_name("executed-invalid-plan-migration");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id = "mid-1".to_string();
+        let mut invalid = test_subtask(project::SubtaskStatus::Passed);
+        invalid.allowed_file_paths.clear();
+        invalid.auto_tag = Some("metheus/auto/v0.1.1/task-1".to_string());
+        let mut mid = test_mid_stage(project::MidStageStatus::InProgress);
+        mid.subtasks = vec![invalid];
+        mid.plan_generated_at = Some("2026-07-21T00:00:00Z".to_string());
+        mid.plan_approved_at = Some("2026-07-21T00:00:00Z".to_string());
+        mid.plan_revision = 1;
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone.mid_stages = vec![mid];
+        proj.milestones = vec![milestone];
+        activate_autopilot(&mut proj, "milestone-1");
+        crate::save_project(&proj)?;
+
+        let migrated = migrate_project_workflow(project_name).await?;
+        let migrated_mid = &migrated.milestones[0].mid_stages[0];
+        assert!(migrated_mid.plan_approved_at.is_some());
+        assert_eq!(migrated_mid.plan_revision, 1);
+        assert_eq!(
+            migrated
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .ok_or("迁移后缺少自动驾驶状态".to_string())?
+                .recovery_action,
+            project::AutopilotRecoveryAction::WaitHumanDecision
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn long_unicode_error_is_persisted_without_invalid_boundary() -> Result<(), String> {
         let project_name = unique_project_name("ap-unicode");
         let _guard = ProjectDataGuard::new(&project_name)?;
@@ -2389,17 +2948,21 @@ mod tests {
         let long_error = "错误详情".repeat(AUTOPILOT_ERROR_MESSAGE_MAX_LENGTH);
         let updated =
             autopilot_mark_error(project_name, "自动驾驶失败".to_string(), long_error).await?;
-        let saved_error = &updated
+        let autopilot = updated
             .workflow_state
             .autopilot_state
             .as_ref()
-            .ok_or("长错误未持久化自动驾驶状态".to_string())?
-            .error_message;
+            .ok_or("长错误未持久化自动驾驶状态".to_string())?;
+        let saved_error = &autopilot.error_message;
         assert_eq!(
             saved_error.chars().count(),
             AUTOPILOT_ERROR_MESSAGE_MAX_LENGTH + 3
         );
         assert!(saved_error.ends_with("..."));
+        assert_eq!(
+            autopilot.recovery_action,
+            project::AutopilotRecoveryAction::RetryAutopilotAdvance
+        );
         Ok(())
     }
 }

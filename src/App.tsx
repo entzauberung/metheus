@@ -6,6 +6,8 @@
 // ...
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
+import { executionPollingOwnsNextAdvance } from "./autopilotPolicy";
+import { getWorkspaceAction } from "./workspacePolicy";
 import "./App.css";
 import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, AutopilotNextStep } from "./types";
 import { ProjectEntry } from "./ProjectEntry";
@@ -18,7 +20,7 @@ import { ActionButton } from "./components/ActionButton";
 import { Modal } from "./components/Modal";
 import { ConsoleStepShell } from "./components/ConsoleStepShell";
 import { WorkflowActionBar } from "./components/WorkflowActionBar";
-import { Check, GitBranch, ListTodo, Pause, Play, RotateCcw, Search, Square, WandSparkles, X } from "lucide-react";
+import { Check, GitBranch, ListTodo, Pause, Play, RefreshCw, RotateCcw, Search, Square, WandSparkles, X } from "lucide-react";
 import { AutopilotControlBar } from "./components/AutopilotControlBar";
 import ExecutionTree from "./ExecutionTree";
 import ChatRoom from "./ChatRoom";
@@ -353,9 +355,9 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.name, project?.execution_session?.active, project?.execution_session?.status, project?.execution_session?.subtask_id, startupRecoveryDone]);
 
-  // Fetch workspace status when entering Execution
+  // Fetch workspace status before plan approval and throughout execution.
   useEffect(() => {
-    if (!project || project.workflow_state.current_step !== "Execution") return;
+    if (!project || !["PlanApproving", "Execution"].includes(project.workflow_state.current_step)) return;
     invokeWithTimeout<ExecutionWorkspaceStatus>("get_execution_workspace_status", { projectName: project.name })
       .then(setWorkspaceStatus)
       .catch(() => setWorkspaceStatus(null));
@@ -434,6 +436,12 @@ function App() {
       // 代次失效检查
       if (autopilotGenerationRef.current !== generation) return;
 
+      if (next.waiting_for_execution) {
+        setIsExecuting(true);
+        startExecutionPolling(proj.name, generation);
+        return;
+      }
+
       // 终止字段是后端强制契约，必须先于 result_kind 处理。
       if (next.is_error || !next.command) {
         const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
@@ -494,8 +502,12 @@ function App() {
             });
             setExecutionStatus(pipelineState);
             setIsExecuting(pipelineState.status === "Running");
-            if (pipelineState.status === "Running" && autopilotGenerationRef.current === generation) {
+            if (
+              executionPollingOwnsNextAdvance(pipelineState)
+              && autopilotGenerationRef.current === generation
+            ) {
               startExecutionPolling(proj.name, generation);
+              return;
             }
             if (pipelineState.status !== "Running") {
               const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
@@ -1348,6 +1360,8 @@ function App() {
         type: status.ready ? "success" : "warning",
         message: status.status_message,
       });
+      const latest = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
+      handleChatComplete(latest);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "准备执行工作区失败：" + String(err) });
     } finally {
@@ -1502,6 +1516,31 @@ function App() {
     }
   };
 
+  const handleRegenerateInvalidPlan = async () => {
+    if (!project || !beginConsoleAction("regenerate_invalid_plan")) return;
+    try {
+      const milestone = project.milestones.find(item => item.id === project.current_milestone_id);
+      const midStage = milestone?.mid_stages.find(item => item.id === project.current_mid_stage_id);
+      if (!midStage) throw new Error("当前中阶段不存在。");
+      const source = project.workflow_state.current_step === "PlanApproving"
+        ? "approval_rejected"
+        : "check_failed";
+      const updated = await invokeWithTimeout<Project>("regenerate_execution_plan", {
+        projectName: project.name,
+        expectedDataRevision: project.workflow_state.data_revision,
+        expectedPlanDraftRevision: midStage.plan_draft_revision,
+        feedback: "补全并校正每个小阶段的精确文件范围。",
+        source,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "success", message: "执行计划已重新生成，请重新检查。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "重新生成计划失败：" + String(err) });
+    } finally {
+      endConsoleAction();
+    }
+  };
+
   // === 恢复执行基线：实际 Git 回退；失败时保留恢复面板与后端原始错误 ===
   const handleAcknowledgeExecutionRecovery = async () => {
     if (!project || !beginConsoleAction("acknowledge_recovery")) return;
@@ -1546,6 +1585,12 @@ function App() {
         if (pipelineStatus.awaiting_confirmation) {
           setIsExecuting(false);
         }
+      }
+      if (["PlanApproving", "Execution"].includes(updated.workflow_state.current_step)) {
+        const status = await invokeWithTimeout<ExecutionWorkspaceStatus>("get_execution_workspace_status", {
+          projectName: project.name,
+        });
+        setWorkspaceStatus(status);
       }
       setFeedbackMsg({ type: "info", message: "项目状态已同步。" });
     } catch (err) {
@@ -1805,6 +1850,8 @@ function App() {
                 onSync={handleSyncProject}
                 onRetryCurrent={handleRetryCurrentSubtask}
                 onAcknowledgeRecovery={handleAcknowledgeExecutionRecovery}
+                onRegeneratePlan={handleRegenerateInvalidPlan}
+                onPrepareWorkspace={handlePrepareExecutionWorkspace}
               />
               {feedbackMsg && (
                 <FeedbackBanner
@@ -1826,6 +1873,9 @@ function App() {
                   onActionStart={beginConsoleAction}
                   onActionEnd={endConsoleAction}
                   onFeedback={setFeedbackMsg}
+                  workspaceStatus={workspaceStatus}
+                  onPrepareWorkspace={handlePrepareExecutionWorkspace}
+                  onRefreshWorkspace={handleSyncProject}
                 />
               )}
               {/* V1 执行阶段 UI — 仅在 Execution 步骤渲染 */}
@@ -1907,6 +1957,9 @@ function App() {
                   onActionStart={beginConsoleAction}
                   onActionEnd={endConsoleAction}
                   onFeedback={setFeedbackMsg}
+                  workspaceStatus={workspaceStatus}
+                  onPrepareWorkspace={handlePrepareExecutionWorkspace}
+                  onRefreshWorkspace={handleSyncProject}
                 />
               )}
               {/* 未识别步骤只显示错误，不回退到旧业务控制台。 */}
@@ -2032,6 +2085,7 @@ function V1ExecutionPanel({
     : null;
 
   const workspaceReady = workspaceStatus?.ready === true;
+  const workspaceAction = getWorkspaceAction(workspaceStatus);
 
   return (
     <div className="v1-execution-panel" style={{ padding: "24px" }}>
@@ -2093,16 +2147,38 @@ function V1ExecutionPanel({
 
       {/* Workspace status banner — 失败会话期间隐藏准备环境 */}
       {!hasExecutionFailure && planApproved && workspaceStatus && !workspaceReady && (
-        <FeedbackBanner type="warning" message={workspaceStatus.status_message} />
+        <FeedbackBanner
+          type="warning"
+          message={workspaceStatus.status_message}
+          details={workspaceStatus.changes.map(change =>
+            `${change.tracked ? `${change.index_status}${change.worktree_status}` : "??"} ${change.path}`
+          )}
+        />
       )}
 
-      {/* Workspace preparation */}
-      {!hasExecutionFailure && planApproved && !workspaceReady && (
+      {/* Workspace preparation is only valid before repository metadata exists. */}
+      {!hasExecutionFailure && planApproved && workspaceAction === "prepare" && (
         <div style={{ marginBottom: "20px" }}>
           <ActionButton icon={<GitBranch size={16} />} loading={busy} loadingLabel="准备中"
             onClick={handlePrepareWorkspace}>准备执行环境</ActionButton>
           <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
             执行小阶段前需要初始化 Git 仓库并创建首次提交。
+          </p>
+        </div>
+      )}
+
+      {!hasExecutionFailure && planApproved && workspaceStatus &&
+        workspaceAction !== "none" && workspaceAction !== "prepare" && (
+        <div style={{ marginBottom: "20px" }}>
+          <ActionButton icon={<RefreshCw size={16} />} disabled={busy} onClick={onSyncProject}>
+            刷新工作区
+          </ActionButton>
+          <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
+            {workspaceAction === "resolve_changes"
+              ? "请先处理上方列出的工作区变更，再刷新状态。"
+              : workspaceAction === "configure_identity"
+                ? "请先配置 Git user.name 和 user.email，再刷新状态。"
+                : "请修复项目路径后刷新状态。"}
           </p>
         </div>
       )}

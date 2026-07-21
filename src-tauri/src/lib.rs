@@ -16,6 +16,7 @@ mod executor;
 mod git_ops;
 mod json_utils;
 mod pipeline;
+mod plan_contract;
 mod project;
 mod prompts;
 mod snapshot;
@@ -156,7 +157,6 @@ pub fn run() {
             crate::commands::milestone::suggest_rollback_checkpoint,
             crate::commands::milestone::generate_future_milestone_draft,
             crate::commands::milestone::approve_future_milestones,
-            crate::executor::execute_subtask,
             crate::test_runner::check_subtask,
             crate::commands::milestone::summarize_milestone,
             crate::pipeline::execute_current_subtask,
@@ -175,8 +175,6 @@ pub fn run() {
             crate::pipeline::acknowledge_execution_recovery,
             crate::commands::project_ops::approve_mid_stage,
             crate::commands::project_ops::reject_mid_stage,
-            crate::git_ops::git_save_node,
-            crate::git_ops::git_save_subtask,
             crate::constitution::update_constitution,
             crate::constitution::compact_constitution,
             crate::constitution::read_constitution,

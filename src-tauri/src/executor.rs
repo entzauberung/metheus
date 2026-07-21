@@ -1,4 +1,4 @@
-use crate::pipeline::{PipelineState, PipelineStatus, append_runtime_log};
+use crate::pipeline::{append_runtime_log, PipelineState, PipelineStatus};
 use crate::project;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -72,9 +72,7 @@ async fn stream_process_pipe(
                             || pipeline.status == PipelineStatus::Failed
                         {
                             // 仍继续读管道防堵塞，但不追加日志
-                        } else if execution_id.is_empty()
-                            || pipeline.execution_id == execution_id
-                        {
+                        } else if execution_id.is_empty() || pipeline.execution_id == execution_id {
                             append_runtime_log(
                                 pipeline,
                                 "info",
@@ -101,10 +99,7 @@ async fn stream_process_pipe(
     }
 
     if truncated {
-        let marker = format!(
-            "\n…[输出已截断，累计超过 {} 字节上限]",
-            MAX_STREAM_BYTES
-        );
+        let marker = format!("\n…[输出已截断，累计超过 {} 字节上限]", MAX_STREAM_BYTES);
         collected.extend_from_slice(marker.as_bytes());
         let mut guard = state.lock().await;
         if let Some(pipeline) = guard.as_mut() {
@@ -151,19 +146,43 @@ async fn terminate_child_process(
 pub(crate) async fn execute_subtask_inner(
     project_path: &str,
     prompt: &str,
+    authorized_paths: &[String],
     subtask_id: &str,
     execution_id: &str,
     state: Arc<Mutex<Option<PipelineState>>>,
+) -> Result<project::ExecutionResult, project::SubTaskError> {
+    execute_subtask_inner_with_program(
+        project_path,
+        prompt,
+        authorized_paths,
+        subtask_id,
+        execution_id,
+        state,
+        std::ffi::OsStr::new("claude"),
+    )
+    .await
+}
+
+async fn execute_subtask_inner_with_program(
+    project_path: &str,
+    prompt: &str,
+    authorized_paths: &[String],
+    subtask_id: &str,
+    execution_id: &str,
+    state: Arc<Mutex<Option<PipelineState>>>,
+    cli_program: &std::ffi::OsStr,
 ) -> Result<project::ExecutionResult, project::SubTaskError> {
     // 1. 执行前记录文件内容指纹
     let before_files = crate::test_runner::get_file_snapshot(project_path);
     // 2. 拼接完整 prompt（V1：精确执行已批准任务，信息不足时停止）
     let full_prompt = format!(
         "{}\n\n=== V1 执行约束 ===\n\
-        1. 只执行上述任务，不得自行扩展文件范围或改变架构。\n\
+        允许新增、修改或删除的精确文件路径：\n- {}\n\
+        1. 只执行上述任务，只能变更列出的精确文件，不得扩展到目录、相邻文件或改变架构。\n\
         2. 信息不足或发现范围外问题时，必须停止并说明阻塞原因，不得自行猜测或扩展。\n\
         3. 完成后不要输出总结，直接结束。",
-        prompt
+        prompt,
+        authorized_paths.join("\n- ")
     );
     // 3. 确定模型名（从环境变量读取，带白名单校验和降级兜底）
     let model_env = match std::env::var("METHEUS_MODEL") {
@@ -182,7 +201,7 @@ pub(crate) async fn execute_subtask_inner(
         crate::constants::DEEPSEEK_WORKFLOW_MODEL.to_string()
     };
     // 4. 用 tokio::process::Command 启动 Claude Code（非阻塞）
-    let mut child = tokio::process::Command::new("claude")
+    let mut child = tokio::process::Command::new(cli_program)
         .args([
             "--dangerously-skip-permissions",
             "--model",
@@ -192,7 +211,8 @@ pub(crate) async fn execute_subtask_inner(
         ])
         .kill_on_drop(true)
         .current_dir(project_path)
-        .stdin(std::process::Stdio::piped())
+        // `claude -p --dangerously-skip-permissions` 是非交互协议，不应向 stdin 盲写确认。
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -237,39 +257,7 @@ pub(crate) async fn execute_subtask_inner(
             }
         }
     }
-    // 5. 自动应答：信任确认 + 文件写入确认（异步写入 stdin）
-    if let Some(mut stdin) = child.stdin.take() {
-        use tokio::io::AsyncWriteExt;
-        if let Err(error) = stdin.write_all(b"1\n").await {
-            let termination = terminate_child_process(&mut child, "写入执行确认失败").await;
-            let _stdout = collect_pipe(stdout_reader, "stdout").await;
-            let _stderr = collect_pipe(stderr_reader, "stderr").await;
-            clear_child_pid(&state, execution_id).await;
-            termination?;
-            return Err(project::SubTaskError::ExecutionFailed {
-                message: format!("写入 Claude Code 执行确认失败：{}", error),
-            });
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        /* 安全上限：最大自动应答次数。Claude Code 通常只会在开始前询问 1-3 次确认，
-        此处设 20 为兜底。后续可改为动态检测 stdout 中是否包含 "?" 或 "确认" 等
-        提示语来决定是否需要继续应答。 */
-        const MAX_AUTO_CONFIRM: u32 = 20;
-        for _ in 0..MAX_AUTO_CONFIRM {
-            if let Err(error) = stdin.write_all(b"yes\n").await {
-                let termination = terminate_child_process(&mut child, "写入自动确认失败").await;
-                let _stdout = collect_pipe(stdout_reader, "stdout").await;
-                let _stderr = collect_pipe(stderr_reader, "stderr").await;
-                clear_child_pid(&state, execution_id).await;
-                termination?;
-                return Err(project::SubTaskError::ExecutionFailed {
-                    message: format!("写入 Claude Code 自动确认失败：{}", error),
-                });
-            }
-        }
-        // stdin 在这里 drop，关闭管道
-    }
-    // 6. 轮询等待进程结束，期间检查暂停标志和超时
+    // 5. 轮询等待进程结束，期间检查暂停标志和超时
     let start_time = std::time::Instant::now();
     loop {
         match child.try_wait() {
@@ -282,11 +270,8 @@ pub(crate) async fn execute_subtask_inner(
                 let success = status.success();
                 // 获取新增、修改和删除的文件列表
                 let after_files = crate::test_runner::get_file_snapshot(project_path);
-                let file_changes = if success {
-                    crate::test_runner::detect_changes(&before_files, &after_files, project_path)
-                } else {
-                    vec![]
-                };
+                let file_changes =
+                    crate::test_runner::detect_changes(&before_files, &after_files, project_path);
                 let error_log = if success {
                     String::new()
                 } else {
@@ -385,34 +370,44 @@ pub(crate) async fn execute_subtask_inner(
     }
 }
 
-/// Tauri command 壳：前端调用入口，内部委托给 execute_subtask_inner。
-/// 前端直接调时没有暂停状态，传一个临时空 state。
-#[tauri::command]
-pub(crate) async fn execute_subtask(
-    project_path: String,
-    prompt: String,
-    subtask_id: String,
-    _milestone_id: String,
-    _mid_stage_id: String,
-) -> Result<project::ExecutionResult, String> {
-    // 前端直接调用时，没有流水线上下文，传空 state
-    let dummy_state = Arc::new(Mutex::new(None));
-    execute_subtask_inner(&project_path, &prompt, &subtask_id, "", dummy_state)
-        .await
-        .map_err(|e| match e {
-            project::SubTaskError::UserPaused => "用户暂停".to_string(),
-            project::SubTaskError::ExecutionFailed { message } => message,
-            project::SubTaskError::Timeout => "执行超时".to_string(),
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pipeline::{PipelineState, PipelineStatus};
     use std::io::Cursor;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    struct TestDirectory {
+        path: PathBuf,
+    }
+
+    impl TestDirectory {
+        fn new(label: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("metheus-{label}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).expect("应能创建测试目录");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_cli(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, format!("#!/bin/sh\nset -eu\n{body}\n")).expect("应能写入假 CLI");
+        let mut permissions = std::fs::metadata(path)
+            .expect("应能读取假 CLI 元数据")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("应能设置假 CLI 执行权限");
+    }
 
     fn test_pipeline(execution_id: &str) -> PipelineState {
         PipelineState {
@@ -500,5 +495,98 @@ mod tests {
         assert!(collected.len() <= MAX_STREAM_BYTES + 200);
         let text = String::from_utf8_lossy(&collected);
         assert!(text.contains("输出已截断"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn noninteractive_cli_may_close_stdin_and_complete_normally() {
+        let directory = TestDirectory::new("cli-success");
+        let cli_path = directory.path.join("fake-claude");
+        write_fake_cli(
+            &cli_path,
+            "exec 0<&-\nprintf 'generated by fake cli\\n' > cli-output.txt\nprintf 'fake cli complete\\n'",
+        );
+        let state = Arc::new(Mutex::new(Some(test_pipeline("exec-cli"))));
+
+        let result = execute_subtask_inner_with_program(
+            directory.path.to_str().expect("测试路径应为 UTF-8"),
+            "生成测试文件",
+            &["cli-output.txt".to_string()],
+            "subtask-1",
+            "exec-cli",
+            state.clone(),
+            cli_path.as_os_str(),
+        )
+        .await
+        .expect("提前关闭 stdin 不应导致执行失败");
+
+        assert!(result.success);
+        assert!(result.output.contains("fake cli complete"));
+        assert!(result
+            .file_changes
+            .iter()
+            .any(|path| path == "cli-output.txt"));
+        assert!(directory.path.join("cli-output.txt").is_file());
+        assert_eq!(state.lock().await.as_ref().and_then(|s| s.child_pid), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn noninteractive_cli_nonzero_exit_is_reported_without_protocol_error() {
+        let directory = TestDirectory::new("cli-failure");
+        let cli_path = directory.path.join("fake-claude");
+        write_fake_cli(
+            &cli_path,
+            "exec 0<&-\nprintf 'expected failure\\n' >&2\nexit 7",
+        );
+        let state = Arc::new(Mutex::new(Some(test_pipeline("exec-cli-failure"))));
+
+        let result = execute_subtask_inner_with_program(
+            directory.path.to_str().expect("测试路径应为 UTF-8"),
+            "触发失败",
+            &["cli-output.txt".to_string()],
+            "subtask-1",
+            "exec-cli-failure",
+            state,
+            cli_path.as_os_str(),
+        )
+        .await
+        .expect("CLI 退出码应通过 ExecutionResult 返回");
+
+        assert!(!result.success);
+        assert!(result.error_log.contains("exit code: Some(7)"));
+        assert!(result.error_log.contains("expected failure"));
+        assert!(!result.error_log.contains("stdin"));
+    }
+
+    /// 发布前手动烟测：
+    /// `cargo test executor::tests::real_claude_cli_smoke_test -- --ignored --nocapture`
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires an authenticated Claude CLI, network access, and model quota"]
+    async fn real_claude_cli_smoke_test() {
+        let directory = TestDirectory::new("real-cli-smoke");
+        let state = Arc::new(Mutex::new(Some(test_pipeline("exec-real-cli"))));
+        let result = execute_subtask_inner(
+            directory.path.to_str().expect("测试路径应为 UTF-8"),
+            "只创建 real-cli-smoke.txt，文件内容必须恰好为 metheus-real-cli-smoke 加一个换行符。",
+            &["real-cli-smoke.txt".to_string()],
+            "real-cli-smoke",
+            "exec-real-cli",
+            state,
+        )
+        .await
+        .expect("真实 Claude CLI 应能完成非交互执行");
+
+        assert!(result.success, "{}", result.error_log);
+        assert!(result
+            .file_changes
+            .iter()
+            .any(|path| path == "real-cli-smoke.txt"));
+        assert_eq!(
+            std::fs::read_to_string(directory.path.join("real-cli-smoke.txt"))
+                .expect("应能读取烟测输出"),
+            "metheus-real-cli-smoke\n"
+        );
     }
 }

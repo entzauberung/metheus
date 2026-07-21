@@ -1,7 +1,8 @@
 // src/components/AutopilotControlBar.tsx — 全局自动驾驶控制条
 // 在所有 Console 页面顶部显示自动驾驶状态与操作入口
-import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle } from "lucide-react";
+import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle, GitBranch } from "lucide-react";
 import type { Project, PipelineState, AutopilotRecoveryAction } from "../types";
+import { getAutopilotErrorActions } from "../autopilotPolicy";
 
 export interface AutopilotControlBarProps {
   project: Project;
@@ -14,6 +15,8 @@ export interface AutopilotControlBarProps {
   onSync: () => Promise<void>;
   onRetryCurrent?: () => Promise<void>;
   onAcknowledgeRecovery?: () => Promise<void>;
+  onRegeneratePlan?: () => Promise<void>;
+  onPrepareWorkspace?: () => Promise<void>;
 }
 
 function sessionStatusKey(status: string | undefined): string {
@@ -32,7 +35,7 @@ function isRecoverableSession(project: Project): boolean {
 export function AutopilotControlBar({
   project, executionStatus, busy,
   onToggle, onPauseNow, onPauseAfterCurrent, onResume, onSync,
-  onRetryCurrent, onAcknowledgeRecovery,
+  onRetryCurrent, onAcknowledgeRecovery, onRegeneratePlan, onPrepareWorkspace,
 }: AutopilotControlBarProps) {
   const apActive = project.workflow_state.autopilot_active === true;
   const apState = project.workflow_state.autopilot_state;
@@ -95,6 +98,11 @@ export function AutopilotControlBar({
             <RotateCcw size={14} /> 恢复基线并重试
           </button>
         )}
+        {apActive && (
+          <button className="ap-bar-btn" disabled={busy} onClick={() => onToggle(false)}>
+            <Square size={14} /> 关闭
+          </button>
+        )}
       </div>
     </div>
   ) : null;
@@ -129,16 +137,12 @@ export function AutopilotControlBar({
   // 自动驾驶激活且存在执行恢复动作：只显示一个主恢复动作
   if (recoveryBar) return recoveryBar;
 
-  const showGenericResume =
-    (runStatus === "Paused" || runStatus === "ErrorStopped")
-    && recoveryAction !== "RestoreExecutionBaseline"
-    && recoveryAction !== "WaitHumanDecision";
-
-  const showRetryAdvance =
-    runStatus === "ErrorStopped" && recoveryAction === "RetryAutopilotAdvance";
-
-  const showSyncOnly =
-    runStatus === "ErrorStopped" && recoveryAction === "SyncAndClose";
+  const errorActions = getAutopilotErrorActions(
+    runStatus ?? "Paused",
+    recoveryAction,
+  );
+  const showGenericResume = errorActions.canResume;
+  const showRetryAdvance = errorActions.canRetryAdvance;
 
   return (
     <div className={`autopilot-control-bar ${runStatus === "Running" || isExecuting ? "ap-running" : ""} ${runStatus === "ErrorStopped" ? "ap-error" : ""}`}>
@@ -194,28 +198,36 @@ export function AutopilotControlBar({
 
         {/* 暂停或可恢复错误：恢复 + 关闭（执行基线恢复场景已在上方单独处理） */}
         {showGenericResume && (
-          <>
-            <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onResume}>
-              <Play size={14} /> 恢复
-            </button>
-            <button className="ap-bar-btn" disabled={busy} onClick={() => onToggle(false)}>
-              <Square size={14} /> 关闭
-            </button>
-          </>
+          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onResume}>
+            <Play size={14} /> 恢复
+          </button>
         )}
 
         {showRetryAdvance && (
-          <>
-            <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onResume}>
-              <Play size={14} /> 重新尝试自动推进
-            </button>
-            <button className="ap-bar-btn" disabled={busy} onClick={() => onToggle(false)}>
-              <Square size={14} /> 关闭
-            </button>
-          </>
+          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onResume}>
+            <Play size={14} /> 重新尝试自动推进
+          </button>
         )}
 
-        {showSyncOnly && (
+        {errorActions.canRegeneratePlan && onRegeneratePlan && (
+          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onRegeneratePlan}>
+            <RotateCcw size={14} /> 重新生成计划
+          </button>
+        )}
+
+        {errorActions.canPrepareWorkspace && onPrepareWorkspace && (
+          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onPrepareWorkspace}>
+            <GitBranch size={14} /> 准备 Git
+          </button>
+        )}
+
+        {errorActions.canRefreshWorkspace && onPrepareWorkspace && (
+          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onPrepareWorkspace}>
+            <RotateCcw size={14} /> 刷新工作区
+          </button>
+        )}
+
+        {errorActions.canClose && (
           <button className="ap-bar-btn" disabled={busy} onClick={() => onToggle(false)}>
             <Square size={14} /> 关闭
           </button>

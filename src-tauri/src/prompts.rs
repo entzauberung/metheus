@@ -415,8 +415,9 @@ pub(crate) const EXECUTION_PLAN_CHECK_PROMPT: &str = "\
 1. 重复检查：不同小阶段之间是否存在任务重复？\
 2. 遗漏检查：中阶段目标所需的所有工作是否都有对应小阶段？\
 3. 越界检查：小阶段的 allowed_file_paths 是否超出中阶段范围？\
-4. 可执行性检查：每个小阶段的 execution_prompt 是否足够清晰、可被一次性执行？\
-5. 顺序检查：小阶段的执行顺序是否合理？\
+4. 路径契约检查：allowed_file_paths 必须非空，所有文件范围必须是项目内精确相对路径，禁止绝对路径、.、..、目录或通配符。\
+5. 可执行性检查：每个小阶段的 execution_prompt 是否足够清晰、可被一次性执行？\
+6. 顺序检查：小阶段的执行顺序是否合理？\
 \
 输出格式：JSON 对象，字段包括 passed（布尔）、summary（字符串）、\
 omissions（字符串数组）、out_of_scope（字符串数组）、not_executable（字符串数组）、suggestions（字符串数组）。\

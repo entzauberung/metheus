@@ -210,6 +210,12 @@ pub enum AutopilotRecoveryAction {
     SyncAndClose,
     /// 等待人工决策
     WaitHumanDecision,
+    /// 重新生成不满足执行契约的计划
+    RegenerateExecutionPlan,
+    /// 用户显式准备 Git 仓库和首次提交
+    PrepareExecutionWorkspace,
+    /// 用户在应用外处理工作区变更后刷新
+    ResolveWorkspaceChanges,
 }
 
 /// autopilot 持久化状态（写入 WorkflowState，用于刷新恢复）
@@ -1364,6 +1370,31 @@ pub struct ExecutionWorkspaceStatus {
     pub ready: bool,
     /// 给前端显示的状态说明
     pub status_message: String,
+    /// 结构化未就绪原因，前端不得解析 status_message
+    #[serde(default)]
+    pub issues: Vec<ExecutionWorkspaceIssue>,
+    /// staged / unstaged / untracked 变更清单
+    #[serde(default)]
+    pub changes: Vec<ExecutionWorkspaceChange>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExecutionWorkspaceIssue {
+    PathMissing,
+    NotDirectory,
+    NotGitRepository,
+    NoCommits,
+    MissingGitUserName,
+    MissingGitUserEmail,
+    DirtyWorkingTree,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionWorkspaceChange {
+    pub path: String,
+    pub index_status: String,
+    pub worktree_status: String,
+    pub tracked: bool,
 }
 
 /// 宪法变更历史条目 — 小阶段确认后宪法第二部分更新记录
@@ -1760,10 +1791,7 @@ mod tests {
             .remove("recovery_action");
         let restored_ap: AutopilotState = serde_json::from_value(ap_value)
             .map_err(|error| format!("反序列化旧自动驾驶状态失败：{}", error))?;
-        assert_eq!(
-            restored_ap.recovery_action,
-            AutopilotRecoveryAction::None
-        );
+        assert_eq!(restored_ap.recovery_action, AutopilotRecoveryAction::None);
         Ok(())
     }
 }

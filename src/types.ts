@@ -40,7 +40,10 @@ export type AutopilotRecoveryAction =
   | "RestoreExecutionBaseline"
   | "RetryAutopilotAdvance"
   | "SyncAndClose"
-  | "WaitHumanDecision";
+  | "WaitHumanDecision"
+  | "RegenerateExecutionPlan"
+  | "PrepareExecutionWorkspace"
+  | "ResolveWorkspaceChanges";
 
 /** 自动驾驶命令返回类别 */
 export type AutopilotCommandResultKind = "ProjectState" | "PipelineState" | "WorkspaceState" | "NoResult";
@@ -64,6 +67,8 @@ export interface AutopilotNextStep {
   is_error: boolean;
   error_message: string;
   result_kind: AutopilotCommandResultKind;
+  /** 已有匹配的执行会话，前端只应恢复执行轮询 */
+  waiting_for_execution: boolean;
 }
 
 // ========== V2 托管层 ==========
@@ -678,6 +683,24 @@ export interface ExecutionWorkspaceStatus {
   working_tree_clean: boolean;
   ready: boolean;
   status_message: string;
+  issues: ExecutionWorkspaceIssue[];
+  changes: ExecutionWorkspaceChange[];
+}
+
+export type ExecutionWorkspaceIssue =
+  | "PathMissing"
+  | "NotDirectory"
+  | "NotGitRepository"
+  | "NoCommits"
+  | "MissingGitUserName"
+  | "MissingGitUserEmail"
+  | "DirtyWorkingTree";
+
+export interface ExecutionWorkspaceChange {
+  path: string;
+  index_status: string;
+  worktree_status: string;
+  tracked: boolean;
 }
 
 export interface RollbackCheckpoint {

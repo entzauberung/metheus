@@ -1122,6 +1122,32 @@ async fn generate_execution_plan_tasks(
     let reply = crate::api::call_deepseek_api_json(crate::prompts::EXECUTION_PLAN_PROMPT, &context)
         .await
         .map_err(|error| format!("执行计划生成 AI 调用失败：{}", error))?;
+    match parse_execution_plan_tasks(&reply).await {
+        Ok(tasks) => Ok(tasks),
+        Err(validation_error) => {
+            let repair_context = format!(
+                "{}\n\n上一次输出未满足执行计划契约：{}\n请完整重新输出修正后的 JSON 数组。",
+                context, validation_error
+            );
+            let repaired = crate::api::call_deepseek_api_json(
+                crate::prompts::EXECUTION_PLAN_PROMPT,
+                &repair_context,
+            )
+            .await
+            .map_err(|error| format!("执行计划修订 AI 调用失败：{}", error))?;
+            parse_execution_plan_tasks(&repaired)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "执行计划修订后仍不满足契约：{}（首次错误：{}）",
+                        error, validation_error
+                    )
+                })
+        }
+    }
+}
+
+async fn parse_execution_plan_tasks(reply: &str) -> Result<Vec<project::Subtask>, String> {
     let raw: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&reply)
         .await
         .map_err(|error| format!("解析执行计划 JSON 失败：{}", error))?;
@@ -1129,7 +1155,8 @@ async fn generate_execution_plan_tasks(
         return Err("AI 返回的执行计划为空，请重新生成。".to_string());
     }
 
-    raw.iter()
+    let tasks = raw
+        .iter()
         .enumerate()
         .map(|(index, item)| {
             let entity = format!("第 {} 个小阶段", index + 1);
@@ -1158,7 +1185,9 @@ async fn generate_execution_plan_tasks(
                 confirmation_notes: None,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    crate::plan_contract::validate_subtasks(&tasks)?;
+    Ok(tasks)
 }
 
 /// 生成执行计划（V1：动态任务数量，精准上下文注入）
@@ -1315,6 +1344,15 @@ pub(crate) async fn regenerate_execution_plan(
     latest_mid_stage.plan_generated_at = Some(now.clone());
     latest_mid_stage.plan_regeneration_count = old_regeneration_count + 1;
     latest.workflow_state.current_step = project::WorkflowStep::PlanCheck;
+    if let Some(autopilot) = latest.workflow_state.autopilot_state.as_mut() {
+        if autopilot.recovery_action == project::AutopilotRecoveryAction::RegenerateExecutionPlan {
+            autopilot.run_status = project::AutopilotRunStatus::Paused;
+            autopilot.recovery_action = project::AutopilotRecoveryAction::None;
+            autopilot.error_message.clear();
+            autopilot.last_action = "执行计划已重新生成，等待重新检查".to_string();
+            autopilot.last_action_at = now.clone();
+        }
+    }
     latest.workflow_state.data_revision += 1;
     latest.workflow_state.last_transition_at = now;
     crate::save_and_reload_project(&latest)
@@ -1323,7 +1361,7 @@ pub(crate) async fn regenerate_execution_plan(
 /// 检查执行计划
 #[tauri::command]
 pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Project, String> {
-    let proj = crate::load_project(&project_name)?;
+    let mut proj = crate::load_project(&project_name)?;
 
     if proj.workflow_state.current_step != project::WorkflowStep::PlanCheck {
         return Err(format!(
@@ -1345,6 +1383,30 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
         .iter()
         .find(|m| m.id == *mid_stage_id)
         .ok_or("中阶段不存在。")?;
+
+    if let Err(error) = crate::plan_contract::validate_subtasks(&mid.subtasks) {
+        let ms = proj
+            .milestones
+            .iter_mut()
+            .find(|m| m.id == *milestone_id)
+            .ok_or("大阶段不存在。")?;
+        let mid = ms
+            .mid_stages
+            .iter_mut()
+            .find(|m| m.id == *mid_stage_id)
+            .ok_or("中阶段不存在。")?;
+        mid.plan_check_result = Some(project::StagePlanCheckResult {
+            passed: false,
+            omissions: vec![],
+            out_of_scope: vec![],
+            not_executable: vec![error],
+            suggestions: vec!["请重新生成执行计划并补全合法的文件范围。".to_string()],
+            checked_at: chrono::Utc::now().to_rfc3339(),
+        });
+        proj.workflow_state.data_revision += 1;
+        proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+        return crate::save_and_reload_project(&proj);
+    }
 
     let plan_text = mid
         .subtasks
@@ -1454,6 +1516,18 @@ pub(crate) async fn approve_stage_plan(project_name: String) -> Result<project::
     if mid.subtasks.is_empty() {
         return Err("执行计划为空，无法批准。".to_string());
     }
+    crate::plan_contract::validate_subtasks(&mid.subtasks)
+        .map_err(|error| format!("执行计划契约无效，无法批准：{}", error))?;
+
+    let workspace = crate::pipeline::get_execution_workspace_status_inner(&proj.project_path)?;
+    if !workspace.ready {
+        return Err(format!(
+            "Git 工作区尚未满足批准条件：{}",
+            workspace.status_message
+        ));
+    }
+    crate::plan_contract::validate_subtasks_in_project(&mid.subtasks, &proj.project_path)
+        .map_err(|error| format!("执行计划契约无效，无法批准：{}", error))?;
 
     // Idempotency: if already approved, ensure disk consistency
     if mid.plan_approved_at.is_some() && mid.plan_revision > 0 {
@@ -2818,7 +2892,7 @@ pub(crate) async fn regenerate_plan_from_checkpoint(
             auto_tag: None,
             order: 0,
             goal: String::new(),
-            allowed_file_paths: vec![],
+            allowed_file_paths: vec!["tracked.txt".to_string()],
             new_file_paths: vec![],
             evidence_files: vec![],
             context_summary: String::new(),

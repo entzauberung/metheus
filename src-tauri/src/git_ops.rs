@@ -1,896 +1,700 @@
 use crate::project;
-use serde_json;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-/// 在项目目录下执行 git add . → git commit --allow-empty → git tag -f
-/// 专业模式：从中阶段完成处调用（version = "v0.1.1"）
-/// 快速模式：从大阶段完成处调用（version = "v0.1"）
-///
-/// 返回 tag 名，如 "metheus/v0.1.1"
-#[tauri::command]
+fn run_git(project_path: &str, args: &[&str], context: &str) -> Result<Vec<u8>, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(project_path)
+        .output()
+        .map_err(|error| format!("{}：{}", context, error))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{}：{}",
+            context,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn run_git_with_index(
+    project_path: &str,
+    index_path: &Path,
+    args: &[&str],
+    context: &str,
+) -> Result<Vec<u8>, String> {
+    let output = Command::new("git")
+        .args(args)
+        .env("GIT_INDEX_FILE", index_path)
+        .current_dir(project_path)
+        .output()
+        .map_err(|error| format!("{}：{}", context, error))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{}：{}",
+            context,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn head(project_path: &str) -> Result<String, String> {
+    run_git(project_path, &["rev-parse", "HEAD"], "读取 Git HEAD 失败")
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+fn status_paths(project_path: &str) -> Result<Vec<String>, String> {
+    let output = run_git(
+        project_path,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        "读取 Git 工作区状态失败",
+    )?;
+    let entries: Vec<&[u8]> = output
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    let mut paths = Vec::new();
+    let mut index = 0;
+    while index < entries.len() {
+        let entry = entries[index];
+        if entry.len() >= 3 {
+            let index_status = entry[0] as char;
+            let worktree_status = entry[1] as char;
+            paths.push(String::from_utf8_lossy(&entry[3..]).to_string());
+            index += 1;
+            if matches!(index_status, 'R' | 'C') || matches!(worktree_status, 'R' | 'C') {
+                if let Some(source) = entries.get(index) {
+                    paths.push(String::from_utf8_lossy(source).to_string());
+                }
+                index += 1;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    Ok(paths)
+}
+
+fn ensure_clean_workspace(project_path: &str) -> Result<(), String> {
+    let paths = status_paths(project_path)?;
+    if paths.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "工作区存在未提交或未跟踪修改，拒绝执行 Git 操作：{}",
+            paths.join("、")
+        ))
+    }
+}
+
+fn ensure_only_authorized_changes(
+    project_path: &str,
+    authorized_paths: &[String],
+) -> Result<(), String> {
+    let authorized: BTreeSet<&str> = authorized_paths.iter().map(String::as_str).collect();
+    let outside: Vec<String> = status_paths(project_path)?
+        .into_iter()
+        .filter(|path| !authorized.contains(path.as_str()))
+        .collect();
+    if outside.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "工作区包含计划范围外变更，拒绝提交：{}",
+            outside.join("、")
+        ))
+    }
+}
+
+/// 使用隔离的临时 index 捕获授权文件的完整 diff，不改变用户工作区的暂存状态。
+pub(crate) fn capture_authorized_diff(
+    project_path: &str,
+    authorized_paths: &[String],
+) -> Result<String, String> {
+    if authorized_paths.is_empty() {
+        return Err("小阶段授权文件范围为空，无法捕获变更".to_string());
+    }
+    ensure_only_authorized_changes(project_path, authorized_paths)?;
+
+    let index_path =
+        std::env::temp_dir().join(format!("metheus-git-index-{}", uuid::Uuid::new_v4()));
+    let lock_path = PathBuf::from(format!("{}.lock", index_path.to_string_lossy()));
+    let result = (|| {
+        run_git_with_index(
+            project_path,
+            &index_path,
+            &["read-tree", "HEAD"],
+            "初始化临时 Git 索引失败",
+        )?;
+
+        let pathspecs: Vec<String> = authorized_paths
+            .iter()
+            .map(|path| format!(":(literal){}", path))
+            .collect();
+        let mut add_args = vec!["add", "-A", "--"];
+        add_args.extend(pathspecs.iter().map(String::as_str));
+        run_git_with_index(
+            project_path,
+            &index_path,
+            &add_args,
+            "在临时索引中暂存授权文件失败",
+        )?;
+
+        let mut diff_args = vec![
+            "diff",
+            "--cached",
+            "--binary",
+            "--no-ext-diff",
+            "HEAD",
+            "--",
+        ];
+        diff_args.extend(pathspecs.iter().map(String::as_str));
+        run_git_with_index(
+            project_path,
+            &index_path,
+            &diff_args,
+            "读取小阶段授权变更失败",
+        )
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+    })();
+
+    let _ = fs::remove_file(&index_path);
+    let _ = fs::remove_file(lock_path);
+    result
+}
+
+pub(crate) struct GeneratedFileUpdate {
+    relative_path: String,
+    original_content: String,
+    updated_content: String,
+}
+
+impl GeneratedFileUpdate {
+    pub(crate) fn constitution(original_content: String, updated_content: String) -> Self {
+        Self {
+            relative_path: "CONSTITUTION.md".to_string(),
+            original_content,
+            updated_content,
+        }
+    }
+
+    fn changed(&self) -> bool {
+        self.original_content != self.updated_content
+    }
+}
+
+fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("文件缺少父目录：{}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("文件名不是有效 UTF-8：{}", path.display()))?;
+    let temp_path = parent.join(format!(
+        ".{}.metheus-{}.tmp",
+        file_name,
+        uuid::Uuid::new_v4()
+    ));
+    fs::write(&temp_path, content)
+        .map_err(|error| format!("写入临时文件 {} 失败：{}", temp_path.display(), error))?;
+    if let Ok(metadata) = fs::metadata(path) {
+        fs::set_permissions(&temp_path, metadata.permissions()).map_err(|error| {
+            let _ = fs::remove_file(&temp_path);
+            format!("保留文件权限 {} 失败：{}", path.display(), error)
+        })?;
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(&temp_path, path).map_err(|error| {
+            let _ = fs::remove_file(&temp_path);
+            format!("原子替换文件 {} 失败：{}", path.display(), error)
+        })
+    }
+
+    #[cfg(windows)]
+    {
+        let backup_path = parent.join(format!(
+            ".{}.metheus-{}.bak",
+            file_name,
+            uuid::Uuid::new_v4()
+        ));
+        fs::rename(path, &backup_path).map_err(|error| {
+            let _ = fs::remove_file(&temp_path);
+            format!("备份文件 {} 失败：{}", path.display(), error)
+        })?;
+        match fs::rename(&temp_path, path) {
+            Ok(()) => {
+                let _ = fs::remove_file(backup_path);
+                Ok(())
+            }
+            Err(error) => {
+                let restore_result = fs::rename(&backup_path, path);
+                let _ = fs::remove_file(&temp_path);
+                match restore_result {
+                    Ok(()) => Err(format!("原子替换文件 {} 失败：{}", path.display(), error)),
+                    Err(restore_error) => Err(format!(
+                        "替换文件 {} 失败：{}；恢复备份也失败：{}",
+                        path.display(),
+                        error,
+                        restore_error
+                    )),
+                }
+            }
+        }
+    }
+}
+
+fn tag_target(project_path: &str, tag_name: &str) -> Result<Option<String>, String> {
+    let output = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            &format!("refs/tags/{}^{{}}", tag_name),
+        ])
+        .current_dir(project_path)
+        .output()
+        .map_err(|error| format!("检查 Git 标签失败：{}", error))?;
+    if output.status.success() {
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+fn ensure_tag_available(project_path: &str, tag_name: &str) -> Result<bool, String> {
+    let Some(existing) = tag_target(project_path, tag_name)? else {
+        return Ok(false);
+    };
+    let current = head(project_path)?;
+    if existing == current {
+        ensure_clean_workspace(project_path)?;
+        Ok(true)
+    } else {
+        Err(format!(
+            "Git 标签 {} 已指向提交 {}，禁止覆盖为当前提交 {}",
+            tag_name, existing, current
+        ))
+    }
+}
+
+fn create_immutable_tag(project_path: &str, tag_name: &str) -> Result<(), String> {
+    run_git(
+        project_path,
+        &["tag", tag_name],
+        &format!("创建 Git 标签 {} 失败", tag_name),
+    )?;
+    Ok(())
+}
+
+/// 中阶段节点只创建空提交和不可覆盖标签；调用前工作区必须干净。
 pub(crate) async fn git_save_node(
     project_path: String,
     version: String,
     title: String,
 ) -> Result<String, String> {
-    // 1. git add . 加暂存
-    let add_output = std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| format!("git add失败: {}", e))?;
-    if !add_output.status.success() {
-        return Err(format!(
-            "git add 执行失败：\n{}",
-            String::from_utf8_lossy(&add_output.stderr)
-        ));
-    }
-    // 2. git commit -m 记录文档
-    // --allow-empty 确保即使没有文件变更也能提交
-    //    （比如一个中阶段只改了文案，没有代码变更）
-    let commit_message = format!("【弥】节点 {}: {}", version, title);
-    let commit_output = std::process::Command::new("git")
-        .args(["commit", "-m", &commit_message, "--allow-empty"])
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| format!("git commit 执行失败：{}", e))?;
-    if !commit_output.status.success() {
-        // "nothing to commit"不是错误，只是没有变更
-        let stderr = String::from_utf8_lossy(&commit_output.stderr);
-        if !stderr.contains("nothing to commit") {
-            return Err(format!("git commit 执行失败:\n{}", stderr));
-        }
-    }
-    // 3. git tag 打标签
-    // tag 格式 metheus/v0.1.1，用 metheus/ 前缀避免和用户自己的 tag 冲突
-    // -f 允许覆盖已有 tag（如果同一个节点重做后重新存档）
+    ensure_clean_workspace(&project_path)?;
     let tag_name = format!("metheus/{}", version);
-    let tag_output = std::process::Command::new("git")
-        .args(["tag", "-f", &tag_name])
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| format!("git tag 失败: {}", e))?;
-    if !tag_output.status.success() {
-        return Err(format!(
-            "git tag 执行失败: \n{}",
-            String::from_utf8_lossy(&tag_output.stderr)
-        ));
+    if ensure_tag_available(&project_path, &tag_name)? {
+        return Ok(tag_name);
     }
-    // 返回 tag 名， 让调用方决定写回哪个节点
+
+    let commit_message = format!("【弥】节点 {}: {}", version, title);
+    run_git(
+        &project_path,
+        &["commit", "--allow-empty", "-m", &commit_message],
+        "创建中阶段节点提交失败",
+    )?;
+    create_immutable_tag(&project_path, &tag_name)?;
     Ok(tag_name)
 }
 
-/// 小阶段 Git 存档命令
-///
-/// 在项目目录下执行 git add . → git commit --allow-empty → git tag -f
-/// 专业模式 tag 格式：metheus/auto/{mid_stage_version}/task-{subtask_index}
-/// 快速模式 tag 格式：metheus/q/{milestone_version}/task-{subtask_index}
-/// 返回 tag 名，调用方可写回 Subtask.auto_tag
-#[tauri::command]
+/// 小阶段确认只暂存计划授权路径和经过原内容校验的系统生成文件，并创建不可覆盖标签。
 pub(crate) async fn git_save_subtask(
     project_path: String,
     subtask_index: u32,
     mid_stage_version: String,
     subtask_title: String,
+    authorized_paths: Vec<String>,
+    generated_file: Option<GeneratedFileUpdate>,
 ) -> Result<String, String> {
-    git_save_subtask_inner(
+    if authorized_paths.is_empty() {
+        return Err("小阶段授权文件范围为空，拒绝提交".to_string());
+    }
+    let tag_name = format!("metheus/auto/{}/task-{}", mid_stage_version, subtask_index);
+    if ensure_tag_available(&project_path, &tag_name)? {
+        return Ok(tag_name);
+    }
+    ensure_only_authorized_changes(&project_path, &authorized_paths)?;
+
+    let generated_file = generated_file.filter(GeneratedFileUpdate::changed);
+    let mut commit_paths = authorized_paths.clone();
+    if let Some(update) = generated_file.as_ref() {
+        let generated_path = Path::new(&project_path).join(&update.relative_path);
+        let current_content = fs::read_to_string(&generated_path).map_err(|error| {
+            format!("读取系统生成文件 {} 失败：{}", update.relative_path, error)
+        })?;
+        if current_content != update.original_content {
+            return Err(format!(
+                "系统生成文件 {} 在确认期间发生变化，拒绝覆盖",
+                update.relative_path
+            ));
+        }
+        atomic_write_text(&generated_path, &update.updated_content)?;
+        if !commit_paths.contains(&update.relative_path) {
+            commit_paths.push(update.relative_path.clone());
+        }
+    }
+
+    let mut committed = false;
+    let save_result = (|| {
+        ensure_only_authorized_changes(&project_path, &commit_paths)?;
+
+        let pathspecs: Vec<String> = commit_paths
+            .iter()
+            .map(|path| format!(":(literal){}", path))
+            .collect();
+        let mut add_args = vec!["add", "-A", "--"];
+        add_args.extend(pathspecs.iter().map(String::as_str));
+        run_git(&project_path, &add_args, "暂存小阶段授权文件失败")?;
+
+        let staged = run_git(
+            &project_path,
+            &["diff", "--cached", "--name-only", "-z"],
+            "读取暂存区失败",
+        )?;
+        let authorized: BTreeSet<&str> = commit_paths.iter().map(String::as_str).collect();
+        let outside: Vec<String> = staged
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf8_lossy(entry).to_string())
+            .filter(|path| !authorized.contains(path.as_str()))
+            .collect();
+        if !outside.is_empty() {
+            return Err(format!(
+                "暂存区包含计划范围外文件，拒绝提交：{}",
+                outside.join("、")
+            ));
+        }
+
+        let commit_message = format!(
+            "【弥】小阶段 {}/{}：{}",
+            subtask_index, mid_stage_version, subtask_title
+        );
+        run_git(
+            &project_path,
+            &["commit", "--allow-empty", "-m", &commit_message],
+            "创建小阶段提交失败",
+        )?;
+        committed = true;
+        create_immutable_tag(&project_path, &tag_name)?;
+        ensure_clean_workspace(&project_path)?;
+        Ok(tag_name.clone())
+    })();
+
+    if save_result.is_err() && !committed {
+        if let Some(update) = generated_file.as_ref() {
+            let generated_path = Path::new(&project_path).join(&update.relative_path);
+            let pathspec = format!(":(literal){}", update.relative_path);
+            let _ = run_git(
+                &project_path,
+                &["reset", "--quiet", "HEAD", "--", &pathspec],
+                "恢复系统生成文件暂存状态失败",
+            );
+            if let Err(restore_error) = atomic_write_text(&generated_path, &update.original_content)
+            {
+                return Err(format!(
+                    "{}；同时恢复 {} 失败：{}",
+                    save_result.unwrap_err(),
+                    update.relative_path,
+                    restore_error
+                ));
+            }
+        }
+    }
+
+    save_result
+}
+
+/// 手工回退只接受干净工作区，不自动 stash 或丢弃用户变更。
+pub(crate) fn git_reset_to_tag_clean(project_path: &str, tag_name: &str) -> Result<(), String> {
+    ensure_clean_workspace(project_path)?;
+    run_git(
         project_path,
-        subtask_index,
-        mid_stage_version,
-        subtask_title,
-        false,
-    )
-    .await
+        &["rev-parse", "--verify", &format!("{}^{{commit}}", tag_name)],
+        &format!("回退目标 {} 不存在", tag_name),
+    )?;
+    run_git(
+        project_path,
+        &["reset", "--hard", tag_name],
+        &format!("回退到 {} 失败", tag_name),
+    )?;
+    ensure_clean_workspace(project_path)
 }
 
-/// 内部实现：支持快速/专业两种模式的 tag 前缀
-pub(crate) async fn git_save_subtask_inner(
-    project_path: String,
-    subtask_index: u32,
-    version: String,
-    subtask_title: String,
-    is_quick_mode: bool,
-) -> Result<String, String> {
-    // 1. git add . 暂存所有变更
-    let add_output = std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| format!("git add 失败: {}", e))?;
-    if !add_output.status.success() {
-        return Err(format!(
-            "git add 执行失败：\n{}",
-            String::from_utf8_lossy(&add_output.stderr)
-        ));
-    }
-
-    // 2. git commit（--allow-empty 确保即使无文件变更也能提交）
-    let commit_message = format!(
-        "【弥】小阶段 {}/{}：{}",
-        subtask_index, version, subtask_title
-    );
-    let commit_output = std::process::Command::new("git")
-        .args(["commit", "-m", &commit_message, "--allow-empty"])
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| format!("git commit 执行失败：{}", e))?;
-    if !commit_output.status.success() {
-        let stderr = String::from_utf8_lossy(&commit_output.stderr);
-        if !stderr.contains("nothing to commit") {
-            return Err(format!("git commit 执行失败:\n{}", stderr));
+pub(crate) fn delete_tags(project_path: &str, tags: &[String]) -> Result<(), String> {
+    for tag in tags {
+        if tag.is_empty() || tag_target(project_path, tag)?.is_none() {
+            continue;
         }
+        run_git(
+            project_path,
+            &["tag", "-d", tag],
+            &format!("删除废弃 Git 标签 {} 失败", tag),
+        )?;
     }
-
-    // 3. git tag -f（覆盖已有 tag）
-    let tag_prefix = if is_quick_mode {
-        "metheus/q/"
-    } else {
-        "metheus/auto/"
-    };
-    let tag_name = format!("{}{}/task-{}", tag_prefix, version, subtask_index);
-    let tag_output = std::process::Command::new("git")
-        .args(["tag", "-f", &tag_name])
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| format!("git tag 失败: {}", e))?;
-    if !tag_output.status.success() {
-        return Err(format!(
-            "git tag 执行失败:\n{}",
-            String::from_utf8_lossy(&tag_output.stderr)
-        ));
-    }
-
-    Ok(tag_name)
+    Ok(())
 }
 
-/// Git 回退命令
-///
-/// 把项目代码和执行树状态一起回退到指定 tag 对应的版本
-/// 1. 检查工作区是否有未提交变更 → 有则 stash
-/// 2. git reset --hard 到目标 tag → 代码回退
-/// 3. 遍历 project.json → 回退点之后的节点标记为 RolledBack
-#[allow(dead_code)]
-#[tauri::command]
-pub(crate) async fn git_rollback_to_mid_stage(
-    project_path: String,
-    tag_name: String,
-    project_id: String,
-) -> Result<String, String> {
-    // 1. 检查工作区是否有未提交变更
-    let status_output = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| format!("git status 失败: {}", e))?;
-    let status = String::from_utf8_lossy(&status_output.stdout);
-    let has_uncommitted = !status.trim().is_empty();
-    // 如有未提交变更，先 stash 起来，避免被 reset --hard 永久清除
-    if has_uncommitted {
-        let stash_output = std::process::Command::new("git")
-            .args(["stash", "push", "-m", "metheus_rollback_auto_stash"])
-            .current_dir(&project_path)
-            .output()
-            .map_err(|e| format!("git stash 失败: {}", e))?;
-        if !stash_output.status.success() {
-            return Err(format!(
-                "git stash 执行失败:\n{}",
-                String::from_utf8_lossy(&stash_output.stderr)
-            ));
-        }
-    }
-    // 2. git reset --hard 到目标 tag
-    let reset_output = std::process::Command::new("git")
-        .args(["reset", "--hard", &tag_name])
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| format!("git reset 失败: {}", e))?;
-    if !reset_output.status.success() {
-        return Err(format!(
-            "回退到 {} 失败:\n{}",
-            tag_name,
-            String::from_utf8_lossy(&reset_output.stderr)
-        ));
-    }
-    // 2.5 清理被跳过节点的 Git tag
-    // 遍历所有 mid_stage，删除版本号大于目标版本的节点的 git tag
-    {
-        let target_version = tag_name
-            .strip_prefix("metheus/")
-            .unwrap_or(&tag_name)
-            .to_string();
-        let pf = crate::project_data_path(&project_id)?;
-        if pf.exists() {
-            if let Ok(content) = std::fs::read_to_string(&pf) {
-                if let Ok(proj) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(milestones) = proj["milestones"].as_array() {
-                        for milestone in milestones {
-                            if let Some(mid_stages) = milestone["mid_stages"].as_array() {
-                                for mid in mid_stages {
-                                    let version = mid["version"].as_str().unwrap_or("");
-                                    let git_tag = mid["git_tag"].as_str().unwrap_or("");
-                                    if !git_tag.is_empty()
-                                        && compare_version_strings(version, &target_version) > 0
-                                    {
-                                        match std::process::Command::new("git")
-                                            .args(["tag", "-d", git_tag])
-                                            .current_dir(&project_path)
-                                            .output()
-                                        {
-                                            Ok(output) => {
-                                                if !output.status.success() {
-                                                    eprintln!(
-                                                        "警告: 删除 git tag {} 失败: {}",
-                                                        git_tag,
-                                                        String::from_utf8_lossy(&output.stderr)
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "警告: 执行 git tag -d {} 失败: {}",
-                                                    git_tag, e
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // 3. 更新 project.json 中的执行树状态
-    // 从tag_name 中提取版本号，去掉 "metheus/" 前缀
-    let target_version = tag_name
-        .strip_prefix("metheus/")
-        .unwrap_or(&tag_name)
-        .to_string();
-    // 读取 project.json
-    let project_file = crate::project_data_path(&project_id)?;
-    if !project_file.exists() {
-        return Err(format!("项目文件不存在: {}", project_file.display()));
-    }
-    let content =
-        std::fs::read_to_string(&project_file).map_err(|e| format!("读取项目文件失败: {}", e))?;
-    let mut project: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析项目文件失败: {}", e))?;
-    // 遍历 milestones -> mid_stages, 标记回点之后的节点
-    if let Some(milestones) = project["milestones"].as_array_mut() {
-        for milestone in milestones.iter_mut() {
-            if let Some(mid_stages) = milestone["mid_stages"].as_array_mut() {
-                for mid in mid_stages.iter_mut() {
-                    let version = mid["version"].as_str().unwrap_or("");
-                    // 比较版本号：如果当前节点版本 > 目标版本，标记为 RolledBack
-                    if compare_version_strings(version, &target_version) > 0 {
-                        mid["status"] = serde_json::Value::String("RolledBack".to_string());
-                    }
-                }
-            }
-        }
-    }
-    // 写回文件
-    let json_str =
-        serde_json::to_string_pretty(&project).map_err(|e| format!("序列化项目文件失败: {}", e))?;
-    std::fs::write(&project_file, &json_str).map_err(|e| format!("写入项目文件失败: {}", e))?;
-    // 组装返回消息
-    let stash_note = if has_uncommitted {
-        "\n（你有未提交的变更已被临时存储，回退完成后可执行 git stash pop 恢复）"
-    } else {
-        ""
-    };
-    Ok(format!("已回退到 {}{}", tag_name, stash_note))
-}
-
-/// Git 回退到指定小阶段
-///
-/// 把项目代码回退到指定 subtask auto_tag 对应的版本。
-/// 与 git_rollback_to_mid_stage 的区别：回退粒度更细，只回退到某个小阶段（而非中阶段）。
-/// 1. 检查工作区是否有未提交变更 → 有则 stash
-/// 2. git reset --hard 到目标 tag → 代码回退
-/// 3. 遍历 project.json → 回退点之后的 subtasks 和 mid_stages 标记为 RolledBack
-#[allow(dead_code)]
-#[tauri::command]
-pub(crate) async fn git_rollback_to_subtask(
-    project_path: String,
-    project_id: String,
-    tag_name: String,
-) -> Result<String, String> {
-    // 1. 检查工作区是否有未提交变更
-    let status_output = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| format!("git status 失败: {}", e))?;
-    let status = String::from_utf8_lossy(&status_output.stdout);
-    let has_uncommitted = !status.trim().is_empty();
-    // 如有未提交变更，先 stash 起来
-    if has_uncommitted {
-        let stash_output = std::process::Command::new("git")
-            .args(["stash", "push", "-m", "metheus_rollback_auto_stash"])
-            .current_dir(&project_path)
-            .output()
-            .map_err(|e| format!("git stash 失败: {}", e))?;
-        if !stash_output.status.success() {
-            return Err(format!(
-                "git stash 执行失败:\n{}",
-                String::from_utf8_lossy(&stash_output.stderr)
-            ));
-        }
-    }
-
-    // 2. git reset --hard 到目标 tag
-    let reset_output = std::process::Command::new("git")
-        .args(["reset", "--hard", &tag_name])
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| format!("git reset 失败: {}", e))?;
-    if !reset_output.status.success() {
-        // reset 失败，尝试恢复 stash
-        if has_uncommitted {
-            let _ = std::process::Command::new("git")
-                .args(["stash", "pop"])
-                .current_dir(&project_path)
-                .output();
-        }
-        return Err(format!(
-            "回退到 {} 失败:\n{}",
-            tag_name,
-            String::from_utf8_lossy(&reset_output.stderr)
-        ));
-    }
-
-    // 3. 更新 project.json 中的执行树状态
-    // 解析 tag_name 获取目标信息：格式 metheus/auto/{version}/task-{index}
-    let project_file = crate::project_data_path(&project_id)?;
-    if !project_file.exists() {
-        return Err(format!("项目文件不存在: {}", project_file.display()));
-    }
-    let content =
-        std::fs::read_to_string(&project_file).map_err(|e| format!("读取项目文件失败: {}", e))?;
-    let mut project: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析项目文件失败: {}", e))?;
-
-    // 找到目标 subtask 所属的 mid_stage，标记其后的 subtasks 和 mid_stages 为 RolledBack
-    let mut target_found = false;
-    let mut target_mid_stage_id = String::new();
-    let mut passed_target = false;
-
-    if let Some(milestones) = project["milestones"].as_array_mut() {
-        for milestone in milestones.iter_mut() {
-            if let Some(mid_stages) = milestone["mid_stages"].as_array_mut() {
-                for mid in mid_stages.iter_mut() {
-                    // 提前提取 mid_id，避免后续 borrow checker 冲突
-                    let mid_id = mid["id"].as_str().unwrap_or("").to_string();
-
-                    if passed_target {
-                        // 目标之后的 mid_stage → 标记为 RolledBack
-                        mid["status"] = serde_json::Value::String("RolledBack".to_string());
-                        continue;
-                    }
-
-                    if let Some(subtasks) = mid["subtasks"].as_array_mut() {
-                        for subtask in subtasks.iter_mut() {
-                            let auto_tag = subtask["auto_tag"].as_str().unwrap_or("");
-                            if auto_tag == tag_name {
-                                target_found = true;
-                                target_mid_stage_id = mid_id.clone();
-                                // 当前 subtask 保持原状态
-                            } else if target_found && mid_id == target_mid_stage_id {
-                                // 同一 mid_stage 内，目标 subtask 之后的 subtask
-                                subtask["status"] =
-                                    serde_json::Value::String("RolledBack".to_string());
-                            }
-                        }
-                    }
-
-                    if target_found && mid_id == target_mid_stage_id {
-                        // 当前 mid_stage 完成后，后续 mid_stages 标记为 RolledBack
-                        passed_target = true;
-                    }
-                }
-            }
-        }
-    }
-
-    if !target_found {
-        return Err(format!("未找到 tag {} 对应的小阶段", tag_name));
-    }
-
-    // 写回文件
-    let json_str =
-        serde_json::to_string_pretty(&project).map_err(|e| format!("序列化项目文件失败: {}", e))?;
-    std::fs::write(&project_file, &json_str).map_err(|e| format!("写入项目文件失败: {}", e))?;
-
-    // 组装返回消息
-    let stash_note = if has_uncommitted {
-        "\n（你有未提交的变更已被临时存储，回退完成后可执行 git stash pop 恢复）"
-    } else {
-        ""
-    };
-    Ok(format!("已回退到 {}{}", tag_name, stash_note))
-}
-
-/// 获取 metheus/ 前缀的 Git tag 摘要列表
-///
-/// 执行 git tag -l "metheus/*" --sort=-creatordate 获取所有 metheus tag，
-/// 解析为 GitTagInfo 列表返回。非 git 仓库或无匹配 tag 时返回空数组。
+/// 返回项目状态树中记录的 Metheus 标签。
 #[tauri::command]
 pub(crate) async fn get_git_tags_summary(
     project_name: String,
 ) -> Result<project::GitTagTree, String> {
     let proj = crate::load_project(&project_name)?;
-
-    let milestones: Vec<project::MilestoneTagNode> = proj
+    let milestones = proj
         .milestones
         .iter()
-        .map(|ms| {
-            let mid_stages: Vec<project::MidStageTagNode> = ms
+        .map(|milestone| project::MilestoneTagNode {
+            milestone_id: milestone.id.clone(),
+            milestone_title: milestone.title.clone(),
+            milestone_version: milestone.version.clone(),
+            milestone_status: format!("{:?}", milestone.status),
+            mid_stages: milestone
                 .mid_stages
                 .iter()
-                .map(|mid| {
-                    let subtasks: Vec<project::SubtaskTagNode> = mid
+                .map(|mid_stage| project::MidStageTagNode {
+                    mid_stage_id: mid_stage.id.clone(),
+                    mid_stage_title: mid_stage.title.clone(),
+                    mid_stage_version: mid_stage.version.clone(),
+                    mid_stage_tag: mid_stage.git_tag.clone(),
+                    mid_stage_status: format!("{:?}", mid_stage.status),
+                    subtasks: mid_stage
                         .subtasks
                         .iter()
                         .enumerate()
-                        .map(|(idx, st)| project::SubtaskTagNode {
-                            subtask_id: st.id.clone(),
-                            subtask_title: st.title.clone(),
-                            subtask_index: (idx + 1) as u32,
-                            subtask_tag: st.auto_tag.clone().unwrap_or_default(),
-                            subtask_status: format!("{:?}", st.status),
+                        .map(|(index, subtask)| project::SubtaskTagNode {
+                            subtask_id: subtask.id.clone(),
+                            subtask_title: subtask.title.clone(),
+                            subtask_index: (index + 1) as u32,
+                            subtask_tag: subtask.auto_tag.clone().unwrap_or_default(),
+                            subtask_status: format!("{:?}", subtask.status),
                         })
-                        .collect();
-
-                    project::MidStageTagNode {
-                        mid_stage_id: mid.id.clone(),
-                        mid_stage_title: mid.title.clone(),
-                        mid_stage_version: mid.version.clone(),
-                        mid_stage_tag: mid.git_tag.clone(),
-                        mid_stage_status: format!("{:?}", mid.status),
-                        subtasks,
-                    }
+                        .collect(),
                 })
-                .collect();
-
-            project::MilestoneTagNode {
-                milestone_id: ms.id.clone(),
-                milestone_title: ms.title.clone(),
-                milestone_version: ms.version.clone(),
-                milestone_status: format!("{:?}", ms.status),
-                mid_stages,
-            }
+                .collect(),
         })
         .collect();
-
     Ok(project::GitTagTree { milestones })
 }
 
-/// 获取当前工作区的 git diff
-///
-/// 执行 git diff 获取未暂存的变更。非 git 仓库或工作区干净时返回空字符串。
-/// 对预期状态（非 Git 仓库、无提交、HEAD 不存在）静默返回空，不打印错误日志。
+/// 返回 staged、unstaged 和 untracked 状态；diff 内容覆盖已跟踪变更。
 #[tauri::command]
 pub(crate) async fn get_current_diff(project_path: String) -> Result<String, String> {
-    // 1. 检查 .git 是否存在（目录或文件，兼容 worktree）
-    let git_path = std::path::Path::new(&project_path).join(".git");
-    if !git_path.exists() {
+    if !std::path::Path::new(&project_path).join(".git").exists() {
         return Ok(String::new());
     }
-
-    // 2. 执行 git diff
-    let output = std::process::Command::new("git")
-        .args(["diff"])
-        .current_dir(&project_path)
-        .output()
-        .map_err(|e| {
-            eprintln!("[get_current_diff] git 命令不可用: {}", e);
-            format!("git 命令不可用: {}", e)
-        })?;
-
-    // 3. 退出码为零 → 返回 diff 内容（可能为空字符串 = 无变更）
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    let status = run_git(
+        &project_path,
+        &["status", "--short", "--untracked-files=all"],
+        "读取 Git 变更状态失败",
+    )?;
+    let diff = run_git(&project_path, &["diff", "HEAD", "--"], "读取 Git diff 失败")?;
+    let status = String::from_utf8_lossy(&status).trim().to_string();
+    let diff = String::from_utf8_lossy(&diff).trim().to_string();
+    if status.is_empty() && diff.is_empty() {
+        Ok(String::new())
+    } else {
+        Ok(format!("工作区状态：\n{}\n\n变更内容：\n{}", status, diff))
     }
-
-    // 4. 退出码非零 → 分析 stderr 区分场景
-    let stderr_str = String::from_utf8_lossy(&output.stderr);
-    let stderr_lower = stderr_str.to_lowercase();
-
-    // Expected states: not a git repo, no commits, HEAD missing → silent empty
-    if stderr_lower.contains("not a git repository")
-        || stderr_lower.contains("does not have any commits")
-        || stderr_lower.contains("ambiguous argument")
-        || stderr_lower.contains("unknown revision")
-    {
-        return Ok(String::new());
-    }
-
-    // 5. 真正的异常 → 保留日志
-    let truncated: String = stderr_str.chars().take(200).collect();
-    eprintln!("[get_current_diff] 未知 git 错误: {}", truncated);
-    Ok(String::new())
 }
 
-/// 获取项目的代码变更历史（按确认时间排列）
 #[tauri::command]
 pub(crate) async fn get_change_history(
     project_name: String,
 ) -> Result<Vec<project::ChangeHistoryEntry>, String> {
-    let proj = crate::load_project(&project_name)?;
-    Ok(proj.change_history.clone())
+    Ok(crate::load_project(&project_name)?.change_history)
 }
 
-/// 比较两个版本号字符串（eg: "v0.1.1"  "v0.1.3"）
-/// 返回 -1：a < b，0：a == b，1：a > b
-#[allow(dead_code)]
-pub(crate) fn compare_version_strings(a: &str, b: &str) -> i32 {
-    let parts_a: Vec<u32> = a
-        .strip_prefix('v')
-        .unwrap_or(a)
-        .split('.')
-        .filter_map(|s| s.parse::<u32>().ok())
-        .collect();
-    let parts_b: Vec<u32> = b
-        .strip_prefix('v')
-        .unwrap_or(b)
-        .split('.')
-        .filter_map(|s| s.parse::<u32>().ok())
-        .collect();
-    for i in 0..parts_a.len().max(parts_b.len()) {
-        let num_a = parts_a.get(i).copied().unwrap_or(0);
-        let num_b = parts_b.get(i).copied().unwrap_or(0);
-        if num_a < num_b {
-            return -1;
-        }
-        if num_a > num_b {
-            return 1;
-        }
-    }
-    0
-}
-
-/// 把 Git tag 名写入指定中阶段节点，并持久化到 project.json（辅助函数）
 pub(crate) fn save_tag_to_mid_stage(
     project_id: &str,
     mid_stage_id: &str,
     tag_name: &str,
 ) -> Result<(), String> {
-    // 读取 project 文件, ~/.metheus/{project_id}.json
-    let project_file = crate::project_data_path(project_id)?;
-
-    let content = std::fs::read_to_string(&project_file)
-        .map_err(|e| format!("读取 project 文件失败: {}", e))?;
-
-    let mut project: project::Project =
-        serde_json::from_str(&content).map_err(|e| format!("解析 project 文件失败: {}", e))?;
-
-    // 遍历找到对应 mid_stage
-    let mut found = false;
-    for milestone in &mut project.milestones {
-        for mid in &mut milestone.mid_stages {
-            if mid.id == mid_stage_id {
-                mid.git_tag = tag_name.to_string();
-                found = true;
-                break;
-            }
-        }
-        if found {
-            break;
-        }
-    }
-
-    if !found {
-        return Err(format!("未找到中阶段: {}", mid_stage_id));
-    }
-
-    // 写回文件
-    let json = serde_json::to_string_pretty(&project)
-        .map_err(|e| format!("序列化 project 失败: {}", e))?;
-
-    std::fs::write(&project_file, json).map_err(|e| format!("写入 project 文件失败: {}", e))?;
-
-    Ok(())
+    let mut project = crate::load_project(project_id)?;
+    let mid_stage = project
+        .milestones
+        .iter_mut()
+        .flat_map(|milestone| milestone.mid_stages.iter_mut())
+        .find(|mid_stage| mid_stage.id == mid_stage_id)
+        .ok_or_else(|| format!("未找到中阶段: {}", mid_stage_id))?;
+    mid_stage.git_tag = tag_name.to_string();
+    crate::save_project(&project)
 }
 
-/// 内部函数：暂存未提交变更并执行 git reset --hard 到指定 tag
-///
-/// 1. 检查工作区是否有未提交变更（git status --porcelain）
-/// 2. 如有未提交变更，执行 git stash push 暂存
-/// 3. 执行 git reset --hard 到目标 tag
-/// 4. 如果 reset 失败且之前做了 stash，执行 git stash pop 恢复工作区
-///
-/// 返回 bool 表示是否有未提交变更被 stash（供调用方决定是否提示用户）
-pub(crate) fn git_stash_and_reset_to_tag(
-    project_path: &str,
-    tag_name: &str,
-) -> Result<bool, String> {
-    // 1. 检查工作区状态
-    let status_output = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(project_path)
-        .output()
-        .map_err(|e| format!("git status 失败: {}", e))?;
-    let status = String::from_utf8_lossy(&status_output.stdout);
-    let has_uncommitted = !status.trim().is_empty();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
 
-    // 2. 如有未提交变更，先 stash 起来，避免被 reset --hard 永久清除
-    if has_uncommitted {
-        let stash_output = std::process::Command::new("git")
-            .args(["stash", "push", "-m", "metheus_rollback_auto_stash"])
-            .current_dir(project_path)
-            .output()
-            .map_err(|e| format!("git stash 失败: {}", e))?;
-        if !stash_output.status.success() {
-            return Err(format!(
-                "git stash 执行失败:\n{}",
-                String::from_utf8_lossy(&stash_output.stderr)
-            ));
+    struct TempRepo(PathBuf);
+
+    impl TempRepo {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("metheus-git-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path).unwrap();
+            let repo = Self(path);
+            repo.git(&["init", "--quiet"]);
+            repo.git(&["config", "user.name", "Metheus Test"]);
+            repo.git(&["config", "user.email", "metheus-test@example.invalid"]);
+            std::fs::write(repo.0.join("tracked.txt"), "baseline\n").unwrap();
+            repo.git(&["add", "tracked.txt"]);
+            repo.git(&["commit", "--quiet", "-m", "baseline"]);
+            repo
+        }
+
+        fn git(&self, args: &[&str]) -> String {
+            String::from_utf8_lossy(
+                &run_git(self.0.to_str().unwrap(), args, "测试 Git 命令失败").unwrap(),
+            )
+            .trim()
+            .to_string()
         }
     }
 
-    // 3. git reset --hard 到目标 tag
-    let reset_output = std::process::Command::new("git")
-        .args(["reset", "--hard", tag_name])
-        .current_dir(project_path)
-        .output()
-        .map_err(|e| format!("git reset 失败: {}", e))?;
-    if !reset_output.status.success() {
-        // reset 失败，尝试恢复 stash
-        if has_uncommitted {
-            let _ = std::process::Command::new("git")
-                .args(["stash", "pop"])
-                .current_dir(project_path)
-                .output();
-        }
-        return Err(format!(
-            "回退到 {} 失败:\n{}",
-            tag_name,
-            String::from_utf8_lossy(&reset_output.stderr)
-        ));
-    }
-
-    Ok(has_uncommitted)
-}
-
-/// Git 回退到指定小阶段并重置执行数据
-///
-/// 把项目代码回退到指定 subtask auto_tag 对应的版本，并重置该小阶段之后的所有执行数据。
-/// 与 git_rollback_to_subtask 的区别：本命令会彻底重置后续节点的执行状态
-///（status→Pending, execution_result→None, test_result→None, retry_count→0），
-/// 而不是简单地标记为 RolledBack。适用于用户想在某个小阶段重新开始的场景。
-///
-/// 1. 调用 git_stash_and_reset_to_tag 执行 Git 回退（含 stash 保护）
-/// 2. 加载 project.json，定位目标 subtask
-/// 3. 重置目标 subtask 之后的执行数据（同一 mid_stage 内 + 后续 mid_stages + 后续 milestones）
-/// 4. 持久化并返回完整的 Project JSON
-#[allow(dead_code)]
-#[tauri::command]
-pub(crate) async fn rollback_to_subtask_with_reset(
-    project_path: String,
-    project_id: String,
-    tag_name: String,
-) -> Result<String, String> {
-    // 1. 执行 Git 回退（含 stash 保护）
-    let _had_stash = git_stash_and_reset_to_tag(&project_path, &tag_name)?;
-
-    // 2. 加载 Project 结构体
-    let mut project = crate::load_project(&project_id)?;
-
-    // 3. 遍历定位目标 subtask
-    let mut target_milestone_idx: Option<usize> = None;
-    let mut target_mid_stage_idx: Option<usize> = None;
-    let mut target_subtask_idx: Option<usize> = None;
-
-    'search: for (mi, milestone) in project.milestones.iter().enumerate() {
-        for (msi, mid_stage) in milestone.mid_stages.iter().enumerate() {
-            for (si, subtask) in mid_stage.subtasks.iter().enumerate() {
-                if let Some(ref auto_tag) = subtask.auto_tag {
-                    if auto_tag == &tag_name {
-                        target_milestone_idx = Some(mi);
-                        target_mid_stage_idx = Some(msi);
-                        target_subtask_idx = Some(si);
-                        break 'search;
-                    }
-                }
-            }
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
-    let (t_mi, t_msi, t_si) = match (
-        target_milestone_idx,
-        target_mid_stage_idx,
-        target_subtask_idx,
-    ) {
-        (Some(mi), Some(msi), Some(si)) => (mi, msi, si),
-        _ => return Err(format!("未找到 tag {} 对应的小阶段", tag_name)),
-    };
+    #[tokio::test]
+    async fn subtask_commit_rejects_outside_changes_and_never_overwrites_tag() {
+        let repo = TempRepo::new();
+        std::fs::write(repo.0.join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(repo.0.join("outside.txt"), "outside\n").unwrap();
+        let path = repo.0.to_string_lossy().to_string();
+        let rejected = git_save_subtask(
+            path.clone(),
+            1,
+            "v0.1.1".to_string(),
+            "测试".to_string(),
+            vec!["tracked.txt".to_string()],
+            None,
+        )
+        .await;
+        assert!(rejected.is_err());
 
-    // === 回退后清理后续 git tag（确保 git tag 列表与 Project 结构体状态一致）===
-
-    // 第一步：删除同一中阶段内、目标子任务之后的子任务 auto_tag
-    {
-        let mid_stage = &project.milestones[t_mi].mid_stages[t_msi];
-        for subtask in mid_stage.subtasks.iter().skip(t_si + 1) {
-            if let Some(ref tag) = subtask.auto_tag {
-                let output = std::process::Command::new("git")
-                    .args(["tag", "-d", tag])
-                    .current_dir(&project_path)
-                    .output();
-                match output {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        if !stderr.contains("not found") {
-                            eprintln!("警告: 删除 git tag {} 失败: {}", tag, stderr.trim());
-                        }
-                    }
-                    Err(e) => eprintln!("警告: 执行 git tag -d {} 失败: {}", tag, e),
-                }
-            }
-        }
+        std::fs::remove_file(repo.0.join("outside.txt")).unwrap();
+        let tag = git_save_subtask(
+            path.clone(),
+            1,
+            "v0.1.1".to_string(),
+            "测试".to_string(),
+            vec!["tracked.txt".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+        let original = repo.git(&["rev-parse", &tag]);
+        repo.git(&["commit", "--allow-empty", "-m", "later"]);
+        assert!(create_immutable_tag(&path, &tag).is_err());
+        assert_eq!(repo.git(&["rev-parse", &tag]), original);
     }
 
-    // 第二步：删除同一大阶段内、目标中阶段之后的 mid_stage git_tag 及其所有子任务 auto_tag
-    {
-        let milestone = &project.milestones[t_mi];
-        for mid_stage in milestone.mid_stages.iter().skip(t_msi + 1) {
-            if !mid_stage.git_tag.is_empty() {
-                let output = std::process::Command::new("git")
-                    .args(["tag", "-d", &mid_stage.git_tag])
-                    .current_dir(&project_path)
-                    .output();
-                match output {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        if !stderr.contains("not found") {
-                            eprintln!(
-                                "警告: 删除 git tag {} 失败: {}",
-                                mid_stage.git_tag,
-                                stderr.trim()
-                            );
-                        }
-                    }
-                    Err(e) => eprintln!("警告: 执行 git tag -d {} 失败: {}", mid_stage.git_tag, e),
-                }
-            }
-            for subtask in mid_stage.subtasks.iter() {
-                if let Some(ref tag) = subtask.auto_tag {
-                    let output = std::process::Command::new("git")
-                        .args(["tag", "-d", tag])
-                        .current_dir(&project_path)
-                        .output();
-                    match output {
-                        Ok(o) if o.status.success() => {}
-                        Ok(o) => {
-                            let stderr = String::from_utf8_lossy(&o.stderr);
-                            if !stderr.contains("not found") {
-                                eprintln!("警告: 删除 git tag {} 失败: {}", tag, stderr.trim());
-                            }
-                        }
-                        Err(e) => eprintln!("警告: 执行 git tag -d {} 失败: {}", tag, e),
-                    }
-                }
-            }
-        }
+    #[tokio::test]
+    async fn subtask_commit_includes_generated_constitution_and_leaves_workspace_clean() {
+        let repo = TempRepo::new();
+        let original_constitution = "# Constitution\n\n## 第 2 部分\n待更新\n";
+        let updated_constitution =
+            "# Constitution\n\n## 第 2 部分\n\n### 项目结构\n- `index.html`\n";
+        std::fs::write(repo.0.join("CONSTITUTION.md"), original_constitution).unwrap();
+        repo.git(&["add", "CONSTITUTION.md"]);
+        repo.git(&["commit", "--quiet", "-m", "constitution baseline"]);
+        std::fs::write(repo.0.join("index.html"), "<main>ready</main>\n").unwrap();
+
+        let path = repo.0.to_string_lossy().to_string();
+        let authorized = vec!["index.html".to_string()];
+        let diff = capture_authorized_diff(&path, &authorized).unwrap();
+        assert!(diff.contains("new file mode"));
+        assert!(diff.contains("index.html"));
+        assert!(repo.git(&["status", "--short"]).contains("index.html"));
+
+        let tag = git_save_subtask(
+            path,
+            2,
+            "v0.1.1".to_string(),
+            "HTML 与宪法同步".to_string(),
+            authorized,
+            Some(GeneratedFileUpdate::constitution(
+                original_constitution.to_string(),
+                updated_constitution.to_string(),
+            )),
+        )
+        .await
+        .unwrap();
+
+        assert!(repo.git(&["status", "--short"]).is_empty());
+        let committed_files = repo.git(&["show", "--format=", "--name-only", &tag]);
+        assert!(committed_files.contains("index.html"));
+        assert!(committed_files.contains("CONSTITUTION.md"));
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("CONSTITUTION.md")).unwrap(),
+            updated_constitution
+        );
     }
 
-    // 第三步：删除后续大阶段所有 mid_stage git_tag 和所有子任务 auto_tag
-    for milestone in project.milestones.iter().skip(t_mi + 1) {
-        for mid_stage in milestone.mid_stages.iter() {
-            if !mid_stage.git_tag.is_empty() {
-                let output = std::process::Command::new("git")
-                    .args(["tag", "-d", &mid_stage.git_tag])
-                    .current_dir(&project_path)
-                    .output();
-                match output {
-                    Ok(o) if o.status.success() => {}
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        if !stderr.contains("not found") {
-                            eprintln!(
-                                "警告: 删除 git tag {} 失败: {}",
-                                mid_stage.git_tag,
-                                stderr.trim()
-                            );
-                        }
-                    }
-                    Err(e) => eprintln!("警告: 执行 git tag -d {} 失败: {}", mid_stage.git_tag, e),
-                }
-            }
-            for subtask in mid_stage.subtasks.iter() {
-                if let Some(ref tag) = subtask.auto_tag {
-                    let output = std::process::Command::new("git")
-                        .args(["tag", "-d", tag])
-                        .current_dir(&project_path)
-                        .output();
-                    match output {
-                        Ok(o) if o.status.success() => {}
-                        Ok(o) => {
-                            let stderr = String::from_utf8_lossy(&o.stderr);
-                            if !stderr.contains("not found") {
-                                eprintln!("警告: 删除 git tag {} 失败: {}", tag, stderr.trim());
-                            }
-                        }
-                        Err(e) => eprintln!("警告: 执行 git tag -d {} 失败: {}", tag, e),
-                    }
-                }
-            }
-        }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_commit_restores_generated_constitution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repo = TempRepo::new();
+        let original_constitution = "# Constitution\n\n## 第 2 部分\n原始内容\n";
+        let updated_constitution = "# Constitution\n\n## 第 2 部分\n更新内容\n";
+        std::fs::write(repo.0.join("CONSTITUTION.md"), original_constitution).unwrap();
+        repo.git(&["add", "CONSTITUTION.md"]);
+        repo.git(&["commit", "--quiet", "-m", "constitution baseline"]);
+        std::fs::write(repo.0.join("tracked.txt"), "task change\n").unwrap();
+
+        let hook_path = repo.0.join(".git/hooks/pre-commit");
+        std::fs::write(&hook_path, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = std::fs::metadata(&hook_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook_path, permissions).unwrap();
+
+        let result = git_save_subtask(
+            repo.0.to_string_lossy().to_string(),
+            3,
+            "v0.1.1".to_string(),
+            "失败恢复".to_string(),
+            vec!["tracked.txt".to_string()],
+            Some(GeneratedFileUpdate::constitution(
+                original_constitution.to_string(),
+                updated_constitution.to_string(),
+            )),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("CONSTITUTION.md")).unwrap(),
+            original_constitution
+        );
+        assert!(!repo.git(&["status", "--short"]).contains("CONSTITUTION.md"));
     }
 
-    // 记录是否有任何重置操作发生（用于决定 mid_stage / milestone 状态降级）
-    let mut any_reset = false;
-
-    // 4a. 同一 mid_stage 内，目标 subtask 之后的 subtask → 重置为 Pending
-    {
-        let mid_stage = &mut project.milestones[t_mi].mid_stages[t_msi];
-        for subtask in mid_stage.subtasks.iter_mut().skip(t_si + 1) {
-            subtask.status = project::SubtaskStatus::Pending;
-            subtask.execution_result = None;
-            subtask.test_result = None;
-            subtask.retry_count = 0;
-            any_reset = true;
-        }
+    #[test]
+    fn manual_reset_rejects_dirty_workspace() {
+        let repo = TempRepo::new();
+        let target = repo.git(&["rev-parse", "HEAD"]);
+        std::fs::write(repo.0.join("tracked.txt"), "dirty\n").unwrap();
+        assert!(git_reset_to_tag_clean(repo.0.to_str().unwrap(), &target).is_err());
     }
-
-    // 4b. 目标 mid_stage 自身状态降级
-    if any_reset {
-        let mid_stage = &mut project.milestones[t_mi].mid_stages[t_msi];
-        match mid_stage.status {
-            project::MidStageStatus::Completed
-            | project::MidStageStatus::Approved
-            | project::MidStageStatus::RolledBack => {
-                mid_stage.status = project::MidStageStatus::Ready;
-            }
-            _ => { /* 其他状态保持不变 */ }
-        }
-    }
-
-    // 4c. 同一 milestone 内，目标 mid_stage 之后的 mid_stages → 全部重置
-    {
-        let milestone = &mut project.milestones[t_mi];
-        for mid_stage in milestone.mid_stages.iter_mut().skip(t_msi + 1) {
-            mid_stage.status = project::MidStageStatus::Pending;
-            for subtask in mid_stage.subtasks.iter_mut() {
-                subtask.status = project::SubtaskStatus::Pending;
-                subtask.execution_result = None;
-                subtask.test_result = None;
-                subtask.retry_count = 0;
-                any_reset = true;
-            }
-        }
-    }
-
-    // 4d. 目标 milestone 自身状态降级
-    if any_reset {
-        let milestone = &mut project.milestones[t_mi];
-        if milestone.status == project::MilestoneStatus::Completed {
-            milestone.status = project::MilestoneStatus::InProgress;
-        }
-    }
-
-    // 4e. 目标 milestone 之后的 milestones → 全部重置
-    for milestone in project.milestones.iter_mut().skip(t_mi + 1) {
-        milestone.status = project::MilestoneStatus::Pending;
-        for mid_stage in milestone.mid_stages.iter_mut() {
-            mid_stage.status = project::MidStageStatus::Pending;
-            for subtask in mid_stage.subtasks.iter_mut() {
-                subtask.status = project::SubtaskStatus::Pending;
-                subtask.execution_result = None;
-                subtask.test_result = None;
-                subtask.retry_count = 0;
-            }
-        }
-    }
-
-    // 5. 持久化到磁盘
-    crate::save_project(&project)?;
-
-    // 6. 序列化并返回完整的 Project JSON
-    let json_str =
-        serde_json::to_string_pretty(&project).map_err(|e| format!("序列化项目文件失败: {}", e))?;
-
-    Ok(json_str)
 }

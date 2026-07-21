@@ -1,5 +1,5 @@
-import { ArrowRight, BadgeCheck, ClipboardList, RefreshCw, SearchCheck, WandSparkles } from "lucide-react";
-import { Project, StagePlanCheckResult, Subtask } from "../types";
+import { ArrowRight, BadgeCheck, ClipboardList, GitBranch, RefreshCw, SearchCheck, WandSparkles } from "lucide-react";
+import { ExecutionWorkspaceStatus, Project, StagePlanCheckResult, Subtask } from "../types";
 import { ActionButton } from "../components/ActionButton";
 import { ConsoleFeedback, ConsoleStepShell } from "../components/ConsoleStepShell";
 import { EmptyState } from "../components/EmptyState";
@@ -14,6 +14,9 @@ interface Props {
   regenerationModalOpen: boolean; setRegenerationModalOpen: (open: boolean) => void;
   onGenerate: () => void; onCheck: () => void; onApprove: () => void;
   onRegenerate: (source: "check_failed" | "approval_rejected") => void;
+  workspaceStatus: ExecutionWorkspaceStatus | null;
+  onPrepareWorkspace: () => Promise<void>;
+  onRefreshWorkspace: () => Promise<void>;
 }
 
 function checkDetails(check: StagePlanCheckResult): string[] {
@@ -69,6 +72,15 @@ export function ExecutionPlanStep(props: Props) {
   // If plan is approved but step hasn't transitioned to Execution (e.g., after refresh),
   // show a sync/continue button to let the user advance.
   const needsSyncToExecution = isApproved && isAtApprovalStep;
+  const workspaceReady = props.workspaceStatus?.ready === true;
+  const dirtyWorkspace = props.workspaceStatus?.has_commits === true
+    && props.workspaceStatus.issues.includes("DirtyWorkingTree");
+  const workspaceDetails = props.workspaceStatus?.changes.map(change => {
+    const state = change.tracked
+      ? `${change.index_status}${change.worktree_status}`
+      : "??";
+    return `${state} ${change.path}`;
+  }) ?? [];
 
   return <ConsoleStepShell icon={<BadgeCheck />} title="批准执行计划" description={`${tasks.length} 个小阶段`}
     status={isApproved ? "success" : "pending"} statusLabel={isApproved ? "已批准" : "待批准"}
@@ -76,11 +88,30 @@ export function ExecutionPlanStep(props: Props) {
     actions={!props.busy && needsSyncToExecution ? (<WorkflowActionBar>
       <ActionButton icon={<ArrowRight size={16} />} onClick={props.onApprove}>进入执行</ActionButton>
     </WorkflowActionBar>) : (isApproved || props.busy) ? undefined : (<WorkflowActionBar>
-      <ActionButton icon={<BadgeCheck size={16} />} loading={props.busy} onClick={props.onApprove}>批准执行计划</ActionButton>
+      <ActionButton icon={<BadgeCheck size={16} />} loading={props.busy} disabled={!workspaceReady} onClick={props.onApprove}>批准执行计划</ActionButton>
       <ActionButton icon={<RefreshCw size={16} />} variant="danger" onClick={() => props.setRegenerationModalOpen(true)}>驳回并重新生成</ActionButton>
     </WorkflowActionBar>)}>
     {isApproved && <FeedbackBanner type="success" message="执行计划已冻结，已进入执行阶段。" />}
     {!isApproved && check?.passed && <FeedbackBanner type="success" message="检查已通过" />}
+    {!isApproved && props.workspaceStatus && !workspaceReady && (
+      <>
+        <FeedbackBanner
+          type="warning"
+          message={props.workspaceStatus.status_message}
+          details={workspaceDetails}
+        />
+        <WorkflowActionBar>
+          {!dirtyWorkspace && (
+            <ActionButton icon={<GitBranch size={16} />} loading={props.busy} onClick={props.onPrepareWorkspace}>
+              准备 Git
+            </ActionButton>
+          )}
+          <ActionButton icon={<RefreshCw size={16} />} disabled={props.busy} onClick={props.onRefreshWorkspace}>
+            刷新工作区
+          </ActionButton>
+        </WorkflowActionBar>
+      </>
+    )}
     <PlanCards tasks={tasks} />
     {!isApproved && (
       <Modal isOpen={props.regenerationModalOpen} onClose={() => props.setRegenerationModalOpen(false)} title="驳回并重新生成执行计划"
