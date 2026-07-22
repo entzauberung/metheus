@@ -12,7 +12,7 @@ mod constants;
 mod constitution;
 mod constitution_context;
 mod diff;
-mod executor;
+mod engine;
 mod git_ops;
 mod json_utils;
 mod pipeline;
@@ -134,6 +134,8 @@ pub fn run() {
             crate::commands::chat::greet,
             crate::commands::chat::send_message,
             crate::commands::project_ops::get_project,
+            crate::commands::project_ops::check_engine_health,
+            crate::commands::project_ops::update_execution_profile,
             crate::commands::chat::chat_with_role,
             crate::commands::plan::generate_version_plan,
             crate::commands::plan::approve_version_plan,
@@ -200,8 +202,10 @@ pub fn run() {
             crate::commands::workflow::start_managed_flow,
             crate::commands::workflow::managed_next_step,
             crate::commands::workflow::pause_managed_flow,
+            crate::commands::workflow::wait_managed_flow_for_human,
             crate::commands::workflow::resume_managed_flow,
             crate::commands::workflow::stop_managed_flow,
+            crate::commands::workflow::reconcile_managed_milestone_state,
             crate::commands::workflow::start_preflight_check,
             crate::commands::workflow::return_to_discussion,
             crate::commands::workflow::resume_plan_approval,

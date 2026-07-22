@@ -72,7 +72,7 @@ export function ExecutionPlanStep(props: Props) {
   // If plan is approved but step hasn't transitioned to Execution (e.g., after refresh),
   // show a sync/continue button to let the user advance.
   const needsSyncToExecution = isApproved && isAtApprovalStep;
-  const workspaceReady = props.workspaceStatus?.ready === true;
+  const workspaceReady = props.workspaceStatus?.ready_for_new_execution === true;
   const dirtyWorkspace = props.workspaceStatus?.has_commits === true
     && props.workspaceStatus.issues.includes("DirtyWorkingTree");
   const workspaceDetails = props.workspaceStatus?.changes.map(change => {

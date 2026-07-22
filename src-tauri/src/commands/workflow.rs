@@ -638,7 +638,7 @@ pub(crate) async fn restart_checks(project_name: String) -> Result<project::Proj
 }
 
 // ===================================================================
-// V2 托管层（Managed Flow）：ThreeChecks 后自动推进到大阶段批准
+// V2 托管层（Managed Flow）：ThreeChecks 后自动推进到大阶段批准完成
 // ===================================================================
 
 /// 激活托管层：从当前步骤开始自动推进到大阶段批准完成
@@ -670,7 +670,7 @@ pub(crate) async fn start_managed_flow(project_name: String) -> Result<project::
     proj.workflow_state.managed_flow_state = Some(project::ManagedFlowState {
         active: true,
         managed_state: current_step_str,
-        managed_target: "MilestoneApproval".to_string(),
+        managed_target: "MilestoneSelection".to_string(),
         last_action: "托管层已激活，开始自动推进".to_string(),
         last_action_at: now.clone(),
         run_status: project::ManagedRunStatus::Running,
@@ -738,6 +738,18 @@ pub(crate) async fn managed_next_step(project_name: String) -> Result<ManagedNex
         });
     }
 
+    if managed.run_status == project::ManagedRunStatus::WaitingHuman {
+        return Ok(ManagedNextStep {
+            command: String::new(),
+            args: serde_json::json!({}),
+            description: managed.last_action.clone(),
+            reached_target: false,
+            needs_human: true,
+            is_error: false,
+            error_message: String::new(),
+        });
+    }
+
     if managed.run_status == project::ManagedRunStatus::ErrorStopped {
         return Ok(ManagedNextStep {
             command: String::new(),
@@ -781,8 +793,10 @@ pub(crate) async fn managed_next_step(project_name: String) -> Result<ManagedNex
                     .milestone_draft
                     .as_ref()
                     .map(|d| {
-                        d.status != project::MilestoneDraftStatus::CheckFailed
-                            && d.check_result.is_some()
+                        d.status == project::MilestoneDraftStatus::CheckPassed
+                            && d.check_result
+                                .as_deref()
+                                .is_some_and(|result| !result.trim().is_empty())
                             && !d.candidate_milestones.is_empty()
                     })
                     .unwrap_or(false);
@@ -1002,6 +1016,39 @@ pub(crate) async fn pause_managed_flow(project_name: String) -> Result<project::
     crate::save_and_reload_project(&proj)
 }
 
+/// 将托管层置为等待人工，并保留具体阻断原因。
+#[tauri::command]
+pub(crate) async fn wait_managed_flow_for_human(
+    project_name: String,
+    reason: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
+    let managed = proj
+        .workflow_state
+        .managed_flow_state
+        .as_ref()
+        .ok_or("托管层未激活。".to_string())?;
+    if !managed.active {
+        return Err("托管层未激活。".to_string());
+    }
+
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        "托管流程等待人工处理"
+    } else {
+        reason
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(ref mut managed) = proj.workflow_state.managed_flow_state {
+        managed.run_status = project::ManagedRunStatus::WaitingHuman;
+        managed.last_action = reason.to_string();
+        managed.last_action_at = now.clone();
+    }
+    proj.workflow_state.data_revision += 1;
+    proj.workflow_state.last_transition_at = now;
+    crate::save_and_reload_project(&proj)
+}
+
 /// 恢复托管层
 #[tauri::command]
 pub(crate) async fn resume_managed_flow(project_name: String) -> Result<project::Project, String> {
@@ -1017,9 +1064,12 @@ pub(crate) async fn resume_managed_flow(project_name: String) -> Result<project:
         return Err("托管层未激活。".to_string());
     }
 
-    if managed.run_status != project::ManagedRunStatus::Paused {
+    if !matches!(
+        managed.run_status,
+        project::ManagedRunStatus::Paused | project::ManagedRunStatus::WaitingHuman
+    ) {
         return Err(format!(
-            "托管层当前状态为 {:?}，只有暂停状态可以恢复",
+            "托管层当前状态为 {:?}，只有暂停或等待人工状态可以恢复",
             managed.run_status
         ));
     }
@@ -1044,9 +1094,7 @@ pub(crate) async fn resume_managed_flow(project_name: String) -> Result<project:
 
 /// 停止托管层（交接给 autopilot 或回到手动模式）
 ///
-/// 清除 managed_flow_state 并保持在当前步骤，由用户手动操作。
-/// 如果当前在托管范围内但未完成的步骤，保留当前步骤不变。
-/// 如果当前在 Console 阶段且有大阶段可选，过渡到对应的手动选择步骤。
+/// 清除 managed_flow_state 并保持当前人工步骤；仅修复已经批准却仍停在批准页的旧状态。
 #[tauri::command]
 pub(crate) async fn stop_managed_flow(project_name: String) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
@@ -1057,37 +1105,63 @@ pub(crate) async fn stop_managed_flow(project_name: String) -> Result<project::P
 
     let now = chrono::Utc::now().to_rfc3339();
 
-    // Determine the appropriate manual step based on current workflow state
-    use project::WorkflowStep::*;
-    let current_step = &proj.workflow_state.current_step;
-
-    // If we're at a milestone step and there are milestones, transition to
-    // the appropriate manual selection/generation step
-    let new_step = match current_step {
-        MilestoneApproval | MilestoneSelection => {
-            // Check if milestone draft exists and is approved
-            let draft_approved = proj
-                .milestone_draft
-                .as_ref()
-                .map(|d| d.status == project::MilestoneDraftStatus::Approved)
-                .unwrap_or(false);
-            if draft_approved {
-                MilestoneSelection
-            } else {
-                // Go back to milestone generation so user can manually approve
-                MilestoneGeneration
-            }
-        }
-        // For PlanApproval / MilestoneGeneration / MilestoneCheck: keep current step
-        // (user was in the middle of these — let them continue manually)
-        _ => current_step.clone(),
-    };
-
-    proj.workflow_state.current_step = new_step;
+    // 停止托管只释放控制权。仅修复“已经批准却仍停在批准页”的历史状态；
+    // 正常的 CheckPassed 待批准状态必须原地保留给用户手动处理。
+    if proj.workflow_state.current_step == project::WorkflowStep::MilestoneApproval
+        && proj
+            .milestone_draft
+            .as_ref()
+            .is_some_and(|draft| draft.status == project::MilestoneDraftStatus::Approved)
+    {
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
+    }
     proj.workflow_state.managed_flow_state = None;
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = now;
 
+    crate::save_and_reload_project(&proj)
+}
+
+pub(crate) fn reconcile_managed_milestone_project(proj: &mut project::Project) -> bool {
+    let mut changed = false;
+    if proj.workflow_state.current_step == project::WorkflowStep::MilestoneApproval {
+        if let Some(draft) = proj.milestone_draft.as_mut() {
+            let has_check_result = draft
+                .check_result
+                .as_deref()
+                .is_some_and(|result| !result.trim().is_empty());
+            let legacy_status = matches!(
+                draft.status,
+                project::MilestoneDraftStatus::Pending | project::MilestoneDraftStatus::CheckFailed
+            );
+            if legacy_status && has_check_result && !draft.candidate_milestones.is_empty() {
+                draft.status = project::MilestoneDraftStatus::CheckPassed;
+                changed = true;
+            }
+        }
+    }
+
+    if let Some(managed) = proj.workflow_state.managed_flow_state.as_mut() {
+        if managed.managed_target != "MilestoneSelection" {
+            managed.managed_target = "MilestoneSelection".to_string();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// 修复旧版本留下的大阶段检查/托管矛盾状态；不自动恢复暂停的托管流程。
+#[tauri::command]
+pub(crate) async fn reconcile_managed_milestone_state(
+    project_name: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
+    if !reconcile_managed_milestone_project(&mut proj) {
+        return Ok(proj);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    proj.workflow_state.data_revision += 1;
+    proj.workflow_state.last_transition_at = now;
     crate::save_and_reload_project(&proj)
 }
 
@@ -2528,6 +2602,196 @@ mod tests {
         });
     }
 
+    fn managed_milestone_project(
+        project_name: &str,
+        draft_status: project::MilestoneDraftStatus,
+        run_status: project::ManagedRunStatus,
+    ) -> project::Project {
+        let mut proj = project::Project::new(project_name);
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneApproval;
+        proj.workflow_state.managed_flow_state = Some(project::ManagedFlowState {
+            active: true,
+            managed_state: "MilestoneApproval".to_string(),
+            managed_target: "MilestoneApproval".to_string(),
+            last_action: "托管层已暂停".to_string(),
+            last_action_at: "2026-07-22T00:00:00Z".to_string(),
+            run_status,
+            error_message: String::new(),
+        });
+        proj.milestone_draft = Some(project::MilestoneDraft {
+            status: draft_status,
+            check_result: Some("检查通过".to_string()),
+            candidate_milestones: vec![test_milestone(
+                "milestone-1",
+                "测试大阶段",
+                project::MilestoneStatus::Pending,
+            )],
+            ..Default::default()
+        });
+        proj
+    }
+
+    #[tokio::test]
+    async fn managed_milestone_reconcile_repairs_legacy_state_and_is_idempotent(
+    ) -> Result<(), String> {
+        let project_name = unique_project_name("managed-milestone-reconcile");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = managed_milestone_project(
+            &project_name,
+            project::MilestoneDraftStatus::CheckFailed,
+            project::ManagedRunStatus::Paused,
+        );
+        let initial_revision = proj.workflow_state.data_revision;
+        crate::save_project(&proj)?;
+
+        let repaired = reconcile_managed_milestone_state(project_name.clone()).await?;
+        assert_eq!(
+            repaired.milestone_draft.as_ref().map(|draft| &draft.status),
+            Some(&project::MilestoneDraftStatus::CheckPassed)
+        );
+        let managed = repaired
+            .workflow_state
+            .managed_flow_state
+            .as_ref()
+            .ok_or("托管状态缺失".to_string())?;
+        assert_eq!(managed.run_status, project::ManagedRunStatus::Paused);
+        assert_eq!(managed.managed_target, "MilestoneSelection");
+        assert_eq!(repaired.workflow_state.data_revision, initial_revision + 1);
+
+        let repeated = reconcile_managed_milestone_state(project_name).await?;
+        assert_eq!(
+            repeated.workflow_state.data_revision,
+            repaired.workflow_state.data_revision
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn waiting_human_preserves_reason_and_can_resume() -> Result<(), String> {
+        let project_name = unique_project_name("managed-waiting-human");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = managed_milestone_project(
+            &project_name,
+            project::MilestoneDraftStatus::CheckPassed,
+            project::ManagedRunStatus::Running,
+        );
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneCheck;
+        crate::save_project(&proj)?;
+
+        let waiting = wait_managed_flow_for_human(
+            project_name.clone(),
+            "候选大阶段缺失，等待人工处理".to_string(),
+        )
+        .await?;
+        let managed = waiting
+            .workflow_state
+            .managed_flow_state
+            .as_ref()
+            .ok_or("托管状态缺失".to_string())?;
+        assert_eq!(managed.run_status, project::ManagedRunStatus::WaitingHuman);
+        assert_eq!(managed.last_action, "候选大阶段缺失，等待人工处理");
+
+        let resumed = resume_managed_flow(project_name).await?;
+        assert_eq!(
+            resumed
+                .workflow_state
+                .managed_flow_state
+                .as_ref()
+                .map(|managed| &managed.run_status),
+            Some(&project::ManagedRunStatus::Running)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stopping_managed_flow_preserves_milestone_approval_step() -> Result<(), String> {
+        let project_name = unique_project_name("managed-stop-approval");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = managed_milestone_project(
+            &project_name,
+            project::MilestoneDraftStatus::CheckPassed,
+            project::ManagedRunStatus::Paused,
+        );
+        crate::save_project(&proj)?;
+
+        let stopped = stop_managed_flow(project_name).await?;
+        assert_eq!(
+            stopped.workflow_state.current_step,
+            project::WorkflowStep::MilestoneApproval
+        );
+        assert!(stopped.workflow_state.managed_flow_state.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn passed_milestone_flows_from_managed_approval_to_autopilot() -> Result<(), String> {
+        let project_name = unique_project_name("managed-to-autopilot");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = managed_milestone_project(
+            &project_name,
+            project::MilestoneDraftStatus::CheckPassed,
+            project::ManagedRunStatus::Running,
+        );
+        crate::save_project(&proj)?;
+
+        let next = managed_next_step(project_name.clone()).await?;
+        assert_eq!(next.command, "approve_milestone_draft");
+        assert!(!next.needs_human);
+
+        let approved =
+            crate::commands::milestone::approve_milestone_draft(project_name.clone()).await?;
+        assert_eq!(
+            approved.workflow_state.current_step,
+            project::WorkflowStep::MilestoneSelection
+        );
+        assert!(approved.workflow_state.managed_flow_state.is_none());
+
+        let autopilot = toggle_autopilot(project_name, true).await?;
+        assert!(autopilot.workflow_state.autopilot_active);
+        assert!(autopilot.workflow_state.autopilot_state.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_advisor_rejects_stale_failed_status_even_with_check_result(
+    ) -> Result<(), String> {
+        let project_name = unique_project_name("managed-stale-failure");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = managed_milestone_project(
+            &project_name,
+            project::MilestoneDraftStatus::CheckFailed,
+            project::ManagedRunStatus::Running,
+        );
+        crate::save_project(&proj)?;
+
+        let next = managed_next_step(project_name).await?;
+        assert!(next.command.is_empty());
+        assert!(next.needs_human);
+        assert!(!next.is_error);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stopping_managed_flow_repairs_approved_legacy_step() -> Result<(), String> {
+        let project_name = unique_project_name("managed-stop-approved");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = managed_milestone_project(
+            &project_name,
+            project::MilestoneDraftStatus::Approved,
+            project::ManagedRunStatus::Paused,
+        );
+        crate::save_project(&proj)?;
+
+        let stopped = stop_managed_flow(project_name).await?;
+        assert_eq!(
+            stopped.workflow_state.current_step,
+            project::WorkflowStep::MilestoneSelection
+        );
+        assert!(stopped.workflow_state.managed_flow_state.is_none());
+        Ok(())
+    }
+
     #[test]
     fn autopilot_activation_scope_starts_at_milestone_selection() {
         let rejected = [
@@ -2937,6 +3201,10 @@ mod tests {
             git_user_available: true,
             git_email_available: true,
             working_tree_clean: false,
+            git_metadata_ready: false,
+            ready_for_new_execution: false,
+            has_managed_task_changes: false,
+            has_external_changes: true,
             ready: false,
             status_message: "尚无首次提交".to_string(),
             issues: vec![

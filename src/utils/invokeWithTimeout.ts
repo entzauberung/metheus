@@ -94,6 +94,11 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   // V1 新增命令 - 工作流
   transition_workflow: 15,
   migrate_project_workflow: 15,
+  reconcile_managed_milestone_state: 15,
+  wait_managed_flow_for_human: 15,
+  pause_managed_flow: 15,
+  resume_managed_flow: 15,
+  stop_managed_flow: 15,
   toggle_autopilot: 15,
   autopilot_pause: 120,  // 可能涉及 In Stop kill 子进程
   autopilot_next_step: 15,

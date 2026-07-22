@@ -11,7 +11,7 @@ pub(crate) const DEEPSEEK_WORKFLOW_MODEL: &str = "deepseek-v4-flash";
 pub(crate) const DEEPSEEK_API_URL: &str = "https://api.deepseek.com/v1/chat/completions";
 
 /// Claude Code 子进程整体执行超时秒数，防止子进程卡死
-pub(crate) const CLAUDE_CODE_TIMEOUT_SECS: u64 = 600;
+pub(crate) const EXECUTION_ENGINE_TIMEOUT_SECS: u64 = 600;
 
 #[allow(dead_code)]
 pub(crate) const GIT_INIT_FAILED: &str = "自动初始化 Git 仓库失败";

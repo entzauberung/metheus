@@ -1,4 +1,4 @@
-use crate::project;
+use crate::{project, AppState};
 use serde_json;
 
 #[tauri::command]
@@ -112,6 +112,139 @@ pub(crate) async fn get_project(project_name: String) -> Result<project::Project
     crate::load_project(&name)
 }
 
+#[tauri::command]
+pub(crate) async fn check_engine_health(
+    execution_profile: project::ExecutionProfile,
+) -> Result<crate::engine::EngineHealth, String> {
+    crate::engine::validate_profile(&execution_profile)?;
+    Ok(crate::engine::check_engine_health(&execution_profile).await)
+}
+
+async fn ensure_engine_available(
+    execution_profile: &project::ExecutionProfile,
+) -> Result<(), String> {
+    crate::engine::validate_profile(execution_profile)?;
+    let health = crate::engine::check_engine_health(execution_profile).await;
+    if health.status.blocks_execution() {
+        Err(format!("执行引擎不可用：{}", health.message))
+    } else {
+        Ok(())
+    }
+}
+
+fn execution_profile_change_blocker(project: &project::Project) -> Option<&'static str> {
+    if project
+        .execution_session
+        .as_ref()
+        .is_some_and(|session| session.active)
+    {
+        return Some("存在活跃执行会话，不能切换执行引擎");
+    }
+    if project
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .is_some_and(|recovery| {
+            matches!(
+                recovery.phase,
+                project::RecoveryPhase::Diagnosing
+                    | project::RecoveryPhase::Repairing
+                    | project::RecoveryPhase::Retesting
+            )
+        })
+    {
+        return Some("错误恢复正在进行，不能切换执行引擎");
+    }
+    if project
+        .workflow_state
+        .autopilot_state
+        .as_ref()
+        .is_some_and(|autopilot| {
+            autopilot.active && autopilot.run_status == project::AutopilotRunStatus::Running
+        })
+    {
+        return Some("自动驾驶正在推进，暂停后才能切换执行引擎");
+    }
+    if project
+        .workflow_state
+        .managed_flow_state
+        .as_ref()
+        .is_some_and(|managed| {
+            managed.active && managed.run_status == project::ManagedRunStatus::Running
+        })
+    {
+        return Some("托管流程正在推进，暂停后才能切换执行引擎");
+    }
+    None
+}
+
+fn apply_execution_profile(
+    project: &mut project::Project,
+    mut execution_profile: project::ExecutionProfile,
+) -> bool {
+    let unchanged = project.execution_profile.runtime == execution_profile.runtime
+        && project.execution_profile.provider == execution_profile.provider
+        && project.execution_profile.permission_profile == execution_profile.permission_profile;
+    if unchanged {
+        return false;
+    }
+    execution_profile.profile_revision =
+        project.execution_profile.profile_revision.saturating_add(1);
+    project.execution_profile = execution_profile;
+    project.workflow_state.data_revision = project.workflow_state.data_revision.saturating_add(1);
+    project.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+    true
+}
+
+fn apply_entry_execution_profile(
+    project: &mut project::Project,
+    execution_profile: project::ExecutionProfile,
+) -> Result<bool, String> {
+    let changed = project.execution_profile.runtime != execution_profile.runtime
+        || project.execution_profile.provider != execution_profile.provider
+        || project.execution_profile.permission_profile != execution_profile.permission_profile;
+    if !changed {
+        return Ok(false);
+    }
+    if let Some(message) = execution_profile_change_blocker(project) {
+        return Err(message.to_string());
+    }
+    Ok(apply_execution_profile(project, execution_profile))
+}
+
+#[tauri::command]
+pub(crate) async fn update_execution_profile(
+    state: tauri::State<'_, AppState>,
+    project_name: String,
+    expected_data_revision: u64,
+    execution_profile: project::ExecutionProfile,
+) -> Result<project::Project, String> {
+    crate::engine::validate_profile(&execution_profile)?;
+    let pipeline_guard = state.pipeline_state.lock().await;
+    if pipeline_guard
+        .as_ref()
+        .is_some_and(|pipeline| pipeline.status == crate::pipeline::PipelineStatus::Running)
+    {
+        return Err("执行正在运行，不能切换执行引擎".to_string());
+    }
+
+    let mut project = crate::load_project(&project_name)?;
+    if project.workflow_state.data_revision != expected_data_revision {
+        return Err(format!(
+            "项目状态已更新，请同步后重试（当前修订 {}，请求修订 {}）",
+            project.workflow_state.data_revision, expected_data_revision
+        ));
+    }
+    if let Some(message) = execution_profile_change_blocker(&project) {
+        return Err(message.to_string());
+    }
+    ensure_engine_available(&execution_profile).await?;
+    if !apply_execution_profile(&mut project, execution_profile) {
+        return Ok(project);
+    }
+    crate::save_and_reload_project(&project)
+}
+
 /// 初始化项目入口（Before 页面调用）
 /// 创建新项目或安全恢复同名同路径项目。
 ///
@@ -124,6 +257,7 @@ pub(crate) async fn initialize_project_entry(
     project_name: String,
     project_path: String,
     entry_kind: String,
+    execution_profile: Option<project::ExecutionProfile>,
 ) -> Result<project::Project, String> {
     if project_name.trim().is_empty() {
         return Err("项目名称不能为空".to_string());
@@ -137,6 +271,8 @@ pub(crate) async fn initialize_project_entry(
         "HalfProject" => project::ProjectEntryKind::HalfProject,
         _ => return Err(format!("未知的项目来源类型：{}", entry_kind)),
     };
+    let mut selected_profile = execution_profile.unwrap_or_default();
+    ensure_engine_available(&selected_profile).await?;
 
     let path = std::path::Path::new(&project_path);
 
@@ -152,7 +288,26 @@ pub(crate) async fn initialize_project_entry(
                     // Check for stale autopilot state (autopilot active but target milestone gone)
                     let had_stale_autopilot = clean_stale_autopilot_state(&mut existing);
 
-                    if had_stale_session || had_stale_autopilot {
+                    // 修复旧版本留下的大阶段检查/托管矛盾状态。
+                    let managed_milestone_reconciled =
+                        crate::commands::workflow::reconcile_managed_milestone_project(
+                            &mut existing,
+                        );
+
+                    let profile_changed =
+                        apply_entry_execution_profile(&mut existing, selected_profile.clone())?;
+
+                    if managed_milestone_reconciled {
+                        existing.workflow_state.data_revision += 1;
+                        existing.workflow_state.last_transition_at =
+                            chrono::Utc::now().to_rfc3339();
+                    }
+
+                    if had_stale_session
+                        || had_stale_autopilot
+                        || managed_milestone_reconciled
+                        || profile_changed
+                    {
                         // Persist the cleaned state and reload
                         existing = crate::save_and_reload_project(&existing)?;
                     }
@@ -221,6 +376,7 @@ pub(crate) async fn initialize_project_entry(
         }
     }
 
+    selected_profile.profile_revision = 1;
     let mut project = if kind == project::ProjectEntryKind::HalfProject {
         project::Project::new_half(&project_name, &project_path)
     } else {
@@ -228,6 +384,7 @@ pub(crate) async fn initialize_project_entry(
         p.project_path = project_path.to_string();
         p
     };
+    project.execution_profile = selected_profile;
 
     // Set workflow state based on entry kind
     match kind {
@@ -557,4 +714,73 @@ fn clean_stale_autopilot_state(proj: &mut project::Project) -> bool {
     }
 
     should_clean
+}
+
+#[cfg(test)]
+mod execution_profile_tests {
+    use super::*;
+
+    fn codex_profile() -> project::ExecutionProfile {
+        project::ExecutionProfile {
+            runtime: project::ExecutionRuntime::Plugin,
+            provider: project::ExecutionProvider::Codex,
+            permission_profile: project::PermissionProfile::Unattended,
+            profile_revision: 1,
+        }
+    }
+
+    #[test]
+    fn profile_update_increments_both_revisions() {
+        let mut project = project::Project::new("profile-update");
+        project.workflow_state.data_revision = 7;
+        assert!(apply_execution_profile(&mut project, codex_profile()));
+        assert_eq!(
+            project.execution_profile.provider,
+            project::ExecutionProvider::Codex
+        );
+        assert_eq!(project.execution_profile.profile_revision, 2);
+        assert_eq!(project.workflow_state.data_revision, 8);
+        assert!(!apply_execution_profile(&mut project, codex_profile()));
+        assert_eq!(project.workflow_state.data_revision, 8);
+    }
+
+    #[test]
+    fn active_session_and_recovery_block_changes() {
+        let mut project = project::Project::new("profile-blocked");
+        project.execution_session = Some(project::ExecutionSession {
+            active: true,
+            ..Default::default()
+        });
+        assert!(execution_profile_change_blocker(&project)
+            .unwrap()
+            .contains("活跃执行会话"));
+
+        project.execution_session = None;
+        project.workflow_state.recovery_state = Some(project::RecoveryState {
+            phase: project::RecoveryPhase::Repairing,
+            ..Default::default()
+        });
+        assert!(execution_profile_change_blocker(&project)
+            .unwrap()
+            .contains("错误恢复"));
+    }
+
+    #[test]
+    fn entry_profile_is_applied_at_a_stable_boundary_and_never_silently_ignored() {
+        let mut project = project::Project::new("entry-profile");
+        assert!(apply_entry_execution_profile(&mut project, codex_profile()).unwrap());
+        assert_eq!(
+            project.execution_profile.provider,
+            project::ExecutionProvider::Codex
+        );
+
+        project.execution_session = Some(project::ExecutionSession {
+            active: true,
+            ..Default::default()
+        });
+        assert!(
+            apply_entry_execution_profile(&mut project, project::ExecutionProfile::default())
+                .is_err()
+        );
+    }
 }

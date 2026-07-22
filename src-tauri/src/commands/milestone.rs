@@ -453,23 +453,34 @@ pub(crate) async fn check_milestone_draft(
         return Err("当前项目已不在大阶段检查步骤，请刷新页面。".to_string());
     }
 
-    if let Some(ref mut draft) = proj.milestone_draft {
-        draft.check_result = Some(summary.clone());
-    }
-
-    if passed {
-        proj.workflow_state.current_step = project::WorkflowStep::MilestoneApproval;
-    } else {
-        // 检查未通过 → 留在 MilestoneCheck，更新草稿状态
-        if let Some(ref mut draft) = proj.milestone_draft {
-            draft.status = project::MilestoneDraftStatus::CheckFailed;
-        }
-    }
+    apply_milestone_check_result(&mut proj, passed, summary)?;
 
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
     crate::save_and_reload_project(&proj)
+}
+
+fn apply_milestone_check_result(
+    proj: &mut project::Project,
+    passed: bool,
+    summary: String,
+) -> Result<(), String> {
+    let draft = proj
+        .milestone_draft
+        .as_mut()
+        .ok_or("没有大阶段草稿，请先生成大阶段。".to_string())?;
+    draft.check_result = Some(summary);
+    draft.status = if passed {
+        project::MilestoneDraftStatus::CheckPassed
+    } else {
+        project::MilestoneDraftStatus::CheckFailed
+    };
+
+    if passed {
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneApproval;
+    }
+    Ok(())
 }
 
 /// 批准大阶段草稿（V1：将候选大阶段复制为正式 milestones）
@@ -498,12 +509,16 @@ pub(crate) async fn approve_milestone_draft(
         .as_ref()
         .ok_or("没有大阶段草稿，请先生成并检查大阶段。".to_string())?;
 
-    // 3. 验证检查已通过（状态不能是 CheckFailed）
-    if draft.status == project::MilestoneDraftStatus::CheckFailed {
-        return Err("大阶段草稿检查未通过，无法批准。请根据检查反馈调整后重新生成。".to_string());
+    // 3. 只接受明确通过检查的草稿，禁止从非失败状态反向推断通过。
+    if draft.status != project::MilestoneDraftStatus::CheckPassed {
+        return Err("大阶段草稿尚未明确通过检查，无法批准。请先完成质量检查。".to_string());
     }
-    if draft.check_result.is_none() {
-        return Err("大阶段草稿尚未经过检查，请先运行检查。".to_string());
+    if !draft
+        .check_result
+        .as_deref()
+        .is_some_and(|result| !result.trim().is_empty())
+    {
+        return Err("大阶段草稿缺少有效检查结果，请先重新运行检查。".to_string());
     }
 
     // 4. 验证候选列表非空
@@ -534,6 +549,8 @@ pub(crate) async fn approve_milestone_draft(
 
     // 8. 转换到 MilestoneSelection（不得自动选中第一个大阶段）
     proj.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
+    // 大阶段批准是托管层的原子终点；同次保存释放自动驾驶互斥锁。
+    proj.workflow_state.managed_flow_state = None;
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
 
@@ -3180,6 +3197,85 @@ mod tests {
             ));
         }
         proj
+    }
+
+    fn milestone_draft(status: project::MilestoneDraftStatus) -> project::MilestoneDraft {
+        project::MilestoneDraft {
+            status,
+            candidate_milestones: vec![test_milestone(
+                "milestone-draft-1",
+                "候选大阶段",
+                project::MilestoneStatus::Pending,
+            )],
+            check_result: Some("检查通过".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn milestone_check_result_clears_a_previous_failure_on_pass() -> Result<(), String> {
+        let mut proj = project::Project::new("milestone-check-transition");
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneCheck;
+        proj.milestone_draft = Some(milestone_draft(project::MilestoneDraftStatus::CheckFailed));
+
+        apply_milestone_check_result(&mut proj, true, "复检通过".to_string())?;
+
+        assert_eq!(
+            proj.workflow_state.current_step,
+            project::WorkflowStep::MilestoneApproval
+        );
+        let draft = proj
+            .milestone_draft
+            .as_ref()
+            .ok_or("草稿缺失".to_string())?;
+        assert_eq!(draft.status, project::MilestoneDraftStatus::CheckPassed);
+        assert_eq!(draft.check_result.as_deref(), Some("复检通过"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn milestone_approval_requires_check_passed() -> Result<(), String> {
+        for status in [
+            project::MilestoneDraftStatus::Pending,
+            project::MilestoneDraftStatus::CheckFailed,
+        ] {
+            let project_name = unique_project_name("milestone-approval-rejected");
+            let _guard = ProjectDataGuard::new(&project_name)?;
+            let mut proj = project::Project::new(&project_name);
+            proj.workflow_state.current_step = project::WorkflowStep::MilestoneApproval;
+            proj.milestone_draft = Some(milestone_draft(status));
+            crate::save_project(&proj)?;
+
+            assert!(approve_milestone_draft(project_name).await.is_err());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn milestone_approval_atomically_releases_managed_flow() -> Result<(), String> {
+        let project_name = unique_project_name("milestone-approval-managed");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneApproval;
+        proj.workflow_state.managed_flow_state = Some(project::ManagedFlowState {
+            active: true,
+            run_status: project::ManagedRunStatus::Running,
+            ..Default::default()
+        });
+        proj.milestone_draft = Some(milestone_draft(project::MilestoneDraftStatus::CheckPassed));
+        crate::save_project(&proj)?;
+
+        let updated = approve_milestone_draft(project_name).await?;
+        assert_eq!(
+            updated.workflow_state.current_step,
+            project::WorkflowStep::MilestoneSelection
+        );
+        assert!(updated.workflow_state.managed_flow_state.is_none());
+        assert_eq!(
+            updated.milestone_draft.as_ref().map(|draft| &draft.status),
+            Some(&project::MilestoneDraftStatus::Approved)
+        );
+        Ok(())
     }
 
     #[tokio::test]

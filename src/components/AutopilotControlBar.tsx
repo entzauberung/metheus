@@ -3,12 +3,14 @@
 import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle, GitBranch, CheckCircle } from "lucide-react";
 import type { Project, PipelineState, AutopilotRecoveryAction } from "../types";
 import { getAutopilotErrorActions } from "../autopilotPolicy";
+import { getManagedFlowPresentation } from "../managedFlowPolicy";
 
 export interface AutopilotControlBarProps {
   project: Project;
   executionStatus?: PipelineState | null;
   busy: boolean;
   onToggle: (active: boolean) => Promise<void>;
+  onStopManagedFlow: () => Promise<void>;
   onPauseNow: () => Promise<void>;
   onPauseAfterCurrent: () => Promise<void>;
   onResume: () => Promise<void>;
@@ -36,13 +38,14 @@ function isRecoverableSession(project: Project): boolean {
 
 export function AutopilotControlBar({
   project, executionStatus, busy,
-  onToggle, onPauseNow, onPauseAfterCurrent, onResume, onSync,
+  onToggle, onStopManagedFlow, onPauseNow, onPauseAfterCurrent, onResume, onSync,
   onRetryCurrent, onAcknowledgeRecovery, onRegeneratePlan, onPrepareWorkspace,
   onRefreshWorkspace, onResolveHumanRecovery,
 }: AutopilotControlBarProps) {
   const apActive = project.workflow_state.autopilot_active === true;
   const apState = project.workflow_state.autopilot_state;
   const mfActive = project.workflow_state.managed_flow_state?.active === true;
+  const mfState = project.workflow_state.managed_flow_state;
   const isExecuting = executionStatus?.status === "Running";
   const activationSteps = new Set([
     "MilestoneSelection", "MidStageGeneration", "MidStageCheck", "MidStageApproval",
@@ -115,11 +118,22 @@ export function AutopilotControlBar({
     // 未激活：先显示恢复入口，再显示激活入口（托管层活跃时互斥）
     if (recoveryBar) return recoveryBar;
     if (mfActive) {
+      const managed = getManagedFlowPresentation(
+        mfState!,
+        project.workflow_state.current_step,
+        project.milestone_draft,
+      );
       return (
         <div className="autopilot-control-bar" style={{ background: "#f6f8fa", borderColor: "#d0d7de" }}>
           <span className="ap-bar-status" style={{ color: "#656d76" }}>
-            <WandSparkles size={16} /> 托管层运行中，自动驾驶不可用
+            <WandSparkles size={16} /> {managed.statusLabel}，自动驾驶不可用
           </span>
+          {mfState?.last_action && (
+            <span className="ap-bar-action" title={mfState.last_action}>{mfState.last_action}</span>
+          )}
+          <button className="ap-bar-btn" disabled={busy} onClick={onStopManagedFlow} title="停止托管并转为手动处理">
+            <Square size={14} /> 停止托管
+          </button>
         </div>
       );
     }

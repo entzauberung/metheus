@@ -29,6 +29,7 @@ import { ConsoleWorkflowPanel } from "./ConsoleWorkflowPanel";
 import { PauseDecisionPanel } from "./PauseDecisionPanel";
 import { RollbackImpactDialog } from "./RollbackImpactDialog";
 import { MilestoneReviewPanel } from "./MilestoneReviewPanel";
+import { ExecutionEngineSettings } from "./components/ExecutionEngineSettings";
 import FileTree from "./FileTree";
 import FloatingChatBalloon from "./FloatingChatBalloon";
 
@@ -743,28 +744,29 @@ function App() {
         return;
       }
 
+      if (next.is_error) {
+        setFeedbackMsg({
+          type: "error",
+          message: `托管错误：${next.error_message}`,
+        });
+        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
+        handleChatComplete(latest);
+        return;
+      }
+
       if (next.needs_human) {
-        // Transition managed flow to WaitingHuman — stop the loop, wait for user to resolve.
-        // User can resume via the "恢复托管" button which calls resume_managed_flow.
+        // Persist a distinct WaitingHuman state and keep the actual blocker visible.
         try {
-          await invokeWithTimeout<Project>("pause_managed_flow", { projectName: proj.name });
+          await invokeWithTimeout<Project>("wait_managed_flow_for_human", {
+            projectName: proj.name,
+            reason: next.description,
+          });
         } catch { /* best effort */ }
         setFeedbackMsg({
           type: "info",
           message: `托管暂停：${next.description}`,
         });
         // Sync project to reflect the paused state
-        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-        handleChatComplete(latest);
-        return;
-      }
-
-      if (next.is_error) {
-        setFeedbackMsg({
-          type: "error",
-          message: `托管错误：${next.error_message}`,
-        });
-        // Sync and stop
         const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
         handleChatComplete(latest);
         return;
@@ -786,6 +788,16 @@ function App() {
         projectName: proj.name,
       });
       handleChatComplete(updated);
+
+      if (next.command === "approve_milestone_draft"
+          && updated.workflow_state.current_step === "MilestoneSelection"
+          && !updated.workflow_state.managed_flow_state) {
+        setFeedbackMsg({
+          type: "success",
+          message: "托管完成：大阶段已批准。可启动自动驾驶继续推进中阶段和子任务。",
+        });
+        return;
+      }
 
       // Schedule next cycle
       if (managedActiveRef.current && updated.workflow_state.managed_flow_state?.active) {
@@ -984,7 +996,7 @@ function App() {
 
         setProject(project);
 
-        // Build a sequential chain: migrate (if needed) → reconcile → snapshot
+        // Build a sequential chain: migration → managed-state reconcile → execution reconcile → snapshot
         let chain: Promise<any> = Promise.resolve(project);
 
         const needsMigration = project.workflow_state.current_step === "WaitingEntry"
@@ -1002,6 +1014,19 @@ function App() {
             })
           );
         }
+
+        // 独立修复旧版本留下的大阶段检查/托管矛盾状态。
+        chain = chain.then((p: Project) =>
+          invokeWithTimeout<Project>("reconcile_managed_milestone_state", {
+            projectName: p.name,
+          }).then((reconciled) => {
+            handleChatComplete(reconciled);
+            return reconciled;
+          }).catch((err) => {
+            console.error("大阶段托管状态对账失败:", err);
+            return p;
+          })
+        );
 
         // 启动时对账执行状态：清理 stale session、修复工作流状态
         chain = chain.then((p: Project) =>
@@ -1393,7 +1418,7 @@ function App() {
       });
       await refreshExecutionContext(project.name);
       setFeedbackMsg({
-        type: status.ready ? "success" : "warning",
+        type: status.ready_for_new_execution ? "success" : "warning",
         message: status.status_message,
       });
     } catch (err) {
@@ -1411,7 +1436,7 @@ function App() {
       });
       await refreshExecutionContext(project.name);
       setFeedbackMsg({
-        type: status.ready ? "success" : "warning",
+        type: status.ready_for_new_execution ? "success" : "warning",
         message: status.status_message,
       });
     } catch (err) {
@@ -1518,6 +1543,21 @@ function App() {
       });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "切换自动驾驶失败：" + String(err) });
+    } finally {
+      endConsoleAction();
+    }
+  };
+
+  const handleStopManagedFlow = async () => {
+    if (!project || !beginConsoleAction("managed_stop")) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("stop_managed_flow", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+      setFeedbackMsg({ type: "info", message: "托管层已停止，当前步骤已交给手动处理。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "停止托管失败：" + String(err) });
     } finally {
       endConsoleAction();
     }
@@ -1656,7 +1696,9 @@ function App() {
   const handleSyncProject = async () => {
     if (!project || !beginConsoleAction("sync_project")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
+      const updated = await invokeWithTimeout<Project>("reconcile_managed_milestone_state", {
+        projectName: project.name,
+      });
       handleChatComplete(updated);
       // Also refresh pipeline state if available
       const pipelineStatus = await invokeWithTimeout<PipelineState | null>("get_execution_status");
@@ -1803,6 +1845,13 @@ function App() {
       )}
 
       <main className="main-content">
+        <div className="project-utility-bar">
+          <ExecutionEngineSettings
+            project={project}
+            pipeline={executionStatus}
+            onProjectUpdated={handleChatComplete}
+          />
+        </div>
 
         {/* ===== Phase-dependent main content ===== */}
         {(phase === "FirstDiscussion" || phase === "Before") && (
@@ -1924,6 +1973,7 @@ function App() {
                 executionStatus={executionStatus}
                 busy={isConsoleBusy}
                 onToggle={handleToggleAutopilot}
+                onStopManagedFlow={handleStopManagedFlow}
                 onPauseNow={handleAutopilotPauseNow}
                 onPauseAfterCurrent={handleAutopilotPauseAfterCurrent}
                 onResume={handleAutopilotResume}
@@ -1987,7 +2037,7 @@ function App() {
                     projectName={project.name}
                     executionStatus={executionStatus}
                     testLogs={testLogs}
-                    workspaceReady={workspaceStatus?.ready === true}
+                    workspaceReady={workspaceStatus?.git_metadata_ready === true}
                     executionHistory={project.execution_history}
                   />
                 </>
@@ -2168,8 +2218,10 @@ function V1ExecutionPanel({
     ? (!execOk ? "执行未成功" : !testOk ? "核验未通过" : null)
     : null;
 
-  const workspaceReady = workspaceStatus?.ready === true;
+  const workspaceReady = workspaceStatus?.ready_for_new_execution === true;
   const workspaceAction = getWorkspaceAction(workspaceStatus);
+  const managedTaskChanges = workspaceStatus?.has_managed_task_changes === true
+    && workspaceStatus.has_external_changes === false;
 
   return (
     <div className="v1-execution-panel" style={{ padding: "24px" }}>
@@ -2232,10 +2284,10 @@ function V1ExecutionPanel({
       {/* Workspace status banner — 失败会话期间隐藏准备环境 */}
       {!hasExecutionFailure && planApproved && workspaceStatus && !workspaceReady && (
         <FeedbackBanner
-          type="warning"
+          type={managedTaskChanges ? "info" : "warning"}
           message={workspaceStatus.status_message}
           details={workspaceStatus.changes.map(change =>
-            `${change.tracked ? `${change.index_status}${change.worktree_status}` : "??"} ${change.path}`
+            `${change.tracked ? `${change.index_status}${change.worktree_status}` : "??"} ${change.path}${change.managed ? "（当前任务）" : ""}`
           )}
         />
       )}
@@ -2252,7 +2304,8 @@ function V1ExecutionPanel({
       )}
 
       {!hasExecutionFailure && planApproved && workspaceStatus &&
-        workspaceAction !== "none" && workspaceAction !== "prepare" && (
+        workspaceAction !== "none" && workspaceAction !== "prepare"
+        && workspaceAction !== "managed_task_changes" && (
         <div style={{ marginBottom: "20px" }}>
           <ActionButton icon={<RefreshCw size={16} />} disabled={busy} onClick={onSyncProject}>
             刷新工作区

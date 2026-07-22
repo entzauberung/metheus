@@ -137,6 +137,37 @@ export interface WorkflowState {
 
 export type ProjectEntryKind = "NoProject" | "HalfProject";
 
+export type ExecutionRuntime = "BuiltIn" | "Plugin";
+export type ExecutionProvider = "GrokBuild" | "ClaudeCode" | "Codex";
+export type PermissionProfile = "Interactive" | "Unattended";
+
+export interface ExecutionProfile {
+  runtime: ExecutionRuntime;
+  provider: ExecutionProvider;
+  permission_profile: PermissionProfile;
+  profile_revision: number;
+}
+
+export type EngineHealthStatus =
+  | "Available"
+  | "NotInstalled"
+  | "Unauthenticated"
+  | "UnsupportedVersion"
+  | "Disabled"
+  | "Unknown";
+
+export type EngineAuthState = "Authenticated" | "Unauthenticated" | "Unknown";
+
+export interface EngineHealth {
+  provider: ExecutionProvider;
+  status: EngineHealthStatus;
+  executable_path?: string;
+  version?: string;
+  auth_state: EngineAuthState;
+  supports_unattended: boolean;
+  message: string;
+}
+
 // ========== 已有项目基线 ==========
 
 export interface ExistingProjectBaseline {
@@ -177,7 +208,7 @@ export type DraftStatus = "Pending" | "Approved" | "Rejected" | "Expired" | "Sup
 
 // ========== 大阶段草稿 ==========
 
-export type MilestoneDraftStatus = "Pending" | "CheckFailed" | "Approved";
+export type MilestoneDraftStatus = "Pending" | "CheckFailed" | "CheckPassed" | "Approved";
 
 export type MilestoneDraftKind = "Normal" | "FutureOnly";
 
@@ -313,13 +344,9 @@ export interface ExecutionResult {
   output: string;
   error_log: string;
   file_changes: string[];
+  exit_code?: number;
+  engine_provider?: ExecutionProvider;
 }
-
-// 子任务执行错误类型（与 Rust SubTaskError 枚举对应）
-export type SubTaskError =
-  | { type: "UserPaused" }
-  | { type: "ExecutionFailed"; message: string }
-  | { type: "Timeout" };
 
 export interface TestResult {
   passed: boolean;
@@ -332,7 +359,11 @@ export interface TestResult {
   automated_test_status?: "Unknown" | "Passed" | "Failed" | "NotConfigured" | "Unavailable";
   review_passed?: boolean;
   verification_kind?: "Legacy" | "AutomatedTestAndReview" | "CodeReviewOnly" | "HumanOverride";
+  review_evidence_status?: ReviewEvidenceStatus;
+  review_evidence_summary?: string;
 }
+
+export type ReviewEvidenceStatus = "Complete" | "Partial" | "Unavailable";
 
 export interface HumanVerification {
   verification_kind: "HumanOverride";
@@ -466,6 +497,7 @@ export interface Project {
   entry_kind: ProjectEntryKind;
   workflow_state: WorkflowState;
   mode: ProjectMode;
+  execution_profile: ExecutionProfile;
   current_milestone_id: string;
   current_mid_stage_id: string;
   version_plan: string;
@@ -514,6 +546,7 @@ export interface ExecutionSession {
   plan_revision: number;
   subtask_index: number;
   total_subtasks: number;
+  engine_snapshot: ExecutionProfile;
 }
 
 // ========== 宪法变更历史 ==========
@@ -735,6 +768,11 @@ export interface ExecutionWorkspaceStatus {
   git_user_available: boolean;
   git_email_available: boolean;
   working_tree_clean: boolean;
+  git_metadata_ready: boolean;
+  ready_for_new_execution: boolean;
+  has_managed_task_changes: boolean;
+  has_external_changes: boolean;
+  /** @deprecated 使用 ready_for_new_execution。 */
   ready: boolean;
   status_message: string;
   issues: ExecutionWorkspaceIssue[];
@@ -755,6 +793,7 @@ export interface ExecutionWorkspaceChange {
   index_status: string;
   worktree_status: string;
   tracked: boolean;
+  managed: boolean;
 }
 
 export interface RollbackCheckpoint {

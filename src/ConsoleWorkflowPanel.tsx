@@ -5,6 +5,7 @@ import { ConsoleFeedback } from "./components/ConsoleStepShell";
 import { MilestonePlanningStep } from "./console/MilestonePlanningStep";
 import { MidStagePlanningStep } from "./console/MidStagePlanningStep";
 import { ExecutionPlanStep } from "./console/ExecutionPlanStep";
+import { getManagedFlowPresentation } from "./managedFlowPolicy";
 
 interface Props {
   project: Project;
@@ -40,7 +41,9 @@ export function ConsoleWorkflowPanel({
   const beginAction = (action: string) => !busy && onActionStart(action);
 
   const syncProject = async () => {
-    const latest = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
+    const latest = await invokeWithTimeout<Project>("reconcile_managed_milestone_state", {
+      projectName: project.name,
+    });
     onProjectUpdated(latest);
     return latest;
   };
@@ -191,29 +194,37 @@ export function ConsoleWorkflowPanel({
 
   const autopilotRunning = project.workflow_state.autopilot_active === true
     && project.workflow_state.autopilot_state?.run_status === "Running";
-  const planningBusy = busy || autopilotRunning;
   const managedActive = project.workflow_state.managed_flow_state?.active === true;
-  const managedRunning = managedActive && project.workflow_state.managed_flow_state?.run_status === "Running";
-  const managedPaused = managedActive && project.workflow_state.managed_flow_state?.run_status === "Paused";
+  const managedState = project.workflow_state.managed_flow_state;
+  const managedRunning = managedActive && managedState?.run_status === "Running";
+  const planningBusy = busy || autopilotRunning || managedRunning;
+  const managedPresentation = managedState
+    ? getManagedFlowPresentation(managedState, step, project.milestone_draft)
+    : null;
 
   // Managed flow banner (shown during any Console step when managed flow is active)
   const managedBanner = managedActive ? (
-    <div className="feedback-banner" style={{ marginBottom: "12px", padding: "10px 14px", background: managedRunning ? "#f0e6ff" : "#fff8e1", border: `1px solid ${managedRunning ? "#6e40c9" : "#d4a72c"}`, borderRadius: "6px", fontSize: "13px" }}>
+    <div className="feedback-banner" style={{ marginBottom: "12px", padding: "10px 14px", background: managedState?.run_status === "Running" ? "#f0e6ff" : "#fff8e1", border: `1px solid ${managedState?.run_status === "Running" ? "#6e40c9" : "#d4a72c"}`, borderRadius: "6px", fontSize: "13px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <span>
-          🤖 <strong>托管层{managedRunning ? "运行中" : "已暂停"}</strong>
-          {" — "}{project.workflow_state.managed_flow_state?.last_action || "自动推进中..."}
+          <strong>{managedPresentation?.statusLabel}</strong>
+          {" - "}{managedState?.last_action || "自动推进中..."}
         </span>
-        {managedRunning && (
+        <div style={{ display: "flex", gap: "8px", flexShrink: 0 }}>
+          {managedPresentation?.canPause && (
+            <button className="action-btn secondary" style={{ fontSize: "12px", padding: "4px 10px" }}
+              disabled={busy}
+              onClick={() => runProjectCommand("pause_managed_flow", { projectName: project.name }, "托管层已暂停。")}>暂停托管</button>
+          )}
+          {managedPresentation?.canResume && (
+            <button className="action-btn primary" style={{ fontSize: "12px", padding: "4px 10px" }}
+              disabled={busy}
+              onClick={() => runProjectCommand("resume_managed_flow", { projectName: project.name }, "托管层已恢复。")}>{managedPresentation.resumeLabel}</button>
+          )}
           <button className="action-btn secondary" style={{ fontSize: "12px", padding: "4px 10px" }}
             disabled={busy}
-            onClick={() => runProjectCommand("pause_managed_flow", { projectName: project.name }, "托管层已暂停。")}>暂停托管</button>
-        )}
-        {managedPaused && (
-          <button className="action-btn primary" style={{ fontSize: "12px", padding: "4px 10px" }}
-            disabled={busy}
-            onClick={() => runProjectCommand("resume_managed_flow", { projectName: project.name }, "托管层已恢复。")}>恢复托管</button>
-        )}
+            onClick={() => runProjectCommand("stop_managed_flow", { projectName: project.name }, "托管层已停止，已转为手动处理。")}>停止托管</button>
+        </div>
       </div>
     </div>
   ) : null;

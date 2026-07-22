@@ -8,6 +8,7 @@ import { Modal } from "../components/Modal";
 import { StageCandidateCard } from "../components/StageCandidateCard";
 import { WorkflowActionBar } from "../components/WorkflowActionBar";
 import { DEEPSEEK_MODEL_DISPLAY_NAME } from "../constants";
+import { getMilestoneApprovalPolicy } from "../managedFlowPolicy";
 
 interface Props {
   project: Project;
@@ -88,15 +89,18 @@ export function MilestonePlanningStep(props: Props) {
   }
 
   if (step === "MilestoneApproval") {
+    const approval = getMilestoneApprovalPolicy(draft);
     return (
       <ConsoleStepShell icon={<BadgeCheck />} title="批准大阶段"
-        description="质量检查已通过" status="success" statusLabel="待批准"
+        description={approval.description} status={approval.canApprove ? "success" : "failure"} statusLabel={approval.statusLabel}
         feedback={feedback} busy={busy}
         actions={<WorkflowActionBar>
-          <ActionButton icon={<BadgeCheck size={16} />} loading={busy} onClick={props.onApprove}>批准大阶段</ActionButton>
+          <ActionButton icon={<BadgeCheck size={16} />} loading={busy} disabled={!approval.canApprove}
+            disabledReason="草稿没有明确的检查通过状态，请先同步项目状态。" onClick={props.onApprove}>批准大阶段</ActionButton>
           <ActionButton icon={<RefreshCw size={16} />} variant="danger" onClick={() => props.setRegenerationModalOpen(true)}>驳回并重新生成</ActionButton>
         </WorkflowActionBar>}>
-        {draft?.check_result && <FeedbackBanner type="success" message="检查通过" details={[draft.check_result]} />}
+        {approval.canApprove && draft?.check_result && <FeedbackBanner type="success" message="检查通过" details={[draft.check_result]} />}
+        {!approval.canApprove && <FeedbackBanner type="warning" message="大阶段步骤与检查状态不一致，请同步项目状态后再批准。" />}
         {renderCandidates()}
         <Modal isOpen={props.regenerationModalOpen} onClose={() => props.setRegenerationModalOpen(false)}
           title="驳回并重新生成大阶段草稿" description="新草稿保存成功前会保留当前草稿。"

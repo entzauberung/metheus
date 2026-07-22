@@ -29,7 +29,10 @@ pub(crate) fn detect_changes(
 
 #[cfg(test)]
 mod change_detection_tests {
-    use super::{detect_changes, git_changed_files, FileSnapshot};
+    use super::{
+        build_review_evidence, detect_changes, git_changed_files, truncate_head_tail, FileSnapshot,
+    };
+    use crate::project::ReviewEvidenceStatus;
     use std::process::Command;
 
     #[test]
@@ -87,6 +90,56 @@ mod change_detection_tests {
         );
         std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    #[test]
+    fn long_html_evidence_keeps_script_changes_at_file_tail() -> Result<(), String> {
+        let path =
+            std::env::temp_dir().join(format!("metheus-review-html-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+        let git = |args: &[&str]| -> Result<(), String> {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&path)
+                .output()
+                .map_err(|error| error.to_string())?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(String::from_utf8_lossy(&output.stderr).to_string())
+            }
+        };
+        git(&["init", "--quiet"])?;
+        git(&["config", "user.name", "Metheus Test"])?;
+        git(&["config", "user.email", "metheus-test@example.invalid"])?;
+        let baseline = format!(
+            "<html>\n<body>\n{}</body>\n</html>\n",
+            "<div>line</div>\n".repeat(300)
+        );
+        std::fs::write(path.join("index.html"), &baseline).map_err(|error| error.to_string())?;
+        git(&["add", "index.html"])?;
+        git(&["commit", "--quiet", "-m", "baseline"])?;
+        let updated = baseline.replace(
+            "</body>",
+            "<script>\nfunction toggleTheme() { document.body.classList.toggle('dark'); }\n</script>\n</body>",
+        );
+        std::fs::write(path.join("index.html"), updated).map_err(|error| error.to_string())?;
+
+        let evidence = build_review_evidence(&path.to_string_lossy(), &["index.html".to_string()]);
+        assert!(evidence.rendered.contains("function toggleTheme"));
+        assert!(evidence.rendered.contains("Git diff"));
+        assert_eq!(evidence.status, ReviewEvidenceStatus::Partial);
+        std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_truncation_respects_unicode_boundaries_and_marks_omission() {
+        let input = "审".repeat(1_000);
+        let (rendered, truncated) = truncate_head_tail(&input, 160);
+        assert!(truncated);
+        assert!(rendered.contains("证据截断"));
+        assert!(rendered.chars().count() <= 160);
     }
 }
 /// 调用方（如 check_subtask）
@@ -164,6 +217,216 @@ fn git_changed_files(project_path: &str) -> Vec<String> {
         }
     }
     files.into_iter().collect()
+}
+
+const MAX_REVIEW_EVIDENCE_CHARS: usize = 30_000;
+const MAX_FILE_EVIDENCE_CHARS: usize = 8_000;
+const FULL_FILE_PREVIEW_CHARS: usize = 4_000;
+
+#[derive(Debug)]
+struct ReviewEvidence {
+    rendered: String,
+    status: project::ReviewEvidenceStatus,
+    summary: String,
+}
+
+fn merge_evidence_status(
+    current: &mut project::ReviewEvidenceStatus,
+    next: project::ReviewEvidenceStatus,
+) {
+    use project::ReviewEvidenceStatus::{Complete, Partial, Unavailable};
+    if matches!(next, Unavailable) || matches!((&*current, next), (Complete, Partial)) {
+        *current = next;
+    }
+}
+
+fn truncate_head_tail(text: &str, limit: usize) -> (String, bool) {
+    let total = text.chars().count();
+    if total <= limit {
+        return (text.to_string(), false);
+    }
+    if limit < 80 {
+        return (text.chars().take(limit).collect(), true);
+    }
+
+    let marker_reserve = 60.min(limit / 3);
+    let content_budget = limit.saturating_sub(marker_reserve);
+    let head_budget = content_budget / 2;
+    let tail_budget = content_budget.saturating_sub(head_budget);
+    let head: String = text.chars().take(head_budget).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(tail_budget)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let omitted = total.saturating_sub(head.chars().count() + tail.chars().count());
+    (
+        format!("{head}\n...[证据截断：省略 {omitted} 个字符]...\n{tail}"),
+        true,
+    )
+}
+
+fn number_lines(text: &str, starting_line: usize) -> String {
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| format!("{:>6} | {}", starting_line + index, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_file_preview(content: &str) -> (String, bool) {
+    let total = content.chars().count();
+    if total <= FULL_FILE_PREVIEW_CHARS {
+        return (number_lines(content, 1), false);
+    }
+
+    let head_budget = 1_000;
+    let tail_budget = 3_000;
+    let head: String = content.chars().take(head_budget).collect();
+    let tail: String = content
+        .chars()
+        .rev()
+        .take(tail_budget)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let tail_start = content.lines().count().saturating_sub(tail.lines().count()) + 1;
+    let omitted = total.saturating_sub(head.chars().count() + tail.chars().count());
+    (
+        format!(
+            "{}\n...[文件内容省略 {omitted} 个字符；省略区域不能作为代码不存在的依据]...\n{}",
+            number_lines(&head, 1),
+            number_lines(&tail, tail_start),
+        ),
+        true,
+    )
+}
+
+fn git_diff_for_file(project_path: &str, file: &str) -> Result<String, String> {
+    let literal_pathspec = format!(":(literal){file}");
+    let output = std::process::Command::new("git")
+        .args([
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--unified=20",
+            "HEAD",
+            "--",
+            &literal_pathspec,
+        ])
+        .current_dir(project_path)
+        .output()
+        .map_err(|error| format!("运行 git diff 失败：{error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(format!(
+            "git diff 失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn build_review_evidence(project_path: &str, files: &[String]) -> ReviewEvidence {
+    if files.is_empty() {
+        return ReviewEvidence {
+            rendered: "（没有可供审查的改动文件）".to_string(),
+            status: project::ReviewEvidenceStatus::Unavailable,
+            summary: "没有可供审查的改动文件".to_string(),
+        };
+    }
+
+    let mut rendered = String::new();
+    let mut status = project::ReviewEvidenceStatus::Complete;
+    let mut notes = Vec::new();
+
+    for (index, file) in files.iter().enumerate() {
+        let remaining_files = files.len().saturating_sub(index).max(1);
+        let remaining_budget = MAX_REVIEW_EVIDENCE_CHARS.saturating_sub(rendered.chars().count());
+        if remaining_budget < 200 {
+            merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Partial);
+            notes.push(format!("另有 {} 个文件因总预算未展开", remaining_files));
+            break;
+        }
+        let file_budget = (remaining_budget / remaining_files)
+            .min(MAX_FILE_EVIDENCE_CHARS)
+            .max(200);
+        let mut section = format!("\n=== {file} ===\n");
+        let mut has_diff = false;
+
+        match git_diff_for_file(project_path, file) {
+            Ok(diff) if !diff.trim().is_empty() => {
+                has_diff = true;
+                section.push_str("[Git diff，变更事实]\n");
+                section.push_str(&diff);
+            }
+            Ok(_) => section.push_str("[Git diff 为空，以下当前文件内容为主要证据]\n"),
+            Err(error) => {
+                merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Unavailable);
+                notes.push(format!("{file}: {error}"));
+                section.push_str(&format!("[Git diff 不可用：{error}]\n"));
+            }
+        }
+
+        let full_path = std::path::Path::new(project_path).join(file);
+        if full_path.exists() {
+            match std::fs::read_to_string(&full_path) {
+                Ok(content) => {
+                    let (preview, partial) = render_file_preview(&content);
+                    section.push_str("\n[当前文件内容，带行号]\n");
+                    section.push_str(&preview);
+                    if partial {
+                        merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Partial);
+                        notes.push(format!("{file}: 当前文件仅提供头尾上下文"));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Partial);
+                    notes.push(format!("{file}: 二进制或非 UTF-8 文件"));
+                    section.push_str("\n[当前文件为二进制或非 UTF-8，未展开文本内容]\n");
+                }
+                Err(error) => {
+                    merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Unavailable);
+                    notes.push(format!("{file}: 读取失败：{error}"));
+                    section.push_str(&format!("\n[当前文件读取失败：{error}]\n"));
+                }
+            }
+        } else {
+            if !has_diff {
+                merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Unavailable);
+                notes.push(format!("{file}: 文件不存在且没有 Git diff"));
+            }
+            section.push_str("\n[当前文件不存在，可能为本次删除]\n");
+        }
+
+        let (section, truncated) = truncate_head_tail(&section, file_budget);
+        if truncated {
+            merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Partial);
+            notes.push(format!("{file}: 单文件证据超过 {file_budget} 字符"));
+        }
+        rendered.push_str(&section);
+        rendered.push('\n');
+    }
+
+    let status_label = match status {
+        project::ReviewEvidenceStatus::Complete => "完整",
+        project::ReviewEvidenceStatus::Partial => "部分",
+        project::ReviewEvidenceStatus::Unavailable => "不可用",
+    };
+    let summary = if notes.is_empty() {
+        format!("证据{status_label}，覆盖 {} 个文件", files.len())
+    } else {
+        format!("证据{status_label}：{}", notes.join("；"))
+    };
+    ReviewEvidence {
+        rendered,
+        status,
+        summary,
+    }
 }
 /// 执行测试命令，带超时控制（spawn + try_wait 轮询）
 /// 返回: (exit_code, stdout, stderr)
@@ -401,57 +664,65 @@ impl AutomatedTestEvidence {
 pub(crate) async fn check_subtask(
     project_path: &str,
     subtask_goal: &str,
+    subtask_id: &str,
+    milestone_id: &str,
+    mid_stage_id: &str,
+) -> Result<project::TestResult, String> {
+    check_subtask_with_context(
+        project_path,
+        subtask_goal,
+        subtask_id,
+        milestone_id,
+        mid_stage_id,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn check_subtask_with_context(
+    project_path: &str,
+    subtask_goal: &str,
     _subtask_id: &str,
     _milestone_id: &str,
     _mid_stage_id: &str,
+    acceptance_criteria: Option<Vec<String>>,
+    authorized_paths: Option<Vec<String>>,
+    execution_prompt: Option<String>,
 ) -> Result<project::TestResult, String> {
     // 1.尝试 git diff --name-only 获取改动文件
     let files = git_changed_files(project_path);
 
     // 2.如果 git diff 没能拿到文件列表，降级：扫描项目目录中的源文件
     let files = if files.is_empty() {
-        walkdir::WalkDir::new(&project_path)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .filter_map(|e| {
-                let path = e.path().strip_prefix(&project_path).ok()?;
-                let ext = path.extension()?.to_str()?;
-                // 只收集常见源代码文件
-                match ext {
-                    "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "cpp"
-                    | "h" | "hpp" | "cs" | "rb" | "php" | "swift" | "kt" | "scala" | "vue"
-                    | "svelte" | "html" | "css" | "scss" | "json" | "yaml" | "yml" | "toml"
-                    | "md" | "txt" => Some(path.to_string_lossy().to_string()),
-                    _ => None,
-                }
-            })
-            .collect::<Vec<String>>()
+        if let Some(paths) = authorized_paths.as_ref().filter(|paths| !paths.is_empty()) {
+            paths.clone()
+        } else {
+            walkdir::WalkDir::new(&project_path)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .filter_map(|e| {
+                    let path = e.path().strip_prefix(&project_path).ok()?;
+                    let ext = path.extension()?.to_str()?;
+                    // 只收集常见源代码文件
+                    match ext {
+                        "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "java" | "c" | "cpp"
+                        | "h" | "hpp" | "cs" | "rb" | "php" | "swift" | "kt" | "scala" | "vue"
+                        | "svelte" | "html" | "css" | "scss" | "json" | "yaml" | "yml" | "toml"
+                        | "md" | "txt" => Some(path.to_string_lossy().to_string()),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<String>>()
+        }
     } else {
         files
     };
 
-    // 3.遍历每个文件，读取内容（限制总大小防止爆 token）
-    let mut file_contents = String::new();
-    const MAX_CONTENT_BYTES: usize = 30_000; // 约 7500 个中文字符
-    for file in &files {
-        if file_contents.len() >= MAX_CONTENT_BYTES {
-            break;
-        }
-        let content = std::fs::read_to_string(std::path::Path::new(&project_path).join(file))
-            .unwrap_or_default();
-        let truncated = if content.len() > 4000 {
-            let prefix: String = content.chars().take(1000).collect();
-            format!(
-                "{}...(省略后续 {} 字符)",
-                prefix,
-                content.chars().count().saturating_sub(1000)
-            )
-        } else {
-            content
-        };
-        file_contents.push_str(&format!("\n=== {} ===\n{}\n", file, truncated));
-    }
+    // 3.以 Git diff 为主证据，并为长文件提供显式标记的头尾上下文。
+    let review_evidence = build_review_evidence(project_path, &files);
     // ===== 真测试：检测项目类型，执行对应的测试命令 =====
     let test_evidence = {
         let project_root = std::path::Path::new(project_path);
@@ -657,22 +928,48 @@ pub(crate) async fn check_subtask(
             truncated, suffix
         )
     };
+    let acceptance_section = acceptance_criteria
+        .as_ref()
+        .filter(|items| !items.is_empty())
+        .map(|items| format!("## 验收标准\n- {}\n\n", items.join("\n- ")))
+        .unwrap_or_default();
+    let execution_section = execution_prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty())
+        .map(|prompt| {
+            let prompt: String = prompt.chars().take(2_000).collect();
+            format!("## 执行提示\n{prompt}\n\n")
+        })
+        .unwrap_or_default();
+    let authorized_section = authorized_paths
+        .as_ref()
+        .filter(|paths| !paths.is_empty())
+        .map(|paths| format!("## 授权文件范围\n- {}\n\n", paths.join("\n- ")))
+        .unwrap_or_default();
+    let review_header = format!(
+        "{}{}{}{}## 审查证据状态\n{}\n证据中出现省略标记时，不得据此断言省略区域中的函数、标签或实现不存在。\n\n",
+        goal_section,
+        acceptance_section,
+        execution_section,
+        authorized_section,
+        review_evidence.summary,
+    );
     let user_message = if let Some(ref test_result) = test_evidence.rendered {
         format!(
             "{}请检查以下代码改动。\n\n## 自动化测试结果\n项目自动化测试已执行，结果如下：\n\n{}\n\n---\n\n## 改动文件列表（共 {} 个文件）\n{}\n\n## 改动文件内容\n{}",
-            goal_section,
+            review_header,
             test_result,
             files.len(),
             files.join("\n"),
-            file_contents
+            review_evidence.rendered
         )
     } else {
         format!(
             "{}请检查以下代码改动：\n\n## 改动文件列表（共 {} 个文件）\n{}\n\n## 改动文件内容\n{}",
-            goal_section,
+            review_header,
             files.len(),
             files.join("\n"),
-            file_contents
+            review_evidence.rendered
         )
     };
     //     test_output.as_ref().map(|s| s.len()).unwrap_or(0));
@@ -730,6 +1027,8 @@ pub(crate) async fn check_subtask(
         }
         project::AutomatedTestStatus::Unavailable => project::VerificationKind::Legacy,
     };
+    test_result.review_evidence_status = review_evidence.status;
+    test_result.review_evidence_summary = review_evidence.summary;
 
     match test_evidence.status {
         project::AutomatedTestStatus::Failed => {

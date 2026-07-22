@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 
 const MAX_DIAGNOSIS_CHARS: usize = 12_000;
 const MAX_EVIDENCE_CHARS: usize = 6_000;
+const MAX_FAILURE_HISTORY: usize = 4;
 const DEFAULT_MAX_ATTEMPTS: u32 = 2;
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -38,7 +39,7 @@ fn record_failed_signature(
     }
     recovery.error_kind = kind;
     recovery.error_signature = signature;
-    recovery.attempt >= recovery.max_attempts || recovery.repeated_signature_count >= 2
+    recovery.attempt >= recovery.max_attempts || recovery.repeated_signature_count >= 3
 }
 
 fn touch(proj: &mut project::Project) {
@@ -69,6 +70,14 @@ fn test_failure_summary(test: Option<&project::TestResult>, fallback: &str) -> S
             truncate_chars(&test.test_output_summary, 2_000)
         ));
     }
+    if test.review_evidence_status != project::ReviewEvidenceStatus::Complete
+        && !test.review_evidence_summary.is_empty()
+    {
+        parts.push(format!(
+            "review_evidence={}",
+            truncate_chars(&test.review_evidence_summary, 2_000)
+        ));
+    }
     if parts.is_empty() {
         fallback.to_string()
     } else {
@@ -88,10 +97,11 @@ pub(crate) fn classify_test_result(
         project::AutomatedTestStatus::Passed
         | project::AutomatedTestStatus::NotConfigured
         | project::AutomatedTestStatus::Unknown => {
-            if test
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("AI API") || warning.contains("解析失败"))
+            if test.review_evidence_status != project::ReviewEvidenceStatus::Complete
+                || test
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("AI API") || warning.contains("解析失败"))
             {
                 project::RecoveryErrorKind::TestUnavailable
             } else {
@@ -109,8 +119,9 @@ fn create_recovery_state(
     failure: String,
 ) -> project::RecoveryState {
     let now = chrono::Utc::now().to_rfc3339();
+    let initial_failure = truncate_chars(&failure, 4_000);
     project::RecoveryState {
-        error_signature: normalized_signature(&kind, &failure),
+        error_signature: normalized_signature(&kind, &initial_failure),
         error_kind: kind,
         phase: project::RecoveryPhase::Diagnosing,
         attempt: 0,
@@ -121,7 +132,13 @@ fn create_recovery_state(
         baseline_commit,
         last_diagnosis: String::new(),
         last_repair_summary: String::new(),
-        original_test_failure: failure,
+        original_test_failure: initial_failure.clone(),
+        replan_attempted: false,
+        failure_history: if initial_failure.is_empty() {
+            vec![]
+        } else {
+            vec![initial_failure]
+        },
         started_at: now.clone(),
         updated_at: now,
     }
@@ -216,6 +233,7 @@ pub(crate) fn ensure_quality_recovery(
                 project::RecoveryPhase::Diagnosing
                     | project::RecoveryPhase::Repairing
                     | project::RecoveryPhase::Retesting
+                    | project::RecoveryPhase::Replanning
             ));
         }
     }
@@ -567,6 +585,8 @@ fn merge_execution_result(
         output: truncate_chars(&output, 32_000),
         error_log: repair.error_log,
         file_changes: paths.into_iter().collect(),
+        exit_code: repair.exit_code,
+        engine_provider: repair.engine_provider,
     }
 }
 
@@ -702,8 +722,10 @@ pub(crate) async fn run_error_recovery(
         "info",
         project::ExecutionEventType::RepairAttemptStarted,
         format!(
-            "开始第 {}/{} 次自动修复",
-            recovery.attempt, recovery.max_attempts
+            "开始第 {}/{} 次自动修复（{}）",
+            recovery.attempt,
+            recovery.max_attempts,
+            session.engine_snapshot.provider.display_name(),
         ),
         Some(&session.milestone_id),
         Some(&session.mid_stage_id),
@@ -741,12 +763,15 @@ pub(crate) async fn run_error_recovery(
     drop(pipeline_guard);
 
     let prompt = repair_prompt(&recovery, &subtask, &diagnosis);
-    let repair_result = crate::executor::execute_subtask_inner(
-        &proj.project_path,
-        &prompt,
-        &authorized_paths,
-        &session.subtask_id,
-        &recovery_execution_id,
+    let repair_result = crate::engine::execute(
+        &session.engine_snapshot,
+        crate::engine::ExecutionRequest {
+            project_path: proj.project_path.clone(),
+            prompt,
+            authorized_paths: authorized_paths.clone(),
+            subtask_id: session.subtask_id.clone(),
+            execution_id: recovery_execution_id.clone(),
+        },
         state.pipeline_state.clone(),
     )
     .await;
@@ -766,7 +791,10 @@ pub(crate) async fn run_error_recovery(
         Ok(result) if result.success => result,
         Ok(result) => {
             let message = if result.error_log.is_empty() {
-                "Claude Code 修复进程非零退出".to_string()
+                format!(
+                    "{} 修复进程非零退出",
+                    session.engine_snapshot.provider.display_name()
+                )
             } else {
                 result.error_log
             };
@@ -780,7 +808,7 @@ pub(crate) async fn run_error_recovery(
             crate::save_project(&proj)?;
             return crate::load_project(&project_name);
         }
-        Err(project::SubTaskError::UserPaused) => {
+        Err(crate::engine::EngineError::Cancelled) => {
             mark_waiting_human(
                 &mut proj,
                 project::RecoveryErrorKind::HumanRequired,
@@ -795,23 +823,23 @@ pub(crate) async fn run_error_recovery(
             crate::save_project(&proj)?;
             return crate::load_project(&project_name);
         }
-        Err(project::SubTaskError::ExecutionFailed { message }) => {
-            handle_repair_execution_failure(
-                &mut proj,
-                &session,
-                &recovery_execution_id,
-                &message,
-                &mut pipeline_guard,
-            )?;
-            crate::save_project(&proj)?;
-            return crate::load_project(&project_name);
-        }
-        Err(project::SubTaskError::Timeout) => {
+        Err(crate::engine::EngineError::Timeout) => {
             handle_repair_execution_failure(
                 &mut proj,
                 &session,
                 &recovery_execution_id,
                 "自动修复执行超时",
+                &mut pipeline_guard,
+            )?;
+            crate::save_project(&proj)?;
+            return crate::load_project(&project_name);
+        }
+        Err(error) => {
+            handle_repair_execution_failure(
+                &mut proj,
+                &session,
+                &recovery_execution_id,
+                &error.to_string(),
                 &mut pipeline_guard,
             )?;
             crate::save_project(&proj)?;
@@ -930,12 +958,19 @@ pub(crate) async fn run_error_recovery(
     } else {
         subtask.execution_prompt.clone()
     };
-    let test = crate::test_runner::check_subtask(
+    let test = crate::test_runner::check_subtask_with_context(
         &proj.project_path,
-        &original_prompt,
+        if subtask.goal.is_empty() {
+            &subtask.title
+        } else {
+            &subtask.goal
+        },
         &session.subtask_id,
         &session.milestone_id,
         &session.mid_stage_id,
+        Some(subtask.acceptance_criteria.clone()),
+        Some(authorized_paths.clone()),
+        Some(original_prompt),
     )
     .await
     .unwrap_or(project::TestResult {
@@ -1377,12 +1412,19 @@ pub(crate) async fn resolve_human_recovery(
             } else {
                 subtask.execution_prompt.clone()
             };
-            let test = crate::test_runner::check_subtask(
+            let test = crate::test_runner::check_subtask_with_context(
                 &proj.project_path,
-                &prompt,
+                if subtask.goal.is_empty() {
+                    &subtask.title
+                } else {
+                    &subtask.goal
+                },
                 &session.subtask_id,
                 &session.milestone_id,
                 &session.mid_stage_id,
+                Some(subtask.acceptance_criteria.clone()),
+                Some(authorized_paths.clone()),
+                Some(prompt),
             )
             .await
             .unwrap_or(project::TestResult {
@@ -1509,6 +1551,28 @@ mod tests {
         assert_eq!(
             classify_test_result(Some(&failed_with_unavailable_review)),
             project::RecoveryErrorKind::TestFailure
+        );
+
+        let partial_review = project::TestResult {
+            passed: false,
+            automated_test_status: project::AutomatedTestStatus::Passed,
+            review_evidence_status: project::ReviewEvidenceStatus::Partial,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_test_result(Some(&partial_review)),
+            project::RecoveryErrorKind::TestUnavailable
+        );
+
+        let complete_review = project::TestResult {
+            passed: false,
+            automated_test_status: project::AutomatedTestStatus::Passed,
+            review_evidence_status: project::ReviewEvidenceStatus::Complete,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_test_result(Some(&complete_review)),
+            project::RecoveryErrorKind::ReviewFailure
         );
     }
 

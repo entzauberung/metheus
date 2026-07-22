@@ -183,13 +183,21 @@ pub(crate) async fn execute_current_subtask(
     let mut proj = crate::load_project(&project_name)?;
     let project_path = proj.project_path.clone();
 
-    if proj
+    if let Some(session) = proj
         .execution_session
         .as_ref()
-        .map(|session| session.active && session.status == "executing")
-        .unwrap_or(false)
+        .filter(|session| session.active)
     {
-        return Err("项目已有活跃执行会话，请先同步或处理恢复状态。".to_string());
+        let message = match session.parsed_status() {
+            project::ExecutionSessionStatus::AwaitingConfirmation => {
+                "当前任务已有待确认变更，请先确认、驳回或恢复基线。"
+            }
+            project::ExecutionSessionStatus::QualityBlocked => {
+                "当前任务处于质量阻断状态，请先完成恢复或人工核验。"
+            }
+            _ => "项目已有活跃执行会话，请先同步或处理恢复状态。",
+        };
+        return Err(message.to_string());
     }
 
     let milestone_id = proj.current_milestone_id.clone();
@@ -224,6 +232,13 @@ pub(crate) async fn execute_current_subtask(
     crate::plan_contract::validate_subtasks_in_project(&mid.subtasks, &project_path)
         .map_err(|error| format!("执行计划契约无效：{}", error))?;
 
+    crate::engine::validate_profile(&proj.execution_profile)?;
+    let engine_health = crate::engine::check_engine_health(&proj.execution_profile).await;
+    if engine_health.status.blocks_execution() {
+        return Err(format!("执行引擎不可用：{}", engine_health.message));
+    }
+    let execution_profile = proj.execution_profile.clone();
+
     // Find the next pending subtask
     let next_idx = mid
         .subtasks
@@ -236,6 +251,12 @@ pub(crate) async fn execute_current_subtask(
         crate::plan_contract::validate_subtask(subtask, &format!("第 {} 个小阶段", next_idx + 1))?;
     let subtask_id = subtask.id.clone();
     let subtask_title = subtask.title.clone();
+    let subtask_goal = if subtask.goal.is_empty() {
+        subtask.title.clone()
+    } else {
+        subtask.goal.clone()
+    };
+    let acceptance_criteria = subtask.acceptance_criteria.clone();
     let approved_prompt = if subtask.execution_prompt.is_empty() {
         subtask.prompt.clone()
     } else {
@@ -272,10 +293,11 @@ pub(crate) async fn execute_current_subtask(
         "info",
         project::ExecutionEventType::UserExecute,
         format!(
-            "👆 用户点击执行 ({}/{})：{}",
+            "👆 用户点击执行 ({}/{})：{}（{}）",
             next_idx + 1,
             total,
-            subtask_title
+            subtask_title,
+            execution_profile.provider.display_name(),
         ),
         Some(&milestone_id),
         Some(&mid_stage_id),
@@ -330,6 +352,7 @@ pub(crate) async fn execute_current_subtask(
             plan_revision,
             subtask_index: next_idx,
             total_subtasks: total,
+            engine_snapshot: execution_profile.clone(),
         });
     }
 
@@ -385,11 +408,14 @@ pub(crate) async fn execute_current_subtask(
             mid_stage_id,
             subtask_id,
             subtask_title,
+            subtask_goal,
+            acceptance_criteria,
             approved_prompt,
             authorized_paths,
             next_idx,
             total,
             execution_id,
+            execution_profile,
             background_pipeline_state.clone(),
         )
         .await;
@@ -433,35 +459,41 @@ async fn execute_current_subtask_background(
     mid_stage_id: String,
     subtask_id: String,
     subtask_title: String,
+    subtask_goal: String,
+    acceptance_criteria: Vec<String>,
     approved_prompt: String,
     authorized_paths: Vec<String>,
     subtask_idx: usize,
     total: usize,
     execution_id: String,
+    execution_profile: project::ExecutionProfile,
     pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
 ) -> Result<(), BackgroundExecutionFailure> {
-    let exec_result = match crate::executor::execute_subtask_inner(
-        &project_path,
-        &approved_prompt,
-        &authorized_paths,
-        &subtask_id,
-        &execution_id,
+    let exec_result = match crate::engine::execute(
+        &execution_profile,
+        crate::engine::ExecutionRequest {
+            project_path: project_path.clone(),
+            prompt: approved_prompt.clone(),
+            authorized_paths: authorized_paths.clone(),
+            subtask_id: subtask_id.clone(),
+            execution_id: execution_id.clone(),
+        },
         pipeline_state.clone(),
     )
     .await
     {
         Ok(result) => result,
-        Err(project::SubTaskError::UserPaused) => return Ok(()),
-        Err(project::SubTaskError::ExecutionFailed { message }) => {
-            return Err(BackgroundExecutionFailure::new(
-                project::RecoveryErrorKind::ExecutionError,
-                message,
-            ))
-        }
-        Err(project::SubTaskError::Timeout) => {
+        Err(crate::engine::EngineError::Cancelled) => return Ok(()),
+        Err(crate::engine::EngineError::Timeout) => {
             return Err(BackgroundExecutionFailure::new(
                 project::RecoveryErrorKind::ExecutionError,
                 "执行超时".to_string(),
+            ))
+        }
+        Err(error) => {
+            return Err(BackgroundExecutionFailure::new(
+                project::RecoveryErrorKind::ExecutionError,
+                error.to_string(),
             ))
         }
     };
@@ -470,7 +502,7 @@ async fn execute_current_subtask_background(
         return Err(BackgroundExecutionFailure::new(
             project::RecoveryErrorKind::ExecutionError,
             if exec_result.error_log.is_empty() {
-                "Claude Code 非零退出".to_string()
+                format!("{} 非零退出", execution_profile.provider.display_name())
             } else {
                 exec_result.error_log.clone()
             },
@@ -511,12 +543,15 @@ async fn execute_current_subtask_background(
         }
     }
 
-    let test = crate::test_runner::check_subtask(
+    let test = crate::test_runner::check_subtask_with_context(
         &project_path,
-        &approved_prompt,
+        &subtask_goal,
         &subtask_id,
         &subtask_title,
         &mid_stage_id,
+        Some(acceptance_criteria),
+        Some(authorized_paths),
+        Some(approved_prompt),
     )
     .await
     .unwrap_or(project::TestResult {
@@ -596,6 +631,7 @@ async fn execute_current_subtask_background(
         plan_revision: session.plan_revision,
         subtask_index: subtask_idx,
         total_subtasks: total,
+        engine_snapshot: session.engine_snapshot,
     });
     write_execution_history(
         &mut proj,
@@ -1691,13 +1727,17 @@ pub(crate) async fn get_execution_workspace_status(
             git_user_available: false,
             git_email_available: false,
             working_tree_clean: false,
+            git_metadata_ready: false,
+            ready_for_new_execution: false,
+            has_managed_task_changes: false,
+            has_external_changes: false,
             ready: false,
             status_message: "项目路径未设置。".to_string(),
             issues: vec![project::ExecutionWorkspaceIssue::PathMissing],
             changes: vec![],
         });
     }
-    get_execution_workspace_status_inner(path)
+    get_execution_workspace_status_for_project(&proj)
 }
 
 /// 准备执行工作区：在批准前或执行阶段由用户显式初始化 Git 并创建首次提交。
@@ -1836,7 +1876,7 @@ pub(crate) async fn prepare_execution_workspace(
         }
     }
 
-    let final_status = get_execution_workspace_status_inner(&path)?;
+    let final_status = get_execution_workspace_status_for_project(&proj)?;
     if final_status.ready {
         write_execution_history(
             &mut proj,
@@ -1886,7 +1926,7 @@ pub(crate) async fn refresh_execution_workspace(
     project_name: String,
 ) -> Result<project::ExecutionWorkspaceStatus, String> {
     let mut proj = crate::load_project(&project_name)?;
-    let status = get_execution_workspace_status_inner(&proj.project_path)?;
+    let status = get_execution_workspace_status_for_project(&proj)?;
     if status.ready {
         let mut resumed = false;
         if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
@@ -1938,6 +1978,7 @@ fn parse_workspace_changes(output: &[u8]) -> Vec<project::ExecutionWorkspaceChan
             index_status: index_status.to_string(),
             worktree_status: worktree_status.to_string(),
             tracked: index_status != '?' || worktree_status != '?',
+            managed: false,
         });
         index += 1;
         if is_rename {
@@ -1964,6 +2005,10 @@ pub(crate) fn get_execution_workspace_status_inner(
             git_user_available: false,
             git_email_available: false,
             working_tree_clean: false,
+            git_metadata_ready: false,
+            ready_for_new_execution: false,
+            has_managed_task_changes: false,
+            has_external_changes: false,
             ready: false,
             status_message: if !path_exists {
                 format!("项目路径 {} 不存在。", path)
@@ -2025,11 +2070,9 @@ pub(crate) fn get_execution_workspace_status_inner(
     };
     let working_tree_clean = is_git_repo && changes.is_empty();
 
-    let ready = is_git_repo
-        && has_commits
-        && git_user_available
-        && git_email_available
-        && working_tree_clean;
+    let git_metadata_ready =
+        is_git_repo && has_commits && git_user_available && git_email_available;
+    let ready_for_new_execution = git_metadata_ready && working_tree_clean;
 
     let mut issues = Vec::new();
     if !is_git_repo {
@@ -2048,7 +2091,7 @@ pub(crate) fn get_execution_workspace_status_inner(
         issues.push(project::ExecutionWorkspaceIssue::DirtyWorkingTree);
     }
 
-    let status_message = if ready {
+    let status_message = if ready_for_new_execution {
         "Git 工作区已就绪，可以执行小阶段。".to_string()
     } else {
         let mut missing = Vec::new();
@@ -2078,11 +2121,82 @@ pub(crate) fn get_execution_workspace_status_inner(
         git_user_available,
         git_email_available,
         working_tree_clean,
-        ready,
+        git_metadata_ready,
+        ready_for_new_execution,
+        has_managed_task_changes: false,
+        has_external_changes: !changes.is_empty(),
+        ready: ready_for_new_execution,
         status_message,
         issues,
         changes,
     })
+}
+
+fn get_execution_workspace_status_for_project(
+    proj: &project::Project,
+) -> Result<project::ExecutionWorkspaceStatus, String> {
+    let mut status = get_execution_workspace_status_inner(&proj.project_path)?;
+    if !status.git_metadata_ready || status.changes.is_empty() {
+        return Ok(status);
+    }
+
+    let managed_paths = proj.execution_session.as_ref().and_then(|session| {
+        if !session.active || session.base_commit.is_empty() {
+            return None;
+        }
+        let current_head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&proj.project_path)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())?;
+        if current_head != session.base_commit {
+            return None;
+        }
+        let subtask = proj
+            .milestones
+            .iter()
+            .find(|milestone| milestone.id == session.milestone_id)
+            .and_then(|milestone| {
+                milestone
+                    .mid_stages
+                    .iter()
+                    .find(|mid_stage| mid_stage.id == session.mid_stage_id)
+            })
+            .and_then(|mid_stage| {
+                mid_stage
+                    .subtasks
+                    .iter()
+                    .find(|subtask| subtask.id == session.subtask_id)
+            })?;
+        Some(
+            subtask
+                .allowed_file_paths
+                .iter()
+                .chain(subtask.new_file_paths.iter())
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+        )
+    });
+
+    if let Some(managed_paths) = managed_paths {
+        for change in &mut status.changes {
+            change.managed = managed_paths.contains(&change.path);
+        }
+    }
+    status.has_managed_task_changes = status.changes.iter().any(|change| change.managed);
+    status.has_external_changes = status.changes.iter().any(|change| !change.managed);
+    status.status_message = if status.has_external_changes && status.has_managed_task_changes {
+        "当前任务有待确认的代码变更，同时存在任务范围外改动。".to_string()
+    } else if status.has_external_changes {
+        "Git 工作区包含当前任务范围外的未提交或未跟踪修改。".to_string()
+    } else if status.has_managed_task_changes {
+        "当前任务有待确认的代码变更。".to_string()
+    } else {
+        status.status_message
+    };
+    Ok(status)
 }
 
 // ===================================================================
@@ -3487,6 +3601,7 @@ mod tests {
             plan_revision: 1,
             subtask_index: 0,
             total_subtasks: 1,
+            engine_snapshot: project::ExecutionProfile::default(),
         }
     }
 
@@ -3681,6 +3796,36 @@ mod tests {
             .changes
             .iter()
             .any(|change| { change.path == "untracked.txt" && !change.tracked }));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_classifies_active_task_changes_separately() -> Result<(), String> {
+        let repo = TempGitRepo::new("managed-workspace")?;
+        let session = execution_session("awaiting_confirmation", "execution-1", &repo.head()?);
+        let project = execution_project(
+            "managed-workspace",
+            &repo.path,
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(session),
+        );
+        std::fs::write(repo.path.join("tracked.txt"), "managed change\n")
+            .map_err(|error| error.to_string())?;
+
+        let managed = get_execution_workspace_status_for_project(&project)?;
+        assert!(managed.git_metadata_ready);
+        assert!(!managed.ready_for_new_execution);
+        assert!(managed.has_managed_task_changes);
+        assert!(!managed.has_external_changes);
+        assert!(managed.changes.iter().all(|change| change.managed));
+        assert!(managed.status_message.contains("待确认"));
+
+        std::fs::write(repo.path.join("outside.txt"), "outside\n")
+            .map_err(|error| error.to_string())?;
+        let mixed = get_execution_workspace_status_for_project(&project)?;
+        assert!(mixed.has_managed_task_changes);
+        assert!(mixed.has_external_changes);
+        assert!(mixed.status_message.contains("范围外"));
         Ok(())
     }
 
@@ -4180,6 +4325,7 @@ mod tests {
             output: String::new(),
             error_log: String::new(),
             file_changes: vec!["tracked.txt".to_string()],
+            ..Default::default()
         });
         subtask.test_result = Some(project::TestResult {
             passed: false,
@@ -4234,6 +4380,7 @@ mod tests {
             output: String::new(),
             error_log: String::new(),
             file_changes: vec!["tracked.txt".to_string()],
+            ..Default::default()
         });
         subtask.test_result = Some(project::TestResult {
             passed: false,
@@ -4298,6 +4445,7 @@ mod tests {
                 output: "fixed".to_string(),
                 error_log: String::new(),
                 file_changes: vec!["tracked.txt".to_string()],
+                ..Default::default()
             });
         let test = project::TestResult {
             passed: true,
@@ -4377,6 +4525,7 @@ mod tests {
             output: String::new(),
             error_log: String::new(),
             file_changes: vec!["tracked.txt".to_string()],
+            ..Default::default()
         });
         subtask.test_result = Some(project::TestResult {
             passed: false,
@@ -4669,6 +4818,7 @@ mod tests {
                     output: "ok".to_string(),
                     error_log: String::new(),
                     file_changes: vec!["tracked.txt".to_string()],
+                    ..Default::default()
                 });
             done.milestones[0].mid_stages[0].subtasks[0].test_result = Some(project::TestResult {
                 passed: true,

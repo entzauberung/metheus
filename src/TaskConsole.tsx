@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
 import { ArrowDown, CheckCircle2, FileDiff, FileText, History, Layers, Milestone, Tags } from "lucide-react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import type { ChangeHistoryEntry, ConstitutionChangeHistory, ExecutionHistoryEntry, GitTagTree, LogEntry, PipelineState, TestLog } from "./types";
+import type { ChangeHistoryEntry, ConstitutionChangeHistory, ExecutionHistoryEntry, GitTagTree, PipelineState, TestLog } from "./types";
+import { mergeExecutionLogs } from "./logPolicy";
 
 const LOG_LEVEL_ICON: Record<string, string> = {
   info: "ℹ",
@@ -116,17 +117,9 @@ export default function TaskConsole({
     }
   }, [executionStatus?.log_history?.length, executionStatus?.current_log, executionHistory?.length, stickToBottom]);
 
-  // 合并持久化历史与本次运行日志；过滤与历史重复的启动记录
-  const historyTexts = new Set((executionHistory ?? []).map((e) => e.text));
-  const runtimeLogs: LogEntry[] = (executionStatus?.log_history ?? []).filter((entry) => {
-    if (historyTexts.has(entry.text) && entry.text.startsWith("▶ 执行中")) {
-      return false;
-    }
-    return true;
-  });
+  const mergedLogs = mergeExecutionLogs(executionHistory, executionStatus?.log_history);
   const hasAnyLog =
-    (executionHistory && executionHistory.length > 0)
-    || runtimeLogs.length > 0
+    mergedLogs.length > 0
     || !!executionStatus?.current_log;
 
   return (
@@ -146,19 +139,10 @@ export default function TaskConsole({
               className="execution-log-list"
               onScroll={handleLogScroll}
             >
-              {/* 持久化执行历史（主视图，刷新不丢） */}
-              {executionHistory && executionHistory.length > 0 && executionHistory.map((entry, i) => (
-                <div key={`hist-${entry.timestamp}-${i}`} className={`execution-log-entry log-${entry.level}`}>
+              {mergedLogs.map((entry) => (
+                <div key={entry.key} className={`execution-log-entry log-${entry.level}${entry.source === "runtime" ? " log-runtime" : ""}`}>
                   <span className="execution-log-time">{formatLogTime(entry.timestamp)}</span>
-                  <span className="execution-log-level">{LOG_LEVEL_ICON[entry.level] || ""}</span>
-                  <span className="execution-log-text">{entry.text}</span>
-                </div>
-              ))}
-              {/* 本次运行实时日志（含流式 stdout/stderr） */}
-              {runtimeLogs.map((entry, i) => (
-                <div key={`rt-${entry.timestamp}-${i}`} className={`execution-log-entry log-${entry.level} log-runtime`}>
-                  <span className="execution-log-time">{formatLogTime(entry.timestamp)}</span>
-                  <span className="execution-log-level">{LOG_LEVEL_ICON[entry.level] || "⚡"}</span>
+                  <span className="execution-log-level">{LOG_LEVEL_ICON[entry.level] || (entry.source === "runtime" ? "⚡" : "")}</span>
                   <span className="execution-log-text">{entry.text}</span>
                 </div>
               ))}

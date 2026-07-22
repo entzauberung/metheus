@@ -1,8 +1,10 @@
 // src/ProjectEntry.tsx — Before 页面：No Project / Half Project 双入口
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import { ProjectEntryKind, Project, PathValidationResult } from "./types";
+import { EngineHealth, ExecutionProfile, ProjectEntryKind, Project, PathValidationResult } from "./types";
 import { Modal } from "./components/Modal";
+import { ExecutionEngineSelector, EngineHealthCheckState } from "./components/ExecutionEngineSelector";
+import { engineHealthBlocksExecution } from "./enginePolicy";
 import { Sparkles, FolderOpen, FolderPlus, ArrowRight } from "lucide-react";
 
 interface ProjectEntryProps {
@@ -31,6 +33,20 @@ export function ProjectEntry({ onProjectCreated }: ProjectEntryProps) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [showCreateConfirm, setShowCreateConfirm] = useState(false);
+  const [executionProfile, setExecutionProfile] = useState<ExecutionProfile>({
+    runtime: "Plugin",
+    provider: "ClaudeCode",
+    permission_profile: "Unattended",
+    profile_revision: 1,
+  });
+  const [engineHealth, setEngineHealth] = useState<EngineHealth | null>(null);
+  const [checkingEngine, setCheckingEngine] = useState(true);
+  const engineUnavailable = checkingEngine || engineHealth === null
+    || engineHealthBlocksExecution(engineHealth);
+  const handleEngineHealthChange = useCallback(({ health, checking }: EngineHealthCheckState) => {
+    setEngineHealth(health);
+    setCheckingEngine(checking);
+  }, []);
 
   const handleSelectKind = (kind: ProjectEntryKind) => {
     setSelectedKind(kind);
@@ -43,6 +59,7 @@ export function ProjectEntry({ onProjectCreated }: ProjectEntryProps) {
     if (!selectedKind) { setError("请先选择项目类型"); return; }
     if (!projectName.trim()) { setError("请输入项目名称"); return; }
     if (!projectPath.trim()) { setError("请输入项目路径"); return; }
+    if (engineUnavailable) { setError(engineHealth?.message || "正在检查执行引擎"); return; }
 
     setLoading(true);
     try {
@@ -102,6 +119,10 @@ export function ProjectEntry({ onProjectCreated }: ProjectEntryProps) {
   };
 
   const handleConfirmCreate = async () => {
+    if (engineUnavailable) {
+      setError(engineHealth?.message || "正在检查执行引擎");
+      return;
+    }
     setShowCreateConfirm(false);
     setLoading(true);
     try {
@@ -119,6 +140,7 @@ export function ProjectEntry({ onProjectCreated }: ProjectEntryProps) {
       projectName: projectName.trim(),
       projectPath: projectPath.trim(),
       entryKind: selectedKind,
+      executionProfile,
     });
     onProjectCreated(project);
   };
@@ -183,12 +205,19 @@ export function ProjectEntry({ onProjectCreated }: ProjectEntryProps) {
             />
           </div>
 
+          <ExecutionEngineSelector
+            value={executionProfile}
+            onChange={setExecutionProfile}
+            disabled={loading}
+            onHealthChange={handleEngineHealthChange}
+          />
+
           {error && <div className="project-entry-error">{error}</div>}
 
           <button
             className="project-entry-submit"
             onClick={handleSubmit}
-            disabled={loading || !projectName.trim() || !projectPath.trim()}
+            disabled={loading || engineUnavailable || !projectName.trim() || !projectPath.trim()}
           >
             {loading ? "处理中..." : (
               <span style={{ display: "inline-flex", alignItems: "center", gap: "8px" }}>
@@ -207,7 +236,7 @@ export function ProjectEntry({ onProjectCreated }: ProjectEntryProps) {
         description={`路径「${projectPath}」尚不存在。确认后将自动创建该目录。`}
         actions={[
           { label: "取消", onClick: () => setShowCreateConfirm(false), variant: "secondary" },
-          { label: "确认创建", onClick: handleConfirmCreate, variant: "primary" },
+          { label: "确认创建", onClick: handleConfirmCreate, variant: "primary", disabled: engineUnavailable },
         ]}
       >
         <div style={{ display: "flex", alignItems: "center", gap: "12px", padding: "8px 0" }}>

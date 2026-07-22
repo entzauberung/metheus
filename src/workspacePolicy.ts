@@ -5,21 +5,19 @@ export type WorkspaceAction =
   | "prepare"
   | "configure_identity"
   | "resolve_changes"
+  | "managed_task_changes"
   | "refresh";
 
 export function getWorkspaceAction(
   status: ExecutionWorkspaceStatus | null,
 ): WorkspaceAction {
   if (!status) return "refresh";
-  if (status.ready) return "none";
+  if (status.ready_for_new_execution) return "none";
   if (
     status.issues.includes("MissingGitUserName")
     || status.issues.includes("MissingGitUserEmail")
   ) {
     return "configure_identity";
-  }
-  if (status.has_commits && status.issues.includes("DirtyWorkingTree")) {
-    return "resolve_changes";
   }
   if (
     status.issues.includes("NotGitRepository")
@@ -27,6 +25,10 @@ export function getWorkspaceAction(
   ) {
     return "prepare";
   }
+  if (status.has_external_changes) {
+    return "resolve_changes";
+  }
+  if (status.has_managed_task_changes) return "managed_task_changes";
   if (status.issues.includes("DirtyWorkingTree")) return "resolve_changes";
   return "refresh";
 }

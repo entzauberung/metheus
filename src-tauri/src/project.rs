@@ -280,6 +280,8 @@ pub enum RecoveryPhase {
     Diagnosing,
     Repairing,
     Retesting,
+    /// 常规修复耗尽后，对当前小阶段做一次受限重规划。
+    Replanning,
     Recovered,
     WaitingHuman,
 }
@@ -304,6 +306,12 @@ pub struct RecoveryState {
     pub last_repair_summary: String,
     #[serde(default)]
     pub original_test_failure: String,
+    /// 常规修复失败后是否已经执行过一次当前小阶段重规划。
+    #[serde(default)]
+    pub replan_attempted: bool,
+    /// 按发生顺序保留压缩后的失败证据，供后续修复和重规划使用。
+    #[serde(default)]
+    pub failure_history: Vec<String>,
     pub started_at: String,
     pub updated_at: String,
 }
@@ -323,6 +331,8 @@ impl Default for RecoveryState {
             last_diagnosis: String::new(),
             last_repair_summary: String::new(),
             original_test_failure: String::new(),
+            replan_attempted: false,
+            failure_history: vec![],
             started_at: String::new(),
             updated_at: String::new(),
         }
@@ -378,7 +388,7 @@ pub struct ManagedFlowState {
     pub active: bool,
     /// 当前托管子状态（对应 WorkflowStep）
     pub managed_state: String,
-    /// 托管终点（固定为 "MilestoneApproval"）
+    /// 托管终点（固定为 "MilestoneSelection"，表示大阶段已批准）
     pub managed_target: String,
     /// 最近一次托管动作说明
     pub last_action: String,
@@ -395,7 +405,7 @@ impl Default for ManagedFlowState {
         ManagedFlowState {
             active: false,
             managed_state: String::new(),
-            managed_target: "MilestoneApproval".to_string(),
+            managed_target: "MilestoneSelection".to_string(),
             last_action: String::new(),
             last_action_at: String::new(),
             run_status: ManagedRunStatus::Running,
@@ -473,6 +483,63 @@ pub enum ProjectMode {
     Professional,
 }
 
+/// 执行引擎的运行载体。插件模式表示由 Metheus 管理外部 CLI 进程。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExecutionRuntime {
+    BuiltIn,
+    Plugin,
+}
+
+/// 实际执行任务的引擎供应方。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExecutionProvider {
+    GrokBuild,
+    ClaudeCode,
+    Codex,
+}
+
+impl ExecutionProvider {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            Self::GrokBuild => "Grok Build",
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+        }
+    }
+}
+
+/// 公共层只描述权限语义，具体 CLI 参数由各适配器映射。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PermissionProfile {
+    Interactive,
+    Unattended,
+}
+
+/// 项目级执行配置；执行开始后会完整复制到 ExecutionSession。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionProfile {
+    pub runtime: ExecutionRuntime,
+    pub provider: ExecutionProvider,
+    pub permission_profile: PermissionProfile,
+    #[serde(default = "default_execution_profile_revision")]
+    pub profile_revision: u64,
+}
+
+fn default_execution_profile_revision() -> u64 {
+    1
+}
+
+impl Default for ExecutionProfile {
+    fn default() -> Self {
+        Self {
+            runtime: ExecutionRuntime::Plugin,
+            provider: ExecutionProvider::ClaudeCode,
+            permission_profile: PermissionProfile::Unattended,
+            profile_revision: default_execution_profile_revision(),
+        }
+    }
+}
+
 impl Default for ProjectMode {
     fn default() -> Self {
         ProjectMode::Professional
@@ -539,7 +606,7 @@ pub struct Subtask {
     /// 不可跨越的边界
     #[serde(default)]
     pub stop_rules: Vec<String>,
-    /// 面向当前统一 DeepSeek 工作流模型的最终执行提示
+    /// 面向项目所选编码执行引擎的最终执行提示
     #[serde(default)]
     pub execution_prompt: String,
     // === V1 人工确认字段 ===
@@ -595,29 +662,17 @@ pub struct MidStage {
     #[serde(default)]
     pub plan_regeneration_count: u32,
 }
-/// 子任务执行错误类型
-/// 区分"用户主动暂停"和"真正的执行失败"
-/// 序列化格式与前端 types.ts 的 SubTaskError 对齐
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum SubTaskError {
-    // 用户主动暂停 → 流水线优雅暂停，保留进度
-    UserPaused,
-    // 执行失败 → 按现有逻辑处理
-    ExecutionFailed {
-        // 错误信息
-        message: String,
-    },
-    // 超时（预留）
-    Timeout,
-}
-///执行结果（claude code执行后的输出)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 执行引擎返回的统一结果。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExecutionResult {
     pub success: bool,
     pub output: String,
     pub error_log: String,
     pub file_changes: Vec<String>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub engine_provider: Option<ExecutionProvider>,
 }
 ///测试工程师的检查结果
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -648,6 +703,20 @@ pub struct TestResult {
     /// 本次结果采用的核验通道。
     #[serde(default)]
     pub verification_kind: VerificationKind,
+    /// AI 审查实际收到的代码证据是否完整；旧项目默认按完整处理以保持兼容。
+    #[serde(default)]
+    pub review_evidence_status: ReviewEvidenceStatus,
+    /// 代码审查证据的压缩摘要，供恢复流程和人工核验展示。
+    #[serde(default)]
+    pub review_evidence_summary: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ReviewEvidenceStatus {
+    #[default]
+    Complete,
+    Partial,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -982,6 +1051,8 @@ pub enum MilestoneDraftStatus {
     Pending,
     /// 检查未通过
     CheckFailed,
+    /// 检查已通过，等待批准
+    CheckPassed,
     /// 已批准（候选大阶段已复制到正式 milestones）
     Approved,
 }
@@ -1218,6 +1289,9 @@ pub struct Project {
     ///项目模式
     #[serde(default)]
     pub mode: ProjectMode,
+    /// 项目后续执行默认使用的引擎；旧项目自动映射为 Claude Code。
+    #[serde(default)]
+    pub execution_profile: ExecutionProfile,
     ///当前大阶段 ID
     #[serde(default)]
     pub current_milestone_id: String,
@@ -1292,6 +1366,7 @@ impl Project {
             entry_kind: ProjectEntryKind::NoProject,
             workflow_state: WorkflowState::default(),
             mode: ProjectMode::Professional,
+            execution_profile: ExecutionProfile::default(),
             current_milestone_id: "".to_string(),
             current_mid_stage_id: "".to_string(),
             version_plan: "".to_string(),
@@ -1491,7 +1566,19 @@ pub struct ExecutionWorkspaceStatus {
     /// Git 工作树是否无已跟踪和未跟踪变更；非 Git 仓库为 false
     #[serde(default)]
     pub working_tree_clean: bool,
-    /// 是否满足执行前置条件
+    /// Git 仓库、HEAD 和提交身份是否可用于只读检查及任务确认。
+    #[serde(default)]
+    pub git_metadata_ready: bool,
+    /// 是否满足启动一个新执行会话的前置条件。
+    #[serde(default)]
+    pub ready_for_new_execution: bool,
+    /// 当前工作树是否包含活动任务授权范围内的受管改动。
+    #[serde(default)]
+    pub has_managed_task_changes: bool,
+    /// 当前工作树是否包含无法归属到活动任务的改动。
+    #[serde(default)]
+    pub has_external_changes: bool,
+    /// 兼容字段，等同于 ready_for_new_execution。
     pub ready: bool,
     /// 给前端显示的状态说明
     pub status_message: String,
@@ -1520,6 +1607,8 @@ pub struct ExecutionWorkspaceChange {
     pub index_status: String,
     pub worktree_status: String,
     pub tracked: bool,
+    #[serde(default)]
+    pub managed: bool,
 }
 
 /// 宪法变更历史条目 — 小阶段确认后宪法第二部分更新记录
@@ -1601,6 +1690,9 @@ pub struct ExecutionSession {
     pub subtask_index: usize,
     /// 总小阶段数
     pub total_subtasks: usize,
+    /// 本次执行实际采用的引擎配置；恢复流程必须沿用该快照。
+    #[serde(default)]
+    pub engine_snapshot: ExecutionProfile,
 }
 
 impl ExecutionSession {
@@ -1654,6 +1746,7 @@ impl Default for ExecutionSession {
             plan_revision: 0,
             subtask_index: 0,
             total_subtasks: 0,
+            engine_snapshot: ExecutionProfile::default(),
         }
     }
 }
@@ -1860,6 +1953,21 @@ mod tests {
             .map_err(|error| format!("反序列化旧执行会话失败：{}", error))?;
         assert!(restored.execution_id.is_empty());
         assert_eq!(restored.status, "executing");
+        assert_eq!(restored.engine_snapshot, ExecutionProfile::default());
+        Ok(())
+    }
+
+    #[test]
+    fn old_project_without_execution_profile_defaults_to_claude() -> Result<(), String> {
+        let mut value = serde_json::to_value(Project::new("legacy"))
+            .map_err(|error| format!("序列化项目失败：{error}"))?;
+        value
+            .as_object_mut()
+            .ok_or("项目未序列化为对象".to_string())?
+            .remove("execution_profile");
+        let restored: Project = serde_json::from_value(value)
+            .map_err(|error| format!("反序列化旧项目失败：{error}"))?;
+        assert_eq!(restored.execution_profile, ExecutionProfile::default());
         Ok(())
     }
 

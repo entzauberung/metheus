@@ -11,6 +11,12 @@ function workspace(issues: ExecutionWorkspaceIssue[]): ExecutionWorkspaceStatus 
     git_user_available: !issues.includes("MissingGitUserName"),
     git_email_available: !issues.includes("MissingGitUserEmail"),
     working_tree_clean: !issues.includes("DirtyWorkingTree"),
+    git_metadata_ready: !issues.some(issue => [
+      "NotGitRepository", "NoCommits", "MissingGitUserName", "MissingGitUserEmail",
+    ].includes(issue)),
+    ready_for_new_execution: issues.length === 0,
+    has_managed_task_changes: false,
+    has_external_changes: issues.includes("DirtyWorkingTree"),
     ready: issues.length === 0,
     status_message: "",
     issues,
@@ -39,5 +45,12 @@ describe("execution workspace action policy", () => {
       "configure_identity",
     );
     expect(getWorkspaceAction(workspace([]))).toBe("none");
+  });
+
+  it("does not ask users to clean managed task changes", () => {
+    const status = workspace(["DirtyWorkingTree"]);
+    status.has_external_changes = false;
+    status.has_managed_task_changes = true;
+    expect(getWorkspaceAction(status)).toBe("managed_task_changes");
   });
 });
