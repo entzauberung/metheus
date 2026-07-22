@@ -286,6 +286,67 @@ pub enum RecoveryPhase {
     WaitingHuman,
 }
 
+/// 测试审查输出的可执行问题。criterion_index 使用从 1 开始的验收项编号。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ReviewIssue {
+    #[serde(default)]
+    pub criterion_index: Option<u32>,
+    #[serde(default)]
+    pub criterion: String,
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub expected: String,
+    #[serde(default)]
+    pub actual: String,
+    #[serde(default)]
+    pub suggested_change: String,
+    #[serde(default)]
+    pub confidence: f64,
+}
+
+/// 恢复循环使用的稳定问题表示；id 由后端根据验收项和文件生成。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RecoveryIssue {
+    pub id: String,
+    #[serde(default)]
+    pub criterion_index: Option<u32>,
+    #[serde(default)]
+    pub criterion: String,
+    #[serde(default)]
+    pub file: String,
+    #[serde(default)]
+    pub expected: String,
+    #[serde(default)]
+    pub actual: String,
+    #[serde(default)]
+    pub suggested_change: String,
+    #[serde(default)]
+    pub confidence: f64,
+}
+
+/// 一轮修复前后的验收问题变化。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RecoveryAttemptRecord {
+    pub attempt: u32,
+    #[serde(default)]
+    pub issue_ids: Vec<String>,
+    #[serde(default)]
+    pub resolved_issue_ids: Vec<String>,
+    #[serde(default)]
+    pub remaining_issue_ids: Vec<String>,
+    #[serde(default)]
+    pub regressed_issue_ids: Vec<String>,
+    #[serde(default)]
+    pub changed_files: Vec<String>,
+    #[serde(default)]
+    pub made_progress: bool,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub recorded_at: String,
+}
+
 /// 当前小阶段的有限恢复循环状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryState {
@@ -312,6 +373,15 @@ pub struct RecoveryState {
     /// 按发生顺序保留压缩后的失败证据，供后续修复和重规划使用。
     #[serde(default)]
     pub failure_history: Vec<String>,
+    /// 当前仍未满足的结构化验收问题。
+    #[serde(default)]
+    pub active_issues: Vec<RecoveryIssue>,
+    /// 每轮修复后的问题集合变化。
+    #[serde(default)]
+    pub attempt_history: Vec<RecoveryAttemptRecord>,
+    /// 重规划后的完整任务是否已经启动过，确保最多执行一次。
+    #[serde(default)]
+    pub replan_execution_attempted: bool,
     pub started_at: String,
     pub updated_at: String,
 }
@@ -333,6 +403,9 @@ impl Default for RecoveryState {
             original_test_failure: String::new(),
             replan_attempted: false,
             failure_history: vec![],
+            active_issues: vec![],
+            attempt_history: vec![],
+            replan_execution_attempted: false,
             started_at: String::new(),
             updated_at: String::new(),
         }
@@ -682,6 +755,9 @@ pub struct TestResult {
     pub issues: Vec<String>,
     #[serde(default)]
     pub suggestion: String,
+    /// 与验收项和文件关联的结构化审查问题。
+    #[serde(default)]
+    pub review_issues: Vec<ReviewIssue>,
     /// 诊断/警告信息（非阻塞），用于向后端调用方和前端传递非致命的诊断信息
     #[serde(default)]
     pub warnings: Vec<String>,
@@ -1803,6 +1879,9 @@ pub enum ExecutionEventType {
     RepairAttemptStarted,
     RepairAttemptCompleted,
     RetestCompleted,
+    ReplanStarted,
+    ReplanCompleted,
+    ReplanExecutionStarted,
     RecoverySucceeded,
     RecoveryExhausted,
     HumanVerificationAccepted,

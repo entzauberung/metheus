@@ -1678,7 +1678,7 @@ function App() {
           ? "重新测试仍未通过，继续等待人工处理。"
           : "重新测试通过，自动驾驶将继续执行。",
         restore_and_retry: "已恢复执行基线，将重新执行当前小阶段。",
-        regenerate_plan: "已恢复基线，将重新生成当前执行计划。",
+        regenerate_plan: "已安排重新规划当前任务，自动驾驶将继续处理。",
         human_override: "人工核验已单独记录，自动驾驶将继续执行。",
       };
       setFeedbackMsg({
@@ -2176,6 +2176,7 @@ function V1ExecutionPanel({
     failedStatus === "execution_failed"
     || failedStatus === "session_lost"
     || failedStatus === "stop_failed";
+  const recoveryActive = project.workflow_state.recovery_state != null;
 
   const handlePrepareWorkspace = async () => {
     if (!project || busy) return;
@@ -2282,7 +2283,7 @@ function V1ExecutionPanel({
       )}
 
       {/* Workspace status banner — 失败会话期间隐藏准备环境 */}
-      {!hasExecutionFailure && planApproved && workspaceStatus && !workspaceReady && (
+      {!hasExecutionFailure && !recoveryActive && planApproved && workspaceStatus && !workspaceReady && (
         <FeedbackBanner
           type={managedTaskChanges ? "info" : "warning"}
           message={workspaceStatus.status_message}
@@ -2293,7 +2294,7 @@ function V1ExecutionPanel({
       )}
 
       {/* Workspace preparation is only valid before repository metadata exists. */}
-      {!hasExecutionFailure && planApproved && workspaceAction === "prepare" && (
+      {!hasExecutionFailure && !recoveryActive && planApproved && workspaceAction === "prepare" && (
         <div style={{ marginBottom: "20px" }}>
           <ActionButton icon={<GitBranch size={16} />} loading={busy} loadingLabel="准备中"
             onClick={handlePrepareWorkspace}>准备执行环境</ActionButton>
@@ -2303,7 +2304,7 @@ function V1ExecutionPanel({
         </div>
       )}
 
-      {!hasExecutionFailure && planApproved && workspaceStatus &&
+      {!hasExecutionFailure && !recoveryActive && planApproved && workspaceStatus &&
         workspaceAction !== "none" && workspaceAction !== "prepare"
         && workspaceAction !== "managed_task_changes" && (
         <div style={{ marginBottom: "20px" }}>
@@ -2321,7 +2322,7 @@ function V1ExecutionPanel({
       )}
 
       {/* Awaiting confirmation */}
-      {!hasExecutionFailure && isAwaiting && awaitingSubtask && (
+      {!hasExecutionFailure && !recoveryActive && isAwaiting && awaitingSubtask && (
         <div style={{ marginBottom: "20px" }}>
           <div style={{ padding: "14px", background: "#ddf4ff", borderRadius: "8px", border: "1px solid #0969da", marginBottom: "16px" }}>
             <strong>待确认：{awaitingSubtask.title}</strong>
@@ -2374,7 +2375,7 @@ function V1ExecutionPanel({
       )}
 
       {/* Next pending subtask — only when workspace is ready and no failure session */}
-      {!hasExecutionFailure && !isAwaiting && planApproved && workspaceReady && nextSubtask && (
+      {!hasExecutionFailure && !recoveryActive && !isAwaiting && planApproved && workspaceReady && nextSubtask && (
         <div style={{ marginBottom: "20px" }}>
           <div style={subtaskCardStyle}>
             <strong>下一个任务：{nextSubtask.title}</strong>

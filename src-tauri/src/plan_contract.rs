@@ -2,6 +2,96 @@ use crate::project;
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
 
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '.')
+}
+
+fn looks_like_contract_identifier(token: &str, followed_by_call: bool) -> bool {
+    if token.is_empty()
+        || !token
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_' || ch == '$')
+    {
+        return false;
+    }
+    followed_by_call
+        || token.contains(['.', '_', '$'])
+        || token
+            .as_bytes()
+            .windows(2)
+            .any(|pair| pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase())
+}
+
+fn acceptance_identifiers(criteria: &[String]) -> BTreeSet<String> {
+    let mut identifiers = BTreeSet::new();
+    for criterion in criteria {
+        let chars = criterion.char_indices().collect::<Vec<_>>();
+        let mut index = 0;
+        let mut in_backticks = false;
+        while index < chars.len() {
+            let (byte_index, ch) = chars[index];
+            if ch == '`' {
+                in_backticks = !in_backticks;
+                index += 1;
+                continue;
+            }
+            if !is_identifier_char(ch) {
+                index += 1;
+                continue;
+            }
+            let start = byte_index;
+            let mut end_index = index + 1;
+            while end_index < chars.len() && is_identifier_char(chars[end_index].1) {
+                end_index += 1;
+            }
+            let end = chars
+                .get(end_index)
+                .map(|(byte_index, _)| *byte_index)
+                .unwrap_or(criterion.len());
+            let token = criterion[start..end].trim_end_matches('.');
+            let followed_by_call = criterion[end..].trim_start().starts_with('(');
+            if (in_backticks || looks_like_contract_identifier(token, followed_by_call))
+                && !token.is_empty()
+            {
+                identifiers.insert(token.to_string());
+            }
+            index = end_index;
+        }
+    }
+    identifiers
+}
+
+fn validate_execution_prompt_contract(
+    subtask: &project::Subtask,
+    entity: &str,
+) -> Result<(), String> {
+    let identifiers = acceptance_identifiers(&subtask.acceptance_criteria);
+    if identifiers.is_empty() {
+        return Ok(());
+    }
+    let prompt = subtask.execution_prompt.trim();
+    let missing = identifiers
+        .into_iter()
+        .filter(|identifier| !prompt.contains(identifier))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{}的 execution_prompt 未精确包含验收契约标识符：{}",
+            entity,
+            missing.join("、")
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_execution_prompt(
+    subtask: &project::Subtask,
+    entity: &str,
+) -> Result<(), String> {
+    validate_execution_prompt_contract(subtask, entity)
+}
+
 fn validate_relative_file_path(path: &str, field: &str, entity: &str) -> Result<String, String> {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -121,6 +211,7 @@ pub(crate) fn validate_subtasks(subtasks: &[project::Subtask]) -> Result<(), Str
         return Err("执行计划为空".to_string());
     }
     for (index, subtask) in subtasks.iter().enumerate() {
+        validate_execution_prompt_contract(subtask, &format!("第 {} 个小阶段", index + 1))?;
         validate_subtask(subtask, &format!("第 {} 个小阶段", index + 1))?;
     }
     Ok(())
@@ -234,5 +325,23 @@ mod tests {
             out_of_scope_changes(&changed, &authorized),
             vec!["README.md".to_string()]
         );
+    }
+
+    #[test]
+    fn execution_prompt_must_preserve_acceptance_identifiers() {
+        let mut task = subtask(&["src/main.ts"], &[]);
+        task.acceptance_criteria = vec![
+            "提供 getEngines()、setDefault(id) 和 isDefault 字段，时间使用 `Date.now`".to_string(),
+        ];
+        task.execution_prompt =
+            "在 src/main.ts 实现 getEngines、setDefault、isDefault，并使用 Date.now".to_string();
+        assert!(validate_subtasks(&[task.clone()]).is_ok());
+
+        task.execution_prompt = "在 src/main.ts 实现 getSearchEngines 和默认引擎切换".to_string();
+        let error = validate_subtasks(&[task]).unwrap_err();
+        assert!(error.contains("getEngines"));
+        assert!(error.contains("setDefault"));
+        assert!(error.contains("isDefault"));
+        assert!(error.contains("Date.now"));
     }
 }

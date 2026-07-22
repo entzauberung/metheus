@@ -150,6 +150,7 @@ fn execution_profile_change_blocker(project: &project::Project) -> Option<&'stat
                 project::RecoveryPhase::Diagnosing
                     | project::RecoveryPhase::Repairing
                     | project::RecoveryPhase::Retesting
+                    | project::RecoveryPhase::Replanning
             )
         })
     {

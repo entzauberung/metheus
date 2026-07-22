@@ -1662,6 +1662,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             project::RecoveryPhase::Diagnosing
                 | project::RecoveryPhase::Repairing
                 | project::RecoveryPhase::Retesting
+                | project::RecoveryPhase::Replanning
         ) {
             let recovery_is_running = proj.execution_session.as_ref().is_some_and(|session| {
                 session.active
@@ -1671,7 +1672,9 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
             if recovery_is_running
                 && matches!(
                     recovery.phase,
-                    project::RecoveryPhase::Repairing | project::RecoveryPhase::Retesting
+                    project::RecoveryPhase::Repairing
+                        | project::RecoveryPhase::Retesting
+                        | project::RecoveryPhase::Replanning
                 )
             {
                 return Ok(AutopilotNextStep {
@@ -1692,6 +1695,7 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                     project::RecoveryPhase::Diagnosing => "正在诊断错误",
                     project::RecoveryPhase::Repairing => "正在继续受限修复",
                     project::RecoveryPhase::Retesting => "正在重新测试",
+                    project::RecoveryPhase::Replanning => "正在重新规划当前任务",
                     _ => "正在恢复",
                 }
                 .to_string(),

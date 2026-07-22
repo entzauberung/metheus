@@ -161,12 +161,26 @@ export function AutopilotControlBar({
   );
   const showGenericResume = errorActions.canResume;
   const showRetryAdvance = errorActions.canRetryAdvance;
+  const lastAttempt = recovery?.attempt_history?.length
+    ? recovery.attempt_history[recovery.attempt_history.length - 1]
+    : undefined;
   const recoveryStatus = recovery ? {
-    Diagnosing: "正在诊断错误",
-    Repairing: `正在执行第 ${recovery.attempt}/${recovery.max_attempts} 次修复`,
-    Retesting: "正在重新测试",
+    Diagnosing: recovery.replan_attempted && recovery.attempt === 0
+      ? "重规划完成，准备从基线重新执行"
+      : recovery.active_issues?.length
+      ? `正在分析 ${recovery.active_issues.length} 个未满足验收项`
+      : "正在诊断错误",
+    Repairing: recovery.replan_attempted
+      ? "正在执行重规划后的当前任务"
+      : `正在执行第 ${recovery.attempt}/${recovery.max_attempts} 次修复`,
+    Retesting: lastAttempt
+      ? `正在重新测试；上一轮解决 ${lastAttempt.resolved_issue_ids.length} 项，剩余 ${lastAttempt.remaining_issue_ids.length + lastAttempt.regressed_issue_ids.length} 项`
+      : "正在重新测试",
+    Replanning: "常规修复耗尽，正在重新规划当前任务",
     Recovered: "自动修复成功，继续执行",
-    WaitingHuman: "自动修复失败，等待人工处理",
+    WaitingHuman: recovery.error_kind === "TestUnavailable" && recovery.attempt === 0
+      ? "自动修复未启动：测试或审查不可用"
+      : "自动恢复已耗尽，等待人工处理",
   }[recovery.phase] : "";
 
   return (
@@ -266,10 +280,12 @@ export function AutopilotControlBar({
               onClick={() => onResolveHumanRecovery("restore_and_retry")}>
               <GitBranch size={14} /> 恢复基线并重试
             </button>
-            <button className="ap-bar-btn" disabled={busy}
-              onClick={() => onResolveHumanRecovery("regenerate_plan")}>
-              <RotateCcw size={14} /> 重新生成计划
-            </button>
+            {!recovery.replan_attempted && (
+              <button className="ap-bar-btn" disabled={busy}
+                onClick={() => onResolveHumanRecovery("regenerate_plan")}>
+                <RotateCcw size={14} /> 重新规划当前任务
+              </button>
+            )}
             <button className="ap-bar-btn" disabled={busy}
               onClick={() => onResolveHumanRecovery("human_override")}>
               <CheckCircle size={14} /> 人工核验通过

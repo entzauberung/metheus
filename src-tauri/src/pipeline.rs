@@ -3087,8 +3087,7 @@ pub fn reconcile_execution_state(
         return ExecutionReconciliation::AwaitingConfirmation;
     }
 
-    // Check session validity
-    if !session.active || session.subtask_id.is_empty() {
+    if session.subtask_id.is_empty() {
         return ExecutionReconciliation::SessionInvalid;
     }
 
@@ -3111,6 +3110,27 @@ pub fn reconcile_execution_state(
 
     if !subtask_exists {
         return ExecutionReconciliation::DataConflict;
+    }
+
+    let queued_recovery = matches!(session.status.as_str(), "replanning" | "replan_ready")
+        && proj
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .is_some_and(|recovery| {
+                recovery.subtask_id == session.subtask_id
+                    && (recovery.phase == project::RecoveryPhase::Replanning
+                        || (session.status == "replan_ready"
+                            && recovery.replan_attempted
+                            && recovery.phase == project::RecoveryPhase::Diagnosing))
+            });
+    if queued_recovery {
+        return ExecutionReconciliation::AwaitingConfirmation;
+    }
+
+    // Check session validity after recognizing persisted recovery queue states.
+    if !session.active {
+        return ExecutionReconciliation::SessionInvalid;
     }
 
     match session.status.as_str() {
@@ -3195,16 +3215,25 @@ pub fn apply_execution_reconciliation(
                     }
                 }
             }
+            let replan_execution_lost = proj
+                .workflow_state
+                .recovery_state
+                .as_ref()
+                .is_some_and(|recovery| recovery.replan_execution_attempted);
             // 自动驾驶显式标记恢复动作，不得靠错误文本猜测
             if proj.workflow_state.autopilot_active {
                 if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
                     let interrupted_recovery = proj.workflow_state.recovery_state.is_some();
-                    ap.run_status = if interrupted_recovery {
+                    ap.run_status = if replan_execution_lost {
+                        project::AutopilotRunStatus::ErrorStopped
+                    } else if interrupted_recovery {
                         project::AutopilotRunStatus::Running
                     } else {
                         project::AutopilotRunStatus::ErrorStopped
                     };
-                    ap.last_action = if interrupted_recovery {
+                    ap.last_action = if replan_execution_lost {
+                        "重规划后的任务执行失联，等待人工处理".to_string()
+                    } else if interrupted_recovery {
                         "自动修复进程失联，准备从基线重新执行".to_string()
                     } else {
                         "执行会话失联，需要恢复执行基线".to_string()
@@ -3213,7 +3242,9 @@ pub fn apply_execution_reconciliation(
                     if ap.error_message.is_empty() {
                         ap.error_message = "执行进程失联，请先恢复执行基线后再继续。".to_string();
                     }
-                    ap.recovery_action = if interrupted_recovery {
+                    ap.recovery_action = if replan_execution_lost {
+                        project::AutopilotRecoveryAction::WaitHumanDecision
+                    } else if interrupted_recovery {
                         project::AutopilotRecoveryAction::RunAutomaticRecovery
                     } else {
                         project::AutopilotRecoveryAction::RestoreExecutionBaseline
@@ -3221,10 +3252,23 @@ pub fn apply_execution_reconciliation(
                 }
             }
             if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
-                recovery.error_kind = project::RecoveryErrorKind::ExecutionError;
-                recovery.phase = project::RecoveryPhase::Diagnosing;
-                recovery.last_repair_summary = "恢复进程中断；下次尝试将先恢复执行基线".to_string();
-                recovery.updated_at = chrono::Utc::now().to_rfc3339();
+                if recovery.replan_execution_attempted {
+                    recovery.error_kind = project::RecoveryErrorKind::HumanRequired;
+                    recovery.phase = project::RecoveryPhase::WaitingHuman;
+                    recovery.last_repair_summary =
+                        "重规划后的任务执行进程失联，禁止自动重复启动".to_string();
+                    recovery.updated_at = chrono::Utc::now().to_rfc3339();
+                } else if recovery.phase == project::RecoveryPhase::Replanning {
+                    recovery.last_repair_summary =
+                        "重规划进程失联；下次尝试将重新开始当前任务重规划".to_string();
+                    recovery.updated_at = chrono::Utc::now().to_rfc3339();
+                } else {
+                    recovery.error_kind = project::RecoveryErrorKind::ExecutionError;
+                    recovery.phase = project::RecoveryPhase::Diagnosing;
+                    recovery.last_repair_summary =
+                        "恢复进程中断；下次尝试将先恢复执行基线".to_string();
+                    recovery.updated_at = chrono::Utc::now().to_rfc3339();
+                }
             }
             proj.workflow_state.data_revision += 1;
             true
@@ -3774,6 +3818,83 @@ mod tests {
             reconcile_execution_state(&awaiting, None),
             ExecutionReconciliation::AwaitingConfirmation
         ));
+
+        let mut replanning = execution_project(
+            "replanning",
+            empty_path,
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(execution_session("replanning", "recovery-plan", "HEAD")),
+        );
+        replanning.workflow_state.recovery_state = Some(project::RecoveryState {
+            phase: project::RecoveryPhase::Replanning,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "recovery-plan".to_string(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            reconcile_execution_state(&replanning, None),
+            ExecutionReconciliation::AwaitingConfirmation
+        ));
+
+        let recovery = replanning.workflow_state.recovery_state.as_mut().unwrap();
+        recovery.phase = project::RecoveryPhase::Diagnosing;
+        recovery.replan_attempted = true;
+        let session = replanning.execution_session.as_mut().unwrap();
+        session.active = false;
+        session.status = "replan_ready".to_string();
+        assert!(matches!(
+            reconcile_execution_state(&replanning, None),
+            ExecutionReconciliation::AwaitingConfirmation
+        ));
+    }
+
+    #[test]
+    fn lost_replanned_execution_stops_for_human() {
+        let session = execution_session("recovering", "replan-execution", "HEAD");
+        let mut proj = execution_project(
+            "replan-execution-lost",
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(session),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::Running,
+            last_action: String::new(),
+            last_action_at: String::new(),
+            error_message: String::new(),
+            recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+        });
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::TestFailure,
+            phase: project::RecoveryPhase::Repairing,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "replan-execution".to_string(),
+            replan_attempted: true,
+            replan_execution_attempted: true,
+            ..Default::default()
+        });
+
+        assert!(apply_execution_reconciliation(
+            &mut proj,
+            &ExecutionReconciliation::SessionLost,
+        ));
+        assert_eq!(
+            proj.workflow_state
+                .recovery_state
+                .as_ref()
+                .map(|state| &state.phase),
+            Some(&project::RecoveryPhase::WaitingHuman)
+        );
+        assert_eq!(
+            proj.workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|state| &state.recovery_action),
+            Some(&project::AutopilotRecoveryAction::WaitHumanDecision)
+        );
     }
 
     #[test]
@@ -4467,6 +4588,73 @@ mod tests {
                 .as_ref()
                 .map(|state| &state.recovery_action),
             Some(&project::AutopilotRecoveryAction::None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exhausted_regular_repair_replans_once_then_waits_for_human() -> Result<(), String> {
+        let session = execution_session("recovering", "recovery-exhausted", "abc123");
+        let mut proj = execution_project(
+            "recovery-exhausted",
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(session.clone()),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::Running,
+            last_action: String::new(),
+            last_action_at: String::new(),
+            error_message: String::new(),
+            recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+        });
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::TestFailure,
+            phase: project::RecoveryPhase::Retesting,
+            attempt: 2,
+            max_attempts: 2,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "recovery-exhausted".to_string(),
+            baseline_commit: "abc123".to_string(),
+            ..Default::default()
+        });
+        proj.milestones[0].mid_stages[0].subtasks[0].execution_result =
+            Some(project::ExecutionResult {
+                success: true,
+                file_changes: vec!["tracked.txt".to_string()],
+                ..Default::default()
+            });
+        let failed = project::TestResult {
+            passed: false,
+            issues: vec!["仍未满足验收标准".to_string()],
+            automated_test_status: project::AutomatedTestStatus::Failed,
+            ..Default::default()
+        };
+
+        crate::recovery::finish_retest(&mut proj, &session, "recovery-exhausted", failed.clone())?;
+        assert_eq!(
+            proj.workflow_state
+                .recovery_state
+                .as_ref()
+                .map(|state| &state.phase),
+            Some(&project::RecoveryPhase::Replanning)
+        );
+
+        let recovery = proj.workflow_state.recovery_state.as_mut().unwrap();
+        recovery.phase = project::RecoveryPhase::Retesting;
+        recovery.replan_attempted = true;
+        recovery.replan_execution_attempted = true;
+        proj.execution_session.as_mut().unwrap().status = "recovering".to_string();
+        crate::recovery::finish_retest(&mut proj, &session, "recovery-exhausted", failed)?;
+        assert_eq!(
+            proj.workflow_state
+                .recovery_state
+                .as_ref()
+                .map(|state| &state.phase),
+            Some(&project::RecoveryPhase::WaitingHuman)
         );
         Ok(())
     }

@@ -57,7 +57,33 @@ export type RecoveryErrorKind =
   | "StateConflict"
   | "HumanRequired";
 
-export type RecoveryPhase = "Diagnosing" | "Repairing" | "Retesting" | "Recovered" | "WaitingHuman";
+export type RecoveryPhase = "Diagnosing" | "Repairing" | "Retesting" | "Replanning" | "Recovered" | "WaitingHuman";
+
+export interface ReviewIssue {
+  criterion_index?: number;
+  criterion: string;
+  file: string;
+  expected: string;
+  actual: string;
+  suggested_change: string;
+  confidence: number;
+}
+
+export interface RecoveryIssue extends ReviewIssue {
+  id: string;
+}
+
+export interface RecoveryAttemptRecord {
+  attempt: number;
+  issue_ids: string[];
+  resolved_issue_ids: string[];
+  remaining_issue_ids: string[];
+  regressed_issue_ids: string[];
+  changed_files: string[];
+  made_progress: boolean;
+  summary: string;
+  recorded_at: string;
+}
 
 export interface RecoveryState {
   error_kind: RecoveryErrorKind;
@@ -72,6 +98,11 @@ export interface RecoveryState {
   last_diagnosis: string;
   last_repair_summary: string;
   original_test_failure: string;
+  replan_attempted: boolean;
+  failure_history: string[];
+  active_issues: RecoveryIssue[];
+  attempt_history: RecoveryAttemptRecord[];
+  replan_execution_attempted: boolean;
   started_at: string;
   updated_at: string;
 }
@@ -352,6 +383,7 @@ export interface TestResult {
   passed: boolean;
   issues: string[];
   suggestion: string;
+  review_issues?: ReviewIssue[];
   warnings?: string[];
   test_command?: string;
   test_exit_code?: number;
