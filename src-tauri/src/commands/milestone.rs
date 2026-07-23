@@ -1203,10 +1203,11 @@ async fn generate_execution_plan_tasks(
     let accepted_deviations = crate::project_facts::accepted_deviations(proj);
     for task in &mut tasks {
         let paths = crate::project_facts::snapshot_paths(task);
-        task.fact_snapshot = Some(crate::project_facts::capture(
+        task.fact_snapshot = Some(crate::project_facts::capture_with_identifiers(
             &proj.project_path,
             &paths,
             accepted_deviations.clone(),
+            &task.required_identifiers,
         )?);
     }
     Ok(tasks)

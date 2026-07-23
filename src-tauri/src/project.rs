@@ -375,6 +375,9 @@ pub struct ProjectFactSnapshot {
     pub event_bindings: Vec<String>,
     #[serde(default)]
     pub relevant_snippets: Vec<String>,
+    /// Context windows selected around task-specific identifiers.
+    #[serde(default)]
+    pub identifier_contexts: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub accepted_deviations: Vec<String>,
     #[serde(default)]
@@ -393,6 +396,9 @@ pub struct RecoveryLearningRecord {
     pub related_paths: Vec<String>,
     #[serde(default)]
     pub required_identifiers: Vec<String>,
+    /// Normalized task-contract fingerprint used to avoid cross-task matches.
+    #[serde(default)]
+    pub acceptance_fingerprint: String,
     #[serde(default)]
     pub stable_constraint: String,
     pub recorded_at: String,
@@ -463,6 +469,15 @@ pub struct RecoveryState {
     /// Repair-level file checkpoint used to undo only the latest regressing attempt.
     #[serde(default)]
     pub checkpoint_id: String,
+    /// A regression was rolled back and the restored workspace must be tested again.
+    #[serde(default)]
+    pub rollback_retest_pending: bool,
+    /// Validation evidence has been rebuilt once for this recovery session.
+    #[serde(default)]
+    pub evidence_rebuild_attempted: bool,
+    /// Repair execution evidence is committed to the task only after retest accepts it.
+    #[serde(default)]
+    pub pending_execution_result: Option<ExecutionResult>,
 }
 
 impl Default for RecoveryState {
@@ -489,6 +504,9 @@ impl Default for RecoveryState {
             updated_at: String::new(),
             engine_failure_kind: None,
             checkpoint_id: String::new(),
+            rollback_retest_pending: false,
+            evidence_rebuild_attempted: false,
+            pending_execution_result: None,
         }
     }
 }

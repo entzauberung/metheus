@@ -91,6 +91,7 @@ export interface ProjectFactSnapshot {
   dom_ids: string[];
   event_bindings: string[];
   relevant_snippets: string[];
+  identifier_contexts: Record<string, string[]>;
   accepted_deviations: string[];
   structural_fingerprint: string;
   captured_at: string;
@@ -103,6 +104,7 @@ export interface RecoveryLearningRecord {
   succeeded: boolean;
   related_paths: string[];
   required_identifiers: string[];
+  acceptance_fingerprint: string;
   stable_constraint: string;
   recorded_at: string;
 }
@@ -155,6 +157,9 @@ export interface RecoveryState {
   updated_at: string;
   engine_failure_kind?: EngineFailureKind;
   checkpoint_id: string;
+  rollback_retest_pending: boolean;
+  evidence_rebuild_attempted: boolean;
+  pending_execution_result?: ExecutionResult;
 }
 
 /** 自动驾驶命令返回类别 */

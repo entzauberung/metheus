@@ -1,4 +1,5 @@
 use crate::project;
+use crate::AppState;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -79,8 +80,12 @@ pub(crate) async fn calibrate_next_subtask(project: &mut project::Project) -> Re
         .cloned()
         .ok_or_else(|| "没有待校准的小阶段。".to_string())?;
     let paths = crate::project_facts::snapshot_paths(&task);
-    let current =
-        crate::project_facts::capture(&project.project_path, &paths, accepted_deviations)?;
+    let current = crate::project_facts::capture_with_identifiers(
+        &project.project_path,
+        &paths,
+        accepted_deviations,
+        &task.required_identifiers,
+    )?;
     if task.fact_snapshot.is_none() {
         let item = project
             .milestones
@@ -169,11 +174,97 @@ pub(crate) async fn calibrate_next_subtask(project: &mut project::Project) -> Re
 
 #[tauri::command]
 pub(crate) async fn calibrate_next_subtask_command(
+    state: tauri::State<'_, AppState>,
     project_name: String,
 ) -> Result<project::Project, String> {
-    let mut project = crate::load_project(&project_name)?;
-    calibrate_next_subtask(&mut project).await?;
-    crate::save_and_reload_project(&project)
+    let initial = crate::load_project(&project_name)?;
+    let initial_revision = initial.workflow_state.data_revision;
+    let initial_milestone = initial.current_milestone_id.clone();
+    let initial_mid_stage = initial.current_mid_stage_id.clone();
+    let initial_step = initial.workflow_state.current_step.clone();
+    let initial_autopilot = initial
+        .workflow_state
+        .autopilot_state
+        .as_ref()
+        .map(|state| (state.active, state.run_status.clone()));
+    let initial_task = initial
+        .milestones
+        .iter()
+        .find(|milestone| milestone.id == initial_milestone)
+        .and_then(|milestone| {
+            milestone
+                .mid_stages
+                .iter()
+                .find(|mid| mid.id == initial_mid_stage)
+        })
+        .and_then(|mid| {
+            mid.subtasks
+                .iter()
+                .find(|task| task.status == project::SubtaskStatus::Pending)
+        })
+        .ok_or_else(|| "没有待校准的小阶段。".to_string())?;
+    let initial_task_id = initial_task.id.clone();
+    let initial_facts = crate::project_facts::capture_with_identifiers(
+        &initial.project_path,
+        &crate::project_facts::snapshot_paths(initial_task),
+        crate::project_facts::accepted_deviations(&initial),
+        &initial_task.required_identifiers,
+    )?;
+    let mut candidate = initial.clone();
+    let changed = calibrate_next_subtask(&mut candidate).await?;
+    let candidate_mutated = candidate.workflow_state.data_revision != initial_revision;
+
+    let _pipeline_guard = state.pipeline_state.lock().await;
+    let latest = crate::load_project(&project_name)?;
+    if latest.workflow_state.data_revision != initial_revision
+        || latest.current_milestone_id != initial_milestone
+        || latest.current_mid_stage_id != initial_mid_stage
+        || latest.workflow_state.current_step != initial_step
+        || latest
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .map(|state| (state.active, state.run_status.clone()))
+            != initial_autopilot
+    {
+        return Err("滚动校准期间项目状态已变化，已丢弃旧计划补丁。".to_string());
+    }
+
+    let latest_task = latest
+        .milestones
+        .iter()
+        .find(|milestone| milestone.id == initial_milestone)
+        .and_then(|milestone| {
+            milestone
+                .mid_stages
+                .iter()
+                .find(|mid| mid.id == initial_mid_stage)
+        })
+        .and_then(|mid| {
+            mid.subtasks
+                .iter()
+                .find(|task| task.status == project::SubtaskStatus::Pending)
+        })
+        .ok_or_else(|| "滚动校准提交时待处理任务已变化。".to_string())?;
+    if latest_task.id != initial_task_id {
+        return Err("滚动校准期间下一任务已变化，已丢弃旧计划补丁。".to_string());
+    }
+    let latest_facts = crate::project_facts::capture_with_identifiers(
+        &latest.project_path,
+        &crate::project_facts::snapshot_paths(latest_task),
+        crate::project_facts::accepted_deviations(&latest),
+        &latest_task.required_identifiers,
+    )?;
+    if latest_facts.git_head != initial_facts.git_head
+        || latest_facts.structural_fingerprint != initial_facts.structural_fingerprint
+    {
+        return Err("滚动校准期间 Git 或项目事实已变化，已丢弃旧计划补丁。".to_string());
+    }
+    if !candidate_mutated {
+        return crate::save_and_reload_project(&latest);
+    }
+    debug_assert!(changed || initial_task.fact_snapshot.is_none());
+    crate::save_and_reload_project(&candidate)
 }
 
 #[cfg(test)]

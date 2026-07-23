@@ -257,7 +257,7 @@ pub(crate) async fn execute_current_subtask(
         subtask.goal.clone()
     };
     let acceptance_criteria = subtask.acceptance_criteria.clone();
-    let learning = crate::recovery_learning::render_matching(&proj, subtask, None);
+    let learning = crate::recovery_learning::render_matching(&proj, subtask, None, None);
     let approved_prompt =
         crate::plan_compiler::compile_execution_prompt_with_learning(subtask, &learning);
 
@@ -986,6 +986,23 @@ fn validate_subtask_quality_gate_with_session_statuses(
                 &test_result.suggestion
             }
         ));
+    }
+
+    if crate::acceptance::needs_evidence(&subtask.acceptance_ledger) {
+        return Err("验收账本存在未证明项，无法确认；请先重建审查证据。".to_string());
+    }
+    if !subtask.acceptance_criteria.is_empty()
+        && subtask.acceptance_ledger.len() != subtask.acceptance_criteria.len()
+    {
+        return Err("验收账本不完整，无法确认；请先重建审查证据。".to_string());
+    }
+    if subtask.acceptance_ledger.iter().any(|item| {
+        !matches!(
+            item.status,
+            project::AcceptanceStatus::Satisfied | project::AcceptanceStatus::AcceptedDeviation
+        )
+    }) {
+        return Err("验收账本仍有未满足或矛盾项，无法确认。".to_string());
     }
 
     Ok(())
@@ -4765,6 +4782,128 @@ mod tests {
     }
 
     #[test]
+    fn regression_rollback_restores_files_and_rebuilds_evidence() -> Result<(), String> {
+        let repo = TempGitRepo::new("recovery-regression-rollback")?;
+        let session = execution_session("recovering", "recovery-regression", "abc123");
+        let mut proj = execution_project(
+            "recovery-regression",
+            &repo.path,
+            project::SubtaskStatus::Executing,
+            Some(session.clone()),
+        );
+        let original_execution = project::ExecutionResult {
+            success: true,
+            output: "original execution".to_string(),
+            file_changes: vec!["tracked.txt".to_string()],
+            ..Default::default()
+        };
+        let original_issue = project::RecoveryIssue {
+            id: "unstructured:original failure".to_string(),
+            actual: "original failure".to_string(),
+            ..Default::default()
+        };
+        let checkpoint_id =
+            crate::recovery_checkpoint::create(&repo.path_string(), &["tracked.txt".to_string()])?;
+        std::fs::write(repo.path.join("tracked.txt"), "regressing repair\n")
+            .map_err(|error| error.to_string())?;
+
+        let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+        subtask.execution_result = Some(original_execution.clone());
+        subtask.test_result = Some(project::TestResult {
+            passed: false,
+            issues: vec!["original failure".to_string()],
+            ..Default::default()
+        });
+        subtask.acceptance_ledger = vec![project::AcceptanceLedgerItem::default()];
+        subtask.human_verification = Some(project::HumanVerification {
+            verification_kind: project::VerificationKind::HumanOverride,
+            verification_reason: "stale evidence".to_string(),
+            verified_at: "now".to_string(),
+            original_test_failure: "original failure".to_string(),
+            resolution: project::HumanResolution::ConfirmActualPass,
+            accepted_criteria: vec![],
+            dependency_check: String::new(),
+        });
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::TestFailure,
+            phase: project::RecoveryPhase::Retesting,
+            attempt: 1,
+            max_attempts: 2,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "recovery-regression".to_string(),
+            checkpoint_id,
+            original_test_failure: "original failure".to_string(),
+            active_issues: vec![original_issue.clone()],
+            pending_execution_result: Some(project::ExecutionResult {
+                success: true,
+                output: "regressing repair".to_string(),
+                file_changes: vec!["tracked.txt".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let rolled_back = crate::recovery::finish_retest(
+            &mut proj,
+            &session,
+            "recovery-regression",
+            project::TestResult {
+                passed: false,
+                issues: vec!["new regression".to_string()],
+                automated_test_status: project::AutomatedTestStatus::Failed,
+                ..Default::default()
+            },
+        )?;
+        assert!(rolled_back);
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("tracked.txt"))
+                .map_err(|error| error.to_string())?,
+            "baseline\n"
+        );
+        let subtask = &proj.milestones[0].mid_stages[0].subtasks[0];
+        assert_eq!(
+            subtask
+                .execution_result
+                .as_ref()
+                .map(|result| &result.output),
+            Some(&original_execution.output)
+        );
+        assert!(subtask.test_result.is_none());
+        assert!(subtask.acceptance_ledger.is_empty());
+        assert!(subtask.human_verification.is_none());
+        let recovery = proj.workflow_state.recovery_state.as_ref().unwrap();
+        assert!(recovery.rollback_retest_pending);
+        assert!(recovery.pending_execution_result.is_none());
+        assert_eq!(recovery.active_issues, vec![original_issue]);
+
+        let rolled_back_again = crate::recovery::finish_retest(
+            &mut proj,
+            &session,
+            "recovery-regression",
+            project::TestResult {
+                passed: false,
+                issues: vec!["original failure".to_string()],
+                automated_test_status: project::AutomatedTestStatus::Failed,
+                ..Default::default()
+            },
+        )?;
+        assert!(!rolled_back_again);
+        let subtask = &proj.milestones[0].mid_stages[0].subtasks[0];
+        let execution_result = subtask.execution_result.as_ref().unwrap();
+        assert!(execution_result.success);
+        assert_eq!(execution_result.output, original_execution.output);
+        assert_eq!(
+            execution_result.file_changes,
+            original_execution.file_changes
+        );
+        assert_eq!(
+            subtask.test_result.as_ref().map(|result| &result.issues),
+            Some(&vec!["original failure".to_string()])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn exhausted_regular_repair_replans_once_then_waits_for_human() -> Result<(), String> {
         let session = execution_session("recovering", "recovery-exhausted", "abc123");
         let mut proj = execution_project(
@@ -4910,6 +5049,43 @@ mod tests {
                 .map(|test| test.passed),
             Some(false)
         );
+    }
+
+    #[test]
+    fn quality_gate_rejects_unknown_acceptance_evidence() {
+        let mut proj = execution_project(
+            "unknown-acceptance",
+            Path::new(""),
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(execution_session(
+                "awaiting_confirmation",
+                "execution-unknown-acceptance",
+                "abc123",
+            )),
+        );
+        let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+        subtask.acceptance_criteria = vec!["criterion".to_string()];
+        subtask.execution_result = Some(project::ExecutionResult {
+            success: true,
+            ..Default::default()
+        });
+        subtask.test_result = Some(project::TestResult {
+            passed: true,
+            ..Default::default()
+        });
+        subtask.acceptance_ledger = vec![project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            criterion: "criterion".to_string(),
+            status: project::AcceptanceStatus::Unknown,
+            ..Default::default()
+        }];
+
+        assert!(validate_subtask_quality_gate(&proj)
+            .unwrap_err()
+            .contains("未证明项"));
+        proj.milestones[0].mid_stages[0].subtasks[0].acceptance_ledger[0].status =
+            project::AcceptanceStatus::Satisfied;
+        assert!(validate_subtask_quality_gate(&proj).is_ok());
     }
 
     #[test]

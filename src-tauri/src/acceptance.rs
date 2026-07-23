@@ -34,6 +34,7 @@ pub(crate) fn build_ledger(
                 )
             } else if result.passed
                 && result.review_evidence_status == project::ReviewEvidenceStatus::Complete
+                && result.review_issues.is_empty()
             {
                 (
                     project::AcceptanceStatus::Satisfied,
@@ -74,7 +75,7 @@ pub(crate) fn needs_evidence(ledger: &[project::AcceptanceLedgerItem]) -> bool {
     !ledger.is_empty()
         && ledger
             .iter()
-            .all(|item| item.status == project::AcceptanceStatus::Unknown)
+            .any(|item| item.status == project::AcceptanceStatus::Unknown)
 }
 
 #[cfg(test)]
@@ -96,6 +97,32 @@ mod tests {
         );
         assert_eq!(ledger[0].status, project::AcceptanceStatus::Unknown);
         assert!(actionable_issues(&ledger).is_empty());
+        assert!(needs_evidence(&ledger));
+    }
+
+    #[test]
+    fn one_unknown_criterion_requires_evidence_rebuild() {
+        let result = project::TestResult {
+            passed: true,
+            review_evidence_status: project::ReviewEvidenceStatus::Complete,
+            review_issues: vec![project::ReviewIssue {
+                criterion_index: Some(1),
+                file: "index.html".to_string(),
+                expected: "a".to_string(),
+                actual: "b".to_string(),
+                suggested_change: "fix".to_string(),
+                confidence: 0.9,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let ledger = build_ledger(
+            &["mapped".to_string(), "unmapped".to_string()],
+            &result,
+            &["index.html".to_string()],
+        );
+        assert_eq!(ledger[0].status, project::AcceptanceStatus::Unsatisfied);
+        assert_eq!(ledger[1].status, project::AcceptanceStatus::Unknown);
         assert!(needs_evidence(&ledger));
     }
 

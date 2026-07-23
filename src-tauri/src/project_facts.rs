@@ -5,6 +5,8 @@ use std::path::{Component, Path};
 
 const MAX_SNIPPET_CHARS: usize = 1_200;
 const MAX_TOTAL_SNIPPET_CHARS: usize = 4_800;
+const MAX_IDENTIFIER_CONTEXT_CHARS: usize = 1_600;
+const MAX_IDENTIFIER_CONTEXTS: usize = 8;
 const MAX_PLANNING_FILES: usize = 80;
 const MAX_PLANNING_FACT_ITEMS: usize = 160;
 const SKIP_DIRS: &[&str] = &[
@@ -50,6 +52,33 @@ fn quoted_values(content: &str, marker: &str) -> Vec<String> {
     values.into_iter().collect()
 }
 
+fn collect_identifier_contexts(
+    content: &str,
+    identifiers: &[String],
+) -> BTreeMap<String, Vec<String>> {
+    let lines = content.lines().collect::<Vec<_>>();
+    identifiers
+        .iter()
+        .filter(|identifier| !identifier.trim().is_empty())
+        .take(MAX_IDENTIFIER_CONTEXTS)
+        .filter_map(|identifier| {
+            let mut contexts = Vec::new();
+            for (index, line) in lines.iter().enumerate() {
+                if line.contains(identifier) {
+                    let start = index.saturating_sub(2);
+                    let end = (index + 3).min(lines.len());
+                    let context = lines[start..end].join("\n");
+                    contexts.push(context.chars().take(MAX_IDENTIFIER_CONTEXT_CHARS).collect());
+                    if contexts.len() >= 3 {
+                        break;
+                    }
+                }
+            }
+            (!contexts.is_empty()).then(|| (identifier.clone(), contexts))
+        })
+        .collect()
+}
+
 fn symbols(content: &str) -> Vec<String> {
     let mut result = BTreeSet::new();
     for line in content.lines() {
@@ -74,13 +103,52 @@ fn symbols(content: &str) -> Vec<String> {
             }
         }
     }
+    for prefix in ["function ", "class ", "const ", "let "] {
+        for (offset, _) in content.match_indices(prefix) {
+            let rest = &content[offset + prefix.len()..];
+            let name = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
+                .collect::<String>();
+            if name.len() > 1 {
+                result.insert(name);
+            }
+        }
+    }
     result.into_iter().collect()
+}
+
+fn storage_values(content: &str) -> Vec<String> {
+    let mut values = BTreeSet::new();
+    for (offset, _) in content.match_indices("localStorage.") {
+        let tail = &content[offset + "localStorage.".len()..];
+        let value = tail
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '$')
+            .collect::<String>();
+        if value.len() > 1 {
+            values.insert(value);
+        }
+    }
+    for marker in ["setItem(", "getItem(", "removeItem("] {
+        values.extend(quoted_values(content, marker));
+    }
+    values.into_iter().collect()
 }
 
 pub(crate) fn capture(
     project_path: &str,
     paths: &[String],
     accepted_deviations: Vec<String>,
+) -> Result<project::ProjectFactSnapshot, String> {
+    capture_with_identifiers(project_path, paths, accepted_deviations, &[])
+}
+
+pub(crate) fn capture_with_identifiers(
+    project_path: &str,
+    paths: &[String],
+    accepted_deviations: Vec<String>,
+    required_identifiers: &[String],
 ) -> Result<project::ProjectFactSnapshot, String> {
     let root = std::fs::canonicalize(project_path)
         .map_err(|error| format!("无法解析项目事实根目录 {}：{}", project_path, error))?;
@@ -90,6 +158,7 @@ pub(crate) fn capture(
     let mut dom_ids = BTreeSet::new();
     let mut event_bindings = BTreeSet::new();
     let mut snippets = Vec::new();
+    let mut identifier_contexts = BTreeMap::new();
 
     let mut snippet_chars = 0;
     for relative in paths.iter().collect::<BTreeSet<_>>() {
@@ -120,9 +189,17 @@ pub(crate) fn capture(
         file_hashes.insert(relative.clone(), sha256(&bytes));
         if let Ok(content) = String::from_utf8(bytes) {
             all_symbols.extend(symbols(&content));
-            storage_keys.extend(quoted_values(&content, "localStorage."));
+            storage_keys.extend(storage_values(&content));
             dom_ids.extend(quoted_values(&content, "getElementById("));
+            dom_ids.extend(quoted_values(&content, "querySelector("));
+            dom_ids.extend(quoted_values(&content, "querySelectorAll("));
+            dom_ids.extend(quoted_values(&content, "id="));
             event_bindings.extend(quoted_values(&content, "addEventListener("));
+            for (identifier, contexts) in
+                collect_identifier_contexts(&content, required_identifiers)
+            {
+                identifier_contexts.entry(identifier).or_insert(contexts);
+            }
             if snippet_chars < MAX_TOTAL_SNIPPET_CHARS {
                 let remaining = MAX_TOTAL_SNIPPET_CHARS - snippet_chars;
                 let snippet: String = content
@@ -140,6 +217,7 @@ pub(crate) fn capture(
         &storage_keys,
         &dom_ids,
         &event_bindings,
+        &identifier_contexts,
         &accepted_deviations,
     ))
     .map_err(|error| format!("序列化项目事实失败：{}", error))?;
@@ -151,6 +229,7 @@ pub(crate) fn capture(
         dom_ids: dom_ids.into_iter().collect(),
         event_bindings: event_bindings.into_iter().collect(),
         relevant_snippets: snippets,
+        identifier_contexts,
         accepted_deviations,
         structural_fingerprint: sha256(&fingerprint_input),
         captured_at: chrono::Utc::now().to_rfc3339(),
@@ -315,10 +394,11 @@ pub(crate) fn next_task_needs_scan_or_calibration(
     let Some(previous) = task.fact_snapshot.as_ref() else {
         return Ok(true);
     };
-    let current = capture(
+    let current = capture_with_identifiers(
         &project.project_path,
         &snapshot_paths(task),
         accepted_deviations(project),
+        &task.required_identifiers,
     )?;
     Ok(has_drift(Some(previous), &current))
 }
@@ -408,6 +488,26 @@ mod tests {
             vec![],
         )
         .is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn captures_identifier_context_from_file_tail_and_modern_dom_apis() {
+        let root =
+            std::env::temp_dir().join(format!("metheus-fact-context-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let content = format!("{}\n<script>function tailAction() {{ localStorage.tail_key = 'x'; document.querySelector('#tail').addEventListener('click', tailAction); }}</script>", "\n".repeat(400));
+        std::fs::write(root.join("index.html"), content).unwrap();
+        let facts = capture_with_identifiers(
+            &root.to_string_lossy(),
+            &["index.html".to_string()],
+            vec![],
+            &["tailAction".to_string()],
+        )
+        .unwrap();
+        assert!(facts.identifier_contexts.contains_key("tailAction"));
+        assert!(facts.symbols.contains(&"tailAction".to_string()));
+        assert!(facts.storage_keys.contains(&"tail_key".to_string()));
         std::fs::remove_dir_all(root).unwrap();
     }
 }
