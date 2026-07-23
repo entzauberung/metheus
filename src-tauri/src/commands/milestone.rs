@@ -86,6 +86,39 @@ fn string_array(
         .collect()
 }
 
+fn required_u32(value: &serde_json::Value, field: &str, entity: &str) -> Result<u32, String> {
+    let number = value
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .filter(|number| *number > 0 && *number <= u32::MAX as u64)
+        .ok_or_else(|| format!("{}缺少正整数字段 {}", entity, field))?;
+    Ok(number as u32)
+}
+
+fn required_u32_array(
+    value: &serde_json::Value,
+    field: &str,
+    entity: &str,
+) -> Result<Vec<u32>, String> {
+    let mut result = value
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{}缺少数组字段 {}", entity, field))?
+        .iter()
+        .map(|item| {
+            item.as_u64()
+                .filter(|number| *number > 0 && *number <= u32::MAX as u64)
+                .map(|number| number as u32)
+                .ok_or_else(|| format!("{}的 {} 包含非正整数项", entity, field))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    result.sort_unstable();
+    if result.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(format!("{}的 {} 包含重复顺序号", entity, field));
+    }
+    Ok(result)
+}
+
 async fn generate_milestone_candidates(
     proj: &project::Project,
     regeneration_feedback: Option<&str>,
@@ -1076,6 +1109,8 @@ fn has_plan_execution_facts(mid_stage: &project::MidStage) -> bool {
                 project::SubtaskStatus::Executing
                     | project::SubtaskStatus::AwaitingConfirmation
                     | project::SubtaskStatus::Passed
+                    | project::SubtaskStatus::AcceptedDeviation
+                    | project::SubtaskStatus::Skipped
             ) || subtask.auto_tag.as_ref().is_some_and(|tag| !tag.is_empty())
         })
 }
@@ -1117,10 +1152,12 @@ async fn generate_execution_plan_tasks(
             format!("\n\n重新生成反馈：\n{}", feedback)
         });
     let context_injection = crate::constitution_context::build_context_injection(proj);
+    let project_facts = crate::project_facts::planning_context(proj)?;
     let context = format!(
         "{}中阶段：{} ({})\n描述：{}\n技术重点：{}\n\n所属大阶段：{} — {}\n\
          项目方案摘要（仅相关部分）：\n{}\n\n项目路径：{}\n\
-         已有文件（仅作参考，不得无差别注入）：\n（由执行器在运行时按 evidence_files 精确读取）{}",
+         当前项目事实（压缩扫描，不含完整文件）：\n{}\n\n\
+         完整文件由执行器在运行时按 evidence_files 精确读取。{}",
         if context_injection.is_empty() {
             String::new()
         } else {
@@ -1134,13 +1171,14 @@ async fn generate_execution_plan_tasks(
         milestone.goal,
         proj.version_plan.chars().take(1000).collect::<String>(),
         proj.project_path,
+        project_facts,
         feedback_section,
     );
     let reply = crate::api::call_deepseek_api_json(crate::prompts::EXECUTION_PLAN_PROMPT, &context)
         .await
         .map_err(|error| format!("执行计划生成 AI 调用失败：{}", error))?;
-    match parse_execution_plan_tasks(&reply).await {
-        Ok(tasks) => Ok(tasks),
+    let mut tasks = match parse_execution_plan_tasks(&reply).await {
+        Ok(tasks) => tasks,
         Err(validation_error) => {
             let repair_context = format!(
                 "{}\n\n上一次输出未满足执行计划契约：{}\n请完整重新输出修正后的 JSON 数组。",
@@ -1159,9 +1197,19 @@ async fn generate_execution_plan_tasks(
                         "执行计划修订后仍不满足契约：{}（首次错误：{}）",
                         error, validation_error
                     )
-                })
+                })?
         }
+    };
+    let accepted_deviations = crate::project_facts::accepted_deviations(proj);
+    for task in &mut tasks {
+        let paths = crate::project_facts::snapshot_paths(task);
+        task.fact_snapshot = Some(crate::project_facts::capture(
+            &proj.project_path,
+            &paths,
+            accepted_deviations.clone(),
+        )?);
     }
+    Ok(tasks)
 }
 
 async fn parse_execution_plan_tasks(reply: &str) -> Result<Vec<project::Subtask>, String> {
@@ -1172,11 +1220,32 @@ async fn parse_execution_plan_tasks(reply: &str) -> Result<Vec<project::Subtask>
         return Err("AI 返回的执行计划为空，请重新生成。".to_string());
     }
 
-    let tasks = raw
+    let dependency_orders = raw
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            required_u32_array(
+                item,
+                "depends_on_orders",
+                &format!("第 {} 个小阶段", index + 1),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut tasks = raw
         .iter()
         .enumerate()
         .map(|(index, item)| {
             let entity = format!("第 {} 个小阶段", index + 1);
+            let order = required_u32(item, "order", &entity)?;
+            if order != index as u32 + 1 {
+                return Err(format!(
+                    "{}的 order 必须为 {}，实际为 {}",
+                    entity,
+                    index + 1,
+                    order
+                ));
+            }
             let execution_prompt = required_string(item, "execution_prompt", &entity)?;
             Ok(project::Subtask {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -1188,7 +1257,7 @@ async fn parse_execution_plan_tasks(reply: &str) -> Result<Vec<project::Subtask>
                 test_result: None,
                 retry_count: 0,
                 auto_tag: None,
-                order: (index + 1) as u32,
+                order,
                 goal: required_string(item, "goal", &entity)?,
                 allowed_file_paths: required_string_array(item, "allowed_file_paths", &entity)?,
                 new_file_paths: string_array(item, "new_file_paths", &entity)?,
@@ -1201,9 +1270,43 @@ async fn parse_execution_plan_tasks(reply: &str) -> Result<Vec<project::Subtask>
                 confirmed_at: None,
                 confirmation_notes: None,
                 human_verification: None,
+                required_identifiers: vec![],
+                acceptance_ledger: vec![],
+                fact_snapshot: None,
+                plan_patch_revision: 0,
+                depends_on: vec![],
+                dependency_notes: required_string(item, "dependency_notes", &entity)?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let task_ids = tasks
+        .iter()
+        .map(|task| (task.order, task.id.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (index, task) in tasks.iter_mut().enumerate() {
+        task.depends_on = dependency_orders[index]
+            .iter()
+            .map(|dependency_order| {
+                if *dependency_order >= task.order {
+                    return Err(format!(
+                        "第 {} 个小阶段的依赖顺序 {} 必须早于当前任务",
+                        index + 1,
+                        dependency_order
+                    ));
+                }
+                task_ids.get(dependency_order).cloned().ok_or_else(|| {
+                    format!(
+                        "第 {} 个小阶段引用了不存在的依赖顺序 {}",
+                        index + 1,
+                        dependency_order
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    for task in &mut tasks {
+        crate::plan_contract::hydrate_subtask_contract(task);
+    }
     crate::plan_contract::validate_subtasks(&tasks)?;
     Ok(tasks)
 }
@@ -1426,29 +1529,48 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
         return crate::save_and_reload_project(&proj);
     }
 
+    let order_by_id = mid
+        .subtasks
+        .iter()
+        .map(|task| (task.id.as_str(), task.order))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let plan_text = mid
         .subtasks
         .iter()
         .enumerate()
         .map(|(i, st)| {
+            let dependency_orders = st
+                .depends_on
+                .iter()
+                .filter_map(|id| order_by_id.get(id.as_str()))
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(
-                "{}. {} — goal: {} — files: [{}] — new: [{}] — criteria: [{}]",
+                "{}. {} — goal: {} — files: [{}] — new: [{}] — evidence: [{}] — criteria: [{}] — depends_on_orders: [{}] — dependency_notes: {} — implementation: {}",
                 i + 1,
                 st.title,
                 st.goal,
                 st.allowed_file_paths.join(", "),
                 st.new_file_paths.join(", "),
+                st.evidence_files.join(", "),
                 st.acceptance_criteria.join("; "),
+                dependency_orders,
+                st.dependency_notes,
+                st.execution_prompt,
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
 
+    let project_facts = crate::project_facts::planning_context(&proj)?;
+
     let context = format!(
-        "中阶段：{} — {}\n技术重点：{}\n\n执行计划（{} 个小阶段）：\n{}",
+        "中阶段：{} — {}\n技术重点：{}\n\n当前项目事实（与计划生成使用相同的压缩扫描）：\n{}\n\n执行计划（{} 个小阶段）：\n{}",
         mid.title,
         mid.description,
         mid.tech_focus,
+        project_facts,
         mid.subtasks.len(),
         plan_text
     );
@@ -2746,216 +2868,6 @@ fn merge_milestones(
     result
 }
 
-/// 在回退后，根据分割点重新生成后续 subtask 的执行计划
-///
-/// 保留分割点之前的已完成 subtask（含分割点自身），
-/// 调用 AI 批量生成分割点之后的后续 subtask，并持久化到 project.json。
-///
-/// 与 handleGeneratePlanForMidStage 中逐个 generate_next_prompt 的区别：
-/// - 本命令一次性生成多个后续 subtask，而非逐个生成
-/// - 提供已完成 subtask 的上下文和 git diff，确保逻辑连贯
-///
-/// 1. 加载项目，定位 milestone → mid_stage → split subtask
-/// 2. 收集已完成 subtask 上下文 + git diff
-/// 3. 调用 AI 批量生成后续 subtask（JSON 数组）
-/// 4. 拼接新旧 subtask，持久化
-/// 5. 返回更新后的 mid_stage JSON
-#[tauri::command]
-#[allow(dead_code)]
-pub(crate) async fn regenerate_plan_from_checkpoint(
-    project_name: String,
-    project_path: String,
-    milestone_id: String,
-    mid_stage_id: String,
-    subtask_id: String,
-) -> Result<String, String> {
-    // 1. 加载项目
-    let mut project = crate::load_project(&project_name)?;
-
-    // 2. 定位目标 mid_stage
-    let milestone = project
-        .milestones
-        .iter()
-        .find(|m| m.id == milestone_id)
-        .ok_or(format!("未找到大阶段: {}", milestone_id))?;
-    let mid_stage = milestone
-        .mid_stages
-        .iter()
-        .find(|ms| ms.id == mid_stage_id)
-        .ok_or(format!("未找到中阶段: {}", mid_stage_id))?;
-
-    let mid_stage_title = mid_stage.title.clone();
-    let mid_stage_description = mid_stage.description.clone();
-
-    // 3. 定位分割点：找到 subtask_id 对应的索引
-    let split_idx = mid_stage
-        .subtasks
-        .iter()
-        .position(|st| st.id == subtask_id)
-        .ok_or(format!("未找到小阶段: {}", subtask_id))?;
-
-    let total_count = mid_stage.subtasks.len();
-    let remaining_count = total_count.saturating_sub(split_idx + 1);
-
-    // 如果没有后续 subtask 需要生成，直接返回当前 mid_stage JSON
-    if remaining_count == 0 {
-        let json_str = serde_json::to_string_pretty(&mid_stage)
-            .map_err(|e| format!("序列化中阶段失败: {}", e))?;
-        return Ok(json_str);
-    }
-
-    // 4. 收集已完成 subtask 的上下文
-    let completed_subtasks: Vec<String> = mid_stage.subtasks[..=split_idx]
-        .iter()
-        .map(|st| {
-            let result_summary = match (&st.execution_result, &st.test_result) {
-                (Some(exec), Some(test)) => {
-                    if test.passed {
-                        format!(
-                            "通过 — {}",
-                            exec.output.chars().take(100).collect::<String>()
-                        )
-                    } else {
-                        format!("未通过 — {}", test.suggestion)
-                    }
-                }
-                (Some(exec), None) => {
-                    format!(
-                        "已执行 — {}",
-                        exec.output.chars().take(100).collect::<String>()
-                    )
-                }
-                _ => "待执行".to_string(),
-            };
-            format!("- {}（结果：{}）", st.title, result_summary)
-        })
-        .collect();
-
-    let completed_context = if completed_subtasks.is_empty() {
-        "（暂无已完成的小阶段）".to_string()
-    } else {
-        completed_subtasks.join("\n")
-    };
-
-    // 5. 获取 git diff
-    let git_diff = match std::process::Command::new("git")
-        .args(["diff"])
-        .current_dir(&project_path)
-        .output()
-    {
-        Ok(output) => {
-            if output.status.success() {
-                let diff_str = String::from_utf8_lossy(&output.stdout).to_string();
-                if diff_str.trim().is_empty() {
-                    "（工作区干净，无未提交变更）".to_string()
-                } else {
-                    diff_str
-                }
-            } else {
-                "（无法获取 git diff）".to_string()
-            }
-        }
-        Err(_) => "（无法获取 git diff）".to_string(),
-    };
-
-    // 6. 构造 AI 请求
-    let user_message = format!(
-        "中阶段标题：{}\n\
-         中阶段描述：{}\n\n\
-         已完成小阶段：\n{}\n\n\
-         分割点：已完成 {} 个小阶段，需要从第 {} 个小阶段开始生成。\n\n\
-         需要生成数量：{}\n\n\
-         当前项目代码变更（git diff）：\n{}",
-        mid_stage_title,
-        mid_stage_description,
-        completed_context,
-        split_idx + 1,
-        split_idx + 2,
-        remaining_count,
-        git_diff
-    );
-
-    // 7. 调用 AI
-    let reply = crate::api::call_deepseek_api_json(
-        crate::prompts::REGENERATE_SUBTASKS_PROMPT,
-        &user_message,
-    )
-    .await
-    .map_err(|e| format!("AI 调用失败: {}", e))?;
-
-    // 8. 解析 AI 返回的 JSON 数组
-    let raw_subtasks: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&reply)
-        .await
-        .map_err(|e| format!("解析小阶段 JSON 失败：{}", e))?;
-
-    // 9. 构建新的 subtask 列表
-    let mut new_subtasks: Vec<project::Subtask> = Vec::new();
-
-    // 保留已完成的 subtask（克隆原始数据）
-    for st in mid_stage.subtasks[..=split_idx].iter() {
-        new_subtasks.push(st.clone());
-    }
-
-    // 追加 AI 生成的新 subtask
-    for raw in raw_subtasks {
-        new_subtasks.push(project::Subtask {
-            id: uuid::Uuid::new_v4().to_string(),
-            title: raw["title"].as_str().unwrap_or("未命名").to_string(),
-            prompt: raw["prompt"].as_str().unwrap_or("").to_string(),
-            status: project::SubtaskStatus::Pending,
-            test_report: String::new(),
-            execution_result: None,
-            test_result: None,
-            retry_count: 0,
-            auto_tag: None,
-            order: 0,
-            goal: String::new(),
-            allowed_file_paths: vec!["tracked.txt".to_string()],
-            new_file_paths: vec![],
-            evidence_files: vec![],
-            context_summary: String::new(),
-            acceptance_criteria: vec![],
-            stop_rules: vec![],
-            execution_prompt: String::new(),
-            confirmed_by_user: None,
-            confirmed_at: None,
-            confirmation_notes: None,
-            human_verification: None,
-        });
-    }
-
-    // 10. 更新 project 中的 mid_stage subtasks
-    {
-        let ms = project
-            .milestones
-            .iter_mut()
-            .find(|m| m.id == milestone_id)
-            .ok_or("更新时找不到大阶段".to_string())?;
-        let mid = ms
-            .mid_stages
-            .iter_mut()
-            .find(|m| m.id == mid_stage_id)
-            .ok_or("更新时找不到中阶段".to_string())?;
-        mid.subtasks = new_subtasks;
-    }
-
-    // 11. 持久化
-    let project = crate::save_and_reload_project(&project)?;
-
-    // 12. 序列化并返回更新后的 mid_stage
-    let updated_mid_stage = project
-        .milestones
-        .iter()
-        .find(|m| m.id == milestone_id)
-        .and_then(|ms| ms.mid_stages.iter().find(|m| m.id == mid_stage_id))
-        .ok_or("序列化时找不到中阶段".to_string())?;
-
-    let json_str = serde_json::to_string_pretty(updated_mid_stage)
-        .map_err(|e| format!("序列化中阶段失败: {}", e))?;
-
-    Ok(json_str)
-}
-
 /// 大阶段完成后的 AI 自然语言总结
 ///
 /// 基于大阶段的执行统计数据（中阶段完成情况、测试通过率、Git 标签等），
@@ -3210,6 +3122,55 @@ mod tests {
             check_result: Some("检查通过".to_string()),
             ..Default::default()
         }
+    }
+
+    fn execution_plan_json(second_dependencies: serde_json::Value) -> String {
+        serde_json::json!([
+            {
+                "order": 1,
+                "title": "建立状态",
+                "goal": "建立状态模型",
+                "allowed_file_paths": ["src/main.ts"],
+                "new_file_paths": [],
+                "evidence_files": ["src/main.ts"],
+                "context_summary": "读取当前状态模型并保持现有字段兼容，先建立后续交互所需的最小状态接口。",
+                "acceptance_criteria": ["提供 `loadState` 函数"],
+                "stop_rules": ["发现范围外变更时停止"],
+                "execution_prompt": "实现状态模型",
+                "depends_on_orders": [],
+                "dependency_notes": "首个任务没有前置依赖"
+            },
+            {
+                "order": 2,
+                "title": "绑定交互",
+                "goal": "绑定状态交互",
+                "allowed_file_paths": ["src/main.ts"],
+                "new_file_paths": [],
+                "evidence_files": ["src/main.ts"],
+                "context_summary": "使用上一任务建立的状态接口绑定交互，并保持已有事件初始化顺序不变。",
+                "acceptance_criteria": ["调用 `loadState`"],
+                "stop_rules": ["缺少状态接口时停止"],
+                "execution_prompt": "绑定交互",
+                "depends_on_orders": second_dependencies,
+                "dependency_notes": "依赖第一个任务建立状态接口"
+            }
+        ])
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn execution_plan_maps_dependency_orders_to_stable_ids() -> Result<(), String> {
+        let tasks =
+            parse_execution_plan_tasks(&execution_plan_json(serde_json::json!([1]))).await?;
+        assert_eq!(tasks[1].depends_on, vec![tasks[0].id.clone()]);
+        assert!(!tasks[1].dependency_notes.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn execution_plan_rejects_forward_dependencies() {
+        let result = parse_execution_plan_tasks(&execution_plan_json(serde_json::json!([2]))).await;
+        assert!(result.is_err());
     }
 
     #[test]

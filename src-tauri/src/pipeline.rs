@@ -257,11 +257,9 @@ pub(crate) async fn execute_current_subtask(
         subtask.goal.clone()
     };
     let acceptance_criteria = subtask.acceptance_criteria.clone();
-    let approved_prompt = if subtask.execution_prompt.is_empty() {
-        subtask.prompt.clone()
-    } else {
-        subtask.execution_prompt.clone()
-    };
+    let learning = crate::recovery_learning::render_matching(&proj, subtask, None);
+    let approved_prompt =
+        crate::plan_compiler::compile_execution_prompt_with_learning(subtask, &learning);
 
     let total = mid.subtasks.len();
     let plan_revision = mid.plan_revision;
@@ -485,27 +483,40 @@ async fn execute_current_subtask_background(
         Ok(result) => result,
         Err(crate::engine::EngineError::Cancelled) => return Ok(()),
         Err(crate::engine::EngineError::Timeout) => {
-            return Err(BackgroundExecutionFailure::new(
+            return Err(BackgroundExecutionFailure::engine(
                 project::RecoveryErrorKind::ExecutionError,
+                project::EngineFailureKind::Timeout,
                 "执行超时".to_string(),
+                None,
             ))
         }
         Err(error) => {
-            return Err(BackgroundExecutionFailure::new(
+            let message = error.to_string();
+            let kind = crate::engine::classify_process_failure(None, &message, "");
+            return Err(BackgroundExecutionFailure::engine(
                 project::RecoveryErrorKind::ExecutionError,
-                error.to_string(),
-            ))
+                kind,
+                message,
+                None,
+            ));
         }
     };
 
     if !exec_result.success {
-        return Err(BackgroundExecutionFailure::new(
+        let message = if exec_result.error_log.is_empty() {
+            format!("{} 非零退出", execution_profile.provider.display_name())
+        } else {
+            exec_result.error_log.clone()
+        };
+        let kind = exec_result
+            .engine_failure_kind
+            .clone()
+            .unwrap_or(project::EngineFailureKind::TaskExecutionError);
+        return Err(BackgroundExecutionFailure::engine(
             project::RecoveryErrorKind::ExecutionError,
-            if exec_result.error_log.is_empty() {
-                format!("{} 非零退出", execution_profile.provider.display_name())
-            } else {
-                exec_result.error_log.clone()
-            },
+            kind,
+            message,
+            Some(exec_result),
         ));
     }
 
@@ -543,14 +554,14 @@ async fn execute_current_subtask_background(
         }
     }
 
-    let test = crate::test_runner::check_subtask_with_context(
+    let mut test = crate::test_runner::check_subtask_with_context(
         &project_path,
         &subtask_goal,
         &subtask_id,
         &subtask_title,
         &mid_stage_id,
-        Some(acceptance_criteria),
-        Some(authorized_paths),
+        Some(acceptance_criteria.clone()),
+        Some(authorized_paths.clone()),
         Some(approved_prompt),
     )
     .await
@@ -562,6 +573,8 @@ async fn execute_current_subtask_background(
         automated_test_status: project::AutomatedTestStatus::Unavailable,
         ..Default::default()
     });
+    test.acceptance_results =
+        crate::acceptance::build_ledger(&acceptance_criteria, &test, &authorized_paths);
 
     // 与暂停命令共用流水线锁，保证 execution_id 校验到项目保存之间不被旧任务穿透。
     let mut pipeline_guard = pipeline_state.lock().await;
@@ -612,6 +625,7 @@ async fn execute_current_subtask_background(
         }
         subtask.execution_result = Some(exec_result);
         subtask.test_result = Some(test.clone());
+        subtask.acceptance_ledger = test.acceptance_results.clone();
         subtask.status = project::SubtaskStatus::AwaitingConfirmation;
     }
 
@@ -716,11 +730,32 @@ async fn execute_current_subtask_background(
 struct BackgroundExecutionFailure {
     kind: project::RecoveryErrorKind,
     message: String,
+    engine_failure_kind: Option<project::EngineFailureKind>,
+    execution_result: Option<project::ExecutionResult>,
 }
 
 impl BackgroundExecutionFailure {
     fn new(kind: project::RecoveryErrorKind, message: String) -> Self {
-        Self { kind, message }
+        Self {
+            kind,
+            message,
+            engine_failure_kind: None,
+            execution_result: None,
+        }
+    }
+
+    fn engine(
+        kind: project::RecoveryErrorKind,
+        engine_failure_kind: project::EngineFailureKind,
+        message: String,
+        execution_result: Option<project::ExecutionResult>,
+    ) -> Self {
+        Self {
+            kind,
+            message,
+            engine_failure_kind: Some(engine_failure_kind),
+            execution_result,
+        }
     }
 
     fn state_conflict(message: &str) -> Self {
@@ -766,18 +801,66 @@ async fn finalize_background_execution_failure(
         return Ok(());
     }
 
+    let engine_blocked = failure
+        .engine_failure_kind
+        .as_ref()
+        .is_some_and(crate::engine::blocks_code_recovery);
+    let baseline = proj
+        .execution_session
+        .as_ref()
+        .map(|session| session.base_commit.clone())
+        .unwrap_or_default();
+
     finalize_execution_failure(
         &mut proj,
         &mut *pipeline_guard,
         subtask_idx,
         &failure.message,
+        failure.execution_result.clone(),
     );
+    let effective_message = if engine_blocked {
+        let target = if baseline.is_empty() {
+            "HEAD"
+        } else {
+            &baseline
+        };
+        match restore_git_execution_baseline(&proj.project_path, target) {
+            Ok(()) => format!("{}；执行引擎阻断后已恢复任务基线", failure.message),
+            Err(error) => format!(
+                "{}；执行引擎阻断后恢复任务基线失败：{}",
+                failure.message, error
+            ),
+        }
+    } else {
+        failure.message.clone()
+    };
     crate::recovery::begin_execution_recovery(
         &mut proj,
-        failure.kind.clone(),
+        if engine_blocked {
+            project::RecoveryErrorKind::EngineBlocked
+        } else {
+            failure.kind.clone()
+        },
         execution_id,
-        &failure.message,
+        &effective_message,
     );
+    if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
+        recovery.engine_failure_kind = failure.engine_failure_kind.clone();
+        if recovery.error_kind == project::RecoveryErrorKind::EngineBlocked {
+            recovery.phase = project::RecoveryPhase::WaitingEngine;
+        }
+    }
+    if engine_blocked {
+        if let Some(session) = proj.execution_session.as_mut() {
+            session.failure_message = effective_message.clone();
+        }
+        if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+            autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
+            autopilot.last_action = "执行引擎不可用，代码恢复未启动".to_string();
+            autopilot.error_message = effective_message.clone();
+            autopilot.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+        }
+    }
     write_execution_history(
         &mut proj,
         "error",
@@ -787,7 +870,7 @@ async fn finalize_background_execution_failure(
             subtask_idx + 1,
             total,
             subtask_title,
-            failure.message
+            effective_message
         ),
         Some(milestone_id),
         Some(mid_stage_id),
@@ -875,6 +958,11 @@ fn validate_subtask_quality_gate_with_session_statuses(
         .is_some_and(|verification| {
             verification.verification_kind == project::VerificationKind::HumanOverride
                 && !verification.verification_reason.trim().is_empty()
+                && matches!(
+                    verification.resolution,
+                    project::HumanResolution::ConfirmActualPass
+                        | project::HumanResolution::AcceptDeviation
+                )
         });
 
     // 人工核验是独立的通过通道；真实测试结果保持原值。
@@ -903,12 +991,116 @@ fn validate_subtask_quality_gate_with_session_statuses(
     Ok(())
 }
 
+fn is_terminal_subtask(status: &project::SubtaskStatus) -> bool {
+    matches!(
+        status,
+        project::SubtaskStatus::Passed
+            | project::SubtaskStatus::AcceptedDeviation
+            | project::SubtaskStatus::Skipped
+    )
+}
+
+/// Reconcile stage state after any terminal task outcome. Passing, accepting a
+/// deviation, and dependency-approved skipping must advance through the same
+/// state transition instead of leaving a completed stage marked InProgress.
+pub(crate) fn reconcile_terminal_stage(
+    proj: &mut project::Project,
+    milestone_id: &str,
+    mid_stage_id: &str,
+) -> (bool, bool) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mid_completed = proj
+        .milestones
+        .iter()
+        .find(|milestone| milestone.id == milestone_id)
+        .and_then(|milestone| {
+            milestone
+                .mid_stages
+                .iter()
+                .find(|mid_stage| mid_stage.id == mid_stage_id)
+        })
+        .is_some_and(|mid_stage| {
+            !mid_stage.subtasks.is_empty()
+                && mid_stage
+                    .subtasks
+                    .iter()
+                    .all(|subtask| is_terminal_subtask(&subtask.status))
+        });
+    if !mid_completed {
+        return (false, false);
+    }
+
+    if let Some(mid_stage) = proj
+        .milestones
+        .iter_mut()
+        .find(|milestone| milestone.id == milestone_id)
+        .and_then(|milestone| {
+            milestone
+                .mid_stages
+                .iter_mut()
+                .find(|mid_stage| mid_stage.id == mid_stage_id)
+        })
+    {
+        mid_stage.status = project::MidStageStatus::Completed;
+        mid_stage.completed_at = Some(now.clone());
+    }
+    let milestone_completed = proj
+        .milestones
+        .iter()
+        .find(|milestone| milestone.id == milestone_id)
+        .is_some_and(|milestone| {
+            !milestone.mid_stages.is_empty()
+                && milestone
+                    .mid_stages
+                    .iter()
+                    .all(|mid_stage| mid_stage.status == project::MidStageStatus::Completed)
+        });
+    if milestone_completed {
+        if let Some(milestone) = proj
+            .milestones
+            .iter_mut()
+            .find(|milestone| milestone.id == milestone_id)
+        {
+            milestone.status = project::MilestoneStatus::Completed;
+            milestone.review_status = Some("pending_review".to_string());
+            milestone.review_conclusion = None;
+        }
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneReview;
+        proj.workflow_state.review_node_id = milestone_id.to_string();
+        if proj.workflow_state.autopilot_active {
+            let milestone_title = proj
+                .milestones
+                .iter()
+                .find(|milestone| milestone.id == milestone_id)
+                .map(|milestone| milestone.title.clone())
+                .unwrap_or_else(|| milestone_id.to_string());
+            let autopilot = proj
+                .workflow_state
+                .autopilot_state
+                .get_or_insert_with(project::AutopilotState::default);
+            autopilot.active = true;
+            autopilot.target_milestone_id = milestone_id.to_string();
+            autopilot.run_status = project::AutopilotRunStatus::WaitingMilestoneReview;
+            autopilot.last_action = format!("到达大阶段边界：{}，等待人工 A/B/C", milestone_title);
+            autopilot.last_action_at = now.clone();
+            autopilot.error_message.clear();
+        }
+    } else {
+        proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
+        proj.current_mid_stage_id.clear();
+    }
+    proj.workflow_state.data_revision = proj.workflow_state.data_revision.saturating_add(1);
+    proj.workflow_state.last_transition_at = now;
+    (true, milestone_completed)
+}
+
 /// 执行器失败时修正磁盘任务、会话、流水线和自动驾驶状态
 fn finalize_execution_failure(
     proj: &mut project::Project,
     pipeline_state: &mut Option<PipelineState>,
     subtask_idx: usize,
     error_message: &str,
+    execution_result: Option<project::ExecutionResult>,
 ) {
     let now = chrono::Utc::now().to_rfc3339();
     let mut error_chars = error_message.chars();
@@ -940,7 +1132,7 @@ fn finalize_execution_failure(
         {
             if let Some(st) = mid.subtasks.get_mut(subtask_idx) {
                 st.status = project::SubtaskStatus::Pending;
-                st.execution_result = None;
+                st.execution_result = execution_result;
                 st.test_result = None;
             }
         }
@@ -1040,19 +1232,6 @@ pub(crate) async fn confirm_subtask_result(
         let _ = crate::save_project(&proj);
         return Err("请先选择大阶段和中阶段。".to_string());
     }
-
-    // 在获取可变借用前，收集当前大阶段其他中阶段的完成状态
-    let other_mid_stages_all_completed = {
-        let ms_for_check = proj.milestones.iter().find(|m| m.id == milestone_id);
-        ms_for_check
-            .map(|ms| {
-                ms.mid_stages
-                    .iter()
-                    .filter(|m| m.id != mid_stage_id)
-                    .all(|m| m.status == project::MidStageStatus::Completed)
-            })
-            .unwrap_or(false)
-    };
 
     // 质量门禁：在创建 Git 标签之前校验执行/测试/证据完整性
     // 认领后 session 为 confirming，质量门禁仍按子任务状态判定
@@ -1234,7 +1413,13 @@ pub(crate) async fn confirm_subtask_result(
             if let Some(ms) = proj.milestones.iter_mut().find(|m| m.id == milestone_id) {
                 if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == mid_stage_id) {
                     if let Some(st) = mid.subtasks.get_mut(subtask_idx) {
-                        st.status = project::SubtaskStatus::Passed;
+                        st.status = if st.human_verification.as_ref().is_some_and(|verification| {
+                            verification.resolution == project::HumanResolution::AcceptDeviation
+                        }) {
+                            project::SubtaskStatus::AcceptedDeviation
+                        } else {
+                            project::SubtaskStatus::Passed
+                        };
                         st.confirmed_by_user = Some(true);
                         st.confirmed_at = Some(now.clone());
                         st.auto_tag = Some(tag_name);
@@ -1312,18 +1497,6 @@ pub(crate) async fn confirm_subtask_result(
     }
 
     // === 中阶段完成检测与工作流推进 ===
-    let all_subtasks_passed = proj
-        .milestones
-        .iter()
-        .find(|m| m.id == milestone_id)
-        .and_then(|ms| ms.mid_stages.iter().find(|m| m.id == mid_stage_id))
-        .map(|mid| {
-            mid.subtasks
-                .iter()
-                .all(|s| s.status == project::SubtaskStatus::Passed)
-        })
-        .unwrap_or(false);
-
     let mid_title_for_node_tag = proj
         .milestones
         .iter()
@@ -1334,40 +1507,8 @@ pub(crate) async fn confirm_subtask_result(
     let mid_version_for_node_tag = mid_version.clone();
     let mid_stage_id_for_node_tag = mid_stage_id.clone();
 
-    if all_subtasks_passed {
-        if let Some(ms) = proj.milestones.iter_mut().find(|m| m.id == milestone_id) {
-            if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == mid_stage_id) {
-                mid.status = project::MidStageStatus::Completed;
-                mid.completed_at = Some(now.clone());
-            }
-            if other_mid_stages_all_completed {
-                ms.status = project::MilestoneStatus::Completed;
-                ms.review_status = Some("pending_review".to_string());
-                ms.review_conclusion = None;
-            }
-        }
-        if other_mid_stages_all_completed {
-            proj.workflow_state.current_step = project::WorkflowStep::MilestoneReview;
-            proj.workflow_state.review_node_id = milestone_id.clone();
-            if proj.workflow_state.autopilot_active {
-                let ap = proj
-                    .workflow_state
-                    .autopilot_state
-                    .get_or_insert_with(project::AutopilotState::default);
-                ap.active = true;
-                ap.target_milestone_id = milestone_id.clone();
-                ap.run_status = project::AutopilotRunStatus::WaitingMilestoneReview;
-                ap.last_action = format!("到达大阶段边界：{}，等待人工 A/B/C", milestone_title);
-                ap.last_action_at = now.clone();
-                ap.error_message.clear();
-            }
-        } else {
-            proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
-            proj.current_mid_stage_id = String::new();
-        }
-        proj.workflow_state.data_revision += 1;
-        proj.workflow_state.last_transition_at = now.clone();
-    }
+    let (all_subtasks_passed, milestone_completed) =
+        reconcile_terminal_stage(&mut proj, &milestone_id, &mid_stage_id);
 
     if all_subtasks_passed {
         write_execution_history(
@@ -1382,7 +1523,7 @@ pub(crate) async fn confirm_subtask_result(
             Some(&mid_stage_id),
             None,
         );
-        if other_mid_stages_all_completed {
+        if milestone_completed {
             write_execution_history(
                 &mut proj,
                 "success",
@@ -2639,6 +2780,7 @@ pub(crate) async fn request_ed_stop(
 /// 测试与内部入口：取得流水线互斥权后，再加载/修改调用方提供的项目事实。
 /// 注意：生产路径由 `request_ed_stop` 在锁内加载最新磁盘项目；本函数假定调用方已在锁内
 /// 持有最新事实，或仅用于单线程测试。
+#[cfg(test)]
 pub(crate) async fn request_ed_stop_with_pipeline_state(
     pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
     proj: &mut project::Project,
@@ -3345,6 +3487,14 @@ pub(crate) async fn acknowledge_execution_recovery(
 ) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
     let project_path = proj.project_path.clone();
+    let waiting_engine = proj
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .is_some_and(|recovery| {
+            recovery.phase == project::RecoveryPhase::WaitingEngine
+                && recovery.error_kind == project::RecoveryErrorKind::EngineBlocked
+        });
 
     let session = proj
         .execution_session
@@ -3381,6 +3531,17 @@ pub(crate) async fn acknowledge_execution_recovery(
         )
     })?;
 
+    if waiting_engine {
+        let health = crate::engine::check_engine_health(&proj.execution_profile).await;
+        if health.status.blocks_execution() {
+            return Err(format!(
+                "执行基线已恢复，但 {} 健康检查未通过：{}。引擎阻断仍保留。",
+                proj.execution_profile.provider.display_name(),
+                health.message
+            ));
+        }
+    }
+
     // 基线恢复成功后才清除会话
     proj.execution_session = None;
     proj.workflow_state.recovery_state = None;
@@ -3410,10 +3571,20 @@ pub(crate) async fn acknowledge_execution_recovery(
     );
 
     if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
-        if ap.recovery_action == project::AutopilotRecoveryAction::RestoreExecutionBaseline {
+        if waiting_engine
+            || ap.recovery_action == project::AutopilotRecoveryAction::RestoreExecutionBaseline
+        {
             ap.recovery_action = project::AutopilotRecoveryAction::None;
             ap.error_message = String::new();
-            ap.last_action = format!("已恢复执行基线：{}", subtask_title);
+            ap.last_action = if waiting_engine {
+                format!(
+                    "{} 健康检查通过，已恢复基线并准备重试：{}",
+                    proj.execution_profile.provider.display_name(),
+                    subtask_title
+                )
+            } else {
+                format!("已恢复执行基线：{}", subtask_title)
+            };
             ap.last_action_at = now.clone();
             // 基线恢复是完整恢复命令，成功后直接回到自动推进。
             if ap.run_status == project::AutopilotRunStatus::ErrorStopped {
@@ -3571,6 +3742,7 @@ mod tests {
             confirmed_at: None,
             confirmation_notes: None,
             human_verification: None,
+            ..Default::default()
         }
     }
 
@@ -4725,6 +4897,9 @@ mod tests {
             verification_reason: "manual smoke test".to_string(),
             verified_at: "2026-07-21T00:00:00Z".to_string(),
             original_test_failure: "runner unavailable".to_string(),
+            resolution: project::HumanResolution::ConfirmActualPass,
+            accepted_criteria: vec![],
+            dependency_check: String::new(),
         });
 
         assert!(validate_subtask_quality_gate(&proj).is_ok());
@@ -4734,6 +4909,34 @@ mod tests {
                 .as_ref()
                 .map(|test| test.passed),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn skipped_last_task_completes_stage_and_milestone() {
+        let mut proj = execution_project(
+            "skip-terminal",
+            Path::new(""),
+            project::SubtaskStatus::Skipped,
+            None,
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState::default());
+        let (mid_completed, milestone_completed) =
+            reconcile_terminal_stage(&mut proj, "milestone-1", "mid-1");
+        assert!(mid_completed);
+        assert!(milestone_completed);
+        assert_eq!(
+            proj.milestones[0].mid_stages[0].status,
+            project::MidStageStatus::Completed
+        );
+        assert_eq!(
+            proj.milestones[0].status,
+            project::MilestoneStatus::Completed
+        );
+        assert_eq!(
+            proj.workflow_state.current_step,
+            project::WorkflowStep::MilestoneReview
         );
     }
 
@@ -4859,7 +5062,7 @@ mod tests {
             recovery_action: project::AutopilotRecoveryAction::None,
         });
         let mut pipeline = Some(pipeline_state("execution-x", PipelineStatus::Running));
-        finalize_execution_failure(&mut proj, &mut pipeline, 0, "timeout");
+        finalize_execution_failure(&mut proj, &mut pipeline, 0, "timeout", None);
 
         let session = proj.execution_session.as_ref().expect("session kept");
         assert_eq!(session.status, "execution_failed");
@@ -4883,6 +5086,85 @@ mod tests {
         );
         // 首次失败 retry_count 仍为 0，但会话可定位恢复
         assert_eq!(proj.milestones[0].mid_stages[0].subtasks[0].retry_count, 0);
+    }
+
+    #[tokio::test]
+    async fn initial_engine_block_restores_baseline_and_preserves_evidence() -> Result<(), String> {
+        let repo = TempGitRepo::new("initial-engine-block")?;
+        let baseline = repo.head()?;
+        std::fs::write(repo.path.join("tracked.txt"), "partial provider change\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(repo.path.join("untracked.txt"), "partial output\n")
+            .map_err(|error| error.to_string())?;
+
+        let project_name = unique_project_name("initial-engine-block");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::Executing,
+            Some(execution_session("executing", "execution-quota", &baseline)),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::Running,
+            ..Default::default()
+        });
+        crate::save_project(&proj)?;
+
+        let pipeline = Arc::new(Mutex::new(Some(pipeline_state(
+            "execution-quota",
+            PipelineStatus::Running,
+        ))));
+        let failure = BackgroundExecutionFailure::engine(
+            project::RecoveryErrorKind::ExecutionError,
+            project::EngineFailureKind::QuotaExceeded,
+            "API Error: 402 Insufficient Balance".to_string(),
+            Some(project::ExecutionResult {
+                success: false,
+                stdout: "API Error: 402 Insufficient Balance".to_string(),
+                engine_failure_kind: Some(project::EngineFailureKind::QuotaExceeded),
+                ..Default::default()
+            }),
+        );
+        finalize_background_execution_failure(
+            &project_name,
+            "milestone-1",
+            "mid-1",
+            "subtask-1",
+            "测试小阶段",
+            0,
+            1,
+            "execution-quota",
+            &failure,
+            pipeline,
+        )
+        .await?;
+
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("tracked.txt")).unwrap(),
+            "baseline\n"
+        );
+        assert!(!repo.path.join("untracked.txt").exists());
+        let persisted = crate::load_project(&project_name)?;
+        let recovery = persisted.workflow_state.recovery_state.as_ref().unwrap();
+        assert_eq!(recovery.phase, project::RecoveryPhase::WaitingEngine);
+        assert_eq!(recovery.attempt, 0);
+        assert_eq!(
+            recovery.engine_failure_kind,
+            Some(project::EngineFailureKind::QuotaExceeded)
+        );
+        assert!(persisted.milestones[0].mid_stages[0].subtasks[0]
+            .execution_result
+            .as_ref()
+            .is_some_and(|result| result.stdout.contains("402 Insufficient Balance")));
+        assert!(persisted
+            .execution_session
+            .as_ref()
+            .is_some_and(|session| session.failure_message.contains("已恢复任务基线")));
+        Ok(())
     }
 
     #[tokio::test]

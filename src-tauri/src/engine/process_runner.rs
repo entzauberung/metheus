@@ -396,6 +396,41 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn stdout_quota_error_from_fake_cli_is_classified() {
+        let directory = TestDirectory::new("quota");
+        let cli = directory.path.join("quota-cli");
+        write_fake_cli(
+            &cli,
+            "printf 'API Error: 402 Insufficient Balance\\n'\nexit 1",
+        );
+        let state = Arc::new(Mutex::new(Some(test_pipeline("quota"))));
+        let output = run_process(
+            ProcessSpec {
+                display_name: "Fake",
+                program: cli.into_os_string(),
+                args: vec![],
+                stdin_payload: None,
+            },
+            directory.path.to_str().unwrap(),
+            "quota",
+            state,
+        )
+        .await
+        .expect("配额错误应保留为结构化进程输出");
+        assert!(!output.success);
+        assert!(output.stdout.contains("402 Insufficient Balance"));
+        assert_eq!(
+            crate::engine::classify_process_failure(
+                output.exit_code,
+                &output.stdout,
+                &output.stderr,
+            ),
+            crate::project::EngineFailureKind::QuotaExceeded
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn paused_pipeline_cancels_process_and_clears_pid() {
         let directory = TestDirectory::new("cancel");
         let cli = directory.path.join("slow-cli");

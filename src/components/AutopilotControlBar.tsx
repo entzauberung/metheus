@@ -1,6 +1,6 @@
 // src/components/AutopilotControlBar.tsx — 全局自动驾驶控制条
 // 在所有 Console 页面顶部显示自动驾驶状态与操作入口
-import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle, GitBranch, CheckCircle } from "lucide-react";
+import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle, GitBranch, CheckCircle, CircleSlash2 } from "lucide-react";
 import type { Project, PipelineState, AutopilotRecoveryAction } from "../types";
 import { getAutopilotErrorActions } from "../autopilotPolicy";
 import { getManagedFlowPresentation } from "../managedFlowPolicy";
@@ -20,7 +20,9 @@ export interface AutopilotControlBarProps {
   onRegeneratePlan?: () => Promise<void>;
   onPrepareWorkspace?: () => Promise<void>;
   onRefreshWorkspace?: () => Promise<void>;
-  onResolveHumanRecovery?: (resolution: "retest" | "restore_and_retry" | "regenerate_plan" | "human_override") => Promise<void>;
+  onResolveHumanRecovery?: (
+    resolution: "retest" | "restore_and_retry" | "regenerate_plan" | "confirm_actual_pass" | "accept_deviation" | "skip_task",
+  ) => Promise<void>;
 }
 
 function sessionStatusKey(status: string | undefined): string {
@@ -58,6 +60,7 @@ export function AutopilotControlBar({
   const errorMessage = apState?.error_message;
   const recoveryAction: AutopilotRecoveryAction = apState?.recovery_action ?? "None";
   const recovery = project.workflow_state.recovery_state;
+  const waitingEngine = recovery?.phase === "WaitingEngine" || recovery?.error_kind === "EngineBlocked";
   const targetMs = project.milestones.find(m => m.id === project.workflow_state.autopilot_target_milestone_id);
   const targetLabel = targetMs?.title ?? project.workflow_state.autopilot_target_milestone_id;
 
@@ -66,8 +69,8 @@ export function AutopilotControlBar({
   const sessionKey = sessionStatusKey(session?.status);
   const sessionLost = sessionKey === "session_lost";
   const stopFailed = sessionKey === "stop_failed";
-  const needsBaselineRecovery =
-    recoveryAction === "RestoreExecutionBaseline" || (!recovery && isRecoverableSession(project));
+  const needsBaselineRecovery = !waitingEngine
+    && (recoveryAction === "RestoreExecutionBaseline" || (!recovery && isRecoverableSession(project)));
 
   // 恢复入口条（手动 / 自动驾驶共用）
   const recoveryBar = needsBaselineRecovery && (onAcknowledgeRecovery || onRetryCurrent) ? (
@@ -113,6 +116,36 @@ export function AutopilotControlBar({
       </div>
     </div>
   ) : null;
+
+  const engineRecoveryBar = waitingEngine ? (
+    <div className="autopilot-control-bar ap-error">
+      <div className="ap-bar-left">
+        <span className="ap-bar-status"><AlertTriangle size={16} /> 执行引擎阻断</span>
+        {session?.subtask_title && <span className="ap-bar-target">任务：{session.subtask_title}</span>}
+        <span className="ap-bar-error" title={session?.failure_message || errorMessage}>
+          {(session?.failure_message || errorMessage || "执行引擎不可用").slice(0, 100)}
+        </span>
+        <span className="ap-bar-warning">请修复额度或认证，也可以在顶部设置中切换引擎。</span>
+      </div>
+      <div className="ap-bar-right">
+        <button className="ap-bar-btn" disabled={busy} onClick={onSync} title="同步项目状态">
+          <RotateCcw size={14} /> 同步
+        </button>
+        {onAcknowledgeRecovery && (
+          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onAcknowledgeRecovery}>
+            <RotateCcw size={14} /> 检查引擎并重试
+          </button>
+        )}
+        {apActive && (
+          <button className="ap-bar-btn" disabled={busy} onClick={() => onToggle(false)}>
+            <Square size={14} /> 关闭
+          </button>
+        )}
+      </div>
+    </div>
+  ) : null;
+
+  if (engineRecoveryBar) return engineRecoveryBar;
 
   if (!apActive) {
     // 未激活：先显示恢复入口，再显示激活入口（托管层活跃时互斥）
@@ -177,6 +210,16 @@ export function AutopilotControlBar({
       ? `正在重新测试；上一轮解决 ${lastAttempt.resolved_issue_ids.length} 项，剩余 ${lastAttempt.remaining_issue_ids.length + lastAttempt.regressed_issue_ids.length} 项`
       : "正在重新测试",
     Replanning: "常规修复耗尽，正在重新规划当前任务",
+    WaitingEngine: ({
+      QuotaExceeded: "执行额度不足，代码恢复已停止",
+      AuthenticationError: "执行引擎认证失效，代码恢复已停止",
+      RateLimited: "执行引擎限流，代码恢复已停止",
+      ProviderUnavailable: "执行服务不可用，代码恢复已停止",
+      NetworkError: "执行引擎网络不可用，代码恢复已停止",
+      Timeout: "执行引擎超时，代码恢复已停止",
+      ProcessCrash: "执行进程异常，代码恢复已停止",
+      TaskExecutionError: "执行引擎未完成任务",
+    } as const)[recovery.engine_failure_kind ?? "TaskExecutionError"],
     Recovered: "自动修复成功，继续执行",
     WaitingHuman: recovery.error_kind === "TestUnavailable" && recovery.attempt === 0
       ? "自动修复未启动：测试或审查不可用"
@@ -210,6 +253,9 @@ export function AutopilotControlBar({
         )}
         {errorMessage && runStatus === "ErrorStopped" && (
           <span className="ap-bar-error" title={errorMessage}>{errorMessage.slice(0, 80)}{errorMessage.length > 80 ? "…" : ""}</span>
+        )}
+        {waitingEngine && (
+          <span className="ap-bar-warning">请在顶部引擎设置中充值、修复认证或切换引擎，再重试当前任务。</span>
         )}
         {mfActive && <span className="ap-bar-mutex">托管层活跃</span>}
       </div>
@@ -270,6 +316,12 @@ export function AutopilotControlBar({
           </button>
         )}
 
+        {waitingEngine && onAcknowledgeRecovery && (
+          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onAcknowledgeRecovery}>
+            <RotateCcw size={14} /> 检查引擎并重试
+          </button>
+        )}
+
         {recovery?.phase === "WaitingHuman" && onResolveHumanRecovery && (
           <>
             <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy}
@@ -286,9 +338,21 @@ export function AutopilotControlBar({
                 <RotateCcw size={14} /> 重新规划当前任务
               </button>
             )}
+            {recovery.error_kind !== "ExecutionError" && recovery.error_kind !== "EngineBlocked" && (
+              <>
+                <button className="ap-bar-btn" disabled={busy}
+                  onClick={() => onResolveHumanRecovery("confirm_actual_pass")}>
+                  <CheckCircle size={14} /> 确认实际通过
+                </button>
+                <button className="ap-bar-btn" disabled={busy}
+                  onClick={() => onResolveHumanRecovery("accept_deviation")}>
+                  <AlertTriangle size={14} /> 接受偏差并继续
+                </button>
+              </>
+            )}
             <button className="ap-bar-btn" disabled={busy}
-              onClick={() => onResolveHumanRecovery("human_override")}>
-              <CheckCircle size={14} /> 人工核验通过
+              onClick={() => onResolveHumanRecovery("skip_task")}>
+              <CircleSlash2 size={14} /> 跳过当前任务
             </button>
           </>
         )}

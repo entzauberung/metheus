@@ -50,6 +50,9 @@ export type RecoveryErrorKind =
   | "WorkspaceError"
   | "TransientError"
   | "ExecutionError"
+  | "EngineBlocked"
+  | "PlanFailure"
+  | "ValidationFailure"
   | "ScopeViolation"
   | "TestFailure"
   | "ReviewFailure"
@@ -57,7 +60,52 @@ export type RecoveryErrorKind =
   | "StateConflict"
   | "HumanRequired";
 
-export type RecoveryPhase = "Diagnosing" | "Repairing" | "Retesting" | "Replanning" | "Recovered" | "WaitingHuman";
+export type RecoveryPhase = "Diagnosing" | "Repairing" | "Retesting" | "Replanning" | "WaitingEngine" | "Recovered" | "WaitingHuman";
+
+export type EngineFailureKind =
+  | "QuotaExceeded"
+  | "AuthenticationError"
+  | "RateLimited"
+  | "ProviderUnavailable"
+  | "NetworkError"
+  | "Timeout"
+  | "ProcessCrash"
+  | "TaskExecutionError";
+
+export type AcceptanceStatus = "Satisfied" | "Unsatisfied" | "Unknown" | "Contradictory" | "AcceptedDeviation";
+
+export interface AcceptanceLedgerItem {
+  criterion_index: number;
+  criterion: string;
+  status: AcceptanceStatus;
+  evidence: string;
+  confidence: number;
+  updated_at: string;
+}
+
+export interface ProjectFactSnapshot {
+  git_head: string;
+  file_hashes: Record<string, string>;
+  symbols: string[];
+  storage_keys: string[];
+  dom_ids: string[];
+  event_bindings: string[];
+  relevant_snippets: string[];
+  accepted_deviations: string[];
+  structural_fingerprint: string;
+  captured_at: string;
+}
+
+export interface RecoveryLearningRecord {
+  failure_signature: string;
+  failure_domain: string;
+  strategy: string;
+  succeeded: boolean;
+  related_paths: string[];
+  required_identifiers: string[];
+  stable_constraint: string;
+  recorded_at: string;
+}
 
 export interface ReviewIssue {
   criterion_index?: number;
@@ -105,6 +153,8 @@ export interface RecoveryState {
   replan_execution_attempted: boolean;
   started_at: string;
   updated_at: string;
+  engine_failure_kind?: EngineFailureKind;
+  checkpoint_id: string;
 }
 
 /** 自动驾驶命令返回类别 */
@@ -377,6 +427,9 @@ export interface ExecutionResult {
   file_changes: string[];
   exit_code?: number;
   engine_provider?: ExecutionProvider;
+  stdout: string;
+  stderr: string;
+  engine_failure_kind?: EngineFailureKind;
 }
 
 export interface TestResult {
@@ -393,6 +446,7 @@ export interface TestResult {
   verification_kind?: "Legacy" | "AutomatedTestAndReview" | "CodeReviewOnly" | "HumanOverride";
   review_evidence_status?: ReviewEvidenceStatus;
   review_evidence_summary?: string;
+  acceptance_results?: AcceptanceLedgerItem[];
 }
 
 export type ReviewEvidenceStatus = "Complete" | "Partial" | "Unavailable";
@@ -402,6 +456,9 @@ export interface HumanVerification {
   verification_reason: string;
   verified_at: string;
   original_test_failure: string;
+  resolution?: "ConfirmActualPass" | "AcceptDeviation" | "SkipTask";
+  accepted_criteria?: number[];
+  dependency_check?: string;
 }
 
 export interface GeneratedSubtask {
@@ -413,7 +470,7 @@ export interface Subtask {
   id: string;
   title: string;
   prompt: string;
-  status: "Pending" | "Executing" | "AwaitingConfirmation" | "Passed" | "Rejected" | "RolledBack";
+  status: "Pending" | "Executing" | "AwaitingConfirmation" | "Passed" | "AcceptedDeviation" | "Skipped" | "Rejected" | "RolledBack";
   test_report: string;
   execution_result?: ExecutionResult;
   test_result?: TestResult;
@@ -433,6 +490,12 @@ export interface Subtask {
   confirmed_at?: string;
   confirmation_notes?: string;
   human_verification?: HumanVerification;
+  required_identifiers: string[];
+  acceptance_ledger: AcceptanceLedgerItem[];
+  fact_snapshot?: ProjectFactSnapshot;
+  plan_patch_revision: number;
+  depends_on: string[];
+  dependency_notes: string;
 }
 
 export type MidStageStatus = "Pending" | "Ready" | "InProgress" | "Completed" | "Rejected" | "Approved" | "RolledBack";
@@ -550,6 +613,7 @@ export interface Project {
   execution_session?: ExecutionSession;
   /** 执行操作历史（持久化，刷新不丢） */
   execution_history: ExecutionHistoryEntry[];
+  recovery_learning: RecoveryLearningRecord[];
   project_path: string;
 }
 
@@ -631,7 +695,12 @@ export type ExecutionEventType =
   | "RetestCompleted"
   | "RecoverySucceeded"
   | "RecoveryExhausted"
-  | "HumanVerificationAccepted";
+  | "HumanVerificationAccepted"
+  | "ReplanStarted"
+  | "ReplanCompleted"
+  | "ReplanExecutionStarted"
+  | "PlanCalibrationApplied"
+  | "TaskSkipped";
 
 /** 执行历史条目 — 持久化到 Project 中，刷新不丢 */
 export interface ExecutionHistoryEntry {

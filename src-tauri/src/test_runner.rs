@@ -125,10 +125,36 @@ mod change_detection_tests {
         );
         std::fs::write(path.join("index.html"), updated).map_err(|error| error.to_string())?;
 
-        let evidence = build_review_evidence(&path.to_string_lossy(), &["index.html".to_string()]);
+        let evidence = build_review_evidence(
+            &path.to_string_lossy(),
+            &["index.html".to_string()],
+            &["toggleTheme()".to_string()],
+        );
         assert!(evidence.rendered.contains("function toggleTheme"));
         assert!(evidence.rendered.contains("Git diff"));
         assert_eq!(evidence.status, ReviewEvidenceStatus::Partial);
+        std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn long_file_evidence_includes_identifier_context_from_middle() -> Result<(), String> {
+        let path =
+            std::env::temp_dir().join(format!("metheus-review-context-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+        let content = format!(
+            "{}\nfunction targetHandler(event) {{ event.preventDefault(); }}\n{}",
+            "const filler = 1;\n".repeat(500),
+            "const tail = 1;\n".repeat(500)
+        );
+        std::fs::write(path.join("index.html"), content).map_err(|error| error.to_string())?;
+        let evidence = build_review_evidence(
+            &path.to_string_lossy(),
+            &["index.html".to_string()],
+            &["event.preventDefault".to_string()],
+        );
+        assert!(evidence.rendered.contains("验收标识符命中上下文"));
+        assert!(evidence.rendered.contains("targetHandler"));
         std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -331,7 +357,46 @@ fn git_diff_for_file(project_path: &str, file: &str) -> Result<String, String> {
     }
 }
 
-fn build_review_evidence(project_path: &str, files: &[String]) -> ReviewEvidence {
+fn identifier_context(content: &str, identifiers: &[String]) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    let mut rendered = Vec::new();
+    let mut seen = BTreeSet::new();
+    for identifier in identifiers {
+        let needle = identifier
+            .split('.')
+            .next_back()
+            .unwrap_or(identifier)
+            .trim_end_matches("()");
+        if needle.len() < 3 {
+            continue;
+        }
+        for (index, _) in lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains(needle))
+            .take(3)
+        {
+            let start = index.saturating_sub(2);
+            let end = (index + 3).min(lines.len());
+            let key = format!("{start}:{end}");
+            if seen.insert(key) {
+                rendered.push(format!(
+                    "[标识符 {identifier}，第 {}-{} 行]\n{}",
+                    start + 1,
+                    end,
+                    number_lines(&lines[start..end].join("\n"), start + 1),
+                ));
+            }
+        }
+    }
+    rendered.join("\n")
+}
+
+fn build_review_evidence(
+    project_path: &str,
+    files: &[String],
+    identifiers: &[String],
+) -> ReviewEvidence {
     if files.is_empty() {
         return ReviewEvidence {
             rendered: "（没有可供审查的改动文件）".to_string(),
@@ -379,6 +444,11 @@ fn build_review_evidence(project_path: &str, files: &[String]) -> ReviewEvidence
                     let (preview, partial) = render_file_preview(&content);
                     section.push_str("\n[当前文件内容，带行号]\n");
                     section.push_str(&preview);
+                    let context = identifier_context(&content, identifiers);
+                    if !context.is_empty() {
+                        section.push_str("\n\n[验收标识符命中上下文]\n");
+                        section.push_str(&context);
+                    }
                     if partial {
                         merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Partial);
                         notes.push(format!("{file}: 当前文件仅提供头尾上下文"));
@@ -722,7 +792,12 @@ pub(crate) async fn check_subtask_with_context(
     };
 
     // 3.以 Git diff 为主证据，并为长文件提供显式标记的头尾上下文。
-    let review_evidence = build_review_evidence(project_path, &files);
+    let identifiers = crate::plan_contract::acceptance_identifiers(
+        acceptance_criteria.as_deref().unwrap_or_default(),
+    )
+    .into_iter()
+    .collect::<Vec<_>>();
+    let review_evidence = build_review_evidence(project_path, &files, &identifiers);
     // ===== 真测试：检测项目类型，执行对应的测试命令 =====
     let test_evidence = {
         let project_root = std::path::Path::new(project_path);

@@ -6,6 +6,7 @@
 // ...
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use std::fs;
+mod acceptance;
 mod api;
 mod commands;
 mod constants;
@@ -16,10 +17,15 @@ mod engine;
 mod git_ops;
 mod json_utils;
 mod pipeline;
+mod plan_calibration;
+mod plan_compiler;
 mod plan_contract;
 mod project;
+mod project_facts;
 mod prompts;
 mod recovery;
+mod recovery_checkpoint;
+mod recovery_learning;
 mod snapshot;
 mod test_runner;
 use crate::pipeline::PipelineState;
@@ -179,6 +185,7 @@ pub fn run() {
             crate::pipeline::acknowledge_execution_recovery,
             crate::recovery::run_error_recovery,
             crate::recovery::resolve_human_recovery,
+            crate::plan_calibration::calibrate_next_subtask_command,
             crate::commands::project_ops::approve_mid_stage,
             crate::commands::project_ops::reject_mid_stage,
             crate::constitution::update_constitution,

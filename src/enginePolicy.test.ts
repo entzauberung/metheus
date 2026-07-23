@@ -58,4 +58,17 @@ describe("execution engine change policy", () => {
     } as NonNullable<Project["workflow_state"]["autopilot_state"]>;
     expect(engineChangeBlockedReason(autopilot, null)).toBe("自动驾驶正在推进");
   });
+
+  it("allows switching engines while an engine blocker is waiting", () => {
+    const blocked = project();
+    blocked.execution_session = { active: true } as Project["execution_session"];
+    blocked.workflow_state.recovery_state = { phase: "WaitingEngine" } as NonNullable<
+      Project["workflow_state"]["recovery_state"]
+    >;
+    blocked.workflow_state.autopilot_state = {
+      active: true,
+      run_status: "ErrorStopped",
+    } as NonNullable<Project["workflow_state"]["autopilot_state"]>;
+    expect(engineChangeBlockedReason(blocked, null)).toBeNull();
+  });
 });

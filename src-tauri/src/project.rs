@@ -264,6 +264,12 @@ pub enum RecoveryErrorKind {
     WorkspaceError,
     TransientError,
     ExecutionError,
+    /// 执行引擎本身不可用（额度、认证、服务商阻断等），不得进入代码修复。
+    EngineBlocked,
+    /// 执行提示或当前项目事实不足，需要生成受限计划补丁。
+    PlanFailure,
+    /// 验收契约或审查证据本身不可实现/互相矛盾。
+    ValidationFailure,
     ScopeViolation,
     TestFailure,
     ReviewFailure,
@@ -282,6 +288,8 @@ pub enum RecoveryPhase {
     Retesting,
     /// 常规修复耗尽后，对当前小阶段做一次受限重规划。
     Replanning,
+    /// 等待额度、认证或服务商恢复；不消耗代码修复次数。
+    WaitingEngine,
     Recovered,
     WaitingHuman,
 }
@@ -323,6 +331,71 @@ pub struct RecoveryIssue {
     pub suggested_change: String,
     #[serde(default)]
     pub confidence: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum AcceptanceStatus {
+    Satisfied,
+    Unsatisfied,
+    #[default]
+    Unknown,
+    Contradictory,
+    AcceptedDeviation,
+}
+
+/// One durable row per acceptance criterion. Unknown is intentionally distinct
+/// from Unsatisfied so incomplete evidence cannot trigger a code edit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct AcceptanceLedgerItem {
+    pub criterion_index: u32,
+    pub criterion: String,
+    #[serde(default)]
+    pub status: AcceptanceStatus,
+    #[serde(default)]
+    pub evidence: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ProjectFactSnapshot {
+    #[serde(default)]
+    pub git_head: String,
+    #[serde(default)]
+    pub file_hashes: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub symbols: Vec<String>,
+    #[serde(default)]
+    pub storage_keys: Vec<String>,
+    #[serde(default)]
+    pub dom_ids: Vec<String>,
+    #[serde(default)]
+    pub event_bindings: Vec<String>,
+    #[serde(default)]
+    pub relevant_snippets: Vec<String>,
+    #[serde(default)]
+    pub accepted_deviations: Vec<String>,
+    #[serde(default)]
+    pub structural_fingerprint: String,
+    #[serde(default)]
+    pub captured_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct RecoveryLearningRecord {
+    pub failure_signature: String,
+    pub failure_domain: String,
+    pub strategy: String,
+    pub succeeded: bool,
+    #[serde(default)]
+    pub related_paths: Vec<String>,
+    #[serde(default)]
+    pub required_identifiers: Vec<String>,
+    #[serde(default)]
+    pub stable_constraint: String,
+    pub recorded_at: String,
 }
 
 /// 一轮修复前后的验收问题变化。
@@ -384,6 +457,12 @@ pub struct RecoveryState {
     pub replan_execution_attempted: bool,
     pub started_at: String,
     pub updated_at: String,
+    /// 执行端阻断的细分类别；旧项目为空。
+    #[serde(default)]
+    pub engine_failure_kind: Option<EngineFailureKind>,
+    /// Repair-level file checkpoint used to undo only the latest regressing attempt.
+    #[serde(default)]
+    pub checkpoint_id: String,
 }
 
 impl Default for RecoveryState {
@@ -408,6 +487,8 @@ impl Default for RecoveryState {
             replan_execution_attempted: false,
             started_at: String::new(),
             updated_at: String::new(),
+            engine_failure_kind: None,
+            checkpoint_id: String::new(),
         }
     }
 }
@@ -512,9 +593,10 @@ impl Default for ProjectStatus {
     }
 }
 ///小阶段状态
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum SubtaskStatus {
     ///待执行
+    #[default]
     Pending,
     ///执行中
     Executing,
@@ -522,6 +604,10 @@ pub enum SubtaskStatus {
     AwaitingConfirmation,
     ///已通过
     Passed,
+    /// 用户接受已记录的验收偏差后完成；后续计划必须携带该债务。
+    AcceptedDeviation,
+    /// 用户跳过当前任务；只有依赖检查通过后才能继续。
+    Skipped,
     ///已驳回
     Rejected,
     ///已回退
@@ -636,7 +722,7 @@ pub enum MidStageStatus {
     RolledBack,
 }
 ///小阶段（claude code可执行的最小单元）
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Subtask {
     pub id: String,
     pub title: String,
@@ -695,6 +781,24 @@ pub struct Subtask {
     /// 人工核验是独立事实，不得篡改真实测试结果为通过。
     #[serde(default)]
     pub human_verification: Option<HumanVerification>,
+    /// Deterministically extracted identifiers appended by the backend compiler.
+    #[serde(default)]
+    pub required_identifiers: Vec<String>,
+    /// Durable per-criterion verification state.
+    #[serde(default)]
+    pub acceptance_ledger: Vec<AcceptanceLedgerItem>,
+    /// Project facts used when this task was last compiled/calibrated.
+    #[serde(default)]
+    pub fact_snapshot: Option<ProjectFactSnapshot>,
+    /// Number of accepted, immutable-contract-preserving plan patches.
+    #[serde(default)]
+    pub plan_patch_revision: u64,
+    /// Explicit predecessor subtask ids. Old plans default to conservative ordering.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Human-readable dependency binding updated by plan calibration.
+    #[serde(default)]
+    pub dependency_notes: String,
 }
 ///中阶段（域负责人拆解的技术实现模块）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -746,6 +850,28 @@ pub struct ExecutionResult {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub engine_provider: Option<ExecutionProvider>,
+    /// 原始 stdout，额度和服务商错误经常只出现在 stdout。
+    #[serde(default)]
+    pub stdout: String,
+    /// 原始 stderr，保留独立流便于诊断。
+    #[serde(default)]
+    pub stderr: String,
+    /// 执行器错误的确定性分类；前端不得解析文本。
+    #[serde(default)]
+    pub engine_failure_kind: Option<EngineFailureKind>,
+}
+
+/// 执行引擎错误分类。它描述执行环境事实，不代表项目代码质量。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EngineFailureKind {
+    QuotaExceeded,
+    AuthenticationError,
+    RateLimited,
+    ProviderUnavailable,
+    NetworkError,
+    Timeout,
+    ProcessCrash,
+    TaskExecutionError,
 }
 ///测试工程师的检查结果
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -785,6 +911,8 @@ pub struct TestResult {
     /// 代码审查证据的压缩摘要，供恢复流程和人工核验展示。
     #[serde(default)]
     pub review_evidence_summary: String,
+    #[serde(default)]
+    pub acceptance_results: Vec<AcceptanceLedgerItem>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -820,6 +948,23 @@ pub struct HumanVerification {
     pub verification_reason: String,
     pub verified_at: String,
     pub original_test_failure: String,
+    /// 人工决策的具体语义；旧记录默认为 ConfirmActualPass。
+    #[serde(default)]
+    pub resolution: HumanResolution,
+    /// 接受偏差时明确列出的验收项编号。
+    #[serde(default)]
+    pub accepted_criteria: Vec<u32>,
+    /// 跳过任务时记录依赖检查结果。
+    #[serde(default)]
+    pub dependency_check: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum HumanResolution {
+    #[default]
+    ConfirmActualPass,
+    AcceptDeviation,
+    SkipTask,
 }
 ///开发工程师动态生成下一个小阶段
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1425,6 +1570,10 @@ pub struct Project {
     /// 执行操作历史（持久化，刷新不丢）
     #[serde(default)]
     pub execution_history: Vec<ExecutionHistoryEntry>,
+    /// Complete audit history stays in execution_history; only distilled matching
+    /// recovery experience is retained here for future prompts.
+    #[serde(default)]
+    pub recovery_learning: Vec<RecoveryLearningRecord>,
 }
 impl Project {
     /// 创建一个新的空项目。
@@ -1462,6 +1611,7 @@ impl Project {
             project_path: "".to_string(),
             execution_session: None,
             execution_history: vec![],
+            recovery_learning: vec![],
         }
     }
 
@@ -1885,6 +2035,8 @@ pub enum ExecutionEventType {
     RecoverySucceeded,
     RecoveryExhausted,
     HumanVerificationAccepted,
+    PlanCalibrationApplied,
+    TaskSkipped,
 }
 
 impl Default for ExecutionEventType {
@@ -2150,6 +2302,58 @@ mod tests {
             restored_test.automated_test_status,
             AutomatedTestStatus::Unknown
         );
+        Ok(())
+    }
+
+    #[test]
+    fn adaptive_recovery_fields_default_for_old_json() -> Result<(), String> {
+        let mut result_value = serde_json::to_value(ExecutionResult {
+            success: false,
+            output: "legacy".to_string(),
+            error_log: "failed".to_string(),
+            file_changes: vec![],
+            ..Default::default()
+        })
+        .map_err(|error| error.to_string())?;
+        for field in ["stdout", "stderr", "engine_failure_kind"] {
+            result_value.as_object_mut().unwrap().remove(field);
+        }
+        let result: ExecutionResult =
+            serde_json::from_value(result_value).map_err(|error| error.to_string())?;
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
+        assert!(result.engine_failure_kind.is_none());
+
+        let mut subtask_value =
+            serde_json::to_value(Subtask::default()).map_err(|error| error.to_string())?;
+        for field in [
+            "required_identifiers",
+            "acceptance_ledger",
+            "fact_snapshot",
+            "plan_patch_revision",
+            "depends_on",
+            "dependency_notes",
+        ] {
+            subtask_value.as_object_mut().unwrap().remove(field);
+        }
+        let subtask: Subtask =
+            serde_json::from_value(subtask_value).map_err(|error| error.to_string())?;
+        assert!(subtask.required_identifiers.is_empty());
+        assert!(subtask.acceptance_ledger.is_empty());
+        assert!(subtask.fact_snapshot.is_none());
+        assert_eq!(subtask.plan_patch_revision, 0);
+        assert!(subtask.depends_on.is_empty());
+        assert!(subtask.dependency_notes.is_empty());
+
+        let mut project_value = serde_json::to_value(Project::new("legacy-learning"))
+            .map_err(|error| error.to_string())?;
+        project_value
+            .as_object_mut()
+            .unwrap()
+            .remove("recovery_learning");
+        let project: Project =
+            serde_json::from_value(project_value).map_err(|error| error.to_string())?;
+        assert!(project.recovery_learning.is_empty());
         Ok(())
     }
 }

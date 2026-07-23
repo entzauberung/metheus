@@ -2184,14 +2184,29 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                     }
                 }
             } else if has_pending {
+                let needs_calibration =
+                    crate::project_facts::next_task_needs_scan_or_calibration(&proj)
+                        .unwrap_or(true);
                 AutopilotNextStep {
-                    command: "execute_current_subtask".to_string(),
+                    command: if needs_calibration {
+                        "calibrate_next_subtask_command".to_string()
+                    } else {
+                        "execute_current_subtask".to_string()
+                    },
                     args: serde_json::json!({ "projectName": project_name }),
-                    description: "执行下一个待处理小阶段".to_string(),
+                    description: if needs_calibration {
+                        "扫描最新代码事实并按需校准下一任务".to_string()
+                    } else {
+                        "执行下一个待处理小阶段".to_string()
+                    },
                     at_milestone_boundary: false,
                     is_error: false,
                     error_message: String::new(),
-                    result_kind: project::AutopilotCommandResultKind::PipelineState,
+                    result_kind: if needs_calibration {
+                        project::AutopilotCommandResultKind::ProjectState
+                    } else {
+                        project::AutopilotCommandResultKind::PipelineState
+                    },
                     waiting_for_execution: false,
                 }
             } else {
@@ -2533,6 +2548,7 @@ mod tests {
             confirmed_at: None,
             confirmation_notes: None,
             human_verification: None,
+            ..Default::default()
         }
     }
 

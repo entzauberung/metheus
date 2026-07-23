@@ -133,10 +133,16 @@ async fn ensure_engine_available(
 }
 
 fn execution_profile_change_blocker(project: &project::Project) -> Option<&'static str> {
+    let waiting_engine = project
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .is_some_and(|recovery| recovery.phase == project::RecoveryPhase::WaitingEngine);
     if project
         .execution_session
         .as_ref()
         .is_some_and(|session| session.active)
+        && !waiting_engine
     {
         return Some("存在活跃执行会话，不能切换执行引擎");
     }
@@ -161,7 +167,9 @@ fn execution_profile_change_blocker(project: &project::Project) -> Option<&'stat
         .autopilot_state
         .as_ref()
         .is_some_and(|autopilot| {
-            autopilot.active && autopilot.run_status == project::AutopilotRunStatus::Running
+            autopilot.active
+                && autopilot.run_status == project::AutopilotRunStatus::Running
+                && !waiting_engine
         })
     {
         return Some("自动驾驶正在推进，暂停后才能切换执行引擎");
@@ -764,6 +772,21 @@ mod execution_profile_tests {
         assert!(execution_profile_change_blocker(&project)
             .unwrap()
             .contains("错误恢复"));
+    }
+
+    #[test]
+    fn waiting_engine_allows_profile_change() {
+        let mut project = project::Project::new("profile-engine-blocked");
+        project.execution_session = Some(project::ExecutionSession {
+            active: true,
+            ..Default::default()
+        });
+        project.workflow_state.recovery_state = Some(project::RecoveryState {
+            phase: project::RecoveryPhase::WaitingEngine,
+            error_kind: project::RecoveryErrorKind::EngineBlocked,
+            ..Default::default()
+        });
+        assert!(execution_profile_change_blocker(&project).is_none());
     }
 
     #[test]

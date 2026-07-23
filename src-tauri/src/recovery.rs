@@ -1,7 +1,6 @@
 use crate::pipeline::{self, PipelineState, PipelineStatus, SubtaskStatusItem};
 use crate::project;
 use crate::AppState;
-use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_DIAGNOSIS_CHARS: usize = 12_000;
@@ -257,6 +256,9 @@ pub(crate) fn classify_test_result_with_context(
         project::AutomatedTestStatus::Passed
         | project::AutomatedTestStatus::NotConfigured
         | project::AutomatedTestStatus::Unknown => {
+            if crate::acceptance::needs_evidence(&test.acceptance_results) {
+                return project::RecoveryErrorKind::ValidationFailure;
+            }
             if has_review_transport_failure(test)
                 || test.review_evidence_status == project::ReviewEvidenceStatus::Unavailable
             {
@@ -264,7 +266,13 @@ pub(crate) fn classify_test_result_with_context(
             }
             match test.review_evidence_status {
                 project::ReviewEvidenceStatus::Complete => {
-                    project::RecoveryErrorKind::ReviewFailure
+                    if subtask.is_some_and(|subtask| {
+                        !actionable_recovery_issues(test, subtask, authorized_paths).is_empty()
+                    }) {
+                        project::RecoveryErrorKind::ReviewFailure
+                    } else {
+                        project::RecoveryErrorKind::ValidationFailure
+                    }
                 }
                 project::ReviewEvidenceStatus::Partial
                     if subtask.is_some_and(|subtask| {
@@ -275,7 +283,7 @@ pub(crate) fn classify_test_result_with_context(
                 }
                 project::ReviewEvidenceStatus::Partial
                 | project::ReviewEvidenceStatus::Unavailable => {
-                    project::RecoveryErrorKind::TestUnavailable
+                    project::RecoveryErrorKind::ValidationFailure
                 }
             }
         }
@@ -323,6 +331,8 @@ fn create_recovery_state(
         replan_execution_attempted: false,
         started_at: now.clone(),
         updated_at: now,
+        engine_failure_kind: None,
+        checkpoint_id: String::new(),
     }
 }
 
@@ -446,7 +456,10 @@ pub(crate) fn ensure_quality_recovery(
     if let Some(test) = subtask.test_result.as_ref() {
         recovery.active_issues = recovery_issues(test, subtask, &authorized_paths);
     }
-    let automatic = !matches!(kind, project::RecoveryErrorKind::TestUnavailable);
+    let automatic = !matches!(
+        kind,
+        project::RecoveryErrorKind::TestUnavailable | project::RecoveryErrorKind::ValidationFailure
+    );
     if !automatic {
         recovery.phase = project::RecoveryPhase::WaitingHuman;
     }
@@ -463,7 +476,7 @@ pub(crate) fn ensure_quality_recovery(
     if automatic {
         set_autopilot_recovering(proj, "正在诊断质量错误");
     } else {
-        set_autopilot_waiting(proj, "测试或审查服务不可用，需要人工核验");
+        set_autopilot_waiting(proj, "验收证据不可用或不足，需要重建证据后再判断");
         if let Some(current) = proj.execution_session.as_mut() {
             current.status = "quality_blocked".to_string();
             current.failure_message = gate_reason.to_string();
@@ -609,15 +622,21 @@ fn build_diagnosis(
         .filter(|record| !record.made_progress)
         .map(|_| "\n策略要求：上一轮没有取得可验证进展，本轮必须更换实现策略，不得重复同一修改。")
         .unwrap_or_default();
+    let learning = crate::recovery_learning::render_matching(
+        proj,
+        subtask,
+        Some(&format!("{:?}", recovery.error_kind)),
+    );
     truncate_chars(
         &format!(
-            "恢复类型：{:?}\n当前目标：{}\n验收标准（最高优先级，精确标识符必须逐字遵循）：\n- {}\n当前未满足项：\n{}\n修复轮次历史：\n{}{}\n允许修改：\n- {}\n允许新建：\n- {}\n当前基线：{}\n失败证据：\n{}\n执行错误：\n{}\n当前受限 diff：\n{}\n上次修复摘要：\n{}",
+            "恢复类型：{:?}\n当前目标：{}\n验收标准（最高优先级，精确标识符必须逐字遵循）：\n- {}\n当前未满足项：\n{}\n修复轮次历史：\n{}{}\n匹配的纠错经验：\n{}\n允许修改：\n- {}\n允许新建：\n- {}\n当前基线：{}\n失败证据：\n{}\n执行错误：\n{}\n当前受限 diff：\n{}\n上次修复摘要：\n{}",
             recovery.error_kind,
             if subtask.goal.is_empty() { &subtask.title } else { &subtask.goal },
             subtask.acceptance_criteria.join("\n- "),
             issue_list_for_prompt(&recovery.active_issues),
             attempt_history_for_prompt(&recovery.attempt_history),
             strategy_note,
+            if learning.is_empty() { "（无）" } else { &learning },
             authorized_paths.join("\n- "),
             subtask.new_file_paths.join("\n- "),
             recovery.baseline_commit,
@@ -635,11 +654,7 @@ fn repair_prompt(
     subtask: &project::Subtask,
     diagnosis: &str,
 ) -> String {
-    let original = if subtask.execution_prompt.is_empty() {
-        &subtask.prompt
-    } else {
-        &subtask.execution_prompt
-    };
+    let original = crate::plan_compiler::compile_execution_prompt(subtask);
     if recovery.replan_attempted {
         format!(
             "执行受限重规划后的当前小阶段完整任务。工作区已恢复到该任务开始前的 Git 基线；必须完整实现全部验收标准，不得只补最后一次差异，不得扩大任务范围。\n\n重规划后的完整任务：\n{}\n\n失败历史与安全边界：\n{}",
@@ -658,34 +673,16 @@ fn repair_prompt(
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct RecoveryReplanOutput {
-    execution_prompt: String,
-    covered_criteria: Vec<u32>,
-    #[serde(default)]
-    rationale: String,
-}
-
 fn validate_replan_output(
-    mut output: RecoveryReplanOutput,
-    criterion_count: usize,
-) -> Result<RecoveryReplanOutput, String> {
-    if output.execution_prompt.trim().is_empty() {
-        return Err("当前任务重规划返回了空 execution_prompt。".to_string());
+    output: crate::plan_calibration::PlanPatchOutput,
+) -> Result<crate::plan_calibration::PlanPatchOutput, String> {
+    if output.implementation_guidance.trim().is_empty()
+        || output.context_summary.trim().is_empty()
+        || output.evidence_files.is_empty()
+        || output.dependency_notes.trim().is_empty()
+    {
+        return Err("当前任务计划补丁缺少实现指引、当前背景、证据文件或依赖说明。".to_string());
     }
-    let expected = (1..=criterion_count as u32).collect::<Vec<_>>();
-    if expected.is_empty() {
-        return Err("当前小阶段没有可供重规划核对的验收标准。".to_string());
-    }
-    output.covered_criteria.sort_unstable();
-    output.covered_criteria.dedup();
-    if output.covered_criteria != expected {
-        return Err(format!(
-            "当前任务重规划没有完整覆盖验收标准：期望 {:?}，实际 {:?}",
-            expected, output.covered_criteria
-        ));
-    }
-    output.execution_prompt = output.execution_prompt.trim().to_string();
     Ok(output)
 }
 
@@ -751,16 +748,41 @@ async fn replan_current_subtask(
     pipeline::restore_git_execution_baseline(&proj.project_path, target)
         .map_err(|error| format!("当前任务重规划前恢复执行基线失败：{}", error))?;
 
+    let current_facts = crate::project_facts::capture(
+        &proj.project_path,
+        &crate::project_facts::snapshot_paths(subtask),
+        crate::project_facts::accepted_deviations(proj),
+    )?;
+    let current_facts_text = serde_json::to_string_pretty(&current_facts)
+        .map_err(|error| format!("序列化当前任务事实失败：{}", error))?;
+    let context = truncate_chars(
+        &format!(
+            "恢复基线上的最新项目事实：\n{}\n\n{}",
+            current_facts_text, context
+        ),
+        MAX_DIAGNOSIS_CHARS,
+    );
+
     let reply =
         crate::api::call_deepseek_api_json(crate::prompts::RECOVERY_REPLAN_PROMPT, &context)
             .await
             .map_err(|error| format!("当前任务重规划 AI 调用失败：{}", error))?;
-    let output: RecoveryReplanOutput = crate::json_utils::parse_json_with_retry(&reply)
-        .await
-        .map_err(|error| format!("当前任务重规划结果解析失败：{}", error))?;
-    let output = validate_replan_output(output, subtask.acceptance_criteria.len())?;
+    let output: crate::plan_calibration::PlanPatchOutput =
+        crate::json_utils::parse_json_with_retry(&reply)
+            .await
+            .map_err(|error| format!("当前任务重规划结果解析失败：{}", error))?;
+    let output = validate_replan_output(output)?;
+    let contract_before = crate::plan_calibration::immutable_contract(subtask)?;
     let mut contract_candidate = subtask.clone();
-    contract_candidate.execution_prompt = output.execution_prompt.clone();
+    contract_candidate.execution_prompt = output.implementation_guidance.trim().to_string();
+    contract_candidate.context_summary = output.context_summary.trim().to_string();
+    contract_candidate.evidence_files = output.evidence_files.clone();
+    contract_candidate.dependency_notes = output.dependency_notes.trim().to_string();
+    crate::plan_contract::hydrate_subtask_contract(&mut contract_candidate);
+    if crate::plan_calibration::immutable_contract(&contract_candidate)? != contract_before {
+        return Err("当前任务计划补丁改变了不可变契约，已拒绝。".to_string());
+    }
+    crate::plan_contract::validate_subtask(&contract_candidate, "当前小阶段重规划")?;
     crate::plan_contract::validate_execution_prompt(&contract_candidate, "当前小阶段重规划")?;
 
     let item = proj
@@ -780,7 +802,13 @@ async fn replan_current_subtask(
                 .find(|item| item.id == session.subtask_id)
         })
         .ok_or_else(|| "重规划完成后无法定位当前小阶段。".to_string())?;
-    item.execution_prompt = output.execution_prompt;
+    item.execution_prompt = contract_candidate.execution_prompt;
+    item.context_summary = contract_candidate.context_summary;
+    item.evidence_files = contract_candidate.evidence_files;
+    item.dependency_notes = contract_candidate.dependency_notes;
+    item.required_identifiers = contract_candidate.required_identifiers;
+    item.fact_snapshot = Some(current_facts);
+    item.plan_patch_revision = item.plan_patch_revision.saturating_add(1);
     item.status = project::SubtaskStatus::Pending;
     item.execution_result = None;
     item.test_result = None;
@@ -867,6 +895,23 @@ fn reset_subtask_to_pending(proj: &mut project::Project, session: &project::Exec
         subtask.execution_result = None;
         subtask.test_result = None;
         subtask.human_verification = None;
+    }
+}
+
+fn finish_repair_checkpoint(proj: &mut project::Project, restore: bool) -> Result<(), String> {
+    let checkpoint_id = proj
+        .workflow_state
+        .recovery_state
+        .as_mut()
+        .map(|state| std::mem::take(&mut state.checkpoint_id))
+        .unwrap_or_default();
+    if checkpoint_id.is_empty() {
+        return Ok(());
+    }
+    if restore {
+        crate::recovery_checkpoint::restore(&checkpoint_id)
+    } else {
+        crate::recovery_checkpoint::discard(&checkpoint_id)
     }
 }
 
@@ -957,6 +1002,9 @@ fn merge_execution_result(
         file_changes: paths.into_iter().collect(),
         exit_code: repair.exit_code,
         engine_provider: repair.engine_provider,
+        stdout: repair.stdout,
+        stderr: repair.stderr,
+        engine_failure_kind: repair.engine_failure_kind,
     }
 }
 
@@ -975,6 +1023,11 @@ pub(crate) async fn run_error_recovery(
 
     let mut proj = crate::load_project(&project_name)?;
     let (mut recovery, mut session, subtask) = current_recovery_context(&proj)?;
+    if recovery.phase == project::RecoveryPhase::WaitingEngine
+        || recovery.error_kind == project::RecoveryErrorKind::EngineBlocked
+    {
+        return Err("执行引擎当前不可用；请恢复额度/认证、切换引擎或稍后重试。".to_string());
+    }
     if recovery.phase == project::RecoveryPhase::WaitingHuman {
         return Err("自动恢复已停止，等待人工处理。".to_string());
     }
@@ -1091,6 +1144,9 @@ pub(crate) async fn run_error_recovery(
         reset_subtask_to_pending(&mut proj, &session);
     }
 
+    recovery.checkpoint_id =
+        crate::recovery_checkpoint::create(&proj.project_path, &authorized_paths)?;
+
     let recovery_execution_id = format!(
         "recovery-{}-{}",
         std::process::id(),
@@ -1190,31 +1246,51 @@ pub(crate) async fn run_error_recovery(
         .as_ref()
         .is_some_and(|current| current.execution_id == recovery_execution_id);
     if !current_matches {
+        if !recovery.checkpoint_id.is_empty() {
+            let _ = crate::recovery_checkpoint::discard(&recovery.checkpoint_id);
+        }
         return crate::load_project(&project_name);
     }
 
     let repair_result = match repair_result {
         Ok(result) if result.success => result,
         Ok(result) => {
+            let engine_failure_kind = result
+                .engine_failure_kind
+                .clone()
+                .unwrap_or(project::EngineFailureKind::TaskExecutionError);
             let message = if result.error_log.is_empty() {
                 format!(
                     "{} 修复进程非零退出",
                     session.engine_snapshot.provider.display_name()
                 )
             } else {
-                result.error_log
+                result.error_log.clone()
             };
-            handle_repair_execution_failure(
-                &mut proj,
-                &session,
-                &recovery_execution_id,
-                &message,
-                &mut pipeline_guard,
-            )?;
+            if crate::engine::blocks_code_recovery(&engine_failure_kind) {
+                handle_repair_engine_block(
+                    &mut proj,
+                    &session,
+                    &recovery_execution_id,
+                    &message,
+                    engine_failure_kind,
+                    Some(result),
+                    &mut pipeline_guard,
+                )?;
+            } else {
+                handle_repair_execution_failure(
+                    &mut proj,
+                    &session,
+                    &recovery_execution_id,
+                    &message,
+                    &mut pipeline_guard,
+                )?;
+            }
             crate::save_project(&proj)?;
             return crate::load_project(&project_name);
         }
         Err(crate::engine::EngineError::Cancelled) => {
+            finish_repair_checkpoint(&mut proj, true)?;
             mark_waiting_human(
                 &mut proj,
                 project::RecoveryErrorKind::HumanRequired,
@@ -1230,24 +1306,40 @@ pub(crate) async fn run_error_recovery(
             return crate::load_project(&project_name);
         }
         Err(crate::engine::EngineError::Timeout) => {
-            handle_repair_execution_failure(
+            handle_repair_engine_block(
                 &mut proj,
                 &session,
                 &recovery_execution_id,
                 "自动修复执行超时",
+                project::EngineFailureKind::Timeout,
+                None,
                 &mut pipeline_guard,
             )?;
             crate::save_project(&proj)?;
             return crate::load_project(&project_name);
         }
         Err(error) => {
-            handle_repair_execution_failure(
-                &mut proj,
-                &session,
-                &recovery_execution_id,
-                &error.to_string(),
-                &mut pipeline_guard,
-            )?;
+            let message = error.to_string();
+            let kind = crate::engine::classify_process_failure(None, &message, "");
+            if crate::engine::blocks_code_recovery(&kind) {
+                handle_repair_engine_block(
+                    &mut proj,
+                    &session,
+                    &recovery_execution_id,
+                    &message,
+                    kind,
+                    None,
+                    &mut pipeline_guard,
+                )?;
+            } else {
+                handle_repair_execution_failure(
+                    &mut proj,
+                    &session,
+                    &recovery_execution_id,
+                    &message,
+                    &mut pipeline_guard,
+                )?;
+            }
             crate::save_project(&proj)?;
             return crate::load_project(&project_name);
         }
@@ -1262,6 +1354,7 @@ pub(crate) async fn run_error_recovery(
             &recovery.baseline_commit
         };
         let restore = pipeline::restore_git_execution_baseline(&proj.project_path, target);
+        finish_repair_checkpoint(&mut proj, restore.is_err())?;
         reset_subtask_to_pending(&mut proj, &session);
         preserve_recovery_session(&mut proj, &session, &recovery_execution_id);
         let message = match restore {
@@ -1400,6 +1493,9 @@ pub(crate) async fn run_error_recovery(
                 && current.execution_id == recovery_execution_id
         });
     if !still_current {
+        if !recovery.checkpoint_id.is_empty() {
+            let _ = crate::recovery_checkpoint::discard(&recovery.checkpoint_id);
+        }
         return Ok(proj);
     }
     finish_retest(&mut proj, &session, &recovery_execution_id, test.clone())?;
@@ -1411,6 +1507,83 @@ pub(crate) async fn run_error_recovery(
     );
     crate::save_project(&proj)?;
     crate::load_project(&project_name)
+}
+
+fn handle_repair_engine_block(
+    proj: &mut project::Project,
+    session: &project::ExecutionSession,
+    execution_id: &str,
+    message: &str,
+    engine_failure_kind: project::EngineFailureKind,
+    execution_result: Option<project::ExecutionResult>,
+    pipeline_state: &mut Option<PipelineState>,
+) -> Result<(), String> {
+    let baseline = proj
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .map(|state| state.baseline_commit.clone())
+        .unwrap_or_default();
+    let restore_result = pipeline::restore_git_execution_baseline(
+        &proj.project_path,
+        if baseline.is_empty() {
+            "HEAD"
+        } else {
+            &baseline
+        },
+    );
+    finish_repair_checkpoint(proj, restore_result.is_err())?;
+    reset_subtask_to_pending(proj, session);
+    if let Some(result) = execution_result {
+        if let Some(item) = proj
+            .milestones
+            .iter_mut()
+            .find(|milestone| milestone.id == session.milestone_id)
+            .and_then(|milestone| {
+                milestone
+                    .mid_stages
+                    .iter_mut()
+                    .find(|mid_stage| mid_stage.id == session.mid_stage_id)
+            })
+            .and_then(|mid_stage| {
+                mid_stage
+                    .subtasks
+                    .iter_mut()
+                    .find(|item| item.id == session.subtask_id)
+            })
+        {
+            item.execution_result = Some(result);
+        }
+    }
+    preserve_recovery_session(proj, session, execution_id);
+    let detail = match restore_result {
+        Ok(()) => format!("执行引擎阻断，已恢复任务基线：{}", message),
+        Err(error) => format!("执行引擎阻断且任务基线恢复失败：{}；{}", message, error),
+    };
+    if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
+        recovery.attempt = recovery.attempt.saturating_sub(1);
+        recovery.error_kind = project::RecoveryErrorKind::EngineBlocked;
+        recovery.engine_failure_kind = Some(engine_failure_kind);
+        recovery.phase = project::RecoveryPhase::WaitingEngine;
+        recovery.last_repair_summary = truncate_chars(&detail, 4_000);
+        recovery.updated_at = chrono::Utc::now().to_rfc3339();
+    }
+    if let Some(current_session) = proj.execution_session.as_mut() {
+        current_session.failure_message = truncate_chars(&detail, 2_048);
+    }
+    set_autopilot_waiting(proj, &detail);
+    pipeline::write_execution_history(
+        proj,
+        "error",
+        project::ExecutionEventType::ExecutionFailed,
+        detail.clone(),
+        Some(&session.milestone_id),
+        Some(&session.mid_stage_id),
+        Some(&session.subtask_id),
+    );
+    set_pipeline_terminal(pipeline_state, execution_id, None, Some(&detail));
+    touch(proj);
+    Ok(())
 }
 
 fn handle_repair_execution_failure(
@@ -1432,6 +1605,7 @@ fn handle_repair_execution_failure(
         &baseline
     };
     let restore_result = pipeline::restore_git_execution_baseline(&proj.project_path, target);
+    finish_repair_checkpoint(proj, restore_result.is_err())?;
     reset_subtask_to_pending(proj, session);
     preserve_recovery_session(proj, session, execution_id);
 
@@ -1484,7 +1658,7 @@ pub(crate) fn finish_retest(
     proj: &mut project::Project,
     session: &project::ExecutionSession,
     execution_id: &str,
-    test: project::TestResult,
+    mut test: project::TestResult,
 ) -> Result<(), String> {
     let recovery_is_current = proj
         .workflow_state
@@ -1520,6 +1694,8 @@ pub(crate) fn finish_retest(
         .clone();
     let authorized_paths = crate::plan_contract::validate_subtask(&subtask, "恢复复测任务")?;
 
+    test.acceptance_results =
+        crate::acceptance::build_ledger(&subtask.acceptance_criteria, &test, &authorized_paths);
     let item = proj
         .milestones
         .iter_mut()
@@ -1539,6 +1715,7 @@ pub(crate) fn finish_retest(
         .ok_or_else(|| "复测完成后无法定位小阶段。".to_string())?;
     item.status = project::SubtaskStatus::AwaitingConfirmation;
     item.test_result = Some(test.clone());
+    item.acceptance_ledger = test.acceptance_results.clone();
 
     let summary = test_failure_summary(Some(&test), "复测未通过");
     pipeline::write_execution_history(
@@ -1556,6 +1733,15 @@ pub(crate) fn finish_retest(
     );
 
     if test.passed {
+        if let Some(checkpoint_id) = proj
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .map(|state| state.checkpoint_id.clone())
+            .filter(|id| !id.is_empty())
+        {
+            crate::recovery_checkpoint::discard(&checkpoint_id)?;
+        }
         if let Some(current_session) = proj.execution_session.as_mut() {
             current_session.execution_id = execution_id.to_string();
             current_session.active = true;
@@ -1572,6 +1758,25 @@ pub(crate) fn finish_retest(
             Some(&session.mid_stage_id),
             Some(&session.subtask_id),
         );
+        if let Some(completed_recovery) = proj.workflow_state.recovery_state.clone() {
+            let strategy = if completed_recovery.replan_attempted {
+                "受限计划补丁后从基线完整重执行"
+            } else {
+                "按验收差异执行受限代码修复"
+            };
+            crate::recovery_learning::record(
+                proj,
+                &completed_recovery,
+                &subtask,
+                strategy,
+                true,
+                &format!(
+                    "保持文件范围 [{}] 与精确标识符 [{}]",
+                    subtask.allowed_file_paths.join("、"),
+                    subtask.required_identifiers.join("、")
+                ),
+            );
+        }
         proj.workflow_state.recovery_state = None;
         if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
             autopilot.run_status = project::AutopilotRunStatus::Running;
@@ -1584,9 +1789,8 @@ pub(crate) fn finish_retest(
         return Ok(());
     }
 
-    let next_kind =
+    let mut next_kind =
         classify_test_result_with_context(Some(&test), Some(&subtask), &authorized_paths);
-    let next_signature = normalized_signature(&next_kind, &summary);
     let next_issues = recovery_issues(&test, &subtask, &authorized_paths);
     let changed_files = subtask
         .execution_result
@@ -1594,6 +1798,7 @@ pub(crate) fn finish_retest(
         .map(|result| result.file_changes.clone())
         .unwrap_or_default();
     let mut next_phase = project::RecoveryPhase::Diagnosing;
+    let mut contradictory_criteria = Vec::new();
     if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
         let previous_ids: BTreeSet<String> = recovery
             .active_issues
@@ -1613,9 +1818,30 @@ pub(crate) fn finish_retest(
             .difference(&previous_ids)
             .cloned()
             .collect::<Vec<_>>();
+        let previously_resolved = recovery
+            .attempt_history
+            .iter()
+            .flat_map(|record| record.resolved_issue_ids.iter())
+            .collect::<BTreeSet<_>>();
+        let oscillating_ids = regressed_issue_ids
+            .iter()
+            .filter(|id| previously_resolved.contains(id))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !oscillating_ids.is_empty() {
+            next_kind = project::RecoveryErrorKind::ValidationFailure;
+            contradictory_criteria.extend(
+                next_issues
+                    .iter()
+                    .filter(|issue| oscillating_ids.contains(&issue.id))
+                    .filter_map(|issue| issue.criterion_index),
+            );
+        }
         let made_progress = !previous_ids.is_empty()
             && !resolved_issue_ids.is_empty()
             && next_ids.len() < previous_ids.len();
+        let introduced_regression = !regressed_issue_ids.is_empty();
+        let regression_count = regressed_issue_ids.len();
         let attempt_summary = format!(
             "第 {} 次复测：解决 {} 项，剩余 {} 项，新增 {} 项",
             recovery.attempt,
@@ -1646,9 +1872,25 @@ pub(crate) fn finish_retest(
         recovery.active_issues = next_issues;
         recovery.last_repair_summary = attempt_summary;
         recovery.updated_at = chrono::Utc::now().to_rfc3339();
+        let checkpoint_id = recovery.checkpoint_id.clone();
+        recovery.checkpoint_id.clear();
+        if introduced_regression && !checkpoint_id.is_empty() {
+            crate::recovery_checkpoint::restore(&checkpoint_id)?;
+            recovery.last_repair_summary = format!(
+                "{}；检测到 {} 个新增回归，已撤销本轮修复",
+                recovery.last_repair_summary, regression_count
+            );
+        } else if !checkpoint_id.is_empty() {
+            crate::recovery_checkpoint::discard(&checkpoint_id)?;
+        }
+        let next_signature = normalized_signature(&next_kind, &summary);
         let regular_repair_exhausted =
             record_failed_signature(recovery, next_kind.clone(), next_signature);
-        next_phase = if next_kind == project::RecoveryErrorKind::TestUnavailable {
+        next_phase = if matches!(
+            next_kind,
+            project::RecoveryErrorKind::TestUnavailable
+                | project::RecoveryErrorKind::ValidationFailure
+        ) {
             project::RecoveryPhase::WaitingHuman
         } else if recovery.replan_execution_attempted {
             project::RecoveryPhase::WaitingHuman
@@ -1658,6 +1900,35 @@ pub(crate) fn finish_retest(
             project::RecoveryPhase::Diagnosing
         };
         recovery.phase = next_phase.clone();
+    }
+
+    if !contradictory_criteria.is_empty() {
+        if let Some(item) = proj
+            .milestones
+            .iter_mut()
+            .find(|milestone| milestone.id == session.milestone_id)
+            .and_then(|milestone| {
+                milestone
+                    .mid_stages
+                    .iter_mut()
+                    .find(|mid_stage| mid_stage.id == session.mid_stage_id)
+            })
+            .and_then(|mid_stage| {
+                mid_stage
+                    .subtasks
+                    .iter_mut()
+                    .find(|item| item.id == session.subtask_id)
+            })
+        {
+            for ledger in &mut item.acceptance_ledger {
+                if contradictory_criteria.contains(&ledger.criterion_index) {
+                    ledger.status = project::AcceptanceStatus::Contradictory;
+                    ledger.evidence =
+                        "该验收项在连续审查中先被解决后再次出现，审查结论发生震荡".to_string();
+                    ledger.updated_at = chrono::Utc::now().to_rfc3339();
+                }
+            }
+        }
     }
 
     if let Some(current_session) = proj.execution_session.as_mut() {
@@ -1673,6 +1944,24 @@ pub(crate) fn finish_retest(
     }
 
     if next_phase == project::RecoveryPhase::WaitingHuman {
+        if let Some(failed_recovery) = proj.workflow_state.recovery_state.clone() {
+            crate::recovery_learning::record(
+                proj,
+                &failed_recovery,
+                &subtask,
+                if failed_recovery.replan_attempted {
+                    "受限计划补丁后从基线完整重执行"
+                } else {
+                    "按验收差异执行受限代码修复"
+                },
+                false,
+                if failed_recovery.error_kind == project::RecoveryErrorKind::ValidationFailure {
+                    "先重建或校正验收证据，禁止继续修改代码"
+                } else {
+                    "该策略未取得稳定进展，后续不得机械重复"
+                },
+            );
+        }
         set_autopilot_waiting(proj, "自动修复未能通过复测，等待人工处理");
         pipeline::write_execution_history(
             proj,
@@ -1739,16 +2028,86 @@ fn changed_paths(project_path: &str) -> Result<Vec<String>, String> {
     Ok(paths)
 }
 
+fn validate_human_acceptance(
+    subtask: &project::Subtask,
+    resolution: &str,
+    reason: &str,
+    accepted_criteria: &[u32],
+) -> Result<project::HumanResolution, String> {
+    if reason.trim().is_empty() {
+        return Err("人工决策必须填写依据。".to_string());
+    }
+    if subtask
+        .execution_result
+        .as_ref()
+        .is_none_or(|result| !result.success)
+    {
+        return Err("执行引擎没有成功完成任务，不能通过人工核验或接受代码偏差。".to_string());
+    }
+    let human_resolution = if resolution == "accept_deviation" {
+        project::HumanResolution::AcceptDeviation
+    } else {
+        project::HumanResolution::ConfirmActualPass
+    };
+    if human_resolution == project::HumanResolution::AcceptDeviation {
+        if accepted_criteria.is_empty() {
+            return Err("接受偏差必须选择至少一个验收项。".to_string());
+        }
+        if accepted_criteria
+            .iter()
+            .any(|index| *index == 0 || *index as usize > subtask.acceptance_criteria.len())
+        {
+            return Err("接受偏差包含无效验收项编号。".to_string());
+        }
+    }
+    Ok(human_resolution)
+}
+
+fn validate_skip_dependencies(
+    skipped: &project::Subtask,
+    remaining: &[project::Subtask],
+) -> Result<String, String> {
+    let hard_dependents = remaining
+        .iter()
+        .filter(|item| item.depends_on.contains(&skipped.id))
+        .map(|item| item.title.clone())
+        .collect::<Vec<_>>();
+    if !hard_dependents.is_empty() {
+        return Err(format!(
+            "后续任务存在硬依赖，不能跳过：{}",
+            hard_dependents.join("、")
+        ));
+    }
+    if !remaining.is_empty()
+        && remaining
+            .iter()
+            .any(|item| item.depends_on.is_empty() && item.dependency_notes.trim().is_empty())
+    {
+        return Err("旧计划没有显式依赖契约，无法证明跳过安全；请先重新校准后续任务。".to_string());
+    }
+    Ok(if remaining.is_empty() {
+        "没有后续任务".to_string()
+    } else {
+        "后续任务显式声明不依赖当前任务".to_string()
+    })
+}
+
 #[tauri::command]
 pub(crate) async fn resolve_human_recovery(
     state: tauri::State<'_, AppState>,
     project_name: String,
     resolution: String,
     reason: String,
+    accepted_criteria: Option<Vec<u32>>,
 ) -> Result<project::Project, String> {
     let _pipeline_guard = state.pipeline_state.lock().await;
     let mut proj = crate::load_project(&project_name)?;
-    let (_recovery, session, subtask) = current_recovery_context(&proj)?;
+    let (recovery, session, subtask) = current_recovery_context(&proj)?;
+    if recovery.phase == project::RecoveryPhase::WaitingEngine
+        || recovery.error_kind == project::RecoveryErrorKind::EngineBlocked
+    {
+        return Err("执行引擎仍处于阻断状态；请通过引擎恢复入口检查或切换引擎。".to_string());
+    }
     let authorized_paths = crate::plan_contract::validate_subtask(&subtask, "人工恢复任务")?;
 
     match resolution.as_str() {
@@ -1776,10 +2135,10 @@ pub(crate) async fn resolve_human_recovery(
                 autopilot.recovery_action = project::AutopilotRecoveryAction::None;
             }
         }
-        "human_override" => {
-            if reason.trim().is_empty() {
-                return Err("人工核验通过必须填写原因。".to_string());
-            }
+        "human_override" | "confirm_actual_pass" | "accept_deviation" => {
+            let accepted = accepted_criteria.unwrap_or_default();
+            let human_resolution =
+                validate_human_acceptance(&subtask, &resolution, &reason, &accepted)?;
             let original_failure =
                 test_failure_summary(subtask.test_result.as_ref(), "没有可用的自动化测试结果");
             let item = proj
@@ -1800,11 +2159,21 @@ pub(crate) async fn resolve_human_recovery(
                 })
                 .ok_or_else(|| "无法定位人工核验的小阶段。".to_string())?;
             item.status = project::SubtaskStatus::AwaitingConfirmation;
+            for ledger in &mut item.acceptance_ledger {
+                if accepted.contains(&ledger.criterion_index) {
+                    ledger.status = project::AcceptanceStatus::AcceptedDeviation;
+                    ledger.evidence = reason.trim().to_string();
+                    ledger.updated_at = chrono::Utc::now().to_rfc3339();
+                }
+            }
             item.human_verification = Some(project::HumanVerification {
                 verification_kind: project::VerificationKind::HumanOverride,
                 verification_reason: reason.clone(),
                 verified_at: chrono::Utc::now().to_rfc3339(),
                 original_test_failure: original_failure,
+                resolution: human_resolution.clone(),
+                accepted_criteria: accepted,
+                dependency_check: String::new(),
             });
             if let Some(current_session) = proj.execution_session.as_mut() {
                 current_session.status = "awaiting_confirmation".to_string();
@@ -1815,18 +2184,162 @@ pub(crate) async fn resolve_human_recovery(
                 &mut proj,
                 "success",
                 project::ExecutionEventType::HumanVerificationAccepted,
-                format!("人工核验通过：{}", reason.trim()),
+                format!(
+                    "{}：{}",
+                    if human_resolution == project::HumanResolution::AcceptDeviation {
+                        "接受偏差并继续"
+                    } else {
+                        "确认实际通过"
+                    },
+                    reason.trim()
+                ),
                 Some(&session.milestone_id),
                 Some(&session.mid_stage_id),
                 Some(&session.subtask_id),
             );
+            if human_resolution == project::HumanResolution::AcceptDeviation {
+                crate::recovery_learning::record_human_constraint(
+                    &mut proj,
+                    &subtask,
+                    "人工接受验收偏差",
+                    reason.trim(),
+                );
+            }
             proj.workflow_state.recovery_state = None;
             if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
                 autopilot.run_status = project::AutopilotRunStatus::Running;
-                autopilot.last_action = "人工核验已记录，继续执行".to_string();
+                autopilot.last_action =
+                    if human_resolution == project::HumanResolution::AcceptDeviation {
+                        "验收偏差已记录，准备将约束传播到后续任务".to_string()
+                    } else {
+                        "人工通过证据已记录，继续执行".to_string()
+                    };
                 autopilot.last_action_at = chrono::Utc::now().to_rfc3339();
                 autopilot.error_message.clear();
                 autopilot.recovery_action = project::AutopilotRecoveryAction::None;
+            }
+        }
+        "skip_task" => {
+            if reason.trim().is_empty() {
+                return Err("跳过任务必须填写原因。".to_string());
+            }
+            let remaining = proj
+                .milestones
+                .iter()
+                .find(|milestone| milestone.id == session.milestone_id)
+                .and_then(|milestone| {
+                    milestone
+                        .mid_stages
+                        .iter()
+                        .find(|mid| mid.id == session.mid_stage_id)
+                })
+                .map(|mid| {
+                    mid.subtasks
+                        .iter()
+                        .filter(|item| {
+                            item.order > subtask.order
+                                && item.status == project::SubtaskStatus::Pending
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let dependency_check = validate_skip_dependencies(&subtask, &remaining)?;
+            let baseline = proj
+                .workflow_state
+                .recovery_state
+                .as_ref()
+                .map(|current| current.baseline_commit.clone())
+                .unwrap_or_default();
+            pipeline::restore_git_execution_baseline(
+                &proj.project_path,
+                if baseline.is_empty() {
+                    "HEAD"
+                } else {
+                    &baseline
+                },
+            )?;
+            let item = proj
+                .milestones
+                .iter_mut()
+                .find(|milestone| milestone.id == session.milestone_id)
+                .and_then(|milestone| {
+                    milestone
+                        .mid_stages
+                        .iter_mut()
+                        .find(|mid| mid.id == session.mid_stage_id)
+                })
+                .and_then(|mid| {
+                    mid.subtasks
+                        .iter_mut()
+                        .find(|item| item.id == session.subtask_id)
+                })
+                .ok_or_else(|| "无法定位要跳过的小阶段。".to_string())?;
+            item.status = project::SubtaskStatus::Skipped;
+            item.execution_result = None;
+            item.test_result = None;
+            item.human_verification = Some(project::HumanVerification {
+                verification_kind: project::VerificationKind::HumanOverride,
+                verification_reason: reason.clone(),
+                verified_at: chrono::Utc::now().to_rfc3339(),
+                original_test_failure: test_failure_summary(
+                    subtask.test_result.as_ref(),
+                    "任务未完成",
+                ),
+                resolution: project::HumanResolution::SkipTask,
+                accepted_criteria: vec![],
+                dependency_check,
+            });
+            proj.execution_session = None;
+            proj.workflow_state.recovery_state = None;
+            if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+                autopilot.run_status = project::AutopilotRunStatus::Running;
+                autopilot.last_action = "当前任务已跳过，后续执行前将重新扫描事实".to_string();
+                autopilot.last_action_at = chrono::Utc::now().to_rfc3339();
+                autopilot.error_message.clear();
+                autopilot.recovery_action = project::AutopilotRecoveryAction::None;
+            }
+            pipeline::write_execution_history(
+                &mut proj,
+                "pause",
+                project::ExecutionEventType::TaskSkipped,
+                format!("跳过任务：{}；{}", subtask.title, reason.trim()),
+                Some(&session.milestone_id),
+                Some(&session.mid_stage_id),
+                Some(&session.subtask_id),
+            );
+            crate::recovery_learning::record_human_constraint(
+                &mut proj,
+                &subtask,
+                "依赖检查后跳过任务",
+                reason.trim(),
+            );
+            let (mid_completed, milestone_completed) = pipeline::reconcile_terminal_stage(
+                &mut proj,
+                &session.milestone_id,
+                &session.mid_stage_id,
+            );
+            if mid_completed {
+                pipeline::write_execution_history(
+                    &mut proj,
+                    "success",
+                    project::ExecutionEventType::MidStageComplete,
+                    "中阶段所有任务已达到终态".to_string(),
+                    Some(&session.milestone_id),
+                    Some(&session.mid_stage_id),
+                    None,
+                );
+            }
+            if milestone_completed {
+                pipeline::write_execution_history(
+                    &mut proj,
+                    "success",
+                    project::ExecutionEventType::AdvanceMilestoneReview,
+                    "所有中阶段已完成，进入大阶段审阅".to_string(),
+                    Some(&session.milestone_id),
+                    None,
+                    None,
+                );
             }
         }
         "regenerate_plan" => {
@@ -2016,6 +2529,7 @@ mod tests {
             confirmed_at: None,
             confirmation_notes: None,
             human_verification: None,
+            ..Default::default()
         }
     }
 
@@ -2060,7 +2574,7 @@ mod tests {
         };
         assert_eq!(
             classify_test_result(Some(&partial_review)),
-            project::RecoveryErrorKind::TestUnavailable
+            project::RecoveryErrorKind::ValidationFailure
         );
 
         let complete_review = project::TestResult {
@@ -2071,7 +2585,7 @@ mod tests {
         };
         assert_eq!(
             classify_test_result(Some(&complete_review)),
-            project::RecoveryErrorKind::ReviewFailure
+            project::RecoveryErrorKind::ValidationFailure
         );
     }
 
@@ -2091,6 +2605,87 @@ mod tests {
         let restored: project::RecoveryState = serde_json::from_value(value).unwrap();
         assert_eq!(restored.repeated_signature_count, 0);
         assert!(restored.baseline_commit.is_empty());
+        assert!(restored.engine_failure_kind.is_none());
+        assert!(restored.checkpoint_id.is_empty());
+    }
+
+    #[test]
+    fn engine_blocked_state_spends_no_repair_or_replan_attempts() {
+        let recovery = project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::EngineBlocked,
+            phase: project::RecoveryPhase::WaitingEngine,
+            engine_failure_kind: Some(project::EngineFailureKind::QuotaExceeded),
+            ..Default::default()
+        };
+        assert_eq!(recovery.attempt, 0);
+        assert!(!recovery.replan_attempted);
+        assert!(!recovery.replan_execution_attempted);
+    }
+
+    #[test]
+    fn human_pass_requires_successful_execution() {
+        let mut subtask = contract_subtask();
+        subtask.execution_result = Some(project::ExecutionResult {
+            success: false,
+            ..Default::default()
+        });
+        assert!(
+            validate_human_acceptance(&subtask, "confirm_actual_pass", "manual evidence", &[],)
+                .is_err()
+        );
+        subtask.execution_result.as_mut().unwrap().success = true;
+        assert_eq!(
+            validate_human_acceptance(&subtask, "confirm_actual_pass", "manual evidence", &[],)
+                .unwrap(),
+            project::HumanResolution::ConfirmActualPass
+        );
+    }
+
+    #[test]
+    fn accepting_deviation_requires_valid_criteria() {
+        let mut subtask = contract_subtask();
+        subtask.execution_result = Some(project::ExecutionResult {
+            success: true,
+            ..Default::default()
+        });
+        assert!(
+            validate_human_acceptance(&subtask, "accept_deviation", "known deviation", &[],)
+                .is_err()
+        );
+        assert!(
+            validate_human_acceptance(&subtask, "accept_deviation", "known deviation", &[2],)
+                .is_err()
+        );
+        assert_eq!(
+            validate_human_acceptance(&subtask, "accept_deviation", "known deviation", &[1],)
+                .unwrap(),
+            project::HumanResolution::AcceptDeviation
+        );
+    }
+
+    #[test]
+    fn skipping_requires_explicit_non_dependency() {
+        let skipped = contract_subtask();
+        let legacy = project::Subtask {
+            id: "next".to_string(),
+            title: "legacy next".to_string(),
+            ..Default::default()
+        };
+        assert!(validate_skip_dependencies(&skipped, &[legacy]).is_err());
+        let dependent = project::Subtask {
+            id: "next".to_string(),
+            title: "dependent".to_string(),
+            depends_on: vec![skipped.id.clone()],
+            ..Default::default()
+        };
+        assert!(validate_skip_dependencies(&skipped, &[dependent]).is_err());
+        let independent = project::Subtask {
+            id: "next".to_string(),
+            title: "independent".to_string(),
+            dependency_notes: "明确不依赖被跳过任务".to_string(),
+            ..Default::default()
+        };
+        assert!(validate_skip_dependencies(&skipped, &[independent]).is_ok());
     }
 
     #[test]
@@ -2138,13 +2733,13 @@ mod tests {
         partial.review_issues[0].confidence = 0.6;
         assert_eq!(
             classify_test_result_with_context(Some(&partial), Some(&subtask), &authorized),
-            project::RecoveryErrorKind::TestUnavailable
+            project::RecoveryErrorKind::ValidationFailure
         );
         partial.review_issues[0].confidence = 0.9;
         partial.review_issues[0].file = "outside.html".to_string();
         assert_eq!(
             classify_test_result_with_context(Some(&partial), Some(&subtask), &authorized),
-            project::RecoveryErrorKind::TestUnavailable
+            project::RecoveryErrorKind::ValidationFailure
         );
     }
 
@@ -2161,27 +2756,51 @@ mod tests {
     }
 
     #[test]
-    fn replan_output_must_cover_every_acceptance_criterion() {
-        let complete = validate_replan_output(
-            RecoveryReplanOutput {
-                execution_prompt: "  完整重执行当前任务  ".to_string(),
-                covered_criteria: vec![2, 1, 2],
-                rationale: String::new(),
-            },
-            2,
-        )
+    fn replan_patch_requires_only_patchable_fields() {
+        let complete = validate_replan_output(crate::plan_calibration::PlanPatchOutput {
+            implementation_guidance: "  完整重执行当前任务  ".to_string(),
+            context_summary: "当前代码事实".to_string(),
+            evidence_files: vec!["index.html".to_string()],
+            dependency_notes: "保留现有依赖契约".to_string(),
+            rationale: String::new(),
+        })
         .unwrap();
-        assert_eq!(complete.execution_prompt, "完整重执行当前任务");
-        assert_eq!(complete.covered_criteria, vec![1, 2]);
-
-        let missing = validate_replan_output(
-            RecoveryReplanOutput {
-                execution_prompt: "任务".to_string(),
-                covered_criteria: vec![1],
-                rationale: String::new(),
-            },
-            2,
+        assert_eq!(
+            complete.implementation_guidance.trim(),
+            "完整重执行当前任务"
         );
+
+        let missing = validate_replan_output(crate::plan_calibration::PlanPatchOutput {
+            implementation_guidance: "任务".to_string(),
+            context_summary: String::new(),
+            evidence_files: vec![],
+            dependency_notes: String::new(),
+            rationale: String::new(),
+        });
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn repair_prompt_uses_the_backend_compiled_contract() {
+        let task = project::Subtask {
+            title: "拖拽".to_string(),
+            goal: "实现拖拽".to_string(),
+            execution_prompt: "调用 preventDefault()".to_string(),
+            acceptance_criteria: vec!["必须调用 event.preventDefault".to_string()],
+            required_identifiers: vec!["event.preventDefault".to_string()],
+            evidence_files: vec!["index.html".to_string()],
+            ..Default::default()
+        };
+        let prompt = repair_prompt(
+            &project::RecoveryState {
+                error_kind: project::RecoveryErrorKind::ReviewFailure,
+                ..Default::default()
+            },
+            &task,
+            "criterion 1 failed",
+        );
+        assert!(prompt.contains("不可变验收标准"));
+        assert!(prompt.contains("event.preventDefault"));
+        assert!(prompt.contains("index.html"));
     }
 }

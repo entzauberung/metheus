@@ -53,12 +53,14 @@ pub(crate) async fn execute(
     let after_files = crate::test_runner::get_file_snapshot(&request.project_path);
     let file_changes =
         crate::test_runner::detect_changes(&before_files, &after_files, &request.project_path);
+    let engine_failure_kind = (!output.success)
+        .then(|| super::classify_process_failure(output.exit_code, &output.stdout, &output.stderr));
     let error_log = if output.success {
         String::new()
     } else {
         format!(
-            "{} 执行失败 (exit code: {:?})\nstderr:\n{}",
-            display_name, output.exit_code, output.stderr
+            "{} 执行失败 (exit code: {:?}, kind: {:?})\nstdout:\n{}\nstderr:\n{}",
+            display_name, output.exit_code, engine_failure_kind, output.stdout, output.stderr
         )
     };
     let combined_output = format!(
@@ -72,6 +74,9 @@ pub(crate) async fn execute(
         file_changes,
         exit_code: output.exit_code,
         engine_provider: Some(profile.provider.clone()),
+        stdout: output.stdout,
+        stderr: output.stderr,
+        engine_failure_kind,
     })
 }
 

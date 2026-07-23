@@ -23,7 +23,7 @@ fn looks_like_contract_identifier(token: &str, followed_by_call: bool) -> bool {
             .any(|pair| pair[0].is_ascii_lowercase() && pair[1].is_ascii_uppercase())
 }
 
-fn acceptance_identifiers(criteria: &[String]) -> BTreeSet<String> {
+pub(crate) fn acceptance_identifiers(criteria: &[String]) -> BTreeSet<String> {
     let mut identifiers = BTreeSet::new();
     for criterion in criteria {
         let chars = criterion.char_indices().collect::<Vec<_>>();
@@ -70,7 +70,7 @@ fn validate_execution_prompt_contract(
     if identifiers.is_empty() {
         return Ok(());
     }
-    let prompt = subtask.execution_prompt.trim();
+    let prompt = crate::plan_compiler::compile_execution_prompt(subtask);
     let missing = identifiers
         .into_iter()
         .filter(|identifier| !prompt.contains(identifier))
@@ -83,6 +83,24 @@ fn validate_execution_prompt_contract(
         ));
     }
     Ok(())
+}
+
+pub(crate) fn hydrate_subtask_contract(subtask: &mut project::Subtask) {
+    subtask.required_identifiers = acceptance_identifiers(&subtask.acceptance_criteria)
+        .into_iter()
+        .collect();
+    if subtask.acceptance_ledger.is_empty() {
+        subtask.acceptance_ledger = subtask
+            .acceptance_criteria
+            .iter()
+            .enumerate()
+            .map(|(index, criterion)| project::AcceptanceLedgerItem {
+                criterion_index: index as u32 + 1,
+                criterion: criterion.clone(),
+                ..Default::default()
+            })
+            .collect();
+    }
 }
 
 pub(crate) fn validate_execution_prompt(
@@ -199,6 +217,7 @@ pub(crate) fn validate_subtask(
         true,
     )?;
     let new_files = validate_path_list(&subtask.new_file_paths, "new_file_paths", entity, false)?;
+    validate_path_list(&subtask.evidence_files, "evidence_files", entity, false)?;
 
     let mut authorized = BTreeSet::new();
     authorized.extend(allowed);
@@ -210,9 +229,25 @@ pub(crate) fn validate_subtasks(subtasks: &[project::Subtask]) -> Result<(), Str
     if subtasks.is_empty() {
         return Err("执行计划为空".to_string());
     }
+    let order_by_id = subtasks
+        .iter()
+        .map(|subtask| (subtask.id.as_str(), subtask.order))
+        .collect::<std::collections::BTreeMap<_, _>>();
     for (index, subtask) in subtasks.iter().enumerate() {
-        validate_execution_prompt_contract(subtask, &format!("第 {} 个小阶段", index + 1))?;
-        validate_subtask(subtask, &format!("第 {} 个小阶段", index + 1))?;
+        let entity = format!("第 {} 个小阶段", index + 1);
+        validate_execution_prompt_contract(subtask, &entity)?;
+        validate_subtask(subtask, &entity)?;
+        for dependency_id in &subtask.depends_on {
+            let dependency_order = order_by_id
+                .get(dependency_id.as_str())
+                .ok_or_else(|| format!("{}引用了不存在的依赖任务：{}", entity, dependency_id))?;
+            if *dependency_order >= subtask.order {
+                return Err(format!(
+                    "{}的依赖任务必须早于当前任务：{}",
+                    entity, dependency_id
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -291,6 +326,7 @@ mod tests {
             confirmed_at: None,
             confirmation_notes: None,
             human_verification: None,
+            ..Default::default()
         }
     }
 
@@ -328,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_prompt_must_preserve_acceptance_identifiers() {
+    fn compiler_deterministically_preserves_acceptance_identifiers() {
         let mut task = subtask(&["src/main.ts"], &[]);
         task.acceptance_criteria = vec![
             "提供 getEngines()、setDefault(id) 和 isDefault 字段，时间使用 `Date.now`".to_string(),
@@ -338,10 +374,41 @@ mod tests {
         assert!(validate_subtasks(&[task.clone()]).is_ok());
 
         task.execution_prompt = "在 src/main.ts 实现 getSearchEngines 和默认引擎切换".to_string();
-        let error = validate_subtasks(&[task]).unwrap_err();
-        assert!(error.contains("getEngines"));
-        assert!(error.contains("setDefault"));
-        assert!(error.contains("isDefault"));
-        assert!(error.contains("Date.now"));
+        hydrate_subtask_contract(&mut task);
+        assert!(validate_subtasks(&[task.clone()]).is_ok());
+        let compiled = crate::plan_compiler::compile_execution_prompt(&task);
+        for identifier in ["getEngines", "setDefault", "isDefault", "Date.now"] {
+            assert!(compiled.contains(identifier));
+        }
+    }
+
+    #[test]
+    fn dependencies_must_reference_earlier_tasks() {
+        let first = project::Subtask {
+            id: "first".to_string(),
+            order: 1,
+            dependency_notes: "root task".to_string(),
+            ..subtask(&["src/main.ts"], &[])
+        };
+        let mut second = project::Subtask {
+            id: "second".to_string(),
+            order: 2,
+            depends_on: vec![first.id.clone()],
+            dependency_notes: "uses first".to_string(),
+            ..subtask(&["src/main.ts"], &[])
+        };
+        assert!(validate_subtasks(&[first.clone(), second.clone()]).is_ok());
+
+        second.depends_on = vec!["missing".to_string()];
+        assert!(validate_subtasks(&[first.clone(), second]).is_err());
+
+        let mut first_with_forward_dependency = first;
+        first_with_forward_dependency.depends_on = vec!["second".to_string()];
+        let second = project::Subtask {
+            id: "second".to_string(),
+            order: 2,
+            ..subtask(&["src/main.ts"], &[])
+        };
+        assert!(validate_subtasks(&[first_with_forward_dependency, second]).is_err());
     }
 }

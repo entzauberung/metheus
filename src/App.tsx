@@ -1657,19 +1657,42 @@ function App() {
   };
 
   const handleResolveHumanRecovery = async (
-    resolution: "retest" | "restore_and_retry" | "regenerate_plan" | "human_override",
+    resolution: "retest" | "restore_and_retry" | "regenerate_plan" | "confirm_actual_pass" | "accept_deviation" | "skip_task",
   ) => {
     if (!project || !beginConsoleAction(`human_recovery:${resolution}`)) return;
     try {
       let reason = "";
-      if (resolution === "human_override") {
-        reason = window.prompt("请填写人工核验通过的依据")?.trim() ?? "";
+      let acceptedCriteria: number[] | undefined;
+      if (["confirm_actual_pass", "accept_deviation", "skip_task"].includes(resolution)) {
+        const reasonLabel = resolution === "confirm_actual_pass"
+          ? "请填写确认实际通过的证据"
+          : resolution === "accept_deviation"
+            ? "请填写接受偏差的原因及影响"
+            : "请填写跳过任务的原因";
+        reason = window.prompt(reasonLabel)?.trim() ?? "";
         if (!reason) return;
+      }
+      if (resolution === "accept_deviation") {
+        const current = project.workflow_state.recovery_state;
+        const milestone = project.milestones.find(item => item.id === project.execution_session?.milestone_id);
+        const midStage = milestone?.mid_stages.find(item => item.id === project.execution_session?.mid_stage_id);
+        const subtask = midStage?.subtasks.find(item => item.id === current?.subtask_id);
+        const defaults = (subtask?.acceptance_ledger ?? [])
+          .filter(item => item.status !== "Satisfied")
+          .map(item => item.criterion_index);
+        const raw = window.prompt("填写要接受偏差的验收项编号，以逗号分隔", defaults.join(","))?.trim() ?? "";
+        acceptedCriteria = [...new Set(raw.split(/[,，\s]+/).filter(Boolean).map(Number))]
+          .filter(index => Number.isInteger(index) && index > 0);
+        if (acceptedCriteria.length === 0) {
+          setFeedbackMsg({ type: "warning", message: "接受偏差必须选择至少一个验收项。" });
+          return;
+        }
       }
       const updated = await invokeWithTimeout<Project>("resolve_human_recovery", {
         projectName: project.name,
         resolution,
         reason,
+        acceptedCriteria,
       });
       handleChatComplete(updated);
       await refreshExecutionContext(project.name);
@@ -1679,7 +1702,9 @@ function App() {
           : "重新测试通过，自动驾驶将继续执行。",
         restore_and_retry: "已恢复执行基线，将重新执行当前小阶段。",
         regenerate_plan: "已安排重新规划当前任务，自动驾驶将继续处理。",
-        human_override: "人工核验已单独记录，自动驾驶将继续执行。",
+        confirm_actual_pass: "人工通过证据已单独记录，自动驾驶将继续执行。",
+        accept_deviation: "验收偏差已记录，后续任务会携带该约束。",
+        skip_task: "任务已跳过，系统将按依赖契约决定是否继续。",
       };
       setFeedbackMsg({
         type: updated.workflow_state.recovery_state ? "warning" : "success",
