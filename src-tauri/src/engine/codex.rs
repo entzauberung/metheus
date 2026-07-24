@@ -1,10 +1,15 @@
-use super::contract::ProcessSpec;
+use super::contract::{OutputProtocol, ProcessSpec, ProgramSource};
 use std::ffi::OsString;
 
-pub(super) fn process_spec(project_path: &str, prompt: &str) -> ProcessSpec {
+pub(super) fn process_spec(
+    program: OsString,
+    program_source: ProgramSource,
+    project_path: &str,
+    prompt: &str,
+) -> ProcessSpec {
     ProcessSpec {
         display_name: "Codex",
-        program: OsString::from("codex"),
+        program,
         args: vec![
             OsString::from("exec"),
             OsString::from("--color"),
@@ -17,6 +22,11 @@ pub(super) fn process_spec(project_path: &str, prompt: &str) -> ProcessSpec {
             OsString::from("-"),
         ],
         stdin_payload: Some(prompt.to_string()),
+        environment: vec![],
+        environment_remove: vec![],
+        output_protocol: OutputProtocol::RawText,
+        program_source,
+        timeout_secs: crate::constants::EXECUTION_ENGINE_TIMEOUT_SECS,
     }
 }
 
@@ -26,7 +36,12 @@ mod tests {
 
     #[test]
     fn builds_noninteractive_unattended_command() {
-        let spec = process_spec("/tmp/project", "approved prompt");
+        let spec = process_spec(
+            OsString::from("codex"),
+            ProgramSource::PathSearch,
+            "/tmp/project",
+            "approved prompt",
+        );
         let args: Vec<String> = spec
             .args
             .iter()

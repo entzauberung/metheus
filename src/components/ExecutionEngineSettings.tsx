@@ -30,11 +30,14 @@ export function ExecutionEngineSettings({ project, pipeline, onProjectUpdated }:
     setEngineHealth(health);
     setCheckingEngine(checking);
   }, []);
-  const providerLabel = {
+  const providerLabel = project.execution_profile.runtime === "BuiltIn"
+    ? "Grok Build（内置）"
+    : ({
     ClaudeCode: "Claude Code",
     Codex: "Codex",
-    GrokBuild: "Grok Build",
-  }[project.execution_profile.provider];
+    GrokBuild: "Grok Build CLI（本机）",
+    KimiCli: "Kimi CLI",
+  }[project.execution_profile.provider]);
 
   useEffect(() => {
     if (!open) setProfile(project.execution_profile);

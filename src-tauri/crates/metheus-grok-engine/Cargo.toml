@@ -1,0 +1,18 @@
+[package]
+name = "metheus-grok-engine"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0"
+
+[dependencies]
+xai-grok-sampler = { path = "../../../third_party/grok-build-fork/crates/codegen/xai-grok-sampler" }
+xai-grok-sampling-types = { path = "../../../third_party/grok-build-fork/crates/codegen/xai-grok-sampling-types" }
+xai-grok-shell = { path = "../../../third_party/grok-build-fork/crates/codegen/xai-grok-shell", features = ["metheus-embedded"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

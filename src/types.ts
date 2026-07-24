@@ -224,7 +224,7 @@ export interface WorkflowState {
 export type ProjectEntryKind = "NoProject" | "HalfProject";
 
 export type ExecutionRuntime = "BuiltIn" | "Plugin";
-export type ExecutionProvider = "GrokBuild" | "ClaudeCode" | "Codex";
+export type ExecutionProvider = "GrokBuild" | "ClaudeCode" | "Codex" | "KimiCli";
 export type PermissionProfile = "Interactive" | "Unattended";
 
 export interface ExecutionProfile {
@@ -240,17 +240,133 @@ export type EngineHealthStatus =
   | "Unauthenticated"
   | "UnsupportedVersion"
   | "Disabled"
+  | "VerificationRequired"
+  | "VerificationFailed"
   | "Unknown";
 
 export type EngineAuthState = "Authenticated" | "Unauthenticated" | "Unknown";
+export type EngineLocalAuthState = "ConfiguredEvidence" | "Missing" | "Unknown";
+export type EngineOnlineAuthState = "NotVerified" | "Verified" | "Failed";
+export type EngineAuthVerificationMethod =
+  | "None"
+  | "PassiveConfiguration"
+  | "OnlineMinimalRequest"
+  | "OnlineModelList";
+
+export interface EngineAuthenticationResult {
+  local_state: EngineLocalAuthState;
+  online_state: EngineOnlineAuthState;
+  method: EngineAuthVerificationMethod;
+  verified_at?: string;
+  expires_at?: string;
+  failure_kind?: EngineFailureKind;
+  message: string;
+}
 
 export interface EngineHealth {
+  runtime: ExecutionRuntime;
   provider: ExecutionProvider;
   status: EngineHealthStatus;
   executable_path?: string;
   version?: string;
   auth_state: EngineAuthState;
+  authentication: EngineAuthenticationResult;
   supports_unattended: boolean;
+  configuration_valid: boolean;
+  capabilities: string[];
+  source_revision?: string;
+  runtime_self_test: EngineRuntimeSelfTestState;
+  message: string;
+}
+
+export type EngineRuntimeSelfTestState = "NotRun" | "Passed" | "Failed";
+
+export interface EngineRuntimeSelfTestResult {
+  success: boolean;
+  state: EngineRuntimeSelfTestState;
+  source_revision: string;
+  verified_at: string;
+  message: string;
+}
+
+export type ApiInterface = "OpenAiCompatible";
+export type GrokBuildApiBackend = "ChatCompletions" | "Responses" | "Messages";
+export type StructuredOutputPolicy = "NativeJsonObject" | "PromptOnly";
+
+export interface DecisionModelSettingsView {
+  api_interface: ApiInterface;
+  request_url: string;
+  model: string;
+  timeout_secs: number;
+  structured_output: StructuredOutputPolicy;
+}
+
+export interface BuiltInGrokBuildSettingsView {
+  api_backend: GrokBuildApiBackend;
+  api_base_url: string;
+  model: string;
+  timeout_secs: number;
+  max_turns: number;
+}
+
+export interface PluginCliSettingsView {
+  claude_code_path?: string;
+  codex_path?: string;
+  kimi_path?: string;
+  grok_path?: string;
+}
+
+export interface AppSettingsData {
+  schema_version: number;
+  revision: number;
+  decision_model: DecisionModelSettingsView;
+  built_in_grok_build: BuiltInGrokBuildSettingsView;
+  plugin_cli: PluginCliSettingsView;
+}
+
+export type SecretPersistence = "SecureStore" | "SessionOnly";
+export type SecretSource =
+  | "Session"
+  | "SystemCredentialStore"
+  | "Environment"
+  | "LegacyEnvironment"
+  | "Missing";
+
+export interface SecretStatus {
+  configured: boolean;
+  source: SecretSource;
+  hint: string;
+  persistent_available: boolean;
+  persisted: boolean;
+  persistence_error?: string;
+}
+
+export interface AppSettingsView {
+  settings: AppSettingsData;
+  decision_secret: SecretStatus;
+  built_in_grok_build_secret: SecretStatus;
+  load_warning?: string;
+}
+
+export type ModelConnectionTarget = "DecisionModel" | "BuiltInGrokBuild";
+export type ModelConnectionErrorKind =
+  | "MissingSecret"
+  | "InvalidConfiguration"
+  | "Authentication"
+  | "QuotaExceeded"
+  | "RateLimited"
+  | "Timeout"
+  | "Network"
+  | "ProviderUnavailable"
+  | "Protocol"
+  | "HttpStatus";
+
+export interface ConnectionTestResult {
+  success: boolean;
+  target: ModelConnectionTarget;
+  model: string;
+  latency_ms: number;
+  error_kind?: ModelConnectionErrorKind;
   message: string;
 }
 
@@ -432,6 +548,10 @@ export interface ExecutionResult {
   file_changes: string[];
   exit_code?: number;
   engine_provider?: ExecutionProvider;
+  engine_runtime: ExecutionRuntime;
+  engine_settings_revision: number;
+  engine_source_revision: string;
+  engine_api_backend: string;
   stdout: string;
   stderr: string;
   engine_failure_kind?: EngineFailureKind;
@@ -648,6 +768,12 @@ export interface ExecutionSession {
   subtask_index: number;
   total_subtasks: number;
   engine_snapshot: ExecutionProfile;
+  engine_settings_revision: number;
+  engine_source_revision: string;
+  engine_api_backend: string;
+  engine_model: string;
+  endpoint_fingerprint: string;
+  engine_executable_path: string;
 }
 
 // ========== 宪法变更历史 ==========
@@ -705,7 +831,8 @@ export type ExecutionEventType =
   | "ReplanCompleted"
   | "ReplanExecutionStarted"
   | "PlanCalibrationApplied"
-  | "TaskSkipped";
+  | "TaskSkipped"
+  | "EngineProfileChanged";
 
 /** 执行历史条目 — 持久化到 Project 中，刷新不丢 */
 export interface ExecutionHistoryEntry {

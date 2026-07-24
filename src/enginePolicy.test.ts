@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { engineChangeBlockedReason, engineHealthBlocksExecution } from "./enginePolicy";
+import {
+  engineChangeBlockedReason,
+  engineHealthBlocksExecution,
+  executionProviderAllowed,
+  PLUGIN_EXECUTION_PROVIDERS,
+} from "./enginePolicy";
 import type { EngineHealth, PipelineState, Project } from "./types";
 
 function project(): Project {
@@ -24,11 +29,25 @@ function pipeline(status: PipelineState["status"]): PipelineState {
 }
 
 describe("execution engine change policy", () => {
+  it("defines the four plugin choices and only the built-in Grok combination", () => {
+    expect(PLUGIN_EXECUTION_PROVIDERS).toEqual(["ClaudeCode", "Codex", "KimiCli", "GrokBuild"]);
+    for (const provider of PLUGIN_EXECUTION_PROVIDERS) {
+      expect(executionProviderAllowed("Plugin", provider)).toBe(true);
+    }
+    expect(executionProviderAllowed("BuiltIn", "GrokBuild")).toBe(true);
+    expect(executionProviderAllowed("BuiltIn", "ClaudeCode")).toBe(false);
+    expect(executionProviderAllowed("BuiltIn", "Codex")).toBe(false);
+    expect(executionProviderAllowed("BuiltIn", "KimiCli")).toBe(false);
+  });
+
   it("blocks known unusable engines but permits unknown probes", () => {
     const health = (status: EngineHealth["status"]) => ({ status } as EngineHealth);
     expect(engineHealthBlocksExecution(health("NotInstalled"))).toBe(true);
     expect(engineHealthBlocksExecution(health("Unauthenticated"))).toBe(true);
+    expect(engineHealthBlocksExecution(health("UnsupportedVersion"))).toBe(true);
     expect(engineHealthBlocksExecution(health("Disabled"))).toBe(true);
+    expect(engineHealthBlocksExecution(health("VerificationRequired"))).toBe(true);
+    expect(engineHealthBlocksExecution(health("VerificationFailed"))).toBe(true);
     expect(engineHealthBlocksExecution(health("Available"))).toBe(false);
     expect(engineHealthBlocksExecution(health("Unknown"))).toBe(false);
   });

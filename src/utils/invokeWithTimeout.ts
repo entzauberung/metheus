@@ -28,6 +28,13 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
 
   // 数据获取类
   get_project: 10,
+  get_app_settings: 10,
+  update_app_settings: 15,
+  set_api_secret: 15,
+  clear_api_secret: 15,
+  test_model_connection: 620,
+  test_grok_build_runtime: 620,
+  verify_engine_authentication: 45,
   get_project_files: 15,
   get_current_diff: 10,
   get_change_history: 10,

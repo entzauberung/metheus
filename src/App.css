@@ -2255,6 +2255,7 @@
 /* ===== Blueprint: 统一入口页面样式 ===== */
 
 .project-entry-container {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -2263,6 +2264,15 @@
   padding: 40px;
   text-align: center;
   overflow-y: auto;
+}
+
+.project-entry-settings {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  z-index: 5;
+  background: #ffffff;
+  border: 1px solid #d0d7de;
 }
 
 .project-entry-logo {
@@ -2356,6 +2366,10 @@
   gap: 6px;
 }
 
+.engine-provider-options {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .engine-segmented button,
 .engine-provider-options button {
   min-height: 38px;
@@ -2407,6 +2421,10 @@
   overflow-wrap: anywhere;
 }
 
+.engine-health > span {
+  min-width: 0;
+}
+
 .engine-health.available {
   border-color: #4ac26b;
   background: #dafbe1;
@@ -2438,6 +2456,251 @@
   line-height: 1.45;
 }
 
+.application-settings {
+  width: 520px;
+  max-width: 100%;
+}
+
+.settings-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #f6f8fa;
+  margin-bottom: 16px;
+}
+
+.settings-tabs button {
+  min-width: 0;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #57606a;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: normal;
+}
+
+.settings-tabs button.selected {
+  background: #ffffff;
+  color: #1f2328;
+  box-shadow: 0 1px 3px rgba(31, 35, 40, 0.15);
+  font-weight: 600;
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.settings-form > label,
+.settings-secret-row label {
+  min-width: 0;
+  color: #1f2328;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-form input,
+.settings-form select {
+  width: 100%;
+  min-width: 0;
+  height: 36px;
+  margin-top: 5px;
+  padding: 7px 9px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #24292f;
+  font: inherit;
+  font-size: 13px;
+}
+
+.settings-form input:focus,
+.settings-form select:focus {
+  outline: 2px solid rgba(9, 105, 218, 0.22);
+  border-color: #0969da;
+}
+
+.settings-grid-two {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.settings-secret-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 8px;
+}
+
+.settings-secret-hint {
+  margin-left: 7px;
+  color: #656d76;
+  font-size: 11px;
+  font-weight: 400;
+  overflow-wrap: anywhere;
+}
+
+.settings-secret-input {
+  position: relative;
+  display: block;
+}
+
+.settings-secret-input input {
+  padding-right: 38px;
+}
+
+.settings-secret-input button {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: #57606a;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.settings-command,
+.settings-test {
+  min-height: 34px;
+  padding: 7px 11px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #24292f;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.settings-test {
+  align-self: flex-start;
+}
+
+.settings-test-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.plugin-health-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid #d0d7de;
+}
+
+.plugin-health-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(0, 2fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid #d0d7de;
+}
+
+.plugin-health-name {
+  min-width: 0;
+  color: #1f2328;
+  font-size: 12px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.plugin-health-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  min-width: 0;
+  margin: 0;
+}
+
+.plugin-health-facts div {
+  min-width: 0;
+}
+
+.plugin-health-facts dt {
+  color: #656d76;
+  font-size: 10px;
+}
+
+.plugin-health-facts dd {
+  min-width: 0;
+  margin: 2px 0 0;
+  color: #24292f;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.plugin-verify {
+  white-space: nowrap;
+}
+
+.settings-command:disabled,
+.settings-test:disabled,
+.settings-form input:disabled,
+.settings-form select:disabled {
+  opacity: 0.56;
+  cursor: not-allowed;
+}
+
+.settings-state,
+.settings-warning,
+.settings-connection,
+.settings-disabled-state {
+  padding: 8px 10px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  background: #f6f8fa;
+  color: #57606a;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.settings-warning,
+.settings-disabled-state {
+  margin-top: 12px;
+  border-color: #d4a72c;
+  background: #fff8c5;
+  color: #633c01;
+}
+
+.settings-disabled-state {
+  margin-top: 0;
+}
+
+.settings-connection {
+  margin-top: 12px;
+}
+
+.settings-connection.success {
+  border-color: #4ac26b;
+  background: #dafbe1;
+  color: #116329;
+}
+
+.settings-connection.failure {
+  border-color: #ff8182;
+  background: #ffebe9;
+  color: #a40e26;
+}
+
 @media (max-width: 640px) {
   .project-entry-container {
     justify-content: flex-start;
@@ -2451,6 +2714,40 @@
   .modal-content {
     min-width: 0;
     width: calc(100vw - 24px);
+  }
+
+  .application-settings {
+    width: 100%;
+  }
+
+  .settings-grid-two,
+  .settings-secret-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-command {
+    justify-self: start;
+  }
+
+  .settings-test-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-test {
+    width: 100%;
+  }
+
+  .plugin-health-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .plugin-health-facts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .plugin-verify {
+    justify-self: start;
   }
 }
 

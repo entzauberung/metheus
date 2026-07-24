@@ -1,4 +1,4 @@
-use super::contract::{EngineError, ProcessOutput, ProcessSpec};
+use super::contract::{EngineError, OutputProtocol, ProcessOutput, ProcessSpec, ProgramSource};
 use crate::pipeline::{append_runtime_log, PipelineState, PipelineStatus};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -7,6 +7,50 @@ use tokio::task::JoinHandle;
 
 const MAX_RUNTIME_LOG_CHARS: usize = 2_000;
 const MAX_STREAM_BYTES: usize = 256 * 1024;
+
+fn event_text(value: &serde_json::Value) -> Option<&str> {
+    let event_type = value.get("type").and_then(serde_json::Value::as_str);
+    if matches!(event_type, Some("text" | "thought")) {
+        return value.get("data").and_then(serde_json::Value::as_str);
+    }
+    for field in ["content", "text", "message", "result", "response", "data"] {
+        if let Some(text) = value.get(field).and_then(serde_json::Value::as_str) {
+            return Some(text);
+        }
+    }
+    value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+}
+
+fn normalize_stdout(protocol: OutputProtocol, stdout: String) -> String {
+    if protocol == OutputProtocol::RawText {
+        return stdout;
+    }
+    let mut normalized = String::new();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(value) => {
+                if let Some(text) = event_text(&value) {
+                    normalized.push_str(text);
+                    if !text.ends_with('\n') {
+                        normalized.push('\n');
+                    }
+                }
+            }
+            Err(_) => {
+                normalized.push_str(line);
+                normalized.push('\n');
+            }
+        }
+    }
+    if normalized.is_empty() && !stdout.trim().is_empty() {
+        stdout
+    } else {
+        normalized
+    }
+}
 
 async fn clear_child_pid(state: &Arc<Mutex<Option<PipelineState>>>, execution_id: &str) {
     let mut guard = state.lock().await;
@@ -137,6 +181,7 @@ pub(super) async fn run_process(
     let mut command = tokio::process::Command::new(&spec.program);
     command
         .args(&spec.args)
+        .envs(spec.environment.iter().map(|(key, value)| (key, value)))
         .kill_on_drop(true)
         .current_dir(project_path)
         .stdout(std::process::Stdio::piped())
@@ -146,17 +191,37 @@ pub(super) async fn run_process(
         } else {
             std::process::Stdio::null()
         });
+    for key in &spec.environment_remove {
+        command.env_remove(key);
+    }
 
-    let mut child = command.spawn().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            EngineError::NotInstalled(format!(
-                "无法启动 {}：未在 PATH 中找到可执行文件",
-                spec.display_name
-            ))
-        } else {
-            EngineError::StartFailed(format!("无法启动 {}：{error}", spec.display_name))
+    let mut busy_retries = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(26) && busy_retries < 3 => {
+                busy_retries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let source = match spec.program_source {
+                    ProgramSource::PathSearch => "PATH",
+                    ProgramSource::SettingsOverride => "设置的覆盖路径",
+                };
+                return Err(EngineError::NotInstalled(format!(
+                    "无法从 {source} 启动 {}",
+                    spec.display_name
+                )));
+            }
+            Err(error) => {
+                return Err(EngineError::StartFailed(format!(
+                    "无法启动 {}：{error}",
+                    spec.display_name
+                )));
+            }
         }
-    })?;
+    };
 
     if let Some(payload) = spec.stdin_payload {
         let mut stdin = child.stdin.take().ok_or_else(|| {
@@ -202,7 +267,10 @@ pub(super) async fn run_process(
                 let stderr = collect_pipe(stderr_reader, "stderr").await;
                 clear_child_pid(&state, execution_id).await;
                 return Ok(ProcessOutput {
-                    stdout: String::from_utf8_lossy(&stdout).to_string(),
+                    stdout: normalize_stdout(
+                        spec.output_protocol,
+                        String::from_utf8_lossy(&stdout).to_string(),
+                    ),
                     stderr: String::from_utf8_lossy(&stderr).to_string(),
                     exit_code: status.code(),
                     success: status.success(),
@@ -240,11 +308,7 @@ pub(super) async fn run_process(
                     };
                 }
 
-                if started_at.elapsed()
-                    > std::time::Duration::from_secs(
-                        crate::constants::EXECUTION_ENGINE_TIMEOUT_SECS,
-                    )
-                {
+                if started_at.elapsed() > std::time::Duration::from_secs(spec.timeout_secs) {
                     let termination =
                         terminate_child(&mut child, spec.display_name, "执行超时").await;
                     let _ = collect_pipe(stdout_reader, "stdout").await;
@@ -358,6 +422,11 @@ mod tests {
                 program: success_cli.into_os_string(),
                 args: vec![],
                 stdin_payload: Some("approved prompt".to_string()),
+                environment: vec![],
+                environment_remove: vec![],
+                output_protocol: OutputProtocol::RawText,
+                program_source: ProgramSource::SettingsOverride,
+                timeout_secs: 5,
             },
             directory.path.to_str().unwrap(),
             "success",
@@ -382,6 +451,11 @@ mod tests {
                 program: failure_cli.into_os_string(),
                 args: vec![],
                 stdin_payload: None,
+                environment: vec![],
+                environment_remove: vec![],
+                output_protocol: OutputProtocol::RawText,
+                program_source: ProgramSource::SettingsOverride,
+                timeout_secs: 5,
             },
             directory.path.to_str().unwrap(),
             "failure",
@@ -410,6 +484,11 @@ mod tests {
                 program: cli.into_os_string(),
                 args: vec![],
                 stdin_payload: None,
+                environment: vec![],
+                environment_remove: vec![],
+                output_protocol: OutputProtocol::RawText,
+                program_source: ProgramSource::SettingsOverride,
+                timeout_secs: 5,
             },
             directory.path.to_str().unwrap(),
             "quota",
@@ -445,6 +524,11 @@ mod tests {
                     program: cli.into_os_string(),
                     args: vec![],
                     stdin_payload: None,
+                    environment: vec![],
+                    environment_remove: vec![],
+                    output_protocol: OutputProtocol::RawText,
+                    program_source: ProgramSource::SettingsOverride,
+                    timeout_secs: 5,
                 },
                 project_path.to_str().unwrap(),
                 "cancel",
@@ -457,5 +541,41 @@ mod tests {
         let result = task.await.unwrap();
         assert!(matches!(result, Err(EngineError::Cancelled)));
         assert_eq!(state.lock().await.as_ref().unwrap().child_pid, None);
+    }
+
+    #[test]
+    fn json_lines_are_mapped_to_common_text_output() {
+        let output = normalize_stdout(
+            OutputProtocol::JsonLines,
+            "{\"type\":\"text\",\"data\":\"hello \"}\n{\"type\":\"text\",\"data\":\"world\"}\n{\"type\":\"end\"}\n".to_string(),
+        );
+        assert_eq!(output, "hello \nworld\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn process_specific_timeout_stops_fake_cli() {
+        let directory = TestDirectory::new("timeout");
+        let cli = directory.path.join("slow-cli");
+        write_fake_cli(&cli, "exec sleep 10");
+        let state = Arc::new(Mutex::new(Some(test_pipeline("timeout"))));
+        let result = run_process(
+            ProcessSpec {
+                display_name: "Fake",
+                program: cli.into_os_string(),
+                args: vec![],
+                stdin_payload: None,
+                environment: vec![],
+                environment_remove: vec![],
+                output_protocol: OutputProtocol::RawText,
+                program_source: ProgramSource::SettingsOverride,
+                timeout_secs: 1,
+            },
+            directory.path.to_str().unwrap(),
+            "timeout",
+            state,
+        )
+        .await;
+        assert!(matches!(result, Err(EngineError::Timeout)));
     }
 }

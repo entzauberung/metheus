@@ -24,7 +24,7 @@
 | 策略产品经理 | 理解你的想法，生成版本方案 | CEO |
 | 产品经理 | 将版本拆分为大阶段 | CTO |
 | 域负责人 | 将大阶段拆为中阶段，分派子任务 | 技术主管 |
-| 开发工程师 | 执行具体子任务，操控 Claude Code 写代码 | 程序员 |
+| 开发工程师 | 执行具体子任务，通过内置或本机执行引擎写代码 | 程序员 |
 | 测试工程师 | 检查代码质量，确保测试通过 | QA |
 | 宪法维护员 | 自动更新项目知识文档 | 技术文档 |
 
@@ -49,13 +49,15 @@
 
 ### 🧩 3.1 决策-执行分离流水线
 
-策略产品经理通过统一的 DeepSeek v4 Flash 完成对话、检查和规划，执行层操控 Claude Code 写代码。当前阶段优先验证人机交互状态机，不比较模型等级，也不进行强弱模型调度。
+策略产品经理通过可配置的 OpenAI Compatible 决策接口完成对话、检查和规划；执行层可选择 Grok Build 内置运行时，或 Claude Code、Codex、Kimi CLI、Grok Build CLI 本机插件。
 
 > 不是靠强模型带弱模型的分层策略。而是通过精准上下文注入、原子化任务切割和滚动项目宪法，让**任何模型**都能经济地完成高质量项目交付。
 
 流水线支持：`暂停` → `恢复` → `自动重试` → `测试检查` → `宪法更新` → `Git 存档`
 
-> **当前执行层基于 Claude Code 验证核心工作流。** 但 Claude Code 只能串行——子任务逐个排队执行，每个子任务都要重新注入完整上下文，token 消耗层层叠加。这是我们的过渡方案。自研 Rust API 直连引擎已在路线图上：第一个子任务建立基础后，后续子任务**并行注入代码**，共享一次上下文，速度提升数十倍，token 消耗大幅下降。
+Grok Build 内置模式直接在 Rust 进程内运行上游 `MvpAgent → AgentBuilder → SessionActor`，不查找或启动 `grok` 命令。它只开放 `read_file`、`search_replace`、`list_dir` 和 `grep`：所有路径限制在项目根内，写入必须命中执行计划冻结的精确文件清单，搜索不启动 `rg`。Shell、网页、MCP、插件、技能、记忆、Hook 和子代理均不加载；内置请求也不读取 Grok CLI 的模型配置或认证。模型连接与完整运行时自检必须分别通过后才能选择。
+
+仓库同时保留原样审计基线 `third_party/grok-build` 和允许最小嵌入改动的受控 Fork `third_party/grok-build-fork`；来源、修订和逐文件修改理由分别记录在 `UPSTREAM_SOURCE.md`、`FORK_SOURCE.md` 与 `PATCHSET.md`。
 
 ### 📜 3.2 项目宪法（滚动知识库）
 
@@ -96,7 +98,7 @@ metheus/auto/v0.1.1/task-0        ← 子任务 tag
 
 ### 🔓 3.5 模型边界
 
-当前所有 DeepSeek API 工作流统一使用 DeepSeek v4 Flash；Claude Code CLI 继续作为本地代码执行器，两者职责独立。
+决策模型与执行模型各自配置；Grok Build 内置密钥与 Grok Build CLI 的本机认证完全隔离。
 
 > **不被任何 AI 厂商绑定。**
 
@@ -115,7 +117,7 @@ metheus/auto/v0.1.1/task-0        ← 子任务 tag
 | Rust (stable) | 后端编译 |
 | Node.js 20+ | 前端运行 |
 | Tauri CLI | `cargo install tauri-cli` |
-| Claude Code | 执行层代码生成 |
+| 至少一个执行引擎 | Grok Build 内置模式，或 Claude Code / Codex / Kimi / Grok Build CLI |
 | Nix（可选） | 启用 Flakes 环境 |
 
 ### 三步启动
@@ -125,6 +127,8 @@ git clone https://github.com/entzauberung/metheus.git
 cd metheus
 npm install && npm run tauri dev
 ```
+
+在“应用设置”中配置决策模型。使用 Grok Build 内置模式时，另行选择接口后端、地址和模型，将 API Key 保存到系统凭据库或仅用于本次会话，然后依次执行“测试模型连接”和“运行时自检”。API Key 不写入项目或应用设置 JSON。
 
 ### 首次使用的路径
 
@@ -162,6 +166,9 @@ metheus/
 │   │   └── main.rs               # 入口
 │   ├── Cargo.toml
 │   └── tauri.conf.json
+├── third_party/
+│   ├── grok-build/               # 固定修订的原样审计基线
+│   └── grok-build-fork/          # 受控 SessionActor 嵌入 Fork
 ├── package.json
 └── vite.config.ts
 ```
@@ -202,7 +209,7 @@ metheus/
 
 ```
 ⚠️ 自动化回归测试资产尚未建立 → 目前主要依赖构建和手工端到端验收
-⚠️ 设置页模型配置尚未完成 → 当前执行模型仍按本地环境与 Claude Code 预设验证
+⚠️ 真实模型与 CLI 烟雾测试依赖用户自己的认证、网络和额度
 ⚠️ Tauri CSP 尚未收紧 → Alpha 阶段保留，正式分发前需要配置白名单
 ⚠️ 前端入口职责偏重 → App.tsx 仍同时承载状态机、轮询和多视图协调
 ```
@@ -216,7 +223,7 @@ metheus/
 ✓ 项目宪法让 AI 团队的产出质量不随对话轮次衰减
 ✓ 细粒度 Git 回退给了用户真正的安全感
 ✓ 便宜的决策 + 精准的执行 = 独立开发者负担得起的价格
-✓ Claude Code 串行验证已通过 → 自研并行引擎可将速度提升数十倍，token 消耗大幅下降
+✓ Grok Build 已作为受控的 Rust 进程内执行引擎接入统一流水线
 ```
 
 每解决一个问题，就离**用一杯奶茶钱改变世界**更近一步。
@@ -234,11 +241,11 @@ metheus/
 | 阶段 | 目标 | 对象 |
 |------|------|------|
 | **当下 · 第一阶段** | Claude Code 执行层验证核心工作流，跑通从"想法"到"代码"的完整链路 | ✅ 已验证 |
-| **当下 · 第二阶段** | 自研 Rust API 直连并行引擎。第一个子任务打基础，后续子任务并行注入，共享一次上下文，速度提升数十倍，token 消耗大幅下降 | 🔜 规划中 |
+| **当下 · 第二阶段** | Grok Build Rust 进程内执行引擎、系统凭据库、运行时自检和插件认证收口 | ✅ 已完成 |
 | **下一步** | 定制化 AI 工作流模板 + 团队协作版本 | 嵌入式工程师 · 数据分析师 · 产品经理 |
 | **终极** | 极简民用版 + Proletariat 软件基金会（无产阶级软件基金会） | 任何有想法的人 |
 
-> Claude Code 的串行瓶颈只是一个验证阶段的跳板。自研并行引擎是「弥」从"能用"到**"极快且极省"**的结构性蜕变。验证已完成，引擎待建。
+> 当前内置引擎仍按小阶段串行执行；跨任务并行和共享上下文属于后续性能工作，不是当前可用性声明的一部分。
 >
 > 将所有利润投入支持那些用「弥」创造社会价值的人。**用一杯奶茶钱改变世界。**
 

@@ -661,9 +661,10 @@ pub enum ProjectMode {
 }
 
 /// 执行引擎的运行载体。插件模式表示由 Metheus 管理外部 CLI 进程。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum ExecutionRuntime {
     BuiltIn,
+    #[default]
     Plugin,
 }
 
@@ -673,6 +674,7 @@ pub enum ExecutionProvider {
     GrokBuild,
     ClaudeCode,
     Codex,
+    KimiCli,
 }
 
 impl ExecutionProvider {
@@ -681,6 +683,7 @@ impl ExecutionProvider {
             Self::GrokBuild => "Grok Build",
             Self::ClaudeCode => "Claude Code",
             Self::Codex => "Codex",
+            Self::KimiCli => "Kimi CLI",
         }
     }
 }
@@ -868,6 +871,16 @@ pub struct ExecutionResult {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub engine_provider: Option<ExecutionProvider>,
+    #[serde(default)]
+    pub engine_runtime: ExecutionRuntime,
+    #[serde(default)]
+    pub engine_settings_revision: u64,
+    /// 编译进入应用的内置引擎源码修订；插件模式为空。
+    #[serde(default)]
+    pub engine_source_revision: String,
+    /// 内置引擎冻结的 API 后端；插件模式为空。
+    #[serde(default)]
+    pub engine_api_backend: String,
     /// 原始 stdout，额度和服务商错误经常只出现在 stdout。
     #[serde(default)]
     pub stdout: String,
@@ -1937,6 +1950,24 @@ pub struct ExecutionSession {
     /// 本次执行实际采用的引擎配置；恢复流程必须沿用该快照。
     #[serde(default)]
     pub engine_snapshot: ExecutionProfile,
+    /// 应用设置修订号；旧项目为 0，表示无法证明使用当前设置。
+    #[serde(default)]
+    pub engine_settings_revision: u64,
+    /// 编译进入应用的内置引擎源码修订；插件模式为空。
+    #[serde(default)]
+    pub engine_source_revision: String,
+    /// 内置引擎冻结的 API 后端；插件模式为空。
+    #[serde(default)]
+    pub engine_api_backend: String,
+    /// BuiltIn 模型名称；插件使用本机配置时为空。
+    #[serde(default)]
+    pub engine_model: String,
+    /// 接口地址的非敏感指纹；插件模式为空。
+    #[serde(default)]
+    pub endpoint_fingerprint: String,
+    /// 健康检查实际解析到的插件可执行文件路径。
+    #[serde(default)]
+    pub engine_executable_path: String,
 }
 
 impl ExecutionSession {
@@ -1991,6 +2022,12 @@ impl Default for ExecutionSession {
             subtask_index: 0,
             total_subtasks: 0,
             engine_snapshot: ExecutionProfile::default(),
+            engine_settings_revision: 0,
+            engine_source_revision: String::new(),
+            engine_api_backend: String::new(),
+            engine_model: String::new(),
+            endpoint_fingerprint: String::new(),
+            engine_executable_path: String::new(),
         }
     }
 }
@@ -2055,6 +2092,7 @@ pub enum ExecutionEventType {
     HumanVerificationAccepted,
     PlanCalibrationApplied,
     TaskSkipped,
+    EngineProfileChanged,
 }
 
 impl Default for ExecutionEventType {
@@ -2197,12 +2235,28 @@ mod tests {
         let object = value
             .as_object_mut()
             .ok_or("执行会话未序列化为对象".to_string())?;
-        object.remove("execution_id");
+        for field in [
+            "execution_id",
+            "engine_settings_revision",
+            "engine_source_revision",
+            "engine_api_backend",
+            "engine_model",
+            "endpoint_fingerprint",
+            "engine_executable_path",
+        ] {
+            object.remove(field);
+        }
         let restored: ExecutionSession = serde_json::from_value(value)
             .map_err(|error| format!("反序列化旧执行会话失败：{}", error))?;
         assert!(restored.execution_id.is_empty());
         assert_eq!(restored.status, "executing");
         assert_eq!(restored.engine_snapshot, ExecutionProfile::default());
+        assert_eq!(restored.engine_settings_revision, 0);
+        assert!(restored.engine_source_revision.is_empty());
+        assert!(restored.engine_api_backend.is_empty());
+        assert!(restored.engine_model.is_empty());
+        assert!(restored.endpoint_fingerprint.is_empty());
+        assert!(restored.engine_executable_path.is_empty());
         Ok(())
     }
 
@@ -2333,14 +2387,29 @@ mod tests {
             ..Default::default()
         })
         .map_err(|error| error.to_string())?;
-        for field in ["stdout", "stderr", "engine_failure_kind"] {
-            result_value.as_object_mut().unwrap().remove(field);
+        for field in [
+            "engine_runtime",
+            "engine_settings_revision",
+            "engine_source_revision",
+            "engine_api_backend",
+            "stdout",
+            "stderr",
+            "engine_failure_kind",
+        ] {
+            result_value
+                .as_object_mut()
+                .ok_or("执行结果未序列化为对象".to_string())?
+                .remove(field);
         }
         let result: ExecutionResult =
             serde_json::from_value(result_value).map_err(|error| error.to_string())?;
         assert!(result.stdout.is_empty());
+        assert!(result.engine_source_revision.is_empty());
+        assert!(result.engine_api_backend.is_empty());
         assert!(result.stderr.is_empty());
         assert!(result.engine_failure_kind.is_none());
+        assert_eq!(result.engine_runtime, ExecutionRuntime::Plugin);
+        assert_eq!(result.engine_settings_revision, 0);
 
         let mut subtask_value =
             serde_json::to_value(Subtask::default()).map_err(|error| error.to_string())?;

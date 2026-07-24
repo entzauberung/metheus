@@ -232,12 +232,40 @@ pub(crate) async fn execute_current_subtask(
     crate::plan_contract::validate_subtasks_in_project(&mid.subtasks, &project_path)
         .map_err(|error| format!("执行计划契约无效：{}", error))?;
 
-    crate::engine::validate_profile(&proj.execution_profile)?;
-    let engine_health = crate::engine::check_engine_health(&proj.execution_profile).await;
+    let prepared_engine = crate::engine::prepare_engine(&proj.execution_profile).await?;
+    let engine_health = &prepared_engine.health;
     if engine_health.status.blocks_execution() {
         return Err(format!("执行引擎不可用：{}", engine_health.message));
     }
     let execution_profile = proj.execution_profile.clone();
+    let app_settings = prepared_engine.settings();
+    let engine_settings_revision = app_settings.revision;
+    let engine_source_revision = if execution_profile.runtime == project::ExecutionRuntime::BuiltIn
+    {
+        engine_health.source_revision.clone().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let engine_api_backend = if execution_profile.runtime == project::ExecutionRuntime::BuiltIn {
+        app_settings
+            .built_in_grok_build
+            .api_backend
+            .as_str()
+            .to_string()
+    } else {
+        String::new()
+    };
+    let engine_model = if execution_profile.runtime == project::ExecutionRuntime::BuiltIn {
+        app_settings.built_in_grok_build.model.clone()
+    } else {
+        String::new()
+    };
+    let endpoint_fingerprint = if execution_profile.runtime == project::ExecutionRuntime::BuiltIn {
+        crate::settings::endpoint_fingerprint(&app_settings.built_in_grok_build.api_base_url)
+    } else {
+        String::new()
+    };
+    let engine_executable_path = engine_health.executable_path.clone().unwrap_or_default();
 
     // Find the next pending subtask
     let next_idx = mid
@@ -351,6 +379,12 @@ pub(crate) async fn execute_current_subtask(
             subtask_index: next_idx,
             total_subtasks: total,
             engine_snapshot: execution_profile.clone(),
+            engine_settings_revision,
+            engine_source_revision,
+            engine_api_backend,
+            engine_model,
+            endpoint_fingerprint,
+            engine_executable_path,
         });
     }
 
@@ -414,6 +448,7 @@ pub(crate) async fn execute_current_subtask(
             total,
             execution_id,
             execution_profile,
+            prepared_engine,
             background_pipeline_state.clone(),
         )
         .await;
@@ -465,10 +500,11 @@ async fn execute_current_subtask_background(
     total: usize,
     execution_id: String,
     execution_profile: project::ExecutionProfile,
+    prepared_engine: crate::engine::PreparedEngine,
     pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
 ) -> Result<(), BackgroundExecutionFailure> {
     let exec_result = match crate::engine::execute(
-        &execution_profile,
+        prepared_engine,
         crate::engine::ExecutionRequest {
             project_path: project_path.clone(),
             prompt: approved_prompt.clone(),
@@ -646,6 +682,12 @@ async fn execute_current_subtask_background(
         subtask_index: subtask_idx,
         total_subtasks: total,
         engine_snapshot: session.engine_snapshot,
+        engine_settings_revision: session.engine_settings_revision,
+        engine_source_revision: session.engine_source_revision,
+        engine_api_backend: session.engine_api_backend,
+        engine_model: session.engine_model,
+        endpoint_fingerprint: session.endpoint_fingerprint,
+        engine_executable_path: session.engine_executable_path,
     });
     write_execution_history(
         &mut proj,
@@ -3524,6 +3566,7 @@ pub(crate) async fn acknowledge_execution_recovery(
                     | project::ExecutionSessionStatus::ExecutionFailed
             )
         })
+        .cloned()
         .ok_or("当前没有需要恢复的执行失败会话。".to_string())?;
 
     let base_commit = session.base_commit.clone();
@@ -3549,13 +3592,80 @@ pub(crate) async fn acknowledge_execution_recovery(
     })?;
 
     if waiting_engine {
-        let health = crate::engine::check_engine_health(&proj.execution_profile).await;
-        if health.status.blocks_execution() {
+        let prepared_engine = crate::engine::prepare_engine(&proj.execution_profile).await?;
+        if prepared_engine.health.status.blocks_execution() {
             return Err(format!(
                 "执行基线已恢复，但 {} 健康检查未通过：{}。引擎阻断仍保留。",
                 proj.execution_profile.provider.display_name(),
-                health.message
+                prepared_engine.health.message
             ));
+        }
+        let confirmed_revision = prepared_engine.settings().revision;
+        if let Some(current_session) = proj.execution_session.as_mut() {
+            current_session.engine_snapshot = proj.execution_profile.clone();
+            current_session.engine_settings_revision = confirmed_revision;
+            current_session.engine_source_revision =
+                if proj.execution_profile.runtime == project::ExecutionRuntime::BuiltIn {
+                    prepared_engine
+                        .health
+                        .source_revision
+                        .clone()
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+            current_session.engine_api_backend =
+                if proj.execution_profile.runtime == project::ExecutionRuntime::BuiltIn {
+                    prepared_engine
+                        .settings()
+                        .built_in_grok_build
+                        .api_backend
+                        .as_str()
+                        .to_string()
+                } else {
+                    String::new()
+                };
+            current_session.engine_model =
+                if proj.execution_profile.runtime == project::ExecutionRuntime::BuiltIn {
+                    prepared_engine.settings().built_in_grok_build.model.clone()
+                } else {
+                    String::new()
+                };
+            current_session.endpoint_fingerprint =
+                if proj.execution_profile.runtime == project::ExecutionRuntime::BuiltIn {
+                    crate::settings::endpoint_fingerprint(
+                        &prepared_engine.settings().built_in_grok_build.api_base_url,
+                    )
+                } else {
+                    String::new()
+                };
+            current_session.engine_executable_path = prepared_engine
+                .health
+                .executable_path
+                .clone()
+                .unwrap_or_default();
+        }
+        if session.engine_snapshot != proj.execution_profile
+            || session.engine_settings_revision != confirmed_revision
+        {
+            let audit_message = format!(
+                "用户确认执行引擎恢复：{:?}/{}（设置修订 {}） -> {:?}/{}（设置修订 {}）",
+                session.engine_snapshot.runtime,
+                session.engine_snapshot.provider.display_name(),
+                session.engine_settings_revision,
+                proj.execution_profile.runtime,
+                proj.execution_profile.provider.display_name(),
+                confirmed_revision,
+            );
+            write_execution_history(
+                &mut proj,
+                "info",
+                project::ExecutionEventType::EngineProfileChanged,
+                audit_message,
+                Some(&milestone_id),
+                Some(&mid_stage_id),
+                Some(&subtask_id),
+            );
         }
     }
 
@@ -3835,6 +3945,12 @@ mod tests {
             subtask_index: 0,
             total_subtasks: 1,
             engine_snapshot: project::ExecutionProfile::default(),
+            engine_settings_revision: 0,
+            engine_source_revision: String::new(),
+            engine_api_backend: String::new(),
+            engine_model: String::new(),
+            endpoint_fingerprint: String::new(),
+            engine_executable_path: String::new(),
         }
     }
 

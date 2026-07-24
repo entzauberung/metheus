@@ -31,3 +31,9 @@ dirs = "5"
 walkdir = "2"
 chrono = "0.4"
 sha2 = "0.10"
+metheus-grok-engine = { path = "crates/metheus-grok-engine" }
+keyring = "4.1.5"
+
+[workspace]
+members = [".", "crates/metheus-grok-engine"]
+resolver = "2"

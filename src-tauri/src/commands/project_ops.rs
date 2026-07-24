@@ -120,15 +120,21 @@ pub(crate) async fn check_engine_health(
     Ok(crate::engine::check_engine_health(&execution_profile).await)
 }
 
+#[tauri::command]
+pub(crate) async fn verify_engine_authentication(
+    execution_profile: project::ExecutionProfile,
+) -> Result<crate::engine::EngineAuthenticationResult, String> {
+    crate::engine::verify_engine_authentication(&execution_profile).await
+}
+
 async fn ensure_engine_available(
     execution_profile: &project::ExecutionProfile,
-) -> Result<(), String> {
-    crate::engine::validate_profile(execution_profile)?;
-    let health = crate::engine::check_engine_health(execution_profile).await;
-    if health.status.blocks_execution() {
-        Err(format!("执行引擎不可用：{}", health.message))
+) -> Result<crate::engine::PreparedEngine, String> {
+    let prepared = crate::engine::prepare_engine(execution_profile).await?;
+    if prepared.health.status.blocks_execution() {
+        Err(format!("执行引擎不可用：{}", prepared.health.message))
     } else {
-        Ok(())
+        Ok(prepared)
     }
 }
 
@@ -247,10 +253,79 @@ pub(crate) async fn update_execution_profile(
     if let Some(message) = execution_profile_change_blocker(&project) {
         return Err(message.to_string());
     }
-    ensure_engine_available(&execution_profile).await?;
+    let prepared_engine = ensure_engine_available(&execution_profile).await?;
+    let old_profile = project.execution_profile.clone();
+    let waiting_engine = project
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .is_some_and(|recovery| recovery.phase == project::RecoveryPhase::WaitingEngine);
     if !apply_execution_profile(&mut project, execution_profile) {
         return Ok(project);
     }
+    if waiting_engine {
+        if let Some(session) = project.execution_session.as_mut() {
+            session.engine_snapshot = project.execution_profile.clone();
+            session.engine_settings_revision = prepared_engine.settings().revision;
+            session.engine_source_revision =
+                if project.execution_profile.runtime == project::ExecutionRuntime::BuiltIn {
+                    prepared_engine
+                        .health
+                        .source_revision
+                        .clone()
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+            session.engine_api_backend =
+                if project.execution_profile.runtime == project::ExecutionRuntime::BuiltIn {
+                    prepared_engine
+                        .settings()
+                        .built_in_grok_build
+                        .api_backend
+                        .as_str()
+                        .to_string()
+                } else {
+                    String::new()
+                };
+            session.engine_model =
+                if project.execution_profile.runtime == project::ExecutionRuntime::BuiltIn {
+                    prepared_engine.settings().built_in_grok_build.model.clone()
+                } else {
+                    String::new()
+                };
+            session.endpoint_fingerprint =
+                if project.execution_profile.runtime == project::ExecutionRuntime::BuiltIn {
+                    crate::settings::endpoint_fingerprint(
+                        &prepared_engine.settings().built_in_grok_build.api_base_url,
+                    )
+                } else {
+                    String::new()
+                };
+            session.engine_executable_path = prepared_engine
+                .health
+                .executable_path
+                .clone()
+                .unwrap_or_default();
+        }
+    }
+    let audit_message = format!(
+        "执行引擎配置已切换：{:?}/{} -> {:?}/{}；应用设置修订 {}",
+        old_profile.runtime,
+        old_profile.provider.display_name(),
+        project.execution_profile.runtime,
+        project.execution_profile.provider.display_name(),
+        prepared_engine.settings().revision,
+    );
+    crate::pipeline::write_execution_history(
+        &mut project,
+        "info",
+        project::ExecutionEventType::EngineProfileChanged,
+        audit_message,
+        None,
+        None,
+        None,
+    );
     crate::save_and_reload_project(&project)
 }
 
@@ -281,7 +356,7 @@ pub(crate) async fn initialize_project_entry(
         _ => return Err(format!("未知的项目来源类型：{}", entry_kind)),
     };
     let mut selected_profile = execution_profile.unwrap_or_default();
-    ensure_engine_available(&selected_profile).await?;
+    let _prepared_engine = ensure_engine_available(&selected_profile).await?;
 
     let path = std::path::Path::new(&project_path);
 

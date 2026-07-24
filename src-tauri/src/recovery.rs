@@ -1,6 +1,6 @@
+use crate::AppState;
 use crate::pipeline::{self, PipelineState, PipelineStatus, SubtaskStatusItem};
 use crate::project;
-use crate::AppState;
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_DIAGNOSIS_CHARS: usize = 12_000;
@@ -586,6 +586,101 @@ fn current_recovery_context(
     Ok((recovery, session, subtask))
 }
 
+fn execution_snapshot_mismatch(
+    session: &project::ExecutionSession,
+    settings: &crate::settings::AppSettings,
+    health: &crate::engine::EngineHealth,
+) -> Option<String> {
+    if session.engine_settings_revision == 0 {
+        let defaults = crate::settings::AppSettings::default();
+        if settings.decision_model != defaults.decision_model
+            || settings.built_in_grok_build != defaults.built_in_grok_build
+            || settings.plugin_cli != defaults.plugin_cli
+        {
+            return Some("旧执行会话没有设置修订号，且当前应用设置不是兼容默认值".to_string());
+        }
+    } else if session.engine_settings_revision != settings.revision {
+        return Some(format!(
+            "应用设置修订已变化（会话 {}，当前 {}）",
+            session.engine_settings_revision, settings.revision
+        ));
+    }
+
+    if session.engine_snapshot.runtime == project::ExecutionRuntime::BuiltIn {
+        let current_source = health.source_revision.as_deref().unwrap_or_default();
+        if session.engine_source_revision.is_empty() {
+            return Some("旧内置执行会话没有 Grok Build 源码修订，必须重新确认".to_string());
+        }
+        if session.engine_source_revision != current_source {
+            return Some(format!(
+                "Grok Build 源码修订已变化（会话 {}，当前 {}）",
+                session.engine_source_revision, current_source
+            ));
+        }
+        let current_backend = settings.built_in_grok_build.api_backend.as_str();
+        if session.engine_api_backend.is_empty() {
+            return Some("旧内置执行会话没有 API 后端快照，必须重新确认".to_string());
+        }
+        if session.engine_api_backend != current_backend {
+            return Some(format!(
+                "Grok Build API 后端已变化（会话 {}，当前 {}）",
+                session.engine_api_backend, current_backend
+            ));
+        }
+        let fingerprint =
+            crate::settings::endpoint_fingerprint(&settings.built_in_grok_build.api_base_url);
+        if session.engine_model.is_empty() {
+            return Some("旧内置执行会话没有模型快照，必须重新确认".to_string());
+        }
+        if session.engine_model != settings.built_in_grok_build.model {
+            return Some("预装引擎模型与执行快照不一致".to_string());
+        }
+        if session.endpoint_fingerprint.is_empty() {
+            return Some("旧内置执行会话没有接口地址快照，必须重新确认".to_string());
+        }
+        if session.endpoint_fingerprint != fingerprint {
+            return Some("预装引擎接口地址与执行快照不一致".to_string());
+        }
+    }
+
+    if session.engine_snapshot.runtime == project::ExecutionRuntime::Plugin
+        && !session.engine_executable_path.is_empty()
+        && health.executable_path.as_deref() != Some(session.engine_executable_path.as_str())
+    {
+        return Some("插件可执行文件路径与执行快照不一致".to_string());
+    }
+    None
+}
+
+fn wait_for_engine_snapshot_confirmation(
+    proj: &mut project::Project,
+    recovery: &mut project::RecoveryState,
+    session: &project::ExecutionSession,
+    message: &str,
+) {
+    recovery.attempt = recovery.attempt.saturating_sub(1);
+    recovery.error_kind = project::RecoveryErrorKind::EngineBlocked;
+    recovery.phase = project::RecoveryPhase::WaitingEngine;
+    recovery.last_repair_summary = truncate_chars(message, 4_000);
+    recovery.updated_at = chrono::Utc::now().to_rfc3339();
+    proj.workflow_state.recovery_state = Some(recovery.clone());
+    preserve_recovery_session(proj, session, &recovery.execution_id);
+    if let Some(current_session) = proj.execution_session.as_mut() {
+        current_session.failure_message = truncate_chars(message, 2_048);
+    }
+    set_autopilot_waiting(proj, message);
+    pipeline::write_execution_history(
+        proj,
+        "error",
+        project::ExecutionEventType::ExecutionFailed,
+        message.to_string(),
+        Some(&session.milestone_id),
+        Some(&session.mid_stage_id),
+        Some(&session.subtask_id),
+    );
+    touch(proj);
+}
+
 fn git_diff_evidence(project_path: &str, allowed_paths: &[String]) -> String {
     let mut command = std::process::Command::new("git");
     command.args(["diff", "--no-ext-diff", "--unified=3", "--"]);
@@ -646,12 +741,20 @@ fn build_diagnosis(
         &format!(
             "恢复类型：{:?}\n当前目标：{}\n验收标准（最高优先级，精确标识符必须逐字遵循）：\n- {}\n当前未满足项：\n{}\n修复轮次历史：\n{}{}\n匹配的纠错经验：\n{}\n允许修改：\n- {}\n允许新建：\n- {}\n当前基线：{}\n失败证据：\n{}\n执行错误：\n{}\n当前受限 diff：\n{}\n上次修复摘要：\n{}",
             recovery.error_kind,
-            if subtask.goal.is_empty() { &subtask.title } else { &subtask.goal },
+            if subtask.goal.is_empty() {
+                &subtask.title
+            } else {
+                &subtask.goal
+            },
             subtask.acceptance_criteria.join("\n- "),
             issue_list_for_prompt(&recovery.active_issues),
             attempt_history_for_prompt(&recovery.attempt_history),
             strategy_note,
-            if learning.is_empty() { "（无）" } else { &learning },
+            if learning.is_empty() {
+                "（无）"
+            } else {
+                &learning
+            },
             authorized_paths.join("\n- "),
             subtask.new_file_paths.join("\n- "),
             recovery.baseline_commit,
@@ -1081,6 +1184,10 @@ fn merge_execution_result(
         file_changes: paths.into_iter().collect(),
         exit_code: repair.exit_code,
         engine_provider: repair.engine_provider,
+        engine_runtime: repair.engine_runtime,
+        engine_settings_revision: repair.engine_settings_revision,
+        engine_source_revision: repair.engine_source_revision,
+        engine_api_backend: repair.engine_api_backend,
         stdout: repair.stdout,
         stderr: repair.stderr,
         engine_failure_kind: repair.engine_failure_kind,
@@ -1335,6 +1442,32 @@ pub(crate) async fn run_error_recovery(
         reset_subtask_to_pending(&mut proj, &session);
     }
 
+    let prepared_engine = match crate::engine::prepare_engine(&session.engine_snapshot).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let message = format!("准备自动修复执行引擎失败：{error}");
+            wait_for_engine_snapshot_confirmation(&mut proj, &mut recovery, &session, &message);
+            crate::save_project(&proj)?;
+            return crate::load_project(&project_name);
+        }
+    };
+    if prepared_engine.health.status.blocks_execution() {
+        let message = format!("自动修复执行引擎不可用：{}", prepared_engine.health.message);
+        wait_for_engine_snapshot_confirmation(&mut proj, &mut recovery, &session, &message);
+        crate::save_project(&proj)?;
+        return crate::load_project(&project_name);
+    }
+    if let Some(reason) = execution_snapshot_mismatch(
+        &session,
+        prepared_engine.settings(),
+        &prepared_engine.health,
+    ) {
+        let message = format!("执行设置快照需要用户确认：{reason}");
+        wait_for_engine_snapshot_confirmation(&mut proj, &mut recovery, &session, &message);
+        crate::save_project(&proj)?;
+        return crate::load_project(&project_name);
+    }
+
     recovery.checkpoint_id =
         crate::recovery_checkpoint::create(&proj.project_path, &authorized_paths)?;
 
@@ -1417,7 +1550,7 @@ pub(crate) async fn run_error_recovery(
 
     let prompt = repair_prompt(&recovery, &subtask, &diagnosis);
     let repair_result = crate::engine::execute(
-        &session.engine_snapshot,
+        prepared_engine,
         crate::engine::ExecutionRequest {
             project_path: proj.project_path.clone(),
             prompt,
@@ -3060,5 +3193,109 @@ mod tests {
         assert!(prompt.contains("不可变验收标准"));
         assert!(prompt.contains("event.preventDefault"));
         assert!(prompt.contains("index.html"));
+    }
+
+    fn healthy_plugin(path: &str) -> crate::engine::EngineHealth {
+        crate::engine::EngineHealth {
+            runtime: project::ExecutionRuntime::Plugin,
+            provider: project::ExecutionProvider::ClaudeCode,
+            status: crate::engine::EngineHealthStatus::Available,
+            executable_path: Some(path.to_string()),
+            version: Some("test".to_string()),
+            auth_state: crate::engine::EngineAuthState::Authenticated,
+            authentication: crate::engine::EngineAuthenticationResult::unknown("test"),
+            supports_unattended: true,
+            configuration_valid: true,
+            capabilities: vec!["unattended".to_string()],
+            source_revision: None,
+            runtime_self_test: Default::default(),
+            message: "ready".to_string(),
+        }
+    }
+
+    #[test]
+    fn recovery_requires_confirmation_when_settings_or_program_drift() {
+        let settings = crate::settings::AppSettings::default();
+        let mut session = project::ExecutionSession {
+            engine_settings_revision: settings.revision,
+            engine_executable_path: "/tmp/claude-a".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            execution_snapshot_mismatch(&session, &settings, &healthy_plugin("/tmp/claude-a"),)
+                .is_none()
+        );
+
+        session.engine_settings_revision = settings.revision.saturating_add(1);
+        assert!(
+            execution_snapshot_mismatch(&session, &settings, &healthy_plugin("/tmp/claude-a"),)
+                .is_some()
+        );
+
+        session.engine_settings_revision = settings.revision;
+        assert!(
+            execution_snapshot_mismatch(&session, &settings, &healthy_plugin("/tmp/claude-b"),)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn legacy_recovery_only_accepts_compatible_default_settings() {
+        let session = project::ExecutionSession::default();
+        let mut settings = crate::settings::AppSettings::default();
+        assert!(
+            execution_snapshot_mismatch(&session, &settings, &healthy_plugin("/tmp/claude"),)
+                .is_none()
+        );
+        settings.decision_model.model = "custom-model".to_string();
+        assert!(
+            execution_snapshot_mismatch(&session, &settings, &healthy_plugin("/tmp/claude"),)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn built_in_recovery_requires_complete_model_and_endpoint_snapshot() {
+        let settings = crate::settings::AppSettings::default();
+        let mut profile = project::ExecutionProfile::default();
+        profile.runtime = project::ExecutionRuntime::BuiltIn;
+        profile.provider = project::ExecutionProvider::GrokBuild;
+        let health = crate::engine::EngineHealth {
+            runtime: project::ExecutionRuntime::BuiltIn,
+            provider: project::ExecutionProvider::GrokBuild,
+            status: crate::engine::EngineHealthStatus::Available,
+            executable_path: None,
+            version: Some("test".to_string()),
+            auth_state: crate::engine::EngineAuthState::Authenticated,
+            authentication: crate::engine::EngineAuthenticationResult::unknown("test"),
+            supports_unattended: true,
+            configuration_valid: true,
+            capabilities: vec!["embedded".to_string()],
+            source_revision: Some(metheus_grok_engine::source_revision().to_string()),
+            runtime_self_test: Default::default(),
+            message: "ready".to_string(),
+        };
+        let mut session = project::ExecutionSession {
+            engine_snapshot: profile,
+            engine_settings_revision: settings.revision,
+            engine_source_revision: metheus_grok_engine::source_revision().to_string(),
+            engine_api_backend: settings
+                .built_in_grok_build
+                .api_backend
+                .as_str()
+                .to_string(),
+            engine_model: settings.built_in_grok_build.model.clone(),
+            endpoint_fingerprint: crate::settings::endpoint_fingerprint(
+                &settings.built_in_grok_build.api_base_url,
+            ),
+            ..Default::default()
+        };
+
+        assert!(execution_snapshot_mismatch(&session, &settings, &health).is_none());
+        session.engine_model.clear();
+        assert!(execution_snapshot_mismatch(&session, &settings, &health).is_some());
+        session.engine_model = settings.built_in_grok_build.model.clone();
+        session.endpoint_fingerprint.clear();
+        assert!(execution_snapshot_mismatch(&session, &settings, &health).is_some());
     }
 }

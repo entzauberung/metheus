@@ -1,14 +1,37 @@
-use super::contract::{EngineError, ExecutionRequest};
+use super::contract::{EngineError, EngineHealth, ExecutionRequest, ProgramSource};
+use super::health::HealthCheckResult;
 use crate::pipeline::PipelineState;
 use crate::project::{
     ExecutionProfile, ExecutionProvider, ExecutionResult, ExecutionRuntime, PermissionProfile,
 };
+use crate::settings::EngineOperationSnapshot;
+use std::ffi::OsString;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+pub(crate) struct PreparedEngine {
+    profile: ExecutionProfile,
+    pub(crate) health: EngineHealth,
+    operation: EngineOperationSnapshot,
+    program: Option<OsString>,
+    program_source: Option<ProgramSource>,
+}
+
+impl PreparedEngine {
+    pub(crate) fn settings(&self) -> &crate::settings::AppSettings {
+        &self.operation.settings
+    }
+}
+
 pub(crate) fn validate_profile(profile: &ExecutionProfile) -> Result<(), String> {
     match (&profile.runtime, &profile.provider) {
-        (ExecutionRuntime::Plugin, ExecutionProvider::ClaudeCode | ExecutionProvider::Codex) => {}
+        (
+            ExecutionRuntime::Plugin,
+            ExecutionProvider::ClaudeCode
+            | ExecutionProvider::Codex
+            | ExecutionProvider::KimiCli
+            | ExecutionProvider::GrokBuild,
+        ) => {}
         (ExecutionRuntime::BuiltIn, ExecutionProvider::GrokBuild) => {}
         _ => return Err("执行模式与引擎组合无效".to_string()),
     }
@@ -18,14 +41,69 @@ pub(crate) fn validate_profile(profile: &ExecutionProfile) -> Result<(), String>
     Ok(())
 }
 
-pub(crate) async fn execute(
+pub(crate) async fn prepare_engine(profile: &ExecutionProfile) -> Result<PreparedEngine, String> {
+    validate_profile(profile)?;
+    let operation = crate::settings::begin_engine_operation()?;
+    let HealthCheckResult {
+        health,
+        program,
+        program_source,
+    } = super::health::check_engine_health_with_settings(
+        profile,
+        &operation.settings,
+        operation.built_in_grok_build_api_key.as_deref(),
+    )
+    .await;
+    Ok(PreparedEngine {
+        profile: profile.clone(),
+        health,
+        operation,
+        program,
+        program_source,
+    })
+}
+
+pub(crate) async fn check_engine_health(profile: &ExecutionProfile) -> EngineHealth {
+    match prepare_engine(profile).await {
+        Ok(prepared) => prepared.health,
+        Err(message) => super::health::settings_failure(profile, message),
+    }
+}
+
+pub(crate) async fn verify_engine_authentication(
     profile: &ExecutionProfile,
+) -> Result<super::contract::EngineAuthenticationResult, String> {
+    validate_profile(profile)?;
+    let operation = crate::settings::begin_engine_operation()?;
+    super::health::verify_engine_authentication_with_settings(profile, &operation.settings).await
+}
+
+pub(crate) async fn execute(
+    prepared: PreparedEngine,
     request: ExecutionRequest,
     state: Arc<Mutex<Option<PipelineState>>>,
 ) -> Result<ExecutionResult, EngineError> {
-    validate_profile(profile).map_err(EngineError::PermissionError)?;
+    let profile = &prepared.profile;
+    if prepared.health.status.blocks_execution() {
+        let message = format!("执行引擎不可用：{}", prepared.health.message);
+        return if prepared.health.configuration_valid {
+            Err(EngineError::Unavailable(message))
+        } else {
+            Err(EngineError::InvalidConfiguration(message))
+        };
+    }
     if profile.runtime == ExecutionRuntime::BuiltIn {
-        return Err(super::builtin::unavailable_error());
+        let api_key = prepared
+            .operation
+            .built_in_grok_build_api_key
+            .as_deref()
+            .ok_or_else(|| {
+                EngineError::InvalidConfiguration(
+                    "预装 Grok Build API Key 未配置或安全凭据库不可用".to_string(),
+                )
+            })?;
+        return super::builtin::execute(&prepared.operation.settings, api_key, request, state)
+            .await;
     }
 
     let full_prompt = format!(
@@ -36,11 +114,35 @@ pub(crate) async fn execute(
         request.prompt,
         request.authorized_paths.join("\n- ")
     );
+    let program = prepared.program.ok_or_else(|| {
+        EngineError::InvalidConfiguration("健康检查未解析出执行引擎程序路径".to_string())
+    })?;
+    let program_source = prepared.program_source.ok_or_else(|| {
+        EngineError::InvalidConfiguration("健康检查未记录执行引擎程序来源".to_string())
+    })?;
     let before_files = crate::test_runner::get_file_snapshot(&request.project_path);
-    let spec = match profile.provider {
-        ExecutionProvider::ClaudeCode => super::claude_code::process_spec(&full_prompt),
-        ExecutionProvider::Codex => super::codex::process_spec(&request.project_path, &full_prompt),
-        ExecutionProvider::GrokBuild => return Err(super::builtin::unavailable_error()),
+    let spec = match (&profile.runtime, &profile.provider) {
+        (ExecutionRuntime::Plugin, ExecutionProvider::ClaudeCode) => {
+            super::claude_code::process_spec(program, program_source, &full_prompt)
+        }
+        (ExecutionRuntime::Plugin, ExecutionProvider::Codex) => {
+            super::codex::process_spec(program, program_source, &request.project_path, &full_prompt)
+        }
+        (ExecutionRuntime::Plugin, ExecutionProvider::KimiCli) => {
+            super::kimi_cli::process_spec(program, program_source, &full_prompt)
+        }
+        (ExecutionRuntime::Plugin, ExecutionProvider::GrokBuild) => super::grok_cli::process_spec(
+            program,
+            program_source,
+            &request.project_path,
+            &full_prompt,
+        ),
+        (ExecutionRuntime::BuiltIn, ExecutionProvider::GrokBuild) => unreachable!(),
+        _ => {
+            return Err(EngineError::InvalidConfiguration(
+                "执行模式与引擎组合无效".to_string(),
+            ))
+        }
     };
     let display_name = spec.display_name;
     let output = super::process_runner::run_process(
@@ -74,6 +176,10 @@ pub(crate) async fn execute(
         file_changes,
         exit_code: output.exit_code,
         engine_provider: Some(profile.provider.clone()),
+        engine_runtime: profile.runtime.clone(),
+        engine_settings_revision: prepared.operation.settings.revision,
+        engine_source_revision: String::new(),
+        engine_api_backend: String::new(),
         stdout: output.stdout,
         stderr: output.stderr,
         engine_failure_kind,
@@ -86,14 +192,20 @@ mod tests {
 
     #[test]
     fn accepts_supported_profiles() {
-        assert!(validate_profile(&ExecutionProfile::default()).is_ok());
-        assert!(validate_profile(&ExecutionProfile {
-            runtime: ExecutionRuntime::Plugin,
-            provider: ExecutionProvider::Codex,
-            permission_profile: PermissionProfile::Unattended,
-            profile_revision: 2,
-        })
-        .is_ok());
+        for provider in [
+            ExecutionProvider::ClaudeCode,
+            ExecutionProvider::Codex,
+            ExecutionProvider::KimiCli,
+            ExecutionProvider::GrokBuild,
+        ] {
+            assert!(validate_profile(&ExecutionProfile {
+                runtime: ExecutionRuntime::Plugin,
+                provider,
+                permission_profile: PermissionProfile::Unattended,
+                profile_revision: 2,
+            })
+            .is_ok());
+        }
         assert!(validate_profile(&ExecutionProfile {
             runtime: ExecutionRuntime::BuiltIn,
             provider: ExecutionProvider::GrokBuild,
@@ -105,10 +217,13 @@ mod tests {
 
     #[test]
     fn rejects_invalid_combinations_and_interactive_mode() {
-        let mut profile = ExecutionProfile::default();
-        profile.provider = ExecutionProvider::GrokBuild;
+        let mut profile = ExecutionProfile {
+            runtime: ExecutionRuntime::BuiltIn,
+            provider: ExecutionProvider::ClaudeCode,
+            ..ExecutionProfile::default()
+        };
         assert!(validate_profile(&profile).is_err());
-        profile.provider = ExecutionProvider::ClaudeCode;
+        profile.runtime = ExecutionRuntime::Plugin;
         profile.permission_profile = PermissionProfile::Interactive;
         assert!(validate_profile(&profile).is_err());
     }

@@ -1,10 +1,28 @@
-import { EngineHealth, PipelineState, Project } from "./types";
+import { EngineHealth, ExecutionProvider, ExecutionRuntime, PipelineState, Project } from "./types";
+
+export const PLUGIN_EXECUTION_PROVIDERS: ExecutionProvider[] = [
+  "ClaudeCode",
+  "Codex",
+  "KimiCli",
+  "GrokBuild",
+];
+
+export function executionProviderAllowed(
+  runtime: ExecutionRuntime,
+  provider: ExecutionProvider,
+): boolean {
+  return runtime === "BuiltIn"
+    ? provider === "GrokBuild"
+    : PLUGIN_EXECUTION_PROVIDERS.includes(provider);
+}
 
 const BLOCKING_HEALTH_STATUSES = new Set<EngineHealth["status"]>([
   "NotInstalled",
   "Unauthenticated",
   "UnsupportedVersion",
   "Disabled",
+  "VerificationRequired",
+  "VerificationFailed",
 ]);
 
 export function engineHealthBlocksExecution(health: EngineHealth | null): boolean {

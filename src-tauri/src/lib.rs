@@ -26,6 +26,7 @@ mod prompts;
 mod recovery;
 mod recovery_checkpoint;
 mod recovery_learning;
+mod settings;
 mod snapshot;
 mod test_runner;
 use crate::pipeline::PipelineState;
@@ -129,6 +130,9 @@ pub struct AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     load_env();
+    if let Err(error) = crate::settings::initialize_settings() {
+        eprintln!("初始化应用设置失败：{error}");
+    }
     // 启动时清理上次异常退出遗留的孤儿进程
     crate::snapshot::cleanup_orphan_processes_at_startup();
     tauri::Builder::default()
@@ -141,7 +145,14 @@ pub fn run() {
             crate::commands::chat::send_message,
             crate::commands::project_ops::get_project,
             crate::commands::project_ops::check_engine_health,
+            crate::commands::project_ops::verify_engine_authentication,
             crate::commands::project_ops::update_execution_profile,
+            crate::commands::settings::get_app_settings,
+            crate::commands::settings::update_app_settings,
+            crate::commands::settings::set_api_secret,
+            crate::commands::settings::clear_api_secret,
+            crate::commands::settings::test_model_connection,
+            crate::commands::settings::test_grok_build_runtime,
             crate::commands::chat::chat_with_role,
             crate::commands::plan::generate_version_plan,
             crate::commands::plan::approve_version_plan,

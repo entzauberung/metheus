@@ -30,6 +30,7 @@ import { PauseDecisionPanel } from "./PauseDecisionPanel";
 import { RollbackImpactDialog } from "./RollbackImpactDialog";
 import { MilestoneReviewPanel } from "./MilestoneReviewPanel";
 import { ExecutionEngineSettings } from "./components/ExecutionEngineSettings";
+import { ApplicationSettings } from "./components/ApplicationSettings";
 import FileTree from "./FileTree";
 import FloatingChatBalloon from "./FloatingChatBalloon";
 
@@ -1871,6 +1872,7 @@ function App() {
 
       <main className="main-content">
         <div className="project-utility-bar">
+          <ApplicationSettings project={project} pipeline={executionStatus} />
           <ExecutionEngineSettings
             project={project}
             pipeline={executionStatus}

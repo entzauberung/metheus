@@ -1,7 +1,11 @@
-use super::contract::ProcessSpec;
+use super::contract::{OutputProtocol, ProcessSpec, ProgramSource};
 use std::ffi::OsString;
 
-pub(super) fn process_spec(prompt: &str) -> ProcessSpec {
+pub(super) fn process_spec(
+    program: OsString,
+    program_source: ProgramSource,
+    prompt: &str,
+) -> ProcessSpec {
     let configured_model = std::env::var("METHEUS_MODEL")
         .unwrap_or_else(|_| crate::constants::DEEPSEEK_WORKFLOW_MODEL.to_string());
     let model = if configured_model == crate::constants::DEEPSEEK_WORKFLOW_MODEL {
@@ -17,7 +21,7 @@ pub(super) fn process_spec(prompt: &str) -> ProcessSpec {
 
     ProcessSpec {
         display_name: "Claude Code",
-        program: OsString::from("claude"),
+        program,
         args: vec![
             OsString::from("--dangerously-skip-permissions"),
             OsString::from("--model"),
@@ -26,6 +30,11 @@ pub(super) fn process_spec(prompt: &str) -> ProcessSpec {
             OsString::from(prompt),
         ],
         stdin_payload: None,
+        environment: vec![],
+        environment_remove: vec![],
+        output_protocol: OutputProtocol::RawText,
+        program_source,
+        timeout_secs: crate::constants::EXECUTION_ENGINE_TIMEOUT_SECS,
     }
 }
 
@@ -35,7 +44,11 @@ mod tests {
 
     #[test]
     fn builds_noninteractive_unattended_command() {
-        let spec = process_spec("approved prompt");
+        let spec = process_spec(
+            OsString::from("claude"),
+            ProgramSource::PathSearch,
+            "approved prompt",
+        );
         let args: Vec<String> = spec
             .args
             .iter()

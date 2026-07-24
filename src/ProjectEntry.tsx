@@ -4,6 +4,7 @@ import { invokeWithTimeout } from "./utils/invokeWithTimeout";
 import { EngineHealth, ExecutionProfile, ProjectEntryKind, Project, PathValidationResult } from "./types";
 import { Modal } from "./components/Modal";
 import { ExecutionEngineSelector, EngineHealthCheckState } from "./components/ExecutionEngineSelector";
+import { ApplicationSettings } from "./components/ApplicationSettings";
 import { engineHealthBlocksExecution } from "./enginePolicy";
 import { Sparkles, FolderOpen, FolderPlus, ArrowRight } from "lucide-react";
 
@@ -147,6 +148,7 @@ export function ProjectEntry({ onProjectCreated }: ProjectEntryProps) {
 
   return (
     <div className="project-entry-container">
+      <ApplicationSettings className="project-entry-settings" />
       <div className="project-entry-logo">
         <Sparkles size={40} />
       </div>

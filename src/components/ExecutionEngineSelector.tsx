@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Bot, CheckCircle2, CircleAlert, LoaderCircle, PlugZap } from "lucide-react";
 import { invokeWithTimeout } from "../utils/invokeWithTimeout";
 import { EngineHealth, ExecutionProfile, ExecutionProvider } from "../types";
+import { PLUGIN_EXECUTION_PROVIDERS } from "../enginePolicy";
 
 interface Props {
   value: ExecutionProfile;
@@ -15,10 +16,12 @@ export interface EngineHealthCheckState {
   checking: boolean;
 }
 
-const PROVIDERS: Array<{ provider: ExecutionProvider; label: string }> = [
-  { provider: "ClaudeCode", label: "Claude Code" },
-  { provider: "Codex", label: "Codex" },
-];
+const PROVIDER_LABELS: Record<ExecutionProvider, string> = {
+  ClaudeCode: "Claude Code",
+  Codex: "Codex",
+  KimiCli: "Kimi CLI",
+  GrokBuild: "Grok Build CLI（本机）",
+};
 
 function statusClass(health: EngineHealth | null): string {
   if (!health || health.status === "Unknown") return "unknown";
@@ -45,10 +48,20 @@ export function ExecutionEngineSelector({ value, onChange, disabled = false, onH
       .catch(() => {
         if (requestIdRef.current !== requestId) return;
         setHealth({
+          runtime: value.runtime,
           provider: value.provider,
           status: "Unknown",
           auth_state: "Unknown",
+          authentication: {
+            local_state: "Unknown",
+            online_state: "NotVerified",
+            method: "None",
+            message: "暂时无法检查认证状态",
+          },
           supports_unattended: value.runtime === "Plugin",
+          configuration_valid: false,
+          capabilities: [],
+          runtime_self_test: "NotRun",
           message: "暂时无法检查引擎状态",
         });
       })
@@ -60,17 +73,28 @@ export function ExecutionEngineSelector({ value, onChange, disabled = false, onH
   const selectProvider = (provider: ExecutionProvider) => {
     onChange({
       ...value,
-      runtime: "Plugin",
+      runtime: value.runtime,
       provider,
       permission_profile: "Unattended",
     });
   };
 
   const selectPluginMode = () => {
-    const provider = value.provider === "ClaudeCode" || value.provider === "Codex"
-      ? value.provider
-      : "ClaudeCode";
-    selectProvider(provider);
+    onChange({
+      ...value,
+      runtime: "Plugin",
+      provider: value.provider,
+      permission_profile: "Unattended",
+    });
+  };
+
+  const selectBuiltInMode = () => {
+    onChange({
+      ...value,
+      runtime: "BuiltIn",
+      provider: "GrokBuild",
+      permission_profile: "Unattended",
+    });
   };
 
   return (
@@ -89,18 +113,20 @@ export function ExecutionEngineSelector({ value, onChange, disabled = false, onH
         <button
           type="button"
           className={value.runtime === "BuiltIn" ? "selected" : ""}
-          disabled
-          title="当前版本暂未启用"
+          disabled={disabled}
           aria-pressed={value.runtime === "BuiltIn"}
+          onClick={selectBuiltInMode}
         >
-          <Bot size={15} /> 预装引擎
-          <span className="engine-soon">暂未启用</span>
+          <Bot size={15} /> 内置模式
         </button>
       </div>
 
       <div className="engine-selector-label">执行引擎</div>
       <div className="engine-provider-options" role="radiogroup" aria-label="执行引擎">
-        {PROVIDERS.map((item) => (
+        {(value.runtime === "BuiltIn"
+          ? [{ provider: "GrokBuild" as ExecutionProvider, label: "Grok Build（内置）" }]
+          : PLUGIN_EXECUTION_PROVIDERS.map((provider) => ({ provider, label: PROVIDER_LABELS[provider] }))
+        ).map((item) => (
           <button
             type="button"
             role="radio"
@@ -119,9 +145,12 @@ export function ExecutionEngineSelector({ value, onChange, disabled = false, onH
         {checking ? (
           <><LoaderCircle className="engine-health-spinner" size={15} /> 正在检查...</>
         ) : health?.status === "Available" ? (
-          <><CheckCircle2 size={15} /> {health.message}{health.version ? ` · ${health.version}` : ""}</>
+          <>
+            <CheckCircle2 size={15} />
+            <span>{health.message}{health.version ? ` · ${health.version}` : ""}{health.source_revision ? ` · ${health.source_revision.slice(0, 8)}` : ""}</span>
+          </>
         ) : (
-          <><CircleAlert size={15} /> {health?.message || "尚未检查"}</>
+          <><CircleAlert size={15} /> <span>{health?.message || "尚未检查"}</span></>
         )}
       </div>
     </div>
