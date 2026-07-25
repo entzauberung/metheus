@@ -44,7 +44,8 @@ export type AutopilotRecoveryAction =
   | "RegenerateExecutionPlan"
   | "PrepareExecutionWorkspace"
   | "ResolveWorkspaceChanges"
-  | "RunAutomaticRecovery";
+  | "RunAutomaticRecovery"
+  | "RetryGitConfirmation";
 
 export type RecoveryErrorKind =
   | "WorkspaceError"
@@ -630,7 +631,7 @@ export interface Subtask {
   execution_result?: ExecutionResult;
   test_result?: TestResult;
   retry_count: number;
-  auto_tag?: string;  // 小阶段 auto tag，格式 metheus/auto/v0.1.1/task-0
+  auto_tag?: string;  // 实际 Git tag 名；兼容 V1 与实体身份驱动的 V2
   // V1 结构化字段
   order: number;
   goal: string;
@@ -786,9 +787,27 @@ export type ExecutionSessionStatus =
   | "Executing"
   | "AwaitingConfirmation"
   | "QualityBlocked"
+  | "ConfirmationBlocked"
   | "SessionLost"
   | "ExecutionFailed"
   | "StopFailed";
+
+export type ConfirmationPhase =
+  | "NotStarted"
+  | "Preparing"
+  | "CommitCreated"
+  | "TagCreated"
+  | "ProjectFinalizing";
+
+export type GitConfirmationFailureKind =
+  | "TagIdentityConflict"
+  | "LegacyV1TagConflict"
+  | "V2TagIntegrityConflict"
+  | "ScopeViolation"
+  | "CommitFailed"
+  | "TagFailed"
+  | "ProjectFinalizationFailed"
+  | "GitMetadataUnavailable";
 
 /** 执行会话 — 记录当前正在执行或待确认的小阶段 */
 export interface ExecutionSession {
@@ -802,6 +821,11 @@ export interface ExecutionSession {
   base_commit: string;   // 执行前的 Git commit，用于回退基线
   /** 失败原因；旧项目默认空 */
   failure_message?: string;
+  confirmation_transaction_id?: string;
+  confirmation_phase?: ConfirmationPhase;
+  confirmation_candidate_tag?: string;
+  confirmation_commit?: string;
+  confirmation_failure_kind?: GitConfirmationFailureKind;
   started_at: string;
   state_entered_at: string;
   plan_revision: number;
@@ -857,6 +881,10 @@ export type ExecutionEventType =
   | "AdvanceMilestoneReview"
   | "SystemAdvance"
   | "QualityGateBlocked"
+  | "GitConfirmationStarted"
+  | "GitConfirmationCommitCreated"
+  | "GitConfirmationBlocked"
+  | "GitConfirmationCompleted"
   | "RetryScheduled"
   | "ExecutionFailed"
   | "RecoveryStarted"

@@ -222,6 +222,8 @@ pub enum AutopilotRecoveryAction {
     ResolveWorkspaceChanges,
     /// 运行受限的自动诊断、修复和复测循环
     RunAutomaticRecovery,
+    /// 保留已通过代码与质量结果，重新续跑 Git 确认事务
+    RetryGitConfirmation,
 }
 
 /// autopilot 持久化状态（写入 WorkflowState，用于刷新恢复）
@@ -844,7 +846,7 @@ pub struct Subtask {
     pub test_result: Option<TestResult>,
     #[serde(default)]
     pub retry_count: u32,
-    /// 小阶段执行完成后的 Git tag 名，格式 metheus/auto/v0.1.1/task-0
+    /// 小阶段执行完成后的实际 Git tag 名；兼容 V1 与实体身份驱动的 V2 标签。
     #[serde(default)]
     pub auto_tag: Option<String>,
     // === V1 结构化任务字段 ===
@@ -926,7 +928,7 @@ pub struct MidStage {
     pub completed_at: Option<String>,
     pub approved_at: Option<String>,
     #[serde(default)]
-    pub git_tag: String, // Git tag 名，如 "metheus/v0.1.1"
+    pub git_tag: String, // 实际 Git tag 名；兼容 V1 与 V2
     /// 执行计划检查结果
     #[serde(default)]
     pub plan_check_result: Option<StagePlanCheckResult>,
@@ -1997,12 +1999,41 @@ pub enum ExecutionSessionStatus {
     AwaitingConfirmation,
     /// 质量门禁阻断
     QualityBlocked,
+    /// Git 确认事务受阻；代码与质量结果保持不变
+    ConfirmationBlocked,
     /// 进程失联（应用重启后发现进程已死）
     SessionLost,
     /// 执行器失败 / 超时（可恢复执行基线）
     ExecutionFailed,
     /// 暂停失败（In Stop 杀进程或 Git 回退失败）
     StopFailed,
+}
+
+/// Git 确认事务当前阶段。旧会话默认尚未开始确认。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ConfirmationPhase {
+    #[default]
+    NotStarted,
+    Preparing,
+    CommitCreated,
+    TagCreated,
+    ProjectFinalizing,
+}
+
+/// Git 确认失败的结构化分类，恢复入口不得再解析错误文本或工作区脏状态。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GitConfirmationFailureKind {
+    /// 兼容早期 Git 确认实现留下的通用分类；启动对账会按事务事实迁移。
+    TagIdentityConflict,
+    /// 旧 V1 标签只由版本号和序号组成，合法任务之间发生身份碰撞。
+    LegacyV1TagConflict,
+    /// V2 不可变标签已存在但不属于当前确认事务，必须人工核对。
+    V2TagIntegrityConflict,
+    ScopeViolation,
+    CommitFailed,
+    TagFailed,
+    ProjectFinalizationFailed,
+    GitMetadataUnavailable,
 }
 
 /// 执行会话 — 记录当前正在执行或待确认的小阶段，用于刷新恢复
@@ -2029,6 +2060,21 @@ pub struct ExecutionSession {
     /// 失败原因；旧项目默认空
     #[serde(default)]
     pub failure_message: String,
+    /// 一次确认事务的稳定身份；重试必须复用，重新执行任务才会生成新身份。
+    #[serde(default)]
+    pub confirmation_transaction_id: String,
+    /// 当前确认阶段。
+    #[serde(default)]
+    pub confirmation_phase: ConfirmationPhase,
+    /// 由实体 ID 与确认事务 ID 生成的不可变 V2 标签。
+    #[serde(default)]
+    pub confirmation_candidate_tag: String,
+    /// 本事务已经创建的提交；用于中断后只补建标签。
+    #[serde(default)]
+    pub confirmation_commit: String,
+    /// 最近一次确认失败分类。
+    #[serde(default)]
+    pub confirmation_failure_kind: Option<GitConfirmationFailureKind>,
     /// 会话开始时间（ISO 8601）
     pub started_at: String,
     /// 进入当前状态的时间
@@ -2071,6 +2117,9 @@ impl ExecutionSession {
                 ExecutionSessionStatus::AwaitingConfirmation
             }
             "quality_blocked" | "QualityBlocked" => ExecutionSessionStatus::QualityBlocked,
+            "confirmation_blocked" | "ConfirmationBlocked" => {
+                ExecutionSessionStatus::ConfirmationBlocked
+            }
             "session_lost" | "SessionLost" => ExecutionSessionStatus::SessionLost,
             "execution_failed" | "ExecutionFailed" => ExecutionSessionStatus::ExecutionFailed,
             "stop_failed" | "StopFailed" => ExecutionSessionStatus::StopFailed,
@@ -2108,6 +2157,11 @@ impl Default for ExecutionSession {
             status: String::new(),
             base_commit: String::new(),
             failure_message: String::new(),
+            confirmation_transaction_id: String::new(),
+            confirmation_phase: ConfirmationPhase::NotStarted,
+            confirmation_candidate_tag: String::new(),
+            confirmation_commit: String::new(),
+            confirmation_failure_kind: None,
             started_at: String::new(),
             state_entered_at: String::new(),
             plan_revision: 0,
@@ -2167,6 +2221,14 @@ pub enum ExecutionEventType {
     SystemAdvance,
     /// 质量门禁阻断（确认前校验失败）
     QualityGateBlocked,
+    /// Git 确认事务已建立或恢复
+    GitConfirmationStarted,
+    /// Git 提交已创建，后续只允许续跑标签与项目收口
+    GitConfirmationCommitCreated,
+    /// Git 确认受阻，但代码与质量结果已保留
+    GitConfirmationBlocked,
+    /// Git 确认事务完成
+    GitConfirmationCompleted,
     /// 用户确认恢复基线并重新执行
     RetryScheduled,
     /// 执行器失败并完成状态收尾
@@ -2332,6 +2394,11 @@ mod tests {
             .ok_or("执行会话未序列化为对象".to_string())?;
         for field in [
             "execution_id",
+            "confirmation_transaction_id",
+            "confirmation_phase",
+            "confirmation_candidate_tag",
+            "confirmation_commit",
+            "confirmation_failure_kind",
             "engine_settings_revision",
             "engine_source_revision",
             "engine_api_backend",
@@ -2344,6 +2411,11 @@ mod tests {
         let restored: ExecutionSession = serde_json::from_value(value)
             .map_err(|error| format!("反序列化旧执行会话失败：{}", error))?;
         assert!(restored.execution_id.is_empty());
+        assert!(restored.confirmation_transaction_id.is_empty());
+        assert_eq!(restored.confirmation_phase, ConfirmationPhase::NotStarted);
+        assert!(restored.confirmation_candidate_tag.is_empty());
+        assert!(restored.confirmation_commit.is_empty());
+        assert!(restored.confirmation_failure_kind.is_none());
         assert_eq!(restored.status, "executing");
         assert_eq!(restored.engine_snapshot, ExecutionProfile::default());
         assert_eq!(restored.engine_settings_revision, 0);
@@ -2393,6 +2465,21 @@ mod tests {
         };
         assert_eq!(session.parsed_status(), ExecutionSessionStatus::StopFailed);
         assert!(session.is_recoverable_failure());
+    }
+
+    #[test]
+    fn git_confirmation_blocked_has_a_distinct_session_status() {
+        let session = ExecutionSession {
+            active: false,
+            status: "confirmation_blocked".to_string(),
+            confirmation_failure_kind: Some(GitConfirmationFailureKind::TagIdentityConflict),
+            ..Default::default()
+        };
+        assert_eq!(
+            session.parsed_status(),
+            ExecutionSessionStatus::ConfirmationBlocked
+        );
+        assert!(!session.is_recoverable_failure());
     }
 
     #[test]

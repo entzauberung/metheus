@@ -373,6 +373,11 @@ pub(crate) async fn execute_current_subtask(
             status: "executing".to_string(),
             base_commit,
             failure_message: String::new(),
+            confirmation_transaction_id: String::new(),
+            confirmation_phase: project::ConfirmationPhase::NotStarted,
+            confirmation_candidate_tag: String::new(),
+            confirmation_commit: String::new(),
+            confirmation_failure_kind: None,
             started_at: now.clone(),
             state_entered_at: now.clone(),
             plan_revision,
@@ -684,6 +689,11 @@ async fn execute_current_subtask_background(
         status: "awaiting_confirmation".to_string(),
         base_commit: session.base_commit,
         failure_message: String::new(),
+        confirmation_transaction_id: String::new(),
+        confirmation_phase: project::ConfirmationPhase::NotStarted,
+        confirmation_candidate_tag: String::new(),
+        confirmation_commit: String::new(),
+        confirmation_failure_kind: None,
         started_at: session.started_at,
         state_entered_at: now_await,
         plan_revision: session.plan_revision,
@@ -1232,14 +1242,41 @@ fn claim_awaiting_confirmation_under_lock(
     if status == "confirming" || status == "rejecting" {
         return Err("确认或驳回操作正在进行中，请勿重复提交。".to_string());
     }
-    // 仅允许从待确认或质量阻断进入认领
+    // 仅允许从待确认、质量阻断或结构化 Git 确认阻断进入认领
     let allowed = status.eq_ignore_ascii_case("awaiting_confirmation")
-        || status.eq_ignore_ascii_case("quality_blocked");
+        || status.eq_ignore_ascii_case("quality_blocked")
+        || status.eq_ignore_ascii_case("confirmation_blocked");
     if !allowed {
         return Err(format!(
             "任务未处于可确认状态（当前：{}），无法提交。",
             status
         ));
+    }
+    if claim_status == "confirming"
+        && status.eq_ignore_ascii_case("confirmation_blocked")
+        && !confirmation_failure_is_retryable(session.confirmation_failure_kind.as_ref())
+    {
+        return Err(
+            "当前 Git 确认阻断需要人工核对，禁止机械重试；代码与质量结果仍被保留。".to_string(),
+        );
+    }
+    if claim_status == "confirming" {
+        if session.confirmation_transaction_id.is_empty() {
+            session.confirmation_transaction_id = uuid::Uuid::new_v4().to_string();
+        }
+        if session.confirmation_phase == project::ConfirmationPhase::NotStarted {
+            session.confirmation_phase = project::ConfirmationPhase::Preparing;
+        }
+        if session.confirmation_candidate_tag.is_empty() {
+            session.confirmation_candidate_tag = crate::git_ops::subtask_v2_tag(
+                &session.milestone_id,
+                &session.mid_stage_id,
+                &session.subtask_id,
+                &session.confirmation_transaction_id,
+            );
+        }
+        session.confirmation_failure_kind = None;
+        session.failure_message.clear();
     }
     session.status = claim_status.to_string();
     session.state_entered_at = chrono::Utc::now().to_rfc3339();
@@ -1257,15 +1294,96 @@ fn release_confirmation_claim(proj: &mut project::Project, restore_status: &str)
     }
 }
 
+fn confirmation_failure_is_retryable(
+    failure_kind: Option<&project::GitConfirmationFailureKind>,
+) -> bool {
+    matches!(
+        failure_kind,
+        Some(
+            project::GitConfirmationFailureKind::LegacyV1TagConflict
+                | project::GitConfirmationFailureKind::CommitFailed
+                | project::GitConfirmationFailureKind::TagFailed
+                | project::GitConfirmationFailureKind::ProjectFinalizationFailed
+                | project::GitConfirmationFailureKind::GitMetadataUnavailable
+        )
+    )
+}
+
+fn confirmation_recovery_action(
+    failure_kind: &project::GitConfirmationFailureKind,
+) -> project::AutopilotRecoveryAction {
+    match failure_kind {
+        project::GitConfirmationFailureKind::TagIdentityConflict
+        | project::GitConfirmationFailureKind::V2TagIntegrityConflict
+        | project::GitConfirmationFailureKind::ScopeViolation => {
+            project::AutopilotRecoveryAction::WaitHumanDecision
+        }
+        project::GitConfirmationFailureKind::LegacyV1TagConflict
+        | project::GitConfirmationFailureKind::CommitFailed
+        | project::GitConfirmationFailureKind::TagFailed
+        | project::GitConfirmationFailureKind::ProjectFinalizationFailed
+        | project::GitConfirmationFailureKind::GitMetadataUnavailable => {
+            project::AutopilotRecoveryAction::RetryGitConfirmation
+        }
+    }
+}
+
+fn mark_confirmation_blocked(
+    proj: &mut project::Project,
+    failure_kind: project::GitConfirmationFailureKind,
+    message: String,
+) {
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(session) = proj.execution_session.as_mut() {
+        session.active = false;
+        session.status = "confirmation_blocked".to_string();
+        session.failure_message = message.clone();
+        session.confirmation_failure_kind = Some(failure_kind.clone());
+        session.state_entered_at = now.clone();
+    }
+    if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+        autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
+        autopilot.error_message = message.clone();
+        autopilot.last_action = "Git 确认受阻，代码与质量结果已保留".to_string();
+        autopilot.last_action_at = now;
+        autopilot.recovery_action = confirmation_recovery_action(&failure_kind);
+    }
+    let ids = proj.execution_session.as_ref().map(|session| {
+        (
+            session.milestone_id.clone(),
+            session.mid_stage_id.clone(),
+            session.subtask_id.clone(),
+        )
+    });
+    if let Some((milestone_id, mid_stage_id, subtask_id)) = ids {
+        write_execution_history(
+            proj,
+            "error",
+            project::ExecutionEventType::GitConfirmationBlocked,
+            format!("Git 确认受阻：{}；代码与质量结果已保留", message),
+            Some(&milestone_id),
+            Some(&mid_stage_id),
+            Some(&subtask_id),
+        );
+    }
+}
+
 /// V1 确认小阶段执行结果（用户点击"确认通过"）
 #[tauri::command]
 pub(crate) async fn confirm_subtask_result(
     state: tauri::State<'_, AppState>,
     project_name: String,
 ) -> Result<project::Project, String> {
+    confirm_subtask_result_with_pipeline(&state.pipeline_state, project_name).await
+}
+
+async fn confirm_subtask_result_with_pipeline(
+    pipeline_state: &std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    project_name: String,
+) -> Result<project::Project, String> {
     // 与后台完成/启动对账共用流水线锁做 CAS 认领，关闭自动确认与人工确认的并发窗口。
     {
-        let _guard = state.pipeline_state.lock().await;
+        let _guard = pipeline_state.lock().await;
         let mut claim_proj = crate::load_project(&project_name)?;
         claim_awaiting_confirmation_under_lock(&mut claim_proj, "confirming")?;
     }
@@ -1357,12 +1475,29 @@ pub(crate) async fn confirm_subtask_result(
             }
         };
 
-    // Verify Git workspace is still available before tagging
+    let (transaction_id, mut confirmation_phase, mut confirmation_commit, candidate_tag) = proj
+        .execution_session
+        .as_ref()
+        .map(|session| {
+            (
+                session.confirmation_transaction_id.clone(),
+                session.confirmation_phase.clone(),
+                session.confirmation_commit.clone(),
+                session.confirmation_candidate_tag.clone(),
+            )
+        })
+        .ok_or_else(|| "没有活跃的执行会话。".to_string())?;
+
+    // Verify Git workspace is still available before advancing the confirmation transaction.
     let ws = match get_execution_workspace_status_inner(&project_path) {
         Ok(ws) => ws,
         Err(e) => {
-            release_confirmation_claim(&mut proj, "awaiting_confirmation");
-            let _ = crate::save_project(&proj);
+            mark_confirmation_blocked(
+                &mut proj,
+                project::GitConfirmationFailureKind::GitMetadataUnavailable,
+                e.clone(),
+            );
+            crate::save_project(&proj)?;
             return Err(e);
         }
     };
@@ -1373,19 +1508,26 @@ pub(crate) async fn confirm_subtask_result(
         && ws.git_user_available
         && ws.git_email_available;
     if !git_metadata_ready {
-        release_confirmation_claim(&mut proj, "awaiting_confirmation");
-        let _ = crate::save_project(&proj);
-        return Err(format!(
-            "Git 工作区不可用，无法标记确认：{}",
-            ws.status_message
-        ));
+        let message = format!("Git 工作区不可用，无法标记确认：{}", ws.status_message);
+        mark_confirmation_blocked(
+            &mut proj,
+            project::GitConfirmationFailureKind::GitMetadataUnavailable,
+            message.clone(),
+        );
+        crate::save_project(&proj)?;
+        return Err(message);
     }
 
     let now = chrono::Utc::now().to_rfc3339();
 
-    // 在真实 index 之外捕获任务 diff，先在内存中完成宪法更新，再统一提交。
-    let task_diff_result =
-        crate::git_ops::capture_authorized_diff(&project_path, &authorized_paths);
+    // 只有准备阶段读取工作区并生成宪法更新；提交后的重试只读取已记录的提交。
+    let task_diff_result = if confirmation_phase == project::ConfirmationPhase::Preparing {
+        crate::git_ops::capture_authorized_diff(&project_path, &authorized_paths)
+    } else if !confirmation_commit.is_empty() {
+        crate::git_ops::capture_commit_diff(&project_path, &confirmation_commit, &authorized_paths)
+    } else {
+        Ok(String::new())
+    };
     let mut task_diff_text = String::new();
     let mut pending_constitution_entry: Option<project::ConstitutionChangeEntry> = None;
 
@@ -1394,7 +1536,9 @@ pub(crate) async fn confirm_subtask_result(
             task_diff_text = diff_text;
             let diff_summary = crate::diff::extract_diff_summary(&task_diff_text);
             let constitution_path = std::path::Path::new(&project_path).join("CONSTITUTION.md");
-            if constitution_path.exists() {
+            if confirmation_phase == project::ConfirmationPhase::Preparing
+                && constitution_path.exists()
+            {
                 let old_constitution = std::fs::read_to_string(&constitution_path)
                     .map_err(|error| format!("读取 CONSTITUTION.md 失败：{}", error));
                 match old_constitution {
@@ -1440,67 +1584,194 @@ pub(crate) async fn confirm_subtask_result(
         Err(error) => Err(error),
     };
 
-    // 任务文件和 Metheus 生成的宪法更新必须进入同一提交和标签。
-    let tag_result = match generated_file_result {
-        Ok(generated_file) => {
-            crate::git_ops::git_save_subtask(
-                project_path.clone(),
-                (subtask_idx + 1) as u32,
-                mid_version.clone(),
-                subtask_title.clone(),
-                authorized_paths,
-                generated_file,
-            )
-            .await
+    let mut generated_file = match generated_file_result {
+        Ok(generated_file) => generated_file,
+        Err(message) => {
+            mark_confirmation_blocked(
+                &mut proj,
+                project::GitConfirmationFailureKind::CommitFailed,
+                message.clone(),
+            );
+            crate::save_project(&proj)?;
+            return Err(format!("确认提交失败：{}。代码与质量结果已保留。", message));
         }
-        Err(error) => Err(error),
     };
 
-    match tag_result {
-        Ok(tag_name) => {
-            if let Some(ms) = proj.milestones.iter_mut().find(|m| m.id == milestone_id) {
-                if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == mid_stage_id) {
-                    if let Some(st) = mid.subtasks.get_mut(subtask_idx) {
-                        st.status = if st.human_verification.as_ref().is_some_and(|verification| {
-                            verification.resolution == project::HumanResolution::AcceptDeviation
-                        }) {
-                            project::SubtaskStatus::AcceptedDeviation
-                        } else {
-                            project::SubtaskStatus::Passed
-                        };
-                        st.confirmed_by_user = Some(true);
-                        st.confirmed_at = Some(now.clone());
-                        st.auto_tag = Some(tag_name);
-                    }
+    if confirmation_phase == project::ConfirmationPhase::Preparing {
+        write_execution_history(
+            &mut proj,
+            "info",
+            project::ExecutionEventType::GitConfirmationStarted,
+            format!("开始 Git 确认事务：{}", candidate_tag),
+            Some(&milestone_id),
+            Some(&mid_stage_id),
+            Some(&subtask_id),
+        );
+    }
+
+    let tag_name = loop {
+        let progress = crate::git_ops::git_save_subtask(
+            project_path.clone(),
+            milestone_id.clone(),
+            mid_stage_id.clone(),
+            subtask_id.clone(),
+            transaction_id.clone(),
+            (subtask_idx + 1) as u32,
+            mid_version.clone(),
+            subtask_title.clone(),
+            authorized_paths.clone(),
+            generated_file.take(),
+            confirmation_phase.clone(),
+            confirmation_commit.clone(),
+        )
+        .await;
+
+        match progress {
+            Ok(crate::git_ops::GitSaveProgress::CommitCreated { commit, tag }) => {
+                confirmation_phase = project::ConfirmationPhase::CommitCreated;
+                confirmation_commit = commit.clone();
+                if let Some(session) = proj.execution_session.as_mut() {
+                    session.confirmation_phase = confirmation_phase.clone();
+                    session.confirmation_commit = commit.clone();
+                    session.confirmation_candidate_tag = tag;
+                    session.confirmation_failure_kind = None;
                 }
+                write_execution_history(
+                    &mut proj,
+                    "info",
+                    project::ExecutionEventType::GitConfirmationCommitCreated,
+                    format!("Git 确认提交已创建：{}", commit),
+                    Some(&milestone_id),
+                    Some(&mid_stage_id),
+                    Some(&subtask_id),
+                );
+                if let Err(error) = crate::save_project(&proj) {
+                    let message = format!("确认提交已创建，但事务阶段保存失败：{}", error);
+                    mark_confirmation_blocked(
+                        &mut proj,
+                        project::GitConfirmationFailureKind::ProjectFinalizationFailed,
+                        message.clone(),
+                    );
+                    let _ = crate::save_project(&proj);
+                    return Err(message);
+                }
+            }
+            Ok(crate::git_ops::GitSaveProgress::TagCreated { commit, tag }) => {
+                confirmation_phase = project::ConfirmationPhase::TagCreated;
+                confirmation_commit = commit;
+                if let Some(session) = proj.execution_session.as_mut() {
+                    session.confirmation_phase = confirmation_phase.clone();
+                    session.confirmation_commit = confirmation_commit.clone();
+                    session.confirmation_candidate_tag = tag.clone();
+                    session.confirmation_failure_kind = None;
+                }
+                if let Err(error) = crate::save_project(&proj) {
+                    let message = format!("确认标签已创建，但事务阶段保存失败：{}", error);
+                    mark_confirmation_blocked(
+                        &mut proj,
+                        project::GitConfirmationFailureKind::ProjectFinalizationFailed,
+                        message.clone(),
+                    );
+                    let _ = crate::save_project(&proj);
+                    return Err(message);
+                }
+                break tag;
+            }
+            Err(error) => {
+                let message = error.message;
+                mark_confirmation_blocked(&mut proj, error.kind, message.clone());
+                crate::save_project(&proj)?;
+                return Err(format!("确认提交失败：{}。代码与质量结果已保留。", message));
             }
         }
-        Err(e) => {
-            // Git 失败：范围外/残留变更必须恢复基线；纯标签冲突留给人工处理。
-            release_confirmation_claim(&mut proj, "awaiting_confirmation");
-            let workspace_dirty = get_execution_workspace_status_inner(&project_path)
-                .map(|workspace| !workspace.working_tree_clean)
-                .unwrap_or(true);
-            let recovery = if workspace_dirty {
-                if let Some(session) = proj.execution_session.as_mut() {
-                    session.active = false;
-                    session.status = "execution_failed".to_string();
-                    session.failure_message = e.clone();
-                    session.state_entered_at = chrono::Utc::now().to_rfc3339();
-                }
-                project::AutopilotRecoveryAction::RestoreExecutionBaseline
-            } else {
-                project::AutopilotRecoveryAction::WaitHumanDecision
-            };
-            if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
-                autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
-                autopilot.error_message = e.clone();
-                autopilot.last_action = "Git 确认失败".to_string();
-                autopilot.last_action_at = chrono::Utc::now().to_rfc3339();
-                autopilot.recovery_action = recovery;
+    };
+
+    if task_diff_text.is_empty() {
+        task_diff_text = match crate::git_ops::capture_commit_diff(
+            &project_path,
+            &confirmation_commit,
+            &authorized_paths,
+        ) {
+            Ok(diff) => diff,
+            Err(error) => {
+                let message = format!("确认标签已创建，但读取提交差异失败：{}", error);
+                mark_confirmation_blocked(
+                    &mut proj,
+                    project::GitConfirmationFailureKind::ProjectFinalizationFailed,
+                    message.clone(),
+                );
+                crate::save_project(&proj)?;
+                return Err(message);
             }
+        };
+    }
+    let constitution_changed = match crate::git_ops::commit_changed_path(
+        &project_path,
+        &confirmation_commit,
+        "CONSTITUTION.md",
+    ) {
+        Ok(changed) => changed,
+        Err(error) => {
+            let message = format!("确认标签已创建，但读取收口文件失败：{}", error);
+            mark_confirmation_blocked(
+                &mut proj,
+                project::GitConfirmationFailureKind::ProjectFinalizationFailed,
+                message.clone(),
+            );
             crate::save_project(&proj)?;
-            return Err(format!("确认提交失败：{}。任务未标记为通过。", e));
+            return Err(message);
+        }
+    };
+    if pending_constitution_entry.is_none()
+        && !proj
+            .constitution_change_history
+            .iter()
+            .any(|entry| entry.subtask_id == subtask_id)
+        && constitution_changed
+    {
+        let constitution_path = std::path::Path::new(&project_path).join("CONSTITUTION.md");
+        if let Ok(content) = std::fs::read_to_string(constitution_path) {
+            let diff_summary = crate::diff::extract_diff_summary(&task_diff_text);
+            pending_constitution_entry = Some(project::ConstitutionChangeEntry {
+                timestamp: now.clone(),
+                subtask_id: subtask_id.clone(),
+                subtask_title: subtask_title.clone(),
+                change_summary: build_constitution_change_summary(&diff_summary),
+                token_estimate: crate::constitution::estimate_tokens(&extract_constitution_part2(
+                    &content,
+                )),
+            });
+        }
+    }
+
+    if let Some(session) = proj.execution_session.as_mut() {
+        session.confirmation_phase = project::ConfirmationPhase::ProjectFinalizing;
+    }
+    if let Err(error) = crate::save_project(&proj) {
+        let message = format!("Git 标签已创建，但项目收口准备失败：{}", error);
+        mark_confirmation_blocked(
+            &mut proj,
+            project::GitConfirmationFailureKind::ProjectFinalizationFailed,
+            message.clone(),
+        );
+        let _ = crate::save_project(&proj);
+        return Err(message);
+    }
+
+    if let Some(ms) = proj.milestones.iter_mut().find(|m| m.id == milestone_id) {
+        if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == mid_stage_id) {
+            if let Some(st) = mid.subtasks.get_mut(subtask_idx) {
+                st.status = if st.human_verification.as_ref().is_some_and(|verification| {
+                    verification.resolution == project::HumanResolution::AcceptDeviation
+                }) {
+                    project::SubtaskStatus::AcceptedDeviation
+                } else {
+                    project::SubtaskStatus::Passed
+                };
+                st.confirmed_by_user = Some(true);
+                st.confirmed_at = Some(now.clone());
+                st.auto_tag = Some(tag_name);
+            }
         }
     }
 
@@ -1604,6 +1875,29 @@ pub(crate) async fn confirm_subtask_result(
         Some(&mid_stage_id),
         Some(&subtask_id),
     );
+    write_execution_history(
+        &mut proj,
+        "success",
+        project::ExecutionEventType::GitConfirmationCompleted,
+        format!("Git 确认事务完成：{}", transaction_id),
+        Some(&milestone_id),
+        Some(&mid_stage_id),
+        Some(&subtask_id),
+    );
+
+    let autopilot_active = proj.workflow_state.autopilot_active;
+    if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+        if autopilot.recovery_action == project::AutopilotRecoveryAction::RetryGitConfirmation {
+            autopilot.recovery_action = project::AutopilotRecoveryAction::None;
+            autopilot.error_message.clear();
+            autopilot.last_action = format!("Git 确认完成：{}", subtask_title);
+            autopilot.last_action_at = now.clone();
+            if autopilot_active && autopilot.run_status == project::AutopilotRunStatus::ErrorStopped
+            {
+                autopilot.run_status = project::AutopilotRunStatus::Running;
+            }
+        }
+    }
 
     // Clear execution session before saving (小阶段已确认)
     proj.execution_session = None;
@@ -1634,12 +1928,29 @@ pub(crate) async fn confirm_subtask_result(
         }
     }
 
-    let proj = crate::save_and_reload_project(&proj)?;
+    let mut proj = match crate::save_and_reload_project(&proj) {
+        Ok(project) => project,
+        Err(error) => {
+            let message = format!("Git 标签已创建，但项目收口失败：{}", error);
+            if let Ok(mut persisted) = crate::load_project(&project_name) {
+                mark_confirmation_blocked(
+                    &mut persisted,
+                    project::GitConfirmationFailureKind::ProjectFinalizationFailed,
+                    message.clone(),
+                );
+                let _ = crate::save_project(&persisted);
+            }
+            return Err(message);
+        }
+    };
 
     // === 中阶段节点 Git 标签（项目状态已持久化，标签为补充元数据） ===
     if all_subtasks_passed {
         match crate::git_ops::git_save_node(
             project_path.clone(),
+            milestone_id.clone(),
+            mid_stage_id.clone(),
+            transaction_id.clone(),
             mid_version_for_node_tag,
             mid_title_for_node_tag,
         )
@@ -1656,6 +1967,8 @@ pub(crate) async fn confirm_subtask_result(
                         "[execution] 中阶段 git_tag 写入失败（项目状态已推进）：{}",
                         e
                     );
+                } else {
+                    proj = crate::load_project(&project_name)?;
                 }
             }
             Err(e) => {
@@ -1669,7 +1982,7 @@ pub(crate) async fn confirm_subtask_result(
 
     // Clear pipeline state
     {
-        let mut guard = state.pipeline_state.lock().await;
+        let mut guard = pipeline_state.lock().await;
         if let Some(s) = guard.as_mut() {
             s.status = PipelineStatus::Idle;
             s.awaiting_confirmation = false;
@@ -1678,6 +1991,29 @@ pub(crate) async fn confirm_subtask_result(
     }
 
     Ok(proj)
+}
+
+/// 对结构化 Git 确认阻断执行同一事务的幂等续跑。
+#[tauri::command]
+pub(crate) async fn retry_git_confirmation(
+    state: tauri::State<'_, AppState>,
+    project_name: String,
+) -> Result<project::Project, String> {
+    let proj = crate::load_project(&project_name)?;
+    let session = proj
+        .execution_session
+        .as_ref()
+        .filter(|session| {
+            session.parsed_status() == project::ExecutionSessionStatus::ConfirmationBlocked
+        })
+        .ok_or("当前没有受阻的 Git 确认事务。".to_string())?;
+    if !confirmation_failure_is_retryable(session.confirmation_failure_kind.as_ref()) {
+        return Err(
+            "当前 Git 确认阻断属于不可变标签或事务完整性问题，需要人工核对，禁止机械重试。"
+                .to_string(),
+        );
+    }
+    confirm_subtask_result_with_pipeline(&state.pipeline_state, project_name).await
 }
 
 /// V1 驳回小阶段执行结果（用户点击"发现问题"）
@@ -3042,11 +3378,6 @@ pub(crate) async fn preview_rollback_impact(
         .iter()
         .map(|(_, _, st)| st.title.clone())
         .collect();
-    let deleted_tags: Vec<String> = all_subtasks[cp_idx + 1..]
-        .iter()
-        .filter_map(|(_, _, st)| st.auto_tag.clone())
-        .collect();
-
     let target_tag = all_subtasks[cp_idx]
         .2
         .auto_tag
@@ -3057,7 +3388,8 @@ pub(crate) async fn preview_rollback_impact(
         target_checkpoint: format!("{} (tag: {})", all_subtasks[cp_idx].2.title, target_tag),
         retained_nodes: retained,
         discarded_nodes: discarded,
-        deleted_tags,
+        // 不可变标签是审计事实；回退只移动工作树和项目引用，不删除任何标签。
+        deleted_tags: Vec::new(),
         regeneration_scope: format!("从「{}」之后重新生成执行计划", all_subtasks[cp_idx].2.title),
         includes_code_rollback: true,
     })
@@ -3072,27 +3404,17 @@ pub(crate) async fn confirm_rollback(
     let mut proj = crate::load_project(&project_name)?;
     let project_path = proj.project_path.clone();
 
-    // Find checkpoint subtask and collect every later tag in global execution order.
+    // Find checkpoint subtask. Later immutable labels remain in Git as audit history.
     let mut checkpoint_tag: Option<String> = None;
     let mut checkpoint_found = false;
-    let mut discarded_tags = Vec::new();
 
     for ms in &proj.milestones {
         for mid in &ms.mid_stages {
-            let mut mid_has_discarded_task = false;
             for st in &mid.subtasks {
                 if st.id == checkpoint_subtask_id {
                     checkpoint_tag = st.auto_tag.clone();
                     checkpoint_found = true;
-                } else if checkpoint_found {
-                    mid_has_discarded_task = true;
-                    if let Some(tag) = st.auto_tag.clone() {
-                        discarded_tags.push(tag);
-                    }
                 }
-            }
-            if mid_has_discarded_task && !mid.git_tag.is_empty() {
-                discarded_tags.push(mid.git_tag.clone());
             }
         }
     }
@@ -3104,8 +3426,6 @@ pub(crate) async fn confirm_rollback(
     let checkpoint_tag = checkpoint_tag.ok_or("检查点缺少 Git 标签，拒绝回退".to_string())?;
     crate::git_ops::git_reset_to_tag_clean(&project_path, &checkpoint_tag)
         .map_err(|e| format!("Git 回退失败：{}", e))?;
-    crate::git_ops::delete_tags(&project_path, &discarded_tags)
-        .map_err(|error| format!("清理废弃 Git 标签失败：{}", error))?;
 
     // Update project data in the same global order used by the preview.
     let mut passed_checkpoint = false;
@@ -3225,7 +3545,7 @@ pub(crate) fn find_last_passed_subtask(proj: &project::Project) -> Option<projec
 }
 
 /// 执行状态对账结果
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionReconciliation {
     /// 正常停留在 Execution，当前没有活跃会话，等待启动下一个小阶段
     IdleAtExecution,
@@ -3268,7 +3588,7 @@ pub fn reconcile_execution_state(
     if session.is_recoverable_failure()
         || matches!(
             session.status.as_str(),
-            "quality_blocked" | "QualityBlocked"
+            "quality_blocked" | "QualityBlocked" | "confirmation_blocked" | "ConfirmationBlocked"
         )
     {
         if session.subtask_id.is_empty() {
@@ -3493,12 +3813,154 @@ pub fn apply_execution_reconciliation(
 ///
 /// 必须在持有 `pipeline_state` 锁期间调用：先取锁、再 load、再对账/保存，
 /// 避免“先读旧盘 → 后台完成写盘 → 用旧快照覆盖”的窗口（与 ED Stop 同构）。
+fn normalize_legacy_confirmation_conflict_kind(proj: &mut project::Project) -> bool {
+    let Some(session) = proj.execution_session.as_ref() else {
+        return false;
+    };
+    if session.confirmation_failure_kind
+        != Some(project::GitConfirmationFailureKind::TagIdentityConflict)
+    {
+        return false;
+    }
+    let is_legacy_v1_conflict = session.confirmation_transaction_id.is_empty()
+        && session.confirmation_candidate_tag.is_empty()
+        && session.confirmation_commit.is_empty()
+        && session.confirmation_phase == project::ConfirmationPhase::NotStarted;
+    let normalized = if is_legacy_v1_conflict {
+        project::GitConfirmationFailureKind::LegacyV1TagConflict
+    } else {
+        project::GitConfirmationFailureKind::V2TagIntegrityConflict
+    };
+    if let Some(session) = proj.execution_session.as_mut() {
+        session.confirmation_failure_kind = Some(normalized.clone());
+    }
+    if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+        autopilot.recovery_action = confirmation_recovery_action(&normalized);
+    }
+    true
+}
+
+fn migrate_legacy_v1_confirmation_conflict(proj: &mut project::Project) -> bool {
+    let Some(session) = proj.execution_session.as_ref() else {
+        return false;
+    };
+    if !session.confirmation_transaction_id.is_empty()
+        || !matches!(
+            session.status.as_str(),
+            "execution_failed"
+                | "ExecutionFailed"
+                | "awaiting_confirmation"
+                | "AwaitingConfirmation"
+        )
+    {
+        return false;
+    }
+
+    let milestone_id = session.milestone_id.clone();
+    let mid_stage_id = session.mid_stage_id.clone();
+    let subtask_id = session.subtask_id.clone();
+    let Some((mid_version, subtask_index, authorized_paths)) = proj
+        .milestones
+        .iter()
+        .find(|milestone| milestone.id == milestone_id)
+        .and_then(|milestone| {
+            milestone
+                .mid_stages
+                .iter()
+                .find(|mid_stage| mid_stage.id == mid_stage_id)
+        })
+        .and_then(|mid_stage| {
+            mid_stage
+                .subtasks
+                .iter()
+                .enumerate()
+                .find(|(_, subtask)| {
+                    subtask.id == subtask_id
+                        && subtask.status == project::SubtaskStatus::AwaitingConfirmation
+                })
+                .and_then(|(index, subtask)| {
+                    crate::plan_contract::validate_subtask(
+                        subtask,
+                        &format!("第 {} 个小阶段", index + 1),
+                    )
+                    .ok()
+                    .map(|paths| (mid_stage.version.clone(), (index + 1) as u32, paths))
+                })
+        })
+    else {
+        return false;
+    };
+
+    let mut quality_candidate = proj.clone();
+    if let Some(candidate_session) = quality_candidate.execution_session.as_mut() {
+        candidate_session.status = "awaiting_confirmation".to_string();
+        candidate_session.active = true;
+    }
+    if validate_subtask_quality_gate(&quality_candidate).is_err() {
+        return false;
+    }
+    let legacy_conflict = crate::git_ops::is_legacy_v1_tag_conflict(
+        &proj.project_path,
+        &mid_version,
+        subtask_index,
+        &authorized_paths,
+    )
+    .unwrap_or(false);
+    if !legacy_conflict {
+        return false;
+    }
+
+    let message =
+        "检测到旧 V1 标签身份碰撞；代码与质量结果已保留，可改用 V2 标签重新确认提交。".to_string();
+    mark_confirmation_blocked(
+        proj,
+        project::GitConfirmationFailureKind::LegacyV1TagConflict,
+        message,
+    );
+    true
+}
+
 pub(crate) fn reconcile_loaded_project_under_pipeline_lock(
     proj: &mut project::Project,
     pipeline_status: Option<&PipelineState>,
 ) -> bool {
+    let mut modified = normalize_legacy_confirmation_conflict_kind(proj);
+    modified |= migrate_legacy_v1_confirmation_conflict(proj);
     let reconciliation = reconcile_execution_state(proj, pipeline_status);
-    apply_execution_reconciliation(proj, &reconciliation)
+    if reconciliation == ExecutionReconciliation::AwaitingConfirmation {
+        let interrupted_claim = proj
+            .execution_session
+            .as_ref()
+            .map(|session| session.status.clone());
+        match interrupted_claim.as_deref() {
+            Some("confirming") => {
+                let has_transaction = proj
+                    .execution_session
+                    .as_ref()
+                    .is_some_and(|session| !session.confirmation_transaction_id.is_empty());
+                if has_transaction {
+                    mark_confirmation_blocked(
+                        proj,
+                        project::GitConfirmationFailureKind::ProjectFinalizationFailed,
+                        "上次 Git 确认在收口前中断；代码与质量结果已保留。".to_string(),
+                    );
+                } else if let Some(session) = proj.execution_session.as_mut() {
+                    session.status = "awaiting_confirmation".to_string();
+                    session.state_entered_at = chrono::Utc::now().to_rfc3339();
+                }
+                modified = true;
+            }
+            Some("rejecting") => {
+                if let Some(session) = proj.execution_session.as_mut() {
+                    session.status = "awaiting_confirmation".to_string();
+                    session.state_entered_at = chrono::Utc::now().to_rfc3339();
+                }
+                modified = true;
+            }
+            _ => {}
+        }
+    }
+    apply_execution_reconciliation(proj, &reconciliation) || modified
 }
 
 /// 启动时对账执行状态：取流水线锁 → 加载最新项目 → reconcile → apply → 保存。
@@ -3534,6 +3996,14 @@ pub(crate) async fn acknowledge_execution_recovery(
     project_name: String,
 ) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
+    if proj.execution_session.as_ref().is_some_and(|session| {
+        session.parsed_status() == project::ExecutionSessionStatus::ConfirmationBlocked
+    }) {
+        return Err(
+            "当前是 Git 确认受阻，代码与质量结果已保留；请使用“重新确认提交”，不得恢复执行基线。"
+                .to_string(),
+        );
+    }
     let project_path = proj.project_path.clone();
     let waiting_engine = proj
         .workflow_state
@@ -3928,6 +4398,11 @@ mod tests {
             status: status.to_string(),
             base_commit: base_commit.to_string(),
             failure_message: String::new(),
+            confirmation_transaction_id: String::new(),
+            confirmation_phase: project::ConfirmationPhase::NotStarted,
+            confirmation_candidate_tag: String::new(),
+            confirmation_commit: String::new(),
+            confirmation_failure_kind: None,
             started_at: "2026-07-20T00:00:00Z".to_string(),
             state_entered_at: "2026-07-20T00:00:00Z".to_string(),
             plan_revision: 1,
@@ -5717,7 +6192,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_confirmation_claim_reconciles_as_awaiting() {
+    fn git_confirmation_incomplete_claim_reconciles_as_awaiting() {
         let proj = execution_project(
             "claim-crash",
             Path::new(""),
@@ -5731,7 +6206,39 @@ mod tests {
     }
 
     #[test]
-    fn claim_confirmation_is_exclusive() -> Result<(), String> {
+    fn git_confirmation_interrupted_transaction_becomes_retryable_block() {
+        let mut session = execution_session("confirming", "execution-claim", "HEAD");
+        session.confirmation_transaction_id = "transaction-interrupted".to_string();
+        session.confirmation_phase = project::ConfirmationPhase::CommitCreated;
+        session.confirmation_commit = "commit-interrupted".to_string();
+        let mut proj = execution_project(
+            "claim-crash",
+            Path::new(""),
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(session),
+        );
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState::default());
+
+        assert!(reconcile_loaded_project_under_pipeline_lock(
+            &mut proj, None
+        ));
+        let session = proj.execution_session.as_ref().unwrap();
+        assert_eq!(session.status, "confirmation_blocked");
+        assert_eq!(
+            session.confirmation_failure_kind,
+            Some(project::GitConfirmationFailureKind::ProjectFinalizationFailed)
+        );
+        assert_eq!(
+            proj.workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|autopilot| &autopilot.recovery_action),
+            Some(&project::AutopilotRecoveryAction::RetryGitConfirmation)
+        );
+    }
+
+    #[test]
+    fn git_confirmation_claim_is_exclusive_and_reuses_transaction() -> Result<(), String> {
         let project_name = unique_project_name("claim-excl");
         let _guard = ProjectDataGuard::new(&project_name)?;
         let mut proj = execution_project(
@@ -5751,12 +6258,351 @@ mod tests {
             proj.execution_session.as_ref().map(|s| s.status.as_str()),
             Some("confirming")
         );
+        let transaction_id = proj
+            .execution_session
+            .as_ref()
+            .map(|session| session.confirmation_transaction_id.clone())
+            .ok_or("缺少确认会话".to_string())?;
+        let candidate_tag = proj
+            .execution_session
+            .as_ref()
+            .map(|session| session.confirmation_candidate_tag.clone())
+            .ok_or("缺少确认会话".to_string())?;
+        assert!(!transaction_id.is_empty());
+        assert!(candidate_tag.contains(&transaction_id));
 
         let mut second = crate::load_project(&project_name)?;
         let err = claim_awaiting_confirmation_under_lock(&mut second, "confirming")
             .err()
             .ok_or("第二次认领应失败".to_string())?;
         assert!(err.contains("正在进行中") || err.contains("重复"));
+
+        if let Some(session) = second.execution_session.as_mut() {
+            session.status = "confirmation_blocked".to_string();
+            session.confirmation_failure_kind =
+                Some(project::GitConfirmationFailureKind::TagFailed);
+        }
+        crate::save_project(&second)?;
+        let mut retry = crate::load_project(&project_name)?;
+        claim_awaiting_confirmation_under_lock(&mut retry, "confirming")?;
+        let retry_session = retry
+            .execution_session
+            .as_ref()
+            .ok_or("缺少重试确认会话".to_string())?;
+        assert_eq!(retry_session.confirmation_transaction_id, transaction_id);
+        assert_eq!(retry_session.confirmation_candidate_tag, candidate_tag);
+        Ok(())
+    }
+
+    #[test]
+    fn git_confirmation_normalizes_persisted_generic_conflicts_by_transaction_facts() {
+        let mut legacy = execution_project(
+            "legacy-generic-conflict",
+            Path::new(""),
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(execution_session(
+                "confirmation_blocked",
+                "execution-legacy-generic",
+                "HEAD",
+            )),
+        );
+        legacy.workflow_state.autopilot_state = Some(project::AutopilotState::default());
+        legacy
+            .execution_session
+            .as_mut()
+            .unwrap()
+            .confirmation_failure_kind =
+            Some(project::GitConfirmationFailureKind::TagIdentityConflict);
+
+        assert!(normalize_legacy_confirmation_conflict_kind(&mut legacy));
+        assert_eq!(
+            legacy
+                .execution_session
+                .as_ref()
+                .and_then(|session| session.confirmation_failure_kind.as_ref()),
+            Some(&project::GitConfirmationFailureKind::LegacyV1TagConflict)
+        );
+        assert_eq!(
+            legacy
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|autopilot| &autopilot.recovery_action),
+            Some(&project::AutopilotRecoveryAction::RetryGitConfirmation)
+        );
+
+        let mut v2 = legacy.clone();
+        let v2_session = v2.execution_session.as_mut().unwrap();
+        v2_session.confirmation_failure_kind =
+            Some(project::GitConfirmationFailureKind::TagIdentityConflict);
+        v2_session.confirmation_transaction_id = "persisted-transaction".to_string();
+        v2_session.confirmation_phase = project::ConfirmationPhase::Preparing;
+        v2.workflow_state
+            .autopilot_state
+            .as_mut()
+            .unwrap()
+            .recovery_action = project::AutopilotRecoveryAction::RetryGitConfirmation;
+
+        assert!(normalize_legacy_confirmation_conflict_kind(&mut v2));
+        assert_eq!(
+            v2.execution_session
+                .as_ref()
+                .and_then(|session| session.confirmation_failure_kind.as_ref()),
+            Some(&project::GitConfirmationFailureKind::V2TagIntegrityConflict)
+        );
+        assert_eq!(
+            v2.workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|autopilot| &autopilot.recovery_action),
+            Some(&project::AutopilotRecoveryAction::WaitHumanDecision)
+        );
+    }
+
+    #[tokio::test]
+    async fn git_confirmation_v2_integrity_conflict_stops_for_human_without_committing(
+    ) -> Result<(), String> {
+        let repo = TempGitRepo::new("v2-integrity-conflict")?;
+        let project_name = unique_project_name("v2-integrity-conflict");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let transaction_id = "transaction-owned-elsewhere";
+        let candidate_tag =
+            crate::git_ops::subtask_v2_tag("milestone-1", "mid-1", "subtask-1", transaction_id);
+        let unrelated_commit = repo.head()?;
+        repo.git(&["tag", &candidate_tag, &unrelated_commit])?;
+        std::fs::write(repo.path.join("tracked.txt"), "approved task change\n")
+            .map_err(|error| format!("写入待确认变更失败：{}", error))?;
+
+        let mut session = execution_session(
+            "awaiting_confirmation",
+            "v2-integrity-execution",
+            &unrelated_commit,
+        );
+        session.confirmation_transaction_id = transaction_id.to_string();
+        session.confirmation_phase = project::ConfirmationPhase::Preparing;
+        session.confirmation_candidate_tag = candidate_tag.clone();
+        let mut proj = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(session),
+        );
+        let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+        subtask.execution_result = Some(project::ExecutionResult {
+            success: true,
+            output: "approved execution".to_string(),
+            ..Default::default()
+        });
+        subtask.test_result = Some(project::TestResult {
+            passed: true,
+            review_passed: true,
+            ..Default::default()
+        });
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            run_status: project::AutopilotRunStatus::Running,
+            ..Default::default()
+        });
+        crate::save_project(&proj)?;
+        let pipeline = Arc::new(Mutex::new(Some(pipeline_state(
+            "v2-integrity-execution",
+            PipelineStatus::Paused,
+        ))));
+        let commit_count = repo.git(&["rev-list", "--count", "HEAD"])?;
+
+        let error = confirm_subtask_result_with_pipeline(&pipeline, project_name.clone())
+            .await
+            .expect_err("V2 标签完整性冲突必须阻断确认");
+        assert!(error.contains("代码与质量结果已保留"));
+
+        let blocked = crate::load_project(&project_name)?;
+        let blocked_session = blocked
+            .execution_session
+            .as_ref()
+            .ok_or("V2 冲突后缺少确认会话".to_string())?;
+        assert_eq!(blocked_session.status, "confirmation_blocked");
+        assert_eq!(
+            blocked_session.confirmation_failure_kind,
+            Some(project::GitConfirmationFailureKind::V2TagIntegrityConflict)
+        );
+        assert_eq!(
+            blocked
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|autopilot| &autopilot.recovery_action),
+            Some(&project::AutopilotRecoveryAction::WaitHumanDecision)
+        );
+        assert_eq!(
+            blocked.milestones[0].mid_stages[0].subtasks[0].retry_count,
+            0
+        );
+        assert!(blocked.milestones[0].mid_stages[0].subtasks[0]
+            .execution_result
+            .as_ref()
+            .is_some_and(|result| result.success));
+        assert!(blocked.milestones[0].mid_stages[0].subtasks[0]
+            .test_result
+            .as_ref()
+            .is_some_and(|result| result.passed));
+        assert_eq!(
+            crate::git_ops::tag_target(&repo.path_string(), &candidate_tag)?,
+            Some(unrelated_commit)
+        );
+        assert_eq!(repo.git(&["rev-list", "--count", "HEAD"])?, commit_count);
+        assert!(repo.git(&["status", "--short"])?.contains("tracked.txt"));
+
+        let retry_error = confirm_subtask_result_with_pipeline(&pipeline, project_name.clone())
+            .await
+            .expect_err("不可重试的 V2 完整性冲突必须拒绝再次认领");
+        assert!(retry_error.contains("禁止机械重试"));
+        assert_eq!(repo.git(&["rev-list", "--count", "HEAD"])?, commit_count);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn git_confirmation_migrates_legacy_v1_collision_and_completes_v2_confirmation(
+    ) -> Result<(), String> {
+        let repo = TempGitRepo::new("legacy-tag-collision")?;
+        let legacy_target = repo.head()?;
+        repo.git(&["tag", "metheus/auto/v0.1.1/task-1", &legacy_target])?;
+        repo.git(&["commit", "--allow-empty", "-m", "other milestone task"])?;
+        std::fs::write(repo.path.join("tracked.txt"), "approved task change\n")
+            .map_err(|error| format!("写入待确认变更失败：{}", error))?;
+
+        let project_name = unique_project_name("legacy-confirmation");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut session = execution_session("execution_failed", "legacy-execution", &repo.head()?);
+        session.active = false;
+        session.failure_message = "legacy opaque failure".to_string();
+        let mut proj = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(session),
+        );
+        let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+        subtask.execution_result = Some(project::ExecutionResult {
+            success: true,
+            output: "approved execution result".to_string(),
+            ..Default::default()
+        });
+        subtask.test_result = Some(project::TestResult {
+            passed: true,
+            review_passed: true,
+            suggestion: "approved quality result".to_string(),
+            ..Default::default()
+        });
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            recovery_action: project::AutopilotRecoveryAction::RestoreExecutionBaseline,
+            ..Default::default()
+        });
+
+        assert!(reconcile_loaded_project_under_pipeline_lock(
+            &mut proj, None
+        ));
+        let migrated = proj
+            .execution_session
+            .as_ref()
+            .ok_or("迁移后缺少确认会话".to_string())?;
+        assert_eq!(migrated.status, "confirmation_blocked");
+        assert_eq!(
+            migrated.confirmation_failure_kind,
+            Some(project::GitConfirmationFailureKind::LegacyV1TagConflict)
+        );
+        assert!(migrated.confirmation_transaction_id.is_empty());
+        assert_eq!(
+            proj.milestones[0].mid_stages[0].subtasks[0].status,
+            project::SubtaskStatus::AwaitingConfirmation
+        );
+        assert!(proj.milestones[0].mid_stages[0].subtasks[0]
+            .execution_result
+            .as_ref()
+            .is_some_and(|result| result.success));
+        assert!(proj.milestones[0].mid_stages[0].subtasks[0]
+            .test_result
+            .as_ref()
+            .is_some_and(|result| result.passed));
+        assert_eq!(
+            proj.workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|autopilot| &autopilot.recovery_action),
+            Some(&project::AutopilotRecoveryAction::RetryGitConfirmation)
+        );
+        assert_eq!(
+            crate::git_ops::tag_target(&repo.path_string(), "metheus/auto/v0.1.1/task-1")?,
+            Some(legacy_target.clone())
+        );
+        assert!(repo.git(&["status", "--short"])?.contains("tracked.txt"));
+
+        let retry_count = proj.milestones[0].mid_stages[0].subtasks[0].retry_count;
+        let plan_regeneration_count = proj.milestones[0].mid_stages[0].plan_regeneration_count;
+        crate::save_project(&proj)?;
+        let pipeline = Arc::new(Mutex::new(Some(pipeline_state(
+            "legacy-execution",
+            PipelineStatus::Paused,
+        ))));
+
+        let confirmed =
+            confirm_subtask_result_with_pipeline(&pipeline, project_name.clone()).await?;
+        let confirmed_subtask = &confirmed.milestones[0].mid_stages[0].subtasks[0];
+        assert_eq!(confirmed_subtask.status, project::SubtaskStatus::Passed);
+        assert_eq!(confirmed_subtask.retry_count, retry_count);
+        assert_eq!(
+            confirmed.milestones[0].mid_stages[0].plan_regeneration_count,
+            plan_regeneration_count
+        );
+        assert_eq!(
+            confirmed_subtask
+                .execution_result
+                .as_ref()
+                .map(|result| result.output.as_str()),
+            Some("approved execution result")
+        );
+        assert_eq!(
+            confirmed_subtask
+                .test_result
+                .as_ref()
+                .map(|result| result.suggestion.as_str()),
+            Some("approved quality result")
+        );
+        let v2_tag = confirmed_subtask
+            .auto_tag
+            .as_ref()
+            .ok_or("确认完成后缺少 V2 标签".to_string())?;
+        assert!(v2_tag.starts_with("metheus/v2/subtask/milestone-1/mid-1/subtask-1/"));
+        assert!(crate::git_ops::tag_target(&repo.path_string(), v2_tag)?.is_some());
+        assert_eq!(
+            crate::git_ops::tag_target(&repo.path_string(), "metheus/auto/v0.1.1/task-1")?,
+            Some(legacy_target)
+        );
+        assert!(confirmed.execution_session.is_none());
+        let autopilot = confirmed
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .ok_or("确认完成后缺少自动驾驶状态".to_string())?;
+        assert_eq!(
+            autopilot.recovery_action,
+            project::AutopilotRecoveryAction::None
+        );
+        assert_eq!(
+            autopilot.run_status,
+            project::AutopilotRunStatus::WaitingMilestoneReview
+        );
+        let pipeline = pipeline.lock().await;
+        assert_eq!(
+            pipeline.as_ref().map(|state| &state.status),
+            Some(&PipelineStatus::Idle)
+        );
+        assert_eq!(
+            pipeline.as_ref().map(|state| state.awaiting_confirmation),
+            Some(false)
+        );
         Ok(())
     }
 }

@@ -2,6 +2,7 @@ import type {
   AcceptanceLedgerItem,
   AutopilotRecoveryAction,
   AutopilotRunStatus,
+  GitConfirmationFailureKind,
   PipelineState,
   RecoveryState,
   TestResult,
@@ -99,12 +100,46 @@ export function executionPollingOwnsNextAdvance(state: PipelineState): boolean {
   return state.status === "Running";
 }
 
+export interface GitConfirmationBlockPresentation {
+  canRetry: boolean;
+  hint: string;
+}
+
+export function getGitConfirmationBlockPresentation(
+  failureKind: GitConfirmationFailureKind | undefined,
+): GitConfirmationBlockPresentation {
+  switch (failureKind) {
+    case "LegacyV1TagConflict":
+    case "CommitFailed":
+    case "TagFailed":
+    case "ProjectFinalizationFailed":
+    case "GitMetadataUnavailable":
+      return {
+        canRetry: true,
+        hint: "修复 Git 环境后可续跑同一确认事务，不会重新执行代码或质量检查。",
+      };
+    case "ScopeViolation":
+      return {
+        canRetry: false,
+        hint: "请先人工处理任务范围外的工作区变更。",
+      };
+    case "V2TagIntegrityConflict":
+    case "TagIdentityConflict":
+    default:
+      return {
+        canRetry: false,
+        hint: "请人工核对 V2 不可变标签与确认提交；系统不会覆盖、移动或删除标签。",
+      };
+  }
+}
+
 export interface AutopilotErrorActions {
   canResume: boolean;
   canRetryAdvance: boolean;
   canRegeneratePlan: boolean;
   canPrepareWorkspace: boolean;
   canRefreshWorkspace: boolean;
+  canRetryGitConfirmation: boolean;
   canClose: boolean;
 }
 
@@ -123,7 +158,8 @@ export function getAutopilotErrorActions(
       && recoveryAction !== "RegenerateExecutionPlan"
       && recoveryAction !== "PrepareExecutionWorkspace"
       && recoveryAction !== "ResolveWorkspaceChanges"
-      && recoveryAction !== "RunAutomaticRecovery",
+      && recoveryAction !== "RunAutomaticRecovery"
+      && recoveryAction !== "RetryGitConfirmation",
     canRetryAdvance:
       runStatus === "ErrorStopped" && recoveryAction === "RetryAutopilotAdvance",
     canRegeneratePlan:
@@ -132,6 +168,8 @@ export function getAutopilotErrorActions(
       runStatus === "ErrorStopped" && recoveryAction === "PrepareExecutionWorkspace",
     canRefreshWorkspace:
       runStatus === "ErrorStopped" && recoveryAction === "ResolveWorkspaceChanges",
+    canRetryGitConfirmation:
+      runStatus === "ErrorStopped" && recoveryAction === "RetryGitConfirmation",
     canClose: isStopped,
   };
 }

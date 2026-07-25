@@ -1488,6 +1488,9 @@ pub(crate) async fn autopilot_resume(project_name: String) -> Result<project::Pr
                     project::AutopilotRecoveryAction::RunAutomaticRecovery => {
                         return Err("自动错误恢复正在进行，不能手动跳过。".to_string());
                     }
+                    project::AutopilotRecoveryAction::RetryGitConfirmation => {
+                        return Err("Git 确认受阻，请先重新确认提交。".to_string());
+                    }
                     project::AutopilotRecoveryAction::None
                     | project::AutopilotRecoveryAction::RetryAutopilotAdvance => {}
                 }
@@ -1496,6 +1499,7 @@ pub(crate) async fn autopilot_resume(project_name: String) -> Result<project::Pr
                     if let Some(ref session) = proj.execution_session {
                         if session.status == "awaiting_confirmation"
                             || session.status == "quality_blocked"
+                            || session.status == "confirmation_blocked"
                             || session.is_recoverable_failure()
                         {
                             return Err(
@@ -3194,6 +3198,7 @@ mod tests {
             project::AutopilotRecoveryAction::PrepareExecutionWorkspace,
             project::AutopilotRecoveryAction::ResolveWorkspaceChanges,
             project::AutopilotRecoveryAction::RunAutomaticRecovery,
+            project::AutopilotRecoveryAction::RetryGitConfirmation,
         ] {
             let project_name = unique_project_name("ap-resume-blocked");
             let _guard = ProjectDataGuard::new(&project_name)?;

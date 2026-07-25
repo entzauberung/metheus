@@ -196,6 +196,7 @@ pub fn run() {
             crate::commands::milestone::summarize_milestone,
             crate::pipeline::execute_current_subtask,
             crate::pipeline::confirm_subtask_result,
+            crate::pipeline::retry_git_confirmation,
             crate::pipeline::reject_subtask_result,
             crate::pipeline::retry_current_subtask,
             crate::pipeline::get_execution_workspace_status,

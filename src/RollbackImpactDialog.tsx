@@ -125,7 +125,7 @@ function RollbackPreviewV1({ project, onPreview, onConfirm }: V1Props) {
           )}
           {impact.deleted_tags.length > 0 && (
             <div style={{ marginBottom: "8px" }}>
-              <strong>删除标签：</strong> {impact.deleted_tags.join(", ")}
+              <strong>受影响标签：</strong> {impact.deleted_tags.join(", ")}
             </div>
           )}
           <div style={{ marginBottom: "16px" }}>

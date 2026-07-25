@@ -249,7 +249,7 @@ fn atomic_write_text(path: &Path, content: &str) -> Result<(), String> {
     }
 }
 
-fn tag_target(project_path: &str, tag_name: &str) -> Result<Option<String>, String> {
+pub(crate) fn tag_target(project_path: &str, tag_name: &str) -> Result<Option<String>, String> {
     let output = Command::new("git")
         .args([
             "rev-parse",
@@ -268,93 +268,294 @@ fn tag_target(project_path: &str, tag_name: &str) -> Result<Option<String>, Stri
     }
 }
 
-fn ensure_tag_available(project_path: &str, tag_name: &str) -> Result<bool, String> {
-    let Some(existing) = tag_target(project_path, tag_name)? else {
-        return Ok(false);
-    };
-    let current = head(project_path)?;
-    if existing == current {
-        ensure_clean_workspace(project_path)?;
-        Ok(true)
+fn tag_identity_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'-' {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('_');
+            encoded.push_str(&format!("{:02x}", byte));
+        }
+    }
+    if encoded.is_empty() {
+        "empty".to_string()
     } else {
-        Err(format!(
-            "Git 标签 {} 已指向提交 {}，禁止覆盖为当前提交 {}",
-            tag_name, existing, current
-        ))
+        encoded
     }
 }
 
-fn create_immutable_tag(project_path: &str, tag_name: &str) -> Result<(), String> {
+pub(crate) fn subtask_v2_tag(
+    milestone_id: &str,
+    mid_stage_id: &str,
+    subtask_id: &str,
+    transaction_id: &str,
+) -> String {
+    format!(
+        "metheus/v2/subtask/{}/{}/{}/{}",
+        tag_identity_component(milestone_id),
+        tag_identity_component(mid_stage_id),
+        tag_identity_component(subtask_id),
+        tag_identity_component(transaction_id),
+    )
+}
+
+pub(crate) fn node_v2_tag(milestone_id: &str, mid_stage_id: &str, transaction_id: &str) -> String {
+    format!(
+        "metheus/v2/node/{}/{}/{}",
+        tag_identity_component(milestone_id),
+        tag_identity_component(mid_stage_id),
+        tag_identity_component(transaction_id),
+    )
+}
+
+fn transaction_trailer(transaction_id: &str) -> String {
+    format!("Metheus-Confirmation: {}", transaction_id)
+}
+
+fn node_transaction_trailer(transaction_id: &str) -> String {
+    format!("Metheus-Node-Confirmation: {}", transaction_id)
+}
+
+fn commit_has_trailer(project_path: &str, commit: &str, trailer: &str) -> Result<bool, String> {
+    let message = run_git(
+        project_path,
+        &["show", "-s", "--format=%B", commit],
+        "读取 Git 确认提交信息失败",
+    )?;
+    Ok(String::from_utf8_lossy(&message)
+        .lines()
+        .any(|line| line.trim() == trailer))
+}
+
+fn commit_has_transaction(
+    project_path: &str,
+    commit: &str,
+    transaction_id: &str,
+) -> Result<bool, String> {
+    commit_has_trailer(project_path, commit, &transaction_trailer(transaction_id))
+}
+
+fn commit_has_node_transaction(
+    project_path: &str,
+    commit: &str,
+    transaction_id: &str,
+) -> Result<bool, String> {
+    commit_has_trailer(
+        project_path,
+        commit,
+        &node_transaction_trailer(transaction_id),
+    )
+}
+
+fn create_immutable_tag_at(project_path: &str, tag_name: &str, commit: &str) -> Result<(), String> {
     run_git(
         project_path,
-        &["tag", tag_name],
+        &["tag", tag_name, commit],
         &format!("创建 Git 标签 {} 失败", tag_name),
     )?;
     Ok(())
 }
 
+#[cfg(test)]
+fn create_immutable_tag(project_path: &str, tag_name: &str) -> Result<(), String> {
+    let current = head(project_path)?;
+    create_immutable_tag_at(project_path, tag_name, &current)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitConfirmationError {
+    pub kind: project::GitConfirmationFailureKind,
+    pub message: String,
+}
+
+impl GitConfirmationError {
+    fn new(kind: project::GitConfirmationFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GitSaveProgress {
+    CommitCreated { commit: String, tag: String },
+    TagCreated { commit: String, tag: String },
+}
+
 /// 中阶段节点只创建空提交和不可覆盖标签；调用前工作区必须干净。
 pub(crate) async fn git_save_node(
     project_path: String,
+    milestone_id: String,
+    mid_stage_id: String,
+    transaction_id: String,
     version: String,
     title: String,
 ) -> Result<String, String> {
     ensure_clean_workspace(&project_path)?;
-    let tag_name = format!("metheus/{}", version);
-    if ensure_tag_available(&project_path, &tag_name)? {
+    let tag_name = node_v2_tag(&milestone_id, &mid_stage_id, &transaction_id);
+    if let Some(existing) = tag_target(&project_path, &tag_name)? {
+        if commit_has_node_transaction(&project_path, &existing, &transaction_id)? {
+            return Ok(tag_name);
+        }
+        return Err(format!(
+            "Git 标签 {} 已指向其他确认事务的提交 {}，禁止覆盖",
+            tag_name, existing
+        ));
+    }
+    let current = head(&project_path)?;
+    if commit_has_node_transaction(&project_path, &current, &transaction_id)? {
+        create_immutable_tag_at(&project_path, &tag_name, &current)?;
         return Ok(tag_name);
     }
 
-    let commit_message = format!("【弥】节点 {}: {}", version, title);
+    let commit_message = format!(
+        "【弥】节点 {}: {}\n\n{}",
+        version,
+        title,
+        node_transaction_trailer(&transaction_id)
+    );
     run_git(
         &project_path,
         &["commit", "--allow-empty", "-m", &commit_message],
         "创建中阶段节点提交失败",
     )?;
-    create_immutable_tag(&project_path, &tag_name)?;
+    let commit = head(&project_path)?;
+    create_immutable_tag_at(&project_path, &tag_name, &commit)?;
     Ok(tag_name)
 }
 
-/// 小阶段确认只暂存计划授权路径和经过原内容校验的系统生成文件，并创建不可覆盖标签。
+/// 小阶段确认事务一次只推进一个持久化阶段：先提交，再由调用方落盘后补建标签。
 pub(crate) async fn git_save_subtask(
     project_path: String,
+    milestone_id: String,
+    mid_stage_id: String,
+    subtask_id: String,
+    transaction_id: String,
     subtask_index: u32,
     mid_stage_version: String,
     subtask_title: String,
     authorized_paths: Vec<String>,
     generated_file: Option<GeneratedFileUpdate>,
-) -> Result<String, String> {
+    confirmation_phase: project::ConfirmationPhase,
+    confirmation_commit: String,
+) -> Result<GitSaveProgress, GitConfirmationError> {
     if authorized_paths.is_empty() {
-        return Err("小阶段授权文件范围为空，拒绝提交".to_string());
+        return Err(GitConfirmationError::new(
+            project::GitConfirmationFailureKind::ScopeViolation,
+            "小阶段授权文件范围为空，拒绝提交",
+        ));
     }
-    let tag_name = format!("metheus/auto/{}/task-{}", mid_stage_version, subtask_index);
-    if ensure_tag_available(&project_path, &tag_name)? {
-        return Ok(tag_name);
+    if transaction_id.is_empty() {
+        return Err(GitConfirmationError::new(
+            project::GitConfirmationFailureKind::CommitFailed,
+            "确认事务标识为空，拒绝执行 Git 保存",
+        ));
     }
-    ensure_only_authorized_changes(&project_path, &authorized_paths)?;
+    let tag_name = subtask_v2_tag(&milestone_id, &mid_stage_id, &subtask_id, &transaction_id);
+
+    if let Some(existing) = tag_target(&project_path, &tag_name).map_err(|message| {
+        GitConfirmationError::new(project::GitConfirmationFailureKind::TagFailed, message)
+    })? {
+        if commit_has_transaction(&project_path, &existing, &transaction_id).map_err(|message| {
+            GitConfirmationError::new(project::GitConfirmationFailureKind::TagFailed, message)
+        })? {
+            return Ok(GitSaveProgress::TagCreated {
+                commit: existing,
+                tag: tag_name,
+            });
+        }
+        return Err(GitConfirmationError::new(
+            project::GitConfirmationFailureKind::V2TagIntegrityConflict,
+            format!(
+                "Git 标签 {} 已指向其他确认事务的提交 {}，禁止覆盖",
+                tag_name, existing
+            ),
+        ));
+    }
+
+    if matches!(
+        confirmation_phase,
+        project::ConfirmationPhase::CommitCreated
+            | project::ConfirmationPhase::TagCreated
+            | project::ConfirmationPhase::ProjectFinalizing
+    ) || !confirmation_commit.is_empty()
+    {
+        let commit = if confirmation_commit.is_empty() {
+            head(&project_path).map_err(|message| {
+                GitConfirmationError::new(project::GitConfirmationFailureKind::TagFailed, message)
+            })?
+        } else {
+            confirmation_commit
+        };
+        let belongs_to_transaction =
+            commit_has_transaction(&project_path, &commit, &transaction_id).map_err(|message| {
+                GitConfirmationError::new(project::GitConfirmationFailureKind::TagFailed, message)
+            })?;
+        if !belongs_to_transaction {
+            return Err(GitConfirmationError::new(
+                project::GitConfirmationFailureKind::V2TagIntegrityConflict,
+                format!("提交 {} 不属于当前确认事务，拒绝创建标签", commit),
+            ));
+        }
+        create_immutable_tag_at(&project_path, &tag_name, &commit).map_err(|message| {
+            GitConfirmationError::new(project::GitConfirmationFailureKind::TagFailed, message)
+        })?;
+        return Ok(GitSaveProgress::TagCreated {
+            commit,
+            tag: tag_name,
+        });
+    }
+
+    let current = head(&project_path).map_err(|message| {
+        GitConfirmationError::new(project::GitConfirmationFailureKind::CommitFailed, message)
+    })?;
+    if commit_has_transaction(&project_path, &current, &transaction_id).map_err(|message| {
+        GitConfirmationError::new(project::GitConfirmationFailureKind::CommitFailed, message)
+    })? {
+        return Ok(GitSaveProgress::CommitCreated {
+            commit: current,
+            tag: tag_name,
+        });
+    }
+
+    ensure_only_authorized_changes(&project_path, &authorized_paths).map_err(|message| {
+        GitConfirmationError::new(project::GitConfirmationFailureKind::ScopeViolation, message)
+    })?;
 
     let generated_file = generated_file.filter(GeneratedFileUpdate::changed);
     let mut commit_paths = authorized_paths.clone();
     if let Some(update) = generated_file.as_ref() {
         let generated_path = Path::new(&project_path).join(&update.relative_path);
         let current_content = fs::read_to_string(&generated_path).map_err(|error| {
-            format!("读取系统生成文件 {} 失败：{}", update.relative_path, error)
+            GitConfirmationError::new(
+                project::GitConfirmationFailureKind::CommitFailed,
+                format!("读取系统生成文件 {} 失败：{}", update.relative_path, error),
+            )
         })?;
         if current_content != update.original_content {
-            return Err(format!(
-                "系统生成文件 {} 在确认期间发生变化，拒绝覆盖",
-                update.relative_path
+            return Err(GitConfirmationError::new(
+                project::GitConfirmationFailureKind::ScopeViolation,
+                format!(
+                    "系统生成文件 {} 在确认期间发生变化，拒绝覆盖",
+                    update.relative_path
+                ),
             ));
         }
-        atomic_write_text(&generated_path, &update.updated_content)?;
+        atomic_write_text(&generated_path, &update.updated_content).map_err(|message| {
+            GitConfirmationError::new(project::GitConfirmationFailureKind::CommitFailed, message)
+        })?;
         if !commit_paths.contains(&update.relative_path) {
             commit_paths.push(update.relative_path.clone());
         }
     }
 
     let mut committed = false;
-    let save_result = (|| {
-        ensure_only_authorized_changes(&project_path, &commit_paths)?;
+    let save_result: Result<GitSaveProgress, GitConfirmationError> = (|| {
+        ensure_only_authorized_changes(&project_path, &commit_paths).map_err(|message| {
+            GitConfirmationError::new(project::GitConfirmationFailureKind::ScopeViolation, message)
+        })?;
 
         let pathspecs: Vec<String> = commit_paths
             .iter()
@@ -362,13 +563,18 @@ pub(crate) async fn git_save_subtask(
             .collect();
         let mut add_args = vec!["add", "-A", "--"];
         add_args.extend(pathspecs.iter().map(String::as_str));
-        run_git(&project_path, &add_args, "暂存小阶段授权文件失败")?;
+        run_git(&project_path, &add_args, "暂存小阶段授权文件失败").map_err(|message| {
+            GitConfirmationError::new(project::GitConfirmationFailureKind::CommitFailed, message)
+        })?;
 
         let staged = run_git(
             &project_path,
             &["diff", "--cached", "--name-only", "-z"],
             "读取暂存区失败",
-        )?;
+        )
+        .map_err(|message| {
+            GitConfirmationError::new(project::GitConfirmationFailureKind::CommitFailed, message)
+        })?;
         let authorized: BTreeSet<&str> = commit_paths.iter().map(String::as_str).collect();
         let outside: Vec<String> = staged
             .split(|byte| *byte == 0)
@@ -377,25 +583,35 @@ pub(crate) async fn git_save_subtask(
             .filter(|path| !authorized.contains(path.as_str()))
             .collect();
         if !outside.is_empty() {
-            return Err(format!(
-                "暂存区包含计划范围外文件，拒绝提交：{}",
-                outside.join("、")
+            return Err(GitConfirmationError::new(
+                project::GitConfirmationFailureKind::ScopeViolation,
+                format!("暂存区包含计划范围外文件，拒绝提交：{}", outside.join("、")),
             ));
         }
 
         let commit_message = format!(
-            "【弥】小阶段 {}/{}：{}",
-            subtask_index, mid_stage_version, subtask_title
+            "【弥】小阶段 {}/{}：{}\n\n{}",
+            subtask_index,
+            mid_stage_version,
+            subtask_title,
+            transaction_trailer(&transaction_id),
         );
         run_git(
             &project_path,
             &["commit", "--allow-empty", "-m", &commit_message],
             "创建小阶段提交失败",
-        )?;
+        )
+        .map_err(|message| {
+            GitConfirmationError::new(project::GitConfirmationFailureKind::CommitFailed, message)
+        })?;
         committed = true;
-        create_immutable_tag(&project_path, &tag_name)?;
-        ensure_clean_workspace(&project_path)?;
-        Ok(tag_name.clone())
+        let commit = head(&project_path).map_err(|message| {
+            GitConfirmationError::new(project::GitConfirmationFailureKind::CommitFailed, message)
+        })?;
+        Ok(GitSaveProgress::CommitCreated {
+            commit,
+            tag: tag_name.clone(),
+        })
     })();
 
     if save_result.is_err() && !committed {
@@ -409,17 +625,79 @@ pub(crate) async fn git_save_subtask(
             );
             if let Err(restore_error) = atomic_write_text(&generated_path, &update.original_content)
             {
-                return Err(format!(
-                    "{}；同时恢复 {} 失败：{}",
-                    save_result.unwrap_err(),
-                    update.relative_path,
-                    restore_error
+                let original_error = save_result.unwrap_err();
+                return Err(GitConfirmationError::new(
+                    original_error.kind,
+                    format!(
+                        "{}；同时恢复 {} 失败：{}",
+                        original_error.message, update.relative_path, restore_error
+                    ),
                 ));
             }
         }
     }
 
     save_result
+}
+
+/// 读取指定确认提交中仅属于任务授权路径的 diff，用于项目收口中断后的幂等恢复。
+pub(crate) fn capture_commit_diff(
+    project_path: &str,
+    commit: &str,
+    authorized_paths: &[String],
+) -> Result<String, String> {
+    let pathspecs: Vec<String> = authorized_paths
+        .iter()
+        .map(|path| format!(":(literal){}", path))
+        .collect();
+    let mut args = vec!["show", "--format=", "--binary", commit, "--"];
+    args.extend(pathspecs.iter().map(String::as_str));
+    run_git(project_path, &args, "读取确认提交差异失败")
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+}
+
+pub(crate) fn commit_changed_path(
+    project_path: &str,
+    commit: &str,
+    relative_path: &str,
+) -> Result<bool, String> {
+    let pathspec = format!(":(literal){}", relative_path);
+    let output = run_git(
+        project_path,
+        &[
+            "show",
+            "--format=",
+            "--name-only",
+            "-z",
+            commit,
+            "--",
+            &pathspec,
+        ],
+        "读取确认提交文件列表失败",
+    )?;
+    Ok(output
+        .split(|byte| *byte == 0)
+        .any(|entry| entry == relative_path.as_bytes()))
+}
+
+/// 通过 Git 事实识别旧 V1 标签碰撞，不依赖历史错误文本。
+pub(crate) fn is_legacy_v1_tag_conflict(
+    project_path: &str,
+    mid_stage_version: &str,
+    subtask_index: u32,
+    authorized_paths: &[String],
+) -> Result<bool, String> {
+    if authorized_paths.is_empty() {
+        return Ok(false);
+    }
+    let legacy_tag = format!("metheus/auto/{}/task-{}", mid_stage_version, subtask_index);
+    let Some(existing) = tag_target(project_path, &legacy_tag)? else {
+        return Ok(false);
+    };
+    if existing == head(project_path)? {
+        return Ok(false);
+    }
+    Ok(ensure_only_authorized_changes(project_path, authorized_paths).is_ok())
 }
 
 /// 手工回退只接受干净工作区，不自动 stash 或丢弃用户变更。
@@ -436,20 +714,6 @@ pub(crate) fn git_reset_to_tag_clean(project_path: &str, tag_name: &str) -> Resu
         &format!("回退到 {} 失败", tag_name),
     )?;
     ensure_clean_workspace(project_path)
-}
-
-pub(crate) fn delete_tags(project_path: &str, tags: &[String]) -> Result<(), String> {
-    for tag in tags {
-        if tag.is_empty() || tag_target(project_path, tag)?.is_none() {
-            continue;
-        }
-        run_git(
-            project_path,
-            &["tag", "-d", tag],
-            &format!("删除废弃 Git 标签 {} 失败", tag),
-        )?;
-    }
-    Ok(())
 }
 
 /// 返回项目状态树中记录的 Metheus 标签。
@@ -574,29 +838,92 @@ mod tests {
         }
     }
 
+    async fn complete_git_confirmation(
+        project_path: String,
+        milestone_id: &str,
+        mid_stage_id: &str,
+        subtask_id: &str,
+        transaction_id: &str,
+        subtask_index: u32,
+        title: &str,
+        authorized_paths: Vec<String>,
+        generated_file: Option<GeneratedFileUpdate>,
+    ) -> Result<(String, String), GitConfirmationError> {
+        let first = git_save_subtask(
+            project_path.clone(),
+            milestone_id.to_string(),
+            mid_stage_id.to_string(),
+            subtask_id.to_string(),
+            transaction_id.to_string(),
+            subtask_index,
+            "v0.1.1".to_string(),
+            title.to_string(),
+            authorized_paths.clone(),
+            generated_file,
+            project::ConfirmationPhase::Preparing,
+            String::new(),
+        )
+        .await?;
+        match first {
+            GitSaveProgress::TagCreated { commit, tag } => Ok((commit, tag)),
+            GitSaveProgress::CommitCreated { commit, .. } => {
+                match git_save_subtask(
+                    project_path,
+                    milestone_id.to_string(),
+                    mid_stage_id.to_string(),
+                    subtask_id.to_string(),
+                    transaction_id.to_string(),
+                    subtask_index,
+                    "v0.1.1".to_string(),
+                    title.to_string(),
+                    authorized_paths,
+                    None,
+                    project::ConfirmationPhase::CommitCreated,
+                    commit,
+                )
+                .await?
+                {
+                    GitSaveProgress::TagCreated { commit, tag } => Ok((commit, tag)),
+                    GitSaveProgress::CommitCreated { .. } => {
+                        unreachable!("提交阶段之后必须推进到标签阶段")
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn subtask_commit_rejects_outside_changes_and_never_overwrites_tag() {
+    async fn git_confirmation_rejects_outside_changes_and_never_overwrites_tag() {
         let repo = TempRepo::new();
         std::fs::write(repo.0.join("tracked.txt"), "changed\n").unwrap();
         std::fs::write(repo.0.join("outside.txt"), "outside\n").unwrap();
         let path = repo.0.to_string_lossy().to_string();
         let rejected = git_save_subtask(
             path.clone(),
+            "milestone-a".to_string(),
+            "mid-a".to_string(),
+            "subtask-a".to_string(),
+            "transaction-a".to_string(),
             1,
             "v0.1.1".to_string(),
             "测试".to_string(),
             vec!["tracked.txt".to_string()],
             None,
+            project::ConfirmationPhase::Preparing,
+            String::new(),
         )
         .await;
         assert!(rejected.is_err());
 
         std::fs::remove_file(repo.0.join("outside.txt")).unwrap();
-        let tag = git_save_subtask(
+        let (_, tag) = complete_git_confirmation(
             path.clone(),
+            "milestone-a",
+            "mid-a",
+            "subtask-a",
+            "transaction-a",
             1,
-            "v0.1.1".to_string(),
-            "测试".to_string(),
+            "测试",
             vec!["tracked.txt".to_string()],
             None,
         )
@@ -609,7 +936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subtask_commit_includes_generated_constitution_and_leaves_workspace_clean() {
+    async fn git_confirmation_includes_generated_constitution_and_leaves_workspace_clean() {
         let repo = TempRepo::new();
         let original_constitution = "# Constitution\n\n## 第 2 部分\n待更新\n";
         let updated_constitution =
@@ -626,11 +953,14 @@ mod tests {
         assert!(diff.contains("index.html"));
         assert!(repo.git(&["status", "--short"]).contains("index.html"));
 
-        let tag = git_save_subtask(
+        let (_, tag) = complete_git_confirmation(
             path,
+            "milestone-a",
+            "mid-a",
+            "subtask-b",
+            "transaction-b",
             2,
-            "v0.1.1".to_string(),
-            "HTML 与宪法同步".to_string(),
+            "HTML 与宪法同步",
             authorized,
             Some(GeneratedFileUpdate::constitution(
                 original_constitution.to_string(),
@@ -652,7 +982,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn failed_commit_restores_generated_constitution() {
+    async fn git_confirmation_failed_commit_restores_generated_constitution() {
         use std::os::unix::fs::PermissionsExt;
 
         let repo = TempRepo::new();
@@ -671,6 +1001,10 @@ mod tests {
 
         let result = git_save_subtask(
             repo.0.to_string_lossy().to_string(),
+            "milestone-a".to_string(),
+            "mid-a".to_string(),
+            "subtask-c".to_string(),
+            "transaction-c".to_string(),
             3,
             "v0.1.1".to_string(),
             "失败恢复".to_string(),
@@ -679,6 +1013,8 @@ mod tests {
                 original_constitution.to_string(),
                 updated_constitution.to_string(),
             )),
+            project::ConfirmationPhase::Preparing,
+            String::new(),
         )
         .await;
 
@@ -688,6 +1024,195 @@ mod tests {
             original_constitution
         );
         assert!(!repo.git(&["status", "--short"]).contains("CONSTITUTION.md"));
+    }
+
+    #[tokio::test]
+    async fn git_confirmation_v2_identity_does_not_collide_across_milestones() {
+        let repo = TempRepo::new();
+        let path = repo.0.to_string_lossy().to_string();
+        std::fs::write(repo.0.join("tracked.txt"), "milestone one\n").unwrap();
+        let (_, first_tag) = complete_git_confirmation(
+            path.clone(),
+            "milestone-one",
+            "mid-shared",
+            "subtask-shared",
+            "transaction-one",
+            1,
+            "共享序号",
+            vec!["tracked.txt".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+
+        std::fs::write(repo.0.join("tracked.txt"), "milestone two\n").unwrap();
+        let (_, second_tag) = complete_git_confirmation(
+            path,
+            "milestone-two",
+            "mid-shared",
+            "subtask-shared",
+            "transaction-two",
+            1,
+            "共享序号",
+            vec!["tracked.txt".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_ne!(first_tag, second_tag);
+        assert!(first_tag.contains("milestone-one"));
+        assert!(second_tag.contains("milestone-two"));
+    }
+
+    #[tokio::test]
+    async fn git_confirmation_rejects_v2_tag_owned_by_another_transaction() {
+        let repo = TempRepo::new();
+        let path = repo.0.to_string_lossy().to_string();
+        let transaction_id = "transaction-integrity-conflict";
+        let tag = subtask_v2_tag("milestone-a", "mid-a", "subtask-a", transaction_id);
+        let unrelated_commit = repo.git(&["rev-parse", "HEAD"]);
+        create_immutable_tag_at(&path, &tag, &unrelated_commit).unwrap();
+        std::fs::write(repo.0.join("tracked.txt"), "approved task change\n").unwrap();
+        let commit_count = repo.git(&["rev-list", "--count", "HEAD"]);
+
+        let error = git_save_subtask(
+            path.clone(),
+            "milestone-a".to_string(),
+            "mid-a".to_string(),
+            "subtask-a".to_string(),
+            transaction_id.to_string(),
+            1,
+            "v0.1.1".to_string(),
+            "完整性冲突".to_string(),
+            vec!["tracked.txt".to_string()],
+            None,
+            project::ConfirmationPhase::Preparing,
+            String::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind,
+            project::GitConfirmationFailureKind::V2TagIntegrityConflict
+        );
+        assert_eq!(tag_target(&path, &tag).unwrap(), Some(unrelated_commit));
+        assert_eq!(repo.git(&["rev-list", "--count", "HEAD"]), commit_count);
+        assert!(repo.git(&["status", "--short"]).contains("tracked.txt"));
+    }
+
+    #[tokio::test]
+    async fn git_confirmation_retries_tag_without_creating_another_commit() {
+        let repo = TempRepo::new();
+        let path = repo.0.to_string_lossy().to_string();
+        std::fs::write(repo.0.join("tracked.txt"), "confirmed\n").unwrap();
+        let transaction_id = "transaction-retry";
+        let first = git_save_subtask(
+            path.clone(),
+            "milestone-a".to_string(),
+            "mid-a".to_string(),
+            "subtask-retry".to_string(),
+            transaction_id.to_string(),
+            1,
+            "v0.1.1".to_string(),
+            "标签重试".to_string(),
+            vec!["tracked.txt".to_string()],
+            None,
+            project::ConfirmationPhase::Preparing,
+            String::new(),
+        )
+        .await
+        .unwrap();
+        let (commit, tag) = match first {
+            GitSaveProgress::CommitCreated { commit, tag } => (commit, tag),
+            GitSaveProgress::TagCreated { .. } => panic!("首次调用不应越过提交落盘边界"),
+        };
+        let commit_count = repo.git(&["rev-list", "--count", "HEAD"]);
+
+        let lock_path = repo.0.join(".git/refs/tags").join(format!("{}.lock", tag));
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        std::fs::write(&lock_path, "locked").unwrap();
+        let failed = git_save_subtask(
+            path.clone(),
+            "milestone-a".to_string(),
+            "mid-a".to_string(),
+            "subtask-retry".to_string(),
+            transaction_id.to_string(),
+            1,
+            "v0.1.1".to_string(),
+            "标签重试".to_string(),
+            vec!["tracked.txt".to_string()],
+            None,
+            project::ConfirmationPhase::CommitCreated,
+            commit.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failed.kind, project::GitConfirmationFailureKind::TagFailed);
+
+        std::fs::remove_file(lock_path).unwrap();
+        let completed = git_save_subtask(
+            path,
+            "milestone-a".to_string(),
+            "mid-a".to_string(),
+            "subtask-retry".to_string(),
+            transaction_id.to_string(),
+            1,
+            "v0.1.1".to_string(),
+            "标签重试".to_string(),
+            vec!["tracked.txt".to_string()],
+            None,
+            project::ConfirmationPhase::CommitCreated,
+            commit.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repo.git(&["rev-list", "--count", "HEAD"]), commit_count);
+        assert_eq!(completed, GitSaveProgress::TagCreated { commit, tag });
+    }
+
+    #[tokio::test]
+    async fn git_confirmation_node_v2_identity_is_idempotent_and_entity_scoped() {
+        let repo = TempRepo::new();
+        let path = repo.0.to_string_lossy().to_string();
+        let first = git_save_node(
+            path.clone(),
+            "milestone-one".to_string(),
+            "mid-shared".to_string(),
+            "transaction-node-one".to_string(),
+            "v0.1.1".to_string(),
+            "共享节点".to_string(),
+        )
+        .await
+        .unwrap();
+        let after_first = repo.git(&["rev-list", "--count", "HEAD"]);
+        let repeated = git_save_node(
+            path.clone(),
+            "milestone-one".to_string(),
+            "mid-shared".to_string(),
+            "transaction-node-one".to_string(),
+            "v0.1.1".to_string(),
+            "共享节点".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated, first);
+        assert_eq!(repo.git(&["rev-list", "--count", "HEAD"]), after_first);
+
+        let second = git_save_node(
+            path,
+            "milestone-two".to_string(),
+            "mid-shared".to_string(),
+            "transaction-node-two".to_string(),
+            "v0.1.1".to_string(),
+            "共享节点".to_string(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(first, second);
+        assert!(first.contains("milestone-one"));
+        assert!(second.contains("milestone-two"));
     }
 
     #[test]

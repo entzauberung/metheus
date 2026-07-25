@@ -2,7 +2,7 @@
 // 在所有 Console 页面顶部显示自动驾驶状态与操作入口
 import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle, GitBranch, CheckCircle, CircleSlash2, TestTube2, ScanSearch, FileQuestion } from "lucide-react";
 import type { Project, PipelineState, AutopilotRecoveryAction } from "../types";
-import { getAutopilotErrorActions, getQualityStatusPresentation, getRecoveryStatusLabel } from "../autopilotPolicy";
+import { getAutopilotErrorActions, getGitConfirmationBlockPresentation, getQualityStatusPresentation, getRecoveryStatusLabel } from "../autopilotPolicy";
 import { getManagedFlowPresentation } from "../managedFlowPolicy";
 
 export interface AutopilotControlBarProps {
@@ -20,6 +20,7 @@ export interface AutopilotControlBarProps {
   onRegeneratePlan?: () => Promise<void>;
   onPrepareWorkspace?: () => Promise<void>;
   onRefreshWorkspace?: () => Promise<void>;
+  onRetryGitConfirmation?: () => Promise<void>;
   onResolveHumanRecovery?: (
     resolution: "retest" | "restore_and_retry" | "regenerate_plan" | "confirm_actual_pass" | "accept_deviation" | "skip_task",
   ) => Promise<void>;
@@ -42,7 +43,7 @@ export function AutopilotControlBar({
   project, executionStatus, busy,
   onToggle, onStopManagedFlow, onPauseNow, onPauseAfterCurrent, onResume, onSync,
   onRetryCurrent, onAcknowledgeRecovery, onRegeneratePlan, onPrepareWorkspace,
-  onRefreshWorkspace, onResolveHumanRecovery,
+  onRefreshWorkspace, onRetryGitConfirmation, onResolveHumanRecovery,
 }: AutopilotControlBarProps) {
   const apActive = project.workflow_state.autopilot_active === true;
   const apState = project.workflow_state.autopilot_state;
@@ -83,6 +84,10 @@ export function AutopilotControlBar({
   const sessionKey = sessionStatusKey(session?.status);
   const sessionLost = sessionKey === "session_lost";
   const stopFailed = sessionKey === "stop_failed";
+  const confirmationBlocked = sessionKey === "confirmation_blocked";
+  const confirmationPresentation = getGitConfirmationBlockPresentation(
+    session?.confirmation_failure_kind,
+  );
   const needsBaselineRecovery = !waitingEngine
     && (recoveryAction === "RestoreExecutionBaseline" || (!recovery && isRecoverableSession(project)));
 
@@ -131,6 +136,32 @@ export function AutopilotControlBar({
     </div>
   ) : null;
 
+  const confirmationBar = confirmationBlocked ? (
+    <div className="autopilot-control-bar ap-error">
+      <div className="ap-bar-left">
+        <span className="ap-bar-status"><GitBranch size={16} /> Git 确认受阻</span>
+        {session?.subtask_title && <span className="ap-bar-target">任务：{session.subtask_title}</span>}
+        <span className="ap-bar-warning">代码与质量结果已保留，不需要恢复执行基线。</span>
+        {session?.failure_message && (
+          <span className="ap-bar-error" title={session.failure_message}>
+            {session.failure_message.slice(0, 100)}{session.failure_message.length > 100 ? "…" : ""}
+          </span>
+        )}
+      </div>
+      <div className="ap-bar-right">
+        <button className="ap-bar-btn" disabled={busy} onClick={onSync} title="同步项目状态">
+          <RotateCcw size={14} /> 同步
+        </button>
+        {onRetryGitConfirmation && confirmationPresentation.canRetry && (
+          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onRetryGitConfirmation}>
+            <GitBranch size={14} /> 重新确认提交
+          </button>
+        )}
+        <span className="ap-bar-hint">{confirmationPresentation.hint}</span>
+      </div>
+    </div>
+  ) : null;
+
   const engineRecoveryBar = waitingEngine ? (
     <div className="autopilot-control-bar ap-error">
       <div className="ap-bar-left">
@@ -159,6 +190,7 @@ export function AutopilotControlBar({
     </div>
   ) : null;
 
+  if (confirmationBar) return confirmationBar;
   if (engineRecoveryBar) return engineRecoveryBar;
 
   if (!apActive) {

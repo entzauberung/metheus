@@ -6,7 +6,7 @@
 // ...
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import { executionPollingOwnsNextAdvance, getQualityStatusPresentation } from "./autopilotPolicy";
+import { executionPollingOwnsNextAdvance, getGitConfirmationBlockPresentation, getQualityStatusPresentation } from "./autopilotPolicy";
 import { getWorkspaceAction } from "./workspacePolicy";
 import "./App.css";
 import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, AutopilotNextStep, TestResult } from "./types";
@@ -1479,7 +1479,35 @@ function App() {
       setExecutionStatus(null);
       setFeedbackMsg({ type: "success", message: "小阶段已确认通过，Git 标签已创建。" });
     } catch (err) {
+      try {
+        const latest = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
+        handleChatComplete(latest);
+      } catch (syncError) {
+        console.error("确认失败后的状态同步失败:", syncError);
+      }
       setFeedbackMsg({ type: "error", message: "确认失败：" + String(err) });
+    } finally {
+      endConsoleAction();
+    }
+  };
+
+  const handleRetryGitConfirmation = async () => {
+    if (!project || !beginConsoleAction("retry_git_confirmation")) return;
+    try {
+      const updated = await invokeWithTimeout<Project>("retry_git_confirmation", {
+        projectName: project.name,
+      });
+      handleChatComplete(updated);
+      setExecutionStatus(null);
+      setFeedbackMsg({ type: "success", message: "Git 确认已完成，代码与质量结果保持不变。" });
+    } catch (err) {
+      try {
+        const latest = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
+        handleChatComplete(latest);
+      } catch (syncError) {
+        console.error("重新确认提交后的状态同步失败:", syncError);
+      }
+      setFeedbackMsg({ type: "error", message: "重新确认提交失败：" + String(err) });
     } finally {
       endConsoleAction();
     }
@@ -2010,6 +2038,7 @@ function App() {
                 onRegeneratePlan={handleRegenerateInvalidPlan}
                 onPrepareWorkspace={handlePrepareExecutionWorkspace}
                 onRefreshWorkspace={handleRefreshExecutionWorkspace}
+                onRetryGitConfirmation={handleRetryGitConfirmation}
                 onResolveHumanRecovery={handleResolveHumanRecovery}
               />
               {feedbackMsg && (
@@ -2058,6 +2087,7 @@ function App() {
                     onEdStop={handleEdStop}
                     onSyncProject={handleSyncProject}
                     onAcknowledgeRecovery={handleAcknowledgeExecutionRecovery}
+                    onRetryGitConfirmation={handleRetryGitConfirmation}
                   />
                   <TaskConsole
                     projectPath={projectPath}
@@ -2167,6 +2197,7 @@ function V1ExecutionPanel({
   project, executionStatus, workspaceStatus, busy: externalBusy,
   onPrepareWorkspace, onExecute, onConfirm, onReject, onRetry, onInStop, onEdStop, onSyncProject,
   onAcknowledgeRecovery,
+  onRetryGitConfirmation,
 }: {
   project: Project; executionStatus: PipelineState | null;
   workspaceStatus: ExecutionWorkspaceStatus | null;
@@ -2178,6 +2209,7 @@ function V1ExecutionPanel({
   onInStop: () => Promise<void>; onEdStop: () => Promise<void>;
   onSyncProject: () => Promise<void>;
   onAcknowledgeRecovery?: () => Promise<void>;
+  onRetryGitConfirmation?: () => Promise<void>;
 }) {
   const [rejectReason, setRejectReason] = useState("");
   const [localBusy, setLocalBusy] = useState(false);
@@ -2203,6 +2235,10 @@ function V1ExecutionPanel({
     failedStatus === "execution_failed"
     || failedStatus === "session_lost"
     || failedStatus === "stop_failed";
+  const hasConfirmationBlock = failedStatus === "confirmation_blocked";
+  const confirmationPresentation = getGitConfirmationBlockPresentation(
+    failedSession?.confirmation_failure_kind,
+  );
   const recoveryActive = project.workflow_state.recovery_state != null;
 
   const handlePrepareWorkspace = async () => {
@@ -2261,6 +2297,44 @@ function V1ExecutionPanel({
     <div className="v1-execution-panel" style={{ padding: "24px" }}>
       <h2 className="execution-panel-title"><ListTodo size={20} />执行</h2>
 
+      {hasConfirmationBlock && failedSession && (
+        <div className="execution-failure-panel" style={{
+          marginBottom: "20px", padding: "16px",
+          background: "#fff8c5", borderRadius: "8px", border: "1px solid #d4a72c",
+        }}>
+          <div style={{ fontWeight: 600, fontSize: "14px", marginBottom: "8px", color: "#7d4e00" }}>
+            Git 确认受阻
+          </div>
+          <div style={{ fontSize: "13px", color: "#24292f", marginBottom: "8px", overflowWrap: "anywhere" }}>
+            <div>任务：{failedSession.subtask_title || failedSession.subtask_id}</div>
+            <div style={{ marginTop: "6px" }}>代码与质量结果已保留，不需要恢复执行基线。</div>
+            {failedSession.failure_message && (
+              <div style={{ marginTop: "6px", whiteSpace: "pre-wrap" }}>
+                受阻原因：{failedSession.failure_message}
+              </div>
+            )}
+          </div>
+          <WorkflowActionBar>
+            {confirmationPresentation.canRetry && onRetryGitConfirmation && (
+              <ActionButton
+                icon={<GitBranch size={16} />}
+                loading={busy}
+                loadingLabel="确认中"
+                onClick={onRetryGitConfirmation}
+              >
+                重新确认提交
+              </ActionButton>
+            )}
+            <ActionButton icon={<RotateCcw size={16} />} disabled={busy} onClick={onSyncProject}>
+              同步状态
+            </ActionButton>
+          </WorkflowActionBar>
+          <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
+            {confirmationPresentation.hint}
+          </p>
+        </div>
+      )}
+
       {/* 执行失败专用面板：优先显示，隐藏普通执行/准备环境 */}
       {hasExecutionFailure && failedSession && (
         <div className="execution-failure-panel" style={{
@@ -2316,7 +2390,7 @@ function V1ExecutionPanel({
       )}
 
       {/* Workspace status banner — 失败会话期间隐藏准备环境 */}
-      {!hasExecutionFailure && !recoveryActive && planApproved && workspaceStatus && !workspaceReady && (
+      {!hasExecutionFailure && !hasConfirmationBlock && !recoveryActive && planApproved && workspaceStatus && !workspaceReady && (
         <FeedbackBanner
           type={managedTaskChanges ? "info" : "warning"}
           message={workspaceStatus.status_message}
@@ -2327,7 +2401,7 @@ function V1ExecutionPanel({
       )}
 
       {/* Workspace preparation is only valid before repository metadata exists. */}
-      {!hasExecutionFailure && !recoveryActive && planApproved && workspaceAction === "prepare" && (
+      {!hasExecutionFailure && !hasConfirmationBlock && !recoveryActive && planApproved && workspaceAction === "prepare" && (
         <div style={{ marginBottom: "20px" }}>
           <ActionButton icon={<GitBranch size={16} />} loading={busy} loadingLabel="准备中"
             onClick={handlePrepareWorkspace}>准备执行环境</ActionButton>
@@ -2337,7 +2411,7 @@ function V1ExecutionPanel({
         </div>
       )}
 
-      {!hasExecutionFailure && !recoveryActive && planApproved && workspaceStatus &&
+      {!hasExecutionFailure && !hasConfirmationBlock && !recoveryActive && planApproved && workspaceStatus &&
         workspaceAction !== "none" && workspaceAction !== "prepare"
         && workspaceAction !== "managed_task_changes" && (
         <div style={{ marginBottom: "20px" }}>
@@ -2355,7 +2429,7 @@ function V1ExecutionPanel({
       )}
 
       {/* Awaiting confirmation */}
-      {!hasExecutionFailure && !recoveryActive && isAwaiting && awaitingSubtask && (
+      {!hasExecutionFailure && !hasConfirmationBlock && !recoveryActive && isAwaiting && awaitingSubtask && (
         <div style={{ marginBottom: "20px" }}>
           <div style={{ padding: "14px", background: "#ddf4ff", borderRadius: "8px", border: "1px solid #0969da", marginBottom: "16px" }}>
             <strong>待确认：{awaitingSubtask.title}</strong>
@@ -2422,7 +2496,7 @@ function V1ExecutionPanel({
       )}
 
       {/* Next pending subtask — only when workspace is ready and no failure session */}
-      {!hasExecutionFailure && !recoveryActive && !isAwaiting && planApproved && workspaceReady && nextSubtask && (
+      {!hasExecutionFailure && !hasConfirmationBlock && !recoveryActive && !isAwaiting && planApproved && workspaceReady && nextSubtask && (
         <div style={{ marginBottom: "20px" }}>
           <div style={subtaskCardStyle}>
             <strong>下一个任务：{nextSubtask.title}</strong>
@@ -2446,7 +2520,7 @@ function V1ExecutionPanel({
       )}
 
       {/* Pause controls — only visible when execution is actively running */}
-      {isExecuting && !isAwaiting && (
+      {!hasConfirmationBlock && isExecuting && !isAwaiting && (
         <div style={{
           marginBottom: "20px", padding: "16px",
           background: "#fff8f0", borderRadius: "8px", border: "1px solid #e6a23c",
@@ -2488,7 +2562,7 @@ function V1ExecutionPanel({
       )}
 
       {/* All done — workflow should have auto-advanced; this is a safety net */}
-      {!isAwaiting && planApproved && workspaceReady && !nextSubtask && (
+      {!hasConfirmationBlock && !isAwaiting && planApproved && workspaceReady && !nextSubtask && (
         <div style={{ marginBottom: "20px" }}>
           <FeedbackBanner type="success" message="当前中阶段所有小阶段已执行完成。" />
           <p style={{ color: "#656d76", fontSize: "13px", marginTop: "12px" }}>

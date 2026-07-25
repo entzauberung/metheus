@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   executionPollingOwnsNextAdvance,
   getAutopilotErrorActions,
+  getGitConfirmationBlockPresentation,
   getQualityStatusPresentation,
   getRecoveryStatusLabel,
 } from "./autopilotPolicy";
@@ -74,6 +75,7 @@ describe("autopilot scheduling policy", () => {
       "PrepareExecutionWorkspace",
       "ResolveWorkspaceChanges",
       "RunAutomaticRecovery",
+      "RetryGitConfirmation",
     ] as const) {
       expect(getAutopilotErrorActions("ErrorStopped", recovery).canClose).toBe(true);
     }
@@ -97,6 +99,35 @@ describe("autopilot scheduling policy", () => {
       canRetryAdvance: false,
       canClose: true,
     });
+  });
+
+  it("routes Git confirmation blocks only to confirmation retry", () => {
+    expect(getAutopilotErrorActions("ErrorStopped", "RetryGitConfirmation")).toMatchObject({
+      canResume: false,
+      canRetryAdvance: false,
+      canRetryGitConfirmation: true,
+    });
+  });
+
+  it("only allows retry for recoverable Git confirmation failures", () => {
+    for (const failureKind of [
+      "LegacyV1TagConflict",
+      "CommitFailed",
+      "TagFailed",
+      "ProjectFinalizationFailed",
+      "GitMetadataUnavailable",
+    ] as const) {
+      expect(getGitConfirmationBlockPresentation(failureKind).canRetry).toBe(true);
+    }
+
+    for (const failureKind of [
+      "V2TagIntegrityConflict",
+      "TagIdentityConflict",
+      "ScopeViolation",
+      undefined,
+    ] as const) {
+      expect(getGitConfirmationBlockPresentation(failureKind).canRetry).toBe(false);
+    }
   });
 
   it("maps deterministic preconditions to one explicit recovery action", () => {
