@@ -2,7 +2,7 @@
 
 > 弥 · 复杂任务编译系统 — 用精准上下文注入和滚动宪法，把模糊想法编译成可执行、可检查、可回退的代码变更。
 
-> 最后同步：2026-07-24。本文描述 Metheus 仓库当前实现；`src-tauri/CONSTITUTION.md` 是测试/目标项目生成出的项目宪法，不是本仓库的开发约束来源。
+> 最后同步：2026-07-25。本文描述 Metheus 仓库当前实现；`src-tauri/CONSTITUTION.md` 是测试/目标项目生成出的项目宪法，不是本仓库的开发约束来源。
 
 ---
 
@@ -43,8 +43,8 @@
 | **Codex CLI (`codex`)** | 可选插件执行引擎，与 Claude Code 隔离适配，互不耦合参数 |
 | **Kimi CLI (`kimi`)** | 可选插件执行引擎，使用非交互 `stream-json` 输出 |
 | **Grok Build CLI (`grok`)** | 可选插件执行引擎，使用无人值守 `streaming-json` 输出；不读取预装 Grok Build API Key |
-| **Grok Build 内置运行时** | 受控 Fork 中真实的 `MvpAgent → AgentBuilder → SessionActor` Rust 进程内链路；仅开放四项受控项目文件工具，不调用 `grok` 或任意外部子进程 |
-| **`metheus-grok-engine`** | Metheus 防腐适配层；调用受控 Fork facade，桥接设置、凭据、事件、恢复快照与类型化错误；模型连接测试仍直接使用上游 sampler |
+| **Grok Build 内置运行时** | `builtin-grok` / `full-product` 特性显式启用的受控 Fork 进程内链路；日常默认构建使用不引用 Grok 类型的轻量占位边界 |
+| **`metheus-grok-engine`** | 可选的 Metheus 防腐适配层；调用受控 Fork facade，桥接设置、凭据、事件、恢复快照与类型化错误；只在内置特性启用时进入依赖图 |
 | **Grok Build 双源码树** | `third_party/grok-build` 是固定修订的原样审计基线；`third_party/grok-build-fork` 是逐文件登记理由的最小受控 Fork |
 | **Git（程序化操作）** | 版本控制：只提交任务授权路径，并为完成的小阶段/中阶段创建不可覆盖标签 |
 | **reqwest** | Rust HTTP 客户端，调用 OpenAI Compatible 决策模型接口 |
@@ -73,7 +73,7 @@
 - **禁止前端通过 persist_project 任意提交完整项目对象完成关键业务状态变更**。每个审批、检查、生成、执行和回退动作必须调用对应的后端业务接口。
 - **治理模式必须显式区分**：手动模式逐步点击；Managed Flow 只覆盖 ThreeChecks 后到大阶段批准；autopilot 只覆盖已批准大阶段内部流程。任何模式都不得绕过检查、批准、文件范围和 Git 安全边界。
 - **自动驾驶（autopilot）语义（2026-07-15 固化）**：autopilot 只在大阶段边界（`MilestoneReview`）停下由人做 A/B/C；大阶段内部的中阶段生成/检查/批准、执行计划生成/检查/批准、执行、确认全部自动代点；只保留暂停键；执行中暂停等同 In Stop 回退到最近已完成小阶段；autopilot 自动选择下一个未完成大阶段，用户不手选；autopilot 永不自动做 A/B/C 决策。
-- **执行引擎隔离原则（2026-07-23 固化）**：执行层通过 `engine/` 抽象，禁止业务代码直接拼装具体 CLI 参数。`ExecutionProfile` 描述 runtime/provider/permission；执行开始后冻结 profile、应用设置修订、模型、API 后端、接口指纹、内置源码修订或插件可执行路径。合法组合：`Plugin + ClaudeCode`、`Plugin + Codex`、`Plugin + KimiCli`、`Plugin + GrokBuild`、`BuiltIn + GrokBuild`。恢复时任一快照事实不一致必须进入 `WaitingEngine`，经用户明确确认后才能使用新配置。
+- **执行引擎隔离原则（2026-07-25 固化）**：执行层通过 `engine/` 抽象，禁止业务代码直接拼装具体 CLI 参数或引用 `metheus_grok_engine`。`ExecutionProfile` 描述 runtime/provider/permission；执行开始后冻结 profile、应用设置修订、模型、API 后端、接口指纹、内置源码修订或插件可执行路径。合法组合：`Plugin + ClaudeCode`、`Plugin + Codex`、`Plugin + KimiCli`、`Plugin + GrokBuild`、`BuiltIn + GrokBuild`。默认特性为空；只有 `builtin-grok` 或包含它的 `full-product` 才编译内置运行时。轻量模式保留旧项目选择但以 `Disabled` 明确阻断，插件路由不受影响。恢复时任一快照事实不一致必须进入 `WaitingEngine`，经用户明确确认后才能使用新配置。
 - **应用设置与密钥原则（2026-07-23 固化）**：非敏感设置持久化到 `~/.metheus/config/app-settings.json`；决策模型和预装 Grok Build API Key 可安全保存到系统凭据库，或由用户明确选择仅本次会话使用；环境变量仅作兼容回退。密钥不得进入项目、设置文件、执行会话、日志、错误文本或前端持久状态。
 - **稳定性原则（2026-07-15 固化）**：不再保留任何"执行前重新生成提示词 / 固定管线自动重拆"的路径；执行端只执行用户或 autopilot 已确认的既定计划（`execution_prompt`），杜绝 AI 歧义。
 - **本轮真实可体验闭环目标**：No Project 和 Half Project 都能走到正式执行；三项检查无法绕过；In Stop 和 ED Stop 都能真实体验；回退有影响预览；大阶段 A、B、C 都能完整走通；任意关键状态刷新后可以恢复。
@@ -364,8 +364,14 @@ snapshot ──→ project, AppState
 | 函数 | `extract_diff_summary`, `extract_function_signature` |
 
 ### `src-tauri/src/test_runner.rs` — 测试执行引擎
-| 职责 | 识别并执行真实测试命令，压缩输出，采集 tracked/untracked 变更证据，独立保存自动化测试事实与 AI 代码审查结论 |
-| 关键函数 | `check_subtask`, `run_test_command`, `summarize_test_output`, `format_test_result`, `is_test_not_configured`, `get_file_snapshot`, `detect_changes` |
+| 职责 | 识别并执行真实测试命令，压缩输出，采集 tracked/untracked 变更证据，独立保存自动化测试事实与标准/定向/扩展定向 AI 审查结论 |
+| 关键函数 | `check_subtask`, `check_subtask_with_context`, `run_test_command`, `summarize_test_output`, `format_test_result`, `is_test_not_configured`, `get_file_snapshot`, `detect_changes` |
+
+### `src-tauri/src/acceptance.rs` — 逐验收项账本
+| 职责 | 校验证据引用并优先使用 `criterion_reviews` 裁决满足、不满足、未知与契约冲突；兼容没有逐项结果的旧记录 |
+
+### `src-tauri/src/quality_gate.rs` — 统一质量门禁
+| 职责 | 为正常执行、确认和恢复复测统一输出通过、代码不满足、证据不足、契约冲突、审查震荡与测试不可用 |
 
 ### `src-tauri/src/pipeline.rs` — 执行流水线
 | 职责 | 正常小阶段执行、质量门禁、工作区准备/刷新、执行基线恢复、暂停/回退、执行状态对账和持久化执行历史 |
@@ -389,7 +395,8 @@ snapshot ──→ project, AppState
 | `codex.rs` | Codex 适配器：`codex exec … --sandbox danger-full-access -`（prompt 走 stdin） |
 | `kimi_cli.rs` | Kimi CLI 适配器：无人值守 prompt、`stream-json` 与必需能力探测 |
 | `grok_cli.rs` | Grok Build CLI 适配器：无人值守、禁用 memory/subagent/web search、`streaming-json` |
-| `builtin.rs` | 接入 `metheus-grok-engine`；健康检查、源码修订、自检缓存、取消、事件桥和类型化错误映射 |
+| `builtin.rs` | 仅在 `builtin-grok` 启用时接入 `metheus-grok-engine`；健康检查、源码修订、自检缓存、取消、事件桥和类型化错误映射 |
+| `builtin_disabled.rs` | 默认轻量构建的同接口占位边界；不引用 Grok 类型、不读取密钥、不发送网络请求 |
 | `health.rs` | 使用设置路径覆盖或 PATH/PATHEXT 探测可执行文件、版本、认证和无人值守能力 |
 
 ### `src-tauri/src/snapshot.rs` — 快照与孤儿进程保护
@@ -561,7 +568,7 @@ snapshot ──→ project, AppState
 | **应用设置并发修改** | 以 revision 乐观锁拒绝旧写；AI 请求或执行租约存续期间拒绝修改 |
 | **恢复设置快照漂移** | 修复前核对设置修订、模型、地址指纹和程序路径；不一致进入 `WaitingEngine` 且不消耗修复次数 |
 | **3 次 JSON 解析全败** | 返回 `Err` |
-| **执行引擎不可用** | 健康检查阻断 NotInstalled / Unauthenticated / UnsupportedVersion / VerificationRequired / VerificationFailed / Disabled；禁止启动执行或切换到不可用引擎 |
+| **执行引擎不可用** | 健康检查阻断 NotInstalled / Unauthenticated / UnsupportedVersion / VerificationRequired / VerificationFailed / Disabled；轻量构建选择内置 Grok 时返回稳定的 `Disabled`，禁止启动执行或静默切换引擎 |
 | **执行引擎执行失败** | 保存执行证据（含 `engine_provider`）；手动模式提供基线恢复，autopilot 进入 `ExecutionError` 恢复分支并先恢复执行基线 |
 | **执行引擎子进程卡死** | `EXECUTION_ENGINE_TIMEOUT_SECS`=600 强制 kill，按执行错误收尾，不在未知工作区上继续 |
 | **活跃执行/恢复中切换引擎** | `update_execution_profile` 拒绝；前端 `enginePolicy` 同步阻断 |
@@ -634,13 +641,15 @@ snapshot ──→ project, AppState
 3. 首次执行和恢复修复都必须复用经 `plan_contract` 校验的精确 `allowed_file_paths` / `new_file_paths`。
 4. 执行前记录 `base_commit`；执行失败、进程失联或范围越界时按错误策略恢复该基线。
 5. 测试重试和自动修复不得改变原任务标题、目标、验收标准和文件边界。
-6. 自动化测试事实与 AI 代码审查分别保存；质量门禁要求所选核验通道真实通过。
-7. 每个小阶段确认通过后才写回 Passed 状态和 Git 稳定标签；autopilot 可代点确认，手动模式仍由用户确认。
-8. 已 Passed 的任务不得再次执行；重新规划不得静默删除当前中阶段已有的 Passed 任务。
-9. 所有后台执行与恢复写回必须携带并核对 `execution_id`，旧任务不得覆盖新会话。
-10. 执行启动时把项目 `execution_profile` 复制到 `execution_session.engine_snapshot`；同一次执行与恢复链路必须使用该快照，不得读取可能已被用户改写的项目 profile。
-11. 启动执行前必须 `prepare_engine`，在同一设置租约内完成 profile 校验、健康检查、会话快照和实际执行；健康状态阻断时不得启动子进程。
-12. 自动修复前必须核对会话设置快照；设置或可执行路径漂移时进入 `WaitingEngine`，不得静默使用新配置。
+6. 自动化测试事实与 AI 代码审查分别保存；正常执行、人工确认和恢复复测必须调用同一个 `quality_gate`，统一裁决通过、代码不满足、证据不足、契约冲突、审查震荡和测试不可用。
+7. 验收账本优先使用逐验收项审查结果：有效证据支持的满足项不受全局文件 `Partial` 影响；只有有效阻断证据可判为不满足，重复编号、无效引用或证据不足均为未知。
+8. 未知验收项最多依次执行一次 `Targeted` 和一次 `ExpandedTargeted` 补证；补证不得调用编码引擎、创建代码检查点、消耗修复次数或触发重规划。两次仍不足则等待人工。
+9. 每个小阶段确认通过后才写回 Passed 状态和 Git 稳定标签；autopilot 可代点确认，手动模式仍由用户确认。
+10. 已 Passed 的任务不得再次执行；重新规划不得静默删除当前中阶段已有的 Passed 任务。
+11. 所有后台执行与恢复写回必须携带并核对 `execution_id`，旧任务不得覆盖新会话。
+12. 执行启动时把项目 `execution_profile` 复制到 `execution_session.engine_snapshot`；同一次执行与恢复链路必须使用该快照，不得读取可能已被用户改写的项目 profile。
+13. 启动执行前必须 `prepare_engine`，在同一设置租约内完成 profile 校验、健康检查、会话快照和实际执行；健康状态阻断时不得启动子进程。
+14. 自动修复前必须核对会话设置快照；设置或可执行路径漂移时进入 `WaitingEngine`，不得静默使用新配置。
 
 ---
 
@@ -672,18 +681,17 @@ cd ~/metheus && cargo tauri dev
 ### 验证命令
 
 ```bash
-# 编译检查
-cd ~/metheus/src-tauri && cargo check
-cd ~/metheus/src-tauri && cargo build
-cd ~/metheus/src-tauri && cargo fmt --all -- --check
-cd ~/metheus/src-tauri && cargo test
-cd ~/metheus/src-tauri && cargo clippy --all-targets --all-features
+# 日常 Core：格式和主 Rust 库类型检查，不包含内置 Grok
+cd ~/metheus && npm run verify:core-light
 
-# 前端测试、类型检查与构建
-cd ~/metheus && npm test -- --run
-cd ~/metheus && npx tsc --noEmit
-cd ~/metheus && npm run build
+# 修改验收/恢复逻辑后：定向 Rust、TypeScript 和前端策略测试
+cd ~/metheus && npm run verify:quality
+
+# Grok 专项：单任务库类型检查，不执行最终链接
+cd ~/metheus && npm run verify:grok-check
 ```
+
+默认开发构建不包含内置 Grok。发布级验证必须在高资源环境显式启用 `full-product`，再执行完整 Rust、前端和 Tauri 打包门禁；发布命令不得混入上述日常轨道，也不得以 Grok 专项 `cargo check` 代替最终产品验收。
 
 ---
 
@@ -1138,3 +1146,37 @@ ThreeChecks 通过 → 方案草稿生成 → 方案批准 → 进入 Console �
 - 上游完整性：原样基线修订、Git tree 和 archive SHA-256 继续以 `third_party/grok-build/UPSTREAM_SOURCE.md` 为准；Fork 差异以 `PATCHSET.md` 为唯一允许清单。
 - 最终 Rust、前端和 Tauri 构建结果必须在本阶段收尾后按实际命令更新，不得沿用切换到 SessionActor 之前的旧测试计数。
 - 真实付费模型 smoke 未自动执行；发布验收需要使用用户自己的密钥、网络和额度人工完成，且不得输出密钥。
+
+---
+
+## 26. Phase: 轻量开发隔离与验收自纠错收口（2026-07-25）
+
+| 任务 | 当前实现 | 状态 |
+|------|----------|------|
+| 构建隔离 | `metheus-grok-engine` 为可选依赖；默认特性为空；`builtin-grok` 启用内置运行时，`full-product` 表示完整产品能力 | 已完成 |
+| 模块边界 | 条件编译集中在 `engine/`；轻量占位模块提供相同入口且不引用 Grok 类型；插件执行器始终可用 | 已完成 |
+| 独立验证轨道 | Core 使用 `.build/core`、最多双任务；Grok 使用 `.build/grok-full`、单任务且只检查库目标 | 已完成 |
+| 验收账本 | `criterion_reviews` 优先驱动逐项裁决；有效逐项证据不再被全局 `Partial` 一票否决 | 已完成 |
+| 统一质量门禁 | 正常执行、确认和恢复统一输出六类质量结果，自动化测试明确失败始终阻断 | 已完成 |
+| 两级补证 | 生产恢复链路使用 `Targeted → ExpandedTargeted`；与代码修复次数、检查点和重规划完全分离 | 已完成 |
+| 前端语义 | 自动化测试、代码审查和验收证据分别展示；证据不足不再显示为自动修复耗尽 | 已完成 |
+
+### 26.1 三种验证等级
+
+| 等级 | 命令与边界 | 用途 |
+|------|------------|------|
+| 日常 Core | `npm run verify:core-light`；修改验收/恢复逻辑时追加 `npm run verify:quality`；全部使用 `--no-default-features`、`--package metheus --lib`，最多双任务 | 主 Rust 库轻量检查和定向质量回归，不解析 Grok Build |
+| Grok 专项 | `npm run verify:grok-check`；`builtin-grok`、单任务、`cargo check --lib` | 验证完整内置类型边界，不执行最终链接 |
+| 正式发布 | 高资源环境显式启用 `full-product`，执行完整 Rust/前端/Tauri 打包与人工发布检查 | 唯一可用于发布声明的等级；不得由前两项替代 |
+
+资源预检在 Cargo 启动前检查磁盘和可用内存；Grok 轨道检测到其他 Cargo 进程时拒绝启动。两条轨道不得混用或同时清理缓存，禁止用无包名、无目标限制的 Cargo 命令代替脚本。
+
+### 26.2 2026-07-25 实测记录
+
+| 轨道 | 结果 | 墙钟时间 | 峰值 RSS | 缓存目录大小 |
+|------|------|----------|----------|--------------|
+| Core | 格式与 `metheus` 库类型检查通过 | 5.49 秒 | 822,748 KiB | 2.0 GiB |
+| 轻量质量 | Rust 账本 7 项、门禁 4 项、补证 11 项、恢复 17 项；TypeScript 与前端策略 7 项通过 | 9.70 秒 | 1,044,948 KiB | 与 Core 共用 2.0 GiB 轨道 |
+| Grok 专项 | `builtin-grok` 单任务库类型检查通过；无最终链接 | 1 分 22.16 秒 | 3,610,228 KiB | 1.9 GiB |
+
+以上耗时来自已有独立缓存的本机实测，仅用于资源审计，不是性能承诺。检查期间未运行 Tauri dev/build、全工作区构建、真实模型请求或付费 CLI。正式发布级 Tauri 打包未执行，因此本阶段完成只代表开发隔离、质量逻辑和专项类型检查通过，不代表产品发布验收。

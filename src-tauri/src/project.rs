@@ -270,6 +270,12 @@ pub enum RecoveryErrorKind {
     PlanFailure,
     /// 验收契约或审查证据本身不可实现/互相矛盾。
     ValidationFailure,
+    /// 代码结论尚无足够的逐验收项证据，不得触发代码修复。
+    EvidenceInsufficient,
+    /// 验收结论和有效阻断证据互相冲突。
+    ContractContradiction,
+    /// 同一验收项在连续审查中反复改变结论。
+    ValidationOscillation,
     ScopeViolation,
     TestFailure,
     ReviewFailure,
@@ -294,6 +300,55 @@ pub enum RecoveryPhase {
     WaitingHuman,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReviewIssueSeverity {
+    Blocking,
+    Warning,
+    Suggestion,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum EvidenceSourceKind {
+    GitDiff,
+    IdentifierContext,
+    #[default]
+    CurrentFileSnippet,
+}
+
+/// 可持久化的证据元数据。正文只存在于单次审查请求中。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ReviewEvidenceReference {
+    pub block_id: String,
+    pub source_kind: EvidenceSourceKind,
+    pub file: String,
+    #[serde(default)]
+    pub start_line: Option<u32>,
+    #[serde(default)]
+    pub end_line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum CriterionReviewConclusion {
+    Satisfied,
+    Unsatisfied,
+    #[default]
+    EvidenceInsufficient,
+}
+
+/// 测试工程师针对单条验收标准给出的独立结论。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct CriterionReviewResult {
+    pub criterion_index: u32,
+    #[serde(default)]
+    pub criterion: String,
+    #[serde(default)]
+    pub conclusion: CriterionReviewConclusion,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub evidence_references: Vec<ReviewEvidenceReference>,
+}
+
 /// 测试审查输出的可执行问题。criterion_index 使用从 1 开始的验收项编号。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ReviewIssue {
@@ -311,6 +366,11 @@ pub struct ReviewIssue {
     pub suggested_change: String,
     #[serde(default)]
     pub confidence: f64,
+    /// 旧项目缺少该字段；新模型结果必须显式提供。
+    #[serde(default)]
+    pub severity: Option<ReviewIssueSeverity>,
+    #[serde(default)]
+    pub evidence_references: Vec<ReviewEvidenceReference>,
 }
 
 /// 恢复循环使用的稳定问题表示；id 由后端根据验收项和文件生成。
@@ -331,6 +391,10 @@ pub struct RecoveryIssue {
     pub suggested_change: String,
     #[serde(default)]
     pub confidence: f64,
+    #[serde(default)]
+    pub severity: Option<ReviewIssueSeverity>,
+    #[serde(default)]
+    pub evidence_references: Vec<ReviewEvidenceReference>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -353,6 +417,8 @@ pub struct AcceptanceLedgerItem {
     pub status: AcceptanceStatus,
     #[serde(default)]
     pub evidence: String,
+    #[serde(default)]
+    pub evidence_references: Vec<ReviewEvidenceReference>,
     #[serde(default)]
     pub confidence: f64,
     #[serde(default)]
@@ -426,6 +492,14 @@ pub struct RecoveryAttemptRecord {
     pub recorded_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ReviewEvidenceStrategy {
+    #[default]
+    Standard,
+    Targeted,
+    ExpandedTargeted,
+}
+
 /// 当前小阶段的有限恢复循环状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryState {
@@ -475,6 +549,15 @@ pub struct RecoveryState {
     /// Validation evidence has been rebuilt once for this recovery session.
     #[serde(default)]
     pub evidence_rebuild_attempted: bool,
+    /// Number of targeted evidence rebuilds already started.
+    #[serde(default)]
+    pub evidence_rebuild_attempts: u32,
+    /// Acceptance criteria that still need evidence.
+    #[serde(default)]
+    pub pending_evidence_criteria: Vec<u32>,
+    /// Evidence strategies already used by this recovery session.
+    #[serde(default)]
+    pub evidence_strategies: Vec<ReviewEvidenceStrategy>,
     /// Repair execution evidence is committed to the task only after retest accepts it.
     #[serde(default)]
     pub pending_execution_result: Option<ExecutionResult>,
@@ -506,6 +589,9 @@ impl Default for RecoveryState {
             checkpoint_id: String::new(),
             rollback_retest_pending: false,
             evidence_rebuild_attempted: false,
+            evidence_rebuild_attempts: 0,
+            pending_evidence_criteria: vec![],
+            evidence_strategies: vec![],
             pending_execution_result: None,
         }
     }
@@ -915,6 +1001,9 @@ pub struct TestResult {
     /// 与验收项和文件关联的结构化审查问题。
     #[serde(default)]
     pub review_issues: Vec<ReviewIssue>,
+    /// 逐验收项的结构化审查结果。
+    #[serde(default)]
+    pub criterion_reviews: Vec<CriterionReviewResult>,
     /// 诊断/警告信息（非阻塞），用于向后端调用方和前端传递非致命的诊断信息
     #[serde(default)]
     pub warnings: Vec<String>,
@@ -2084,6 +2173,9 @@ pub enum ExecutionEventType {
     RepairAttemptStarted,
     RepairAttemptCompleted,
     RetestCompleted,
+    EvidenceRebuildStarted,
+    EvidenceRebuildCompleted,
+    EvidenceStillInsufficient,
     ReplanStarted,
     ReplanCompleted,
     ReplanExecutionStarted,
@@ -2441,6 +2533,34 @@ mod tests {
         let project: Project =
             serde_json::from_value(project_value).map_err(|error| error.to_string())?;
         assert!(project.recovery_learning.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_contract_old_json_uses_safe_defaults() -> Result<(), String> {
+        let mut test_value =
+            serde_json::to_value(TestResult::default()).map_err(|error| error.to_string())?;
+        test_value
+            .as_object_mut()
+            .ok_or_else(|| "测试结果不是对象".to_string())?
+            .remove("criterion_reviews");
+        let restored: TestResult =
+            serde_json::from_value(test_value).map_err(|error| error.to_string())?;
+        assert!(restored.criterion_reviews.is_empty());
+
+        let mut recovery_value =
+            serde_json::to_value(RecoveryState::default()).map_err(|error| error.to_string())?;
+        let recovery_object = recovery_value
+            .as_object_mut()
+            .ok_or_else(|| "恢复状态不是对象".to_string())?;
+        recovery_object.remove("evidence_rebuild_attempts");
+        recovery_object.remove("pending_evidence_criteria");
+        recovery_object.remove("evidence_strategies");
+        let recovery: RecoveryState =
+            serde_json::from_value(recovery_value).map_err(|error| error.to_string())?;
+        assert_eq!(recovery.evidence_rebuild_attempts, 0);
+        assert!(recovery.pending_evidence_criteria.is_empty());
+        assert!(recovery.evidence_strategies.is_empty());
         Ok(())
     }
 }

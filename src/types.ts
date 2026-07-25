@@ -53,6 +53,9 @@ export type RecoveryErrorKind =
   | "EngineBlocked"
   | "PlanFailure"
   | "ValidationFailure"
+  | "EvidenceInsufficient"
+  | "ContractContradiction"
+  | "ValidationOscillation"
   | "ScopeViolation"
   | "TestFailure"
   | "ReviewFailure"
@@ -73,12 +76,33 @@ export type EngineFailureKind =
   | "TaskExecutionError";
 
 export type AcceptanceStatus = "Satisfied" | "Unsatisfied" | "Unknown" | "Contradictory" | "AcceptedDeviation";
+export type ReviewIssueSeverity = "Blocking" | "Warning" | "Suggestion";
+export type EvidenceSourceKind = "GitDiff" | "IdentifierContext" | "CurrentFileSnippet";
+export type CriterionReviewConclusion = "Satisfied" | "Unsatisfied" | "EvidenceInsufficient";
+export type ReviewEvidenceStrategy = "Standard" | "Targeted" | "ExpandedTargeted";
+
+export interface ReviewEvidenceReference {
+  block_id: string;
+  source_kind: EvidenceSourceKind;
+  file: string;
+  start_line?: number;
+  end_line?: number;
+}
+
+export interface CriterionReviewResult {
+  criterion_index: number;
+  criterion: string;
+  conclusion: CriterionReviewConclusion;
+  confidence: number;
+  evidence_references: ReviewEvidenceReference[];
+}
 
 export interface AcceptanceLedgerItem {
   criterion_index: number;
   criterion: string;
   status: AcceptanceStatus;
   evidence: string;
+  evidence_references: ReviewEvidenceReference[];
   confidence: number;
   updated_at: string;
 }
@@ -117,6 +141,8 @@ export interface ReviewIssue {
   actual: string;
   suggested_change: string;
   confidence: number;
+  severity?: ReviewIssueSeverity;
+  evidence_references?: ReviewEvidenceReference[];
 }
 
 export interface RecoveryIssue extends ReviewIssue {
@@ -159,6 +185,9 @@ export interface RecoveryState {
   checkpoint_id: string;
   rollback_retest_pending: boolean;
   evidence_rebuild_attempted: boolean;
+  evidence_rebuild_attempts: number;
+  pending_evidence_criteria: number[];
+  evidence_strategies: ReviewEvidenceStrategy[];
   pending_execution_result?: ExecutionResult;
 }
 
@@ -562,6 +591,7 @@ export interface TestResult {
   issues: string[];
   suggestion: string;
   review_issues?: ReviewIssue[];
+  criterion_reviews?: CriterionReviewResult[];
   warnings?: string[];
   test_command?: string;
   test_exit_code?: number;
@@ -824,6 +854,9 @@ export type ExecutionEventType =
   | "RepairAttemptStarted"
   | "RepairAttemptCompleted"
   | "RetestCompleted"
+  | "EvidenceRebuildStarted"
+  | "EvidenceRebuildCompleted"
+  | "EvidenceStillInsufficient"
   | "RecoverySucceeded"
   | "RecoveryExhausted"
   | "HumanVerificationAccepted"

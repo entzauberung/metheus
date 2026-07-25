@@ -257,47 +257,7 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 pub(crate) async fn test_model_connection(target: ModelConnectionTarget) -> ConnectionTestResult {
     let started = std::time::Instant::now();
     if target == ModelConnectionTarget::BuiltInGrokBuild {
-        let snapshot = match crate::settings::begin_built_in_grok_build_request() {
-            Ok(snapshot) => snapshot,
-            Err(message) => {
-                return ConnectionTestResult {
-                    success: false,
-                    target,
-                    model: String::new(),
-                    latency_ms: elapsed_millis(started),
-                    error_kind: Some(ModelConnectionErrorKind::MissingSecret),
-                    message,
-                }
-            }
-        };
-        let _settings_revision = snapshot.settings_revision;
-        let config = metheus_grok_engine::GrokBuildExecutionConfig {
-            api_backend: match snapshot.settings.api_backend {
-                crate::settings::GrokBuildApiBackend::ChatCompletions => {
-                    metheus_grok_engine::GrokBuildApiBackend::ChatCompletions
-                }
-                crate::settings::GrokBuildApiBackend::Responses => {
-                    metheus_grok_engine::GrokBuildApiBackend::Responses
-                }
-                crate::settings::GrokBuildApiBackend::Messages => {
-                    metheus_grok_engine::GrokBuildApiBackend::Messages
-                }
-            },
-            api_base_url: snapshot.settings.api_base_url.clone(),
-            model: snapshot.settings.model.clone(),
-            api_key: snapshot.api_key.clone(),
-            timeout_secs: snapshot.settings.timeout_secs,
-            max_turns: snapshot.settings.max_turns,
-        };
-        let result = metheus_grok_engine::test_model_connection(config).await;
-        return ConnectionTestResult {
-            success: result.success,
-            target,
-            model: result.model,
-            latency_ms: result.latency_ms,
-            error_kind: result.error_kind.map(map_grok_connection_error),
-            message: result.message,
-        };
+        return crate::engine::test_builtin_grok_model_connection().await;
     }
     let request = crate::settings::begin_decision_request()
         .map(|snapshot| (snapshot.settings, snapshot.api_key, snapshot._activity));
@@ -346,42 +306,6 @@ pub(crate) async fn test_model_connection(target: ModelConnectionTarget) -> Conn
             error_kind: Some(error.kind),
             message: error.message,
         },
-    }
-}
-
-fn map_grok_connection_error(
-    kind: metheus_grok_engine::GrokBuildRuntimeErrorKind,
-) -> ModelConnectionErrorKind {
-    match kind {
-        metheus_grok_engine::GrokBuildRuntimeErrorKind::InvalidConfiguration => {
-            ModelConnectionErrorKind::InvalidConfiguration
-        }
-        metheus_grok_engine::GrokBuildRuntimeErrorKind::Authentication => {
-            ModelConnectionErrorKind::Authentication
-        }
-        metheus_grok_engine::GrokBuildRuntimeErrorKind::QuotaExceeded => {
-            ModelConnectionErrorKind::QuotaExceeded
-        }
-        metheus_grok_engine::GrokBuildRuntimeErrorKind::RateLimited => {
-            ModelConnectionErrorKind::RateLimited
-        }
-        metheus_grok_engine::GrokBuildRuntimeErrorKind::Network => {
-            ModelConnectionErrorKind::Network
-        }
-        metheus_grok_engine::GrokBuildRuntimeErrorKind::ProviderUnavailable => {
-            ModelConnectionErrorKind::ProviderUnavailable
-        }
-        metheus_grok_engine::GrokBuildRuntimeErrorKind::Timeout => {
-            ModelConnectionErrorKind::Timeout
-        }
-        metheus_grok_engine::GrokBuildRuntimeErrorKind::Cancelled
-        | metheus_grok_engine::GrokBuildRuntimeErrorKind::ToolRejected
-        | metheus_grok_engine::GrokBuildRuntimeErrorKind::ToolFailed
-        | metheus_grok_engine::GrokBuildRuntimeErrorKind::Protocol
-        | metheus_grok_engine::GrokBuildRuntimeErrorKind::MaxTurns
-        | metheus_grok_engine::GrokBuildRuntimeErrorKind::Runtime => {
-            ModelConnectionErrorKind::Protocol
-        }
     }
 }
 

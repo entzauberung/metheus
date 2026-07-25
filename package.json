@@ -1,12 +1,17 @@
 {
   "name": "metheus",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.0.3",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "test:autopilot-policy": "vitest run src/autopilotPolicy.test.ts",
+    "verify:core-light": "./scripts/verify-core-light.sh",
+    "verify:quality": "./scripts/verify-quality.sh",
+    "verify:grok-check": "./scripts/verify-grok-check.sh",
     "preview": "vite preview",
     "tauri": "tauri"
   },

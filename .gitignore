@@ -25,5 +25,6 @@ dist-ssr
 .env
 PROGRESS.md
 target/
+/.build/
 dist/
 *log

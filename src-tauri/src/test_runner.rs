@@ -30,7 +30,9 @@ pub(crate) fn detect_changes(
 #[cfg(test)]
 mod change_detection_tests {
     use super::{
-        build_review_evidence, detect_changes, git_changed_files, truncate_head_tail, FileSnapshot,
+        build_review_evidence_with_request, detect_changes, git_changed_files,
+        normalize_model_review, truncate_head_tail, FileSnapshot, ModelCriterionReview,
+        ModelReviewIssue, ModelReviewResponse, ReviewEvidence, ReviewEvidenceRequest,
     };
     use crate::project::ReviewEvidenceStatus;
     use std::process::Command;
@@ -125,13 +127,14 @@ mod change_detection_tests {
         );
         std::fs::write(path.join("index.html"), updated).map_err(|error| error.to_string())?;
 
-        let evidence = build_review_evidence(
+        let evidence = build_review_evidence_with_request(
             &path.to_string_lossy(),
             &["index.html".to_string()],
             &["toggleTheme()".to_string()],
+            &ReviewEvidenceRequest::default(),
         );
         assert!(evidence.rendered.contains("function toggleTheme"));
-        assert!(evidence.rendered.contains("Git diff"));
+        assert!(evidence.rendered.contains("GitDiff"));
         assert_eq!(evidence.status, ReviewEvidenceStatus::Partial);
         std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
         Ok(())
@@ -148,12 +151,13 @@ mod change_detection_tests {
             "const tail = 1;\n".repeat(500)
         );
         std::fs::write(path.join("index.html"), content).map_err(|error| error.to_string())?;
-        let evidence = build_review_evidence(
+        let evidence = build_review_evidence_with_request(
             &path.to_string_lossy(),
             &["index.html".to_string()],
             &["event.preventDefault".to_string()],
+            &ReviewEvidenceRequest::default(),
         );
-        assert!(evidence.rendered.contains("验收标识符命中上下文"));
+        assert!(evidence.rendered.contains("IdentifierContext"));
         assert!(evidence.rendered.contains("targetHandler"));
         std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
         Ok(())
@@ -166,6 +170,94 @@ mod change_detection_tests {
         assert!(truncated);
         assert!(rendered.contains("证据截断"));
         assert!(rendered.chars().count() <= 160);
+    }
+
+    #[test]
+    fn evidence_builder_targeted_strategies_use_distinct_context() -> Result<(), String> {
+        let path = std::env::temp_dir().join(format!(
+            "metheus-targeted-evidence-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+        let content = format!(
+            "{}\nfunction targetHandler(event) {{ localStorage.setItem('theme', 'dark'); }}\n{}",
+            "const before = 1;\n".repeat(40),
+            "const after = 1;\n".repeat(40)
+        );
+        std::fs::write(path.join("index.html"), content).map_err(|error| error.to_string())?;
+        let criteria = vec!["`targetHandler()` 写入 localStorage theme".to_string()];
+        let targeted = build_review_evidence_with_request(
+            &path.to_string_lossy(),
+            &["index.html".to_string()],
+            &criteria,
+            &ReviewEvidenceRequest {
+                strategy: crate::project::ReviewEvidenceStrategy::Targeted,
+                target_criterion_indices: vec![1],
+            },
+        );
+        let expanded = build_review_evidence_with_request(
+            &path.to_string_lossy(),
+            &["index.html".to_string()],
+            &criteria,
+            &ReviewEvidenceRequest {
+                strategy: crate::project::ReviewEvidenceStrategy::ExpandedTargeted,
+                target_criterion_indices: vec![1],
+            },
+        );
+        assert!(targeted.rendered.contains("targetHandler"));
+        assert!(expanded.rendered.contains("targetHandler"));
+        assert_ne!(targeted.rendered, expanded.rendered);
+        assert!(targeted.rendered.chars().count() <= super::MAX_REVIEW_EVIDENCE_CHARS);
+        assert!(expanded.rendered.chars().count() <= super::MAX_REVIEW_EVIDENCE_CHARS);
+        std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_protocol_warning_does_not_block_satisfied_criterion() {
+        let reference = crate::project::ReviewEvidenceReference {
+            block_id: "E001".to_string(),
+            source_kind: crate::project::EvidenceSourceKind::CurrentFileSnippet,
+            file: "index.html".to_string(),
+            start_line: Some(1),
+            end_line: Some(3),
+        };
+        let evidence = ReviewEvidence {
+            rendered: String::new(),
+            status: crate::project::ReviewEvidenceStatus::Partial,
+            summary: "文件部分展开".to_string(),
+            blocks: std::collections::BTreeMap::from([("E001".to_string(), reference)]),
+        };
+        let response = ModelReviewResponse {
+            passed: false,
+            criterion_reviews: Some(vec![ModelCriterionReview {
+                criterion_index: 1,
+                conclusion: crate::project::CriterionReviewConclusion::Satisfied,
+                confidence: 0.9,
+                evidence_block_ids: vec!["E001".to_string()],
+            }]),
+            review_issues: vec![ModelReviewIssue {
+                actual: "可以改用 let".to_string(),
+                confidence: 0.9,
+                severity: Some(crate::project::ReviewIssueSeverity::Suggestion),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let result = normalize_model_review(
+            response,
+            &["按钮可点击".to_string()],
+            &["index.html".to_string()],
+            &ReviewEvidenceRequest::default(),
+            &evidence,
+        );
+        assert!(result.review_passed);
+        assert!(result.passed);
+        assert_eq!(result.review_issues.len(), 1);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("总体结论")));
     }
 }
 /// 调用方（如 check_subtask）
@@ -246,14 +338,23 @@ fn git_changed_files(project_path: &str) -> Vec<String> {
 }
 
 const MAX_REVIEW_EVIDENCE_CHARS: usize = 30_000;
-const MAX_FILE_EVIDENCE_CHARS: usize = 8_000;
 const FULL_FILE_PREVIEW_CHARS: usize = 4_000;
+const MAX_CRITERION_EVIDENCE_CHARS: usize = 6_000;
+const MAX_TARGETED_CRITERIA: usize = 8;
+const EVIDENCE_CONTEXT_LINES: usize = 6;
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReviewEvidenceRequest {
+    pub strategy: project::ReviewEvidenceStrategy,
+    pub target_criterion_indices: Vec<u32>,
+}
 
 #[derive(Debug)]
 struct ReviewEvidence {
     rendered: String,
     status: project::ReviewEvidenceStatus,
     summary: String,
+    blocks: BTreeMap<String, project::ReviewEvidenceReference>,
 }
 
 fn merge_evidence_status(
@@ -357,9 +458,63 @@ fn git_diff_for_file(project_path: &str, file: &str) -> Result<String, String> {
     }
 }
 
-fn identifier_context(content: &str, identifiers: &[String]) -> String {
+fn criterion_indices(criteria: &[String], request: &ReviewEvidenceRequest) -> Vec<u32> {
+    match request.strategy {
+        project::ReviewEvidenceStrategy::Standard => (1..=criteria.len() as u32).collect(),
+        project::ReviewEvidenceStrategy::Targeted
+        | project::ReviewEvidenceStrategy::ExpandedTargeted => {
+            let mut indices = request
+                .target_criterion_indices
+                .iter()
+                .copied()
+                .filter(|index| *index > 0 && (*index as usize) <= criteria.len())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            indices.truncate(MAX_TARGETED_CRITERIA);
+            indices
+        }
+    }
+}
+
+fn evidence_terms(criteria: &[String], indices: &[u32]) -> Vec<String> {
+    let selected = indices
+        .iter()
+        .filter_map(|index| criteria.get(*index as usize - 1))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut terms = crate::plan_contract::acceptance_identifiers(&selected);
+    for criterion in &selected {
+        for token in criterion.split(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '`' | '\'' | '"' | '(' | ')' | '[' | ']' | ',' | '，' | '。' | '：' | ':'
+                )
+        }) {
+            let token = token.trim_matches(|ch: char| matches!(ch, '#' | '.' | ';'));
+            if token.len() >= 3
+                && (token.starts_with('#')
+                    || token.starts_with('.')
+                    || token.contains("storage")
+                    || token.contains("Storage")
+                    || token.contains("event")
+                    || token.contains("Event"))
+            {
+                terms.insert(token.to_string());
+            }
+        }
+    }
+    terms.into_iter().collect()
+}
+
+fn identifier_blocks(
+    content: &str,
+    identifiers: &[String],
+    radius: usize,
+) -> Vec<(u32, u32, String)> {
     let lines = content.lines().collect::<Vec<_>>();
-    let mut rendered = Vec::new();
+    let mut blocks = Vec::new();
     let mut seen = BTreeSet::new();
     for identifier in identifiers {
         let needle = identifier
@@ -376,64 +531,112 @@ fn identifier_context(content: &str, identifiers: &[String]) -> String {
             .filter(|(_, line)| line.contains(needle))
             .take(3)
         {
-            let start = index.saturating_sub(2);
-            let end = (index + 3).min(lines.len());
-            let key = format!("{start}:{end}");
-            if seen.insert(key) {
-                rendered.push(format!(
-                    "[标识符 {identifier}，第 {}-{} 行]\n{}",
-                    start + 1,
-                    end,
+            let start = index.saturating_sub(radius);
+            let end = (index + radius + 1).min(lines.len());
+            if seen.insert((start, end)) {
+                blocks.push((
+                    start as u32 + 1,
+                    end as u32,
                     number_lines(&lines[start..end].join("\n"), start + 1),
                 ));
             }
         }
     }
-    rendered.join("\n")
+    blocks
 }
 
-fn build_review_evidence(
+fn push_evidence_block(
+    rendered: &mut String,
+    blocks: &mut BTreeMap<String, project::ReviewEvidenceReference>,
+    status: &mut project::ReviewEvidenceStatus,
+    file: &str,
+    source_kind: project::EvidenceSourceKind,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+    body: &str,
+) -> bool {
+    let remaining = MAX_REVIEW_EVIDENCE_CHARS.saturating_sub(rendered.chars().count());
+    if remaining < 200 {
+        merge_evidence_status(status, project::ReviewEvidenceStatus::Partial);
+        return false;
+    }
+    let block_id = format!("E{:03}", blocks.len() + 1);
+    let range = match (start_line, end_line) {
+        (Some(start), Some(end)) => format!("lines {start}-{end}"),
+        _ => "lines n/a".to_string(),
+    };
+    let header = format!("\n[{block_id} | {source_kind:?} | {file} | {range}]\n");
+    let budget = remaining
+        .saturating_sub(header.chars().count())
+        .min(MAX_CRITERION_EVIDENCE_CHARS);
+    let (body, truncated) = truncate_head_tail(body, budget);
+    if truncated {
+        merge_evidence_status(status, project::ReviewEvidenceStatus::Partial);
+    }
+    rendered.push_str(&header);
+    rendered.push_str(&body);
+    rendered.push('\n');
+    blocks.insert(
+        block_id.clone(),
+        project::ReviewEvidenceReference {
+            block_id,
+            source_kind,
+            file: file.to_string(),
+            start_line,
+            end_line,
+        },
+    );
+    true
+}
+
+fn build_review_evidence_with_request(
     project_path: &str,
     files: &[String],
-    identifiers: &[String],
+    criteria: &[String],
+    request: &ReviewEvidenceRequest,
 ) -> ReviewEvidence {
     if files.is_empty() {
         return ReviewEvidence {
             rendered: "（没有可供审查的改动文件）".to_string(),
             status: project::ReviewEvidenceStatus::Unavailable,
             summary: "没有可供审查的改动文件".to_string(),
+            blocks: BTreeMap::new(),
         };
     }
 
+    let indices = criterion_indices(criteria, request);
+    let identifiers = evidence_terms(criteria, &indices);
     let mut rendered = String::new();
     let mut status = project::ReviewEvidenceStatus::Complete;
     let mut notes = Vec::new();
+    let mut blocks = BTreeMap::new();
 
-    for (index, file) in files.iter().enumerate() {
-        let remaining_files = files.len().saturating_sub(index).max(1);
-        let remaining_budget = MAX_REVIEW_EVIDENCE_CHARS.saturating_sub(rendered.chars().count());
-        if remaining_budget < 200 {
+    for file in files {
+        if MAX_REVIEW_EVIDENCE_CHARS.saturating_sub(rendered.chars().count()) < 200 {
             merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Partial);
-            notes.push(format!("另有 {} 个文件因总预算未展开", remaining_files));
+            notes.push("其余文件因总预算未展开".to_string());
             break;
         }
-        let file_budget = (remaining_budget / remaining_files)
-            .min(MAX_FILE_EVIDENCE_CHARS)
-            .max(200);
-        let mut section = format!("\n=== {file} ===\n");
         let mut has_diff = false;
 
         match git_diff_for_file(project_path, file) {
             Ok(diff) if !diff.trim().is_empty() => {
                 has_diff = true;
-                section.push_str("[Git diff，变更事实]\n");
-                section.push_str(&diff);
+                let _ = push_evidence_block(
+                    &mut rendered,
+                    &mut blocks,
+                    &mut status,
+                    file,
+                    project::EvidenceSourceKind::GitDiff,
+                    None,
+                    None,
+                    &diff,
+                );
             }
-            Ok(_) => section.push_str("[Git diff 为空，以下当前文件内容为主要证据]\n"),
+            Ok(_) => {}
             Err(error) => {
                 merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Unavailable);
                 notes.push(format!("{file}: {error}"));
-                section.push_str(&format!("[Git diff 不可用：{error}]\n"));
             }
         }
 
@@ -441,28 +644,65 @@ fn build_review_evidence(
         if full_path.exists() {
             match std::fs::read_to_string(&full_path) {
                 Ok(content) => {
-                    let (preview, partial) = render_file_preview(&content);
-                    section.push_str("\n[当前文件内容，带行号]\n");
-                    section.push_str(&preview);
-                    let context = identifier_context(&content, identifiers);
-                    if !context.is_empty() {
-                        section.push_str("\n\n[验收标识符命中上下文]\n");
-                        section.push_str(&context);
+                    let line_count = content.lines().count() as u32;
+                    if request.strategy == project::ReviewEvidenceStrategy::Standard {
+                        let (preview, partial) = render_file_preview(&content);
+                        let _ = push_evidence_block(
+                            &mut rendered,
+                            &mut blocks,
+                            &mut status,
+                            file,
+                            project::EvidenceSourceKind::CurrentFileSnippet,
+                            Some(1),
+                            Some(line_count.max(1)),
+                            &preview,
+                        );
+                        if partial {
+                            merge_evidence_status(
+                                &mut status,
+                                project::ReviewEvidenceStatus::Partial,
+                            );
+                            notes.push(format!("{file}: 当前文件仅提供头尾上下文"));
+                        }
                     }
-                    if partial {
+
+                    if !identifiers.is_empty() {
+                        let radius = if request.strategy
+                            == project::ReviewEvidenceStrategy::ExpandedTargeted
+                        {
+                            EVIDENCE_CONTEXT_LINES * 2
+                        } else {
+                            EVIDENCE_CONTEXT_LINES
+                        };
+                        for (start, end, context) in
+                            identifier_blocks(&content, &identifiers, radius)
+                        {
+                            if !push_evidence_block(
+                                &mut rendered,
+                                &mut blocks,
+                                &mut status,
+                                file,
+                                project::EvidenceSourceKind::IdentifierContext,
+                                Some(start),
+                                Some(end),
+                                &context,
+                            ) {
+                                break;
+                            }
+                        }
+                    }
+
+                    if request.strategy != project::ReviewEvidenceStrategy::Standard {
                         merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Partial);
-                        notes.push(format!("{file}: 当前文件仅提供头尾上下文"));
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                     merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Partial);
                     notes.push(format!("{file}: 二进制或非 UTF-8 文件"));
-                    section.push_str("\n[当前文件为二进制或非 UTF-8，未展开文本内容]\n");
                 }
                 Err(error) => {
                     merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Unavailable);
                     notes.push(format!("{file}: 读取失败：{error}"));
-                    section.push_str(&format!("\n[当前文件读取失败：{error}]\n"));
                 }
             }
         } else {
@@ -470,16 +710,7 @@ fn build_review_evidence(
                 merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Unavailable);
                 notes.push(format!("{file}: 文件不存在且没有 Git diff"));
             }
-            section.push_str("\n[当前文件不存在，可能为本次删除]\n");
         }
-
-        let (section, truncated) = truncate_head_tail(&section, file_budget);
-        if truncated {
-            merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Partial);
-            notes.push(format!("{file}: 单文件证据超过 {file_budget} 字符"));
-        }
-        rendered.push_str(&section);
-        rendered.push('\n');
     }
 
     let status_label = match status {
@@ -487,17 +718,31 @@ fn build_review_evidence(
         project::ReviewEvidenceStatus::Partial => "部分",
         project::ReviewEvidenceStatus::Unavailable => "不可用",
     };
+    let strategy_label = match request.strategy {
+        project::ReviewEvidenceStrategy::Standard => "标准审查".to_string(),
+        project::ReviewEvidenceStrategy::Targeted => {
+            format!("定向补证（验收项 {:?}）", indices)
+        }
+        project::ReviewEvidenceStrategy::ExpandedTargeted => {
+            format!("扩展定向补证（验收项 {:?}）", indices)
+        }
+    };
     let summary = if notes.is_empty() {
-        format!("证据{status_label}，覆盖 {} 个文件", files.len())
+        format!(
+            "{strategy_label}：证据{status_label}，覆盖 {} 个文件",
+            files.len()
+        )
     } else {
-        format!("证据{status_label}：{}", notes.join("；"))
+        format!("{strategy_label}：证据{status_label}：{}", notes.join("；"))
     };
     ReviewEvidence {
         rendered,
         status,
         summary,
+        blocks,
     }
 }
+
 /// 执行测试命令，带超时控制（spawn + try_wait 轮询）
 /// 返回: (exit_code, stdout, stderr)
 /// 测试辅助函数
@@ -729,6 +974,208 @@ impl AutomatedTestEvidence {
     }
 }
 
+#[derive(Debug, Default, serde::Deserialize)]
+struct ModelCriterionReview {
+    #[serde(default)]
+    criterion_index: u32,
+    #[serde(default)]
+    conclusion: project::CriterionReviewConclusion,
+    #[serde(default)]
+    confidence: f64,
+    #[serde(default)]
+    evidence_block_ids: Vec<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ModelReviewIssue {
+    #[serde(default)]
+    criterion_index: Option<u32>,
+    #[serde(default)]
+    criterion: String,
+    #[serde(default)]
+    file: String,
+    #[serde(default)]
+    expected: String,
+    #[serde(default)]
+    actual: String,
+    #[serde(default)]
+    suggested_change: String,
+    #[serde(default)]
+    confidence: f64,
+    #[serde(default)]
+    severity: Option<project::ReviewIssueSeverity>,
+    #[serde(default)]
+    evidence_block_ids: Vec<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ModelReviewResponse {
+    #[serde(default)]
+    passed: bool,
+    #[serde(default)]
+    issues: Vec<String>,
+    #[serde(default)]
+    suggestion: String,
+    #[serde(default)]
+    review_issues: Vec<ModelReviewIssue>,
+    #[serde(default)]
+    warnings: Vec<String>,
+    #[serde(default)]
+    criterion_reviews: Option<Vec<ModelCriterionReview>>,
+}
+
+fn resolve_evidence_references(
+    block_ids: &[String],
+    evidence: &ReviewEvidence,
+    authorized_paths: &[String],
+) -> Option<Vec<project::ReviewEvidenceReference>> {
+    if block_ids.is_empty() {
+        return None;
+    }
+    let authorized = authorized_paths
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut references = Vec::new();
+    let mut seen = BTreeSet::new();
+    for block_id in block_ids {
+        if !seen.insert(block_id) {
+            continue;
+        }
+        let reference = evidence.blocks.get(block_id)?;
+        if !authorized.is_empty() && !authorized.contains(reference.file.as_str()) {
+            return None;
+        }
+        references.push(reference.clone());
+    }
+    (!references.is_empty()).then_some(references)
+}
+
+fn normalize_model_review(
+    response: ModelReviewResponse,
+    criteria: &[String],
+    authorized_paths: &[String],
+    request: &ReviewEvidenceRequest,
+    evidence: &ReviewEvidence,
+) -> project::TestResult {
+    let requested_indices = criterion_indices(criteria, request);
+    let mut warnings = response.warnings;
+    let model_passed = response.passed;
+    let mut review_issues = Vec::new();
+
+    for issue in response.review_issues {
+        let references =
+            resolve_evidence_references(&issue.evidence_block_ids, evidence, authorized_paths);
+        let blocking = issue.severity == Some(project::ReviewIssueSeverity::Blocking);
+        if issue.severity.is_none()
+            || issue.confidence < 0.7
+            || (blocking && references.is_none())
+            || issue
+                .criterion_index
+                .is_some_and(|index| index == 0 || index as usize > criteria.len())
+        {
+            warnings.push(format!(
+                "审查问题未通过结构化校验，已降为诊断：{}",
+                issue.actual
+            ));
+            continue;
+        }
+        let criterion = issue
+            .criterion_index
+            .and_then(|index| criteria.get(index as usize - 1))
+            .cloned()
+            .unwrap_or(issue.criterion);
+        review_issues.push(project::ReviewIssue {
+            criterion_index: issue.criterion_index,
+            criterion,
+            file: issue.file,
+            expected: issue.expected,
+            actual: issue.actual,
+            suggested_change: issue.suggested_change,
+            confidence: issue.confidence,
+            severity: issue.severity,
+            evidence_references: references.unwrap_or_default(),
+        });
+    }
+
+    let raw_reviews = response.criterion_reviews.unwrap_or_default();
+    let mut counts = BTreeMap::<u32, usize>::new();
+    for review in &raw_reviews {
+        *counts.entry(review.criterion_index).or_default() += 1;
+    }
+    let mut by_index = raw_reviews
+        .into_iter()
+        .filter(|review| counts.get(&review.criterion_index) == Some(&1))
+        .map(|review| (review.criterion_index, review))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut criterion_reviews = Vec::new();
+    for index in requested_indices {
+        let criterion = criteria
+            .get(index as usize - 1)
+            .cloned()
+            .unwrap_or_default();
+        let normalized = by_index.remove(&index).and_then(|review| {
+            let references =
+                resolve_evidence_references(&review.evidence_block_ids, evidence, authorized_paths);
+            let has_blocker = review_issues.iter().any(|issue| {
+                issue.criterion_index == Some(index)
+                    && issue.severity == Some(project::ReviewIssueSeverity::Blocking)
+            });
+            let structurally_valid = review.confidence >= 0.7
+                && references.is_some()
+                && (review.conclusion != project::CriterionReviewConclusion::Unsatisfied
+                    || has_blocker);
+            structurally_valid.then_some(project::CriterionReviewResult {
+                criterion_index: index,
+                criterion: criterion.clone(),
+                conclusion: review.conclusion,
+                confidence: review.confidence,
+                evidence_references: references.unwrap_or_default(),
+            })
+        });
+        if counts.get(&index).copied().unwrap_or_default() > 1 {
+            warnings.push(format!("验收项 {index} 返回重复结论，已按证据不足处理"));
+        }
+        criterion_reviews.push(normalized.unwrap_or(project::CriterionReviewResult {
+            criterion_index: index,
+            criterion,
+            conclusion: project::CriterionReviewConclusion::EvidenceInsufficient,
+            confidence: 0.0,
+            evidence_references: vec![],
+        }));
+    }
+    for index in by_index.keys() {
+        warnings.push(format!("模型返回了未请求或越界的验收项 {index}，已忽略"));
+    }
+
+    let has_blocker = review_issues
+        .iter()
+        .any(|issue| issue.severity == Some(project::ReviewIssueSeverity::Blocking));
+    let review_passed = if criteria.is_empty() {
+        model_passed && !has_blocker
+    } else {
+        criterion_reviews
+            .iter()
+            .all(|review| review.conclusion == project::CriterionReviewConclusion::Satisfied)
+            && !has_blocker
+    };
+    if model_passed != review_passed {
+        warnings.push("模型总体结论与结构化逐项结果不一致，已采用后端重算结果".to_string());
+    }
+
+    project::TestResult {
+        passed: review_passed,
+        issues: response.issues,
+        suggestion: response.suggestion,
+        review_issues,
+        criterion_reviews,
+        warnings,
+        review_passed,
+        ..Default::default()
+    }
+}
+
 /// 测试
 #[tauri::command]
 pub(crate) async fn check_subtask(
@@ -747,6 +1194,7 @@ pub(crate) async fn check_subtask(
         None,
         None,
         None,
+        None,
     )
     .await
 }
@@ -760,6 +1208,7 @@ pub(crate) async fn check_subtask_with_context(
     acceptance_criteria: Option<Vec<String>>,
     authorized_paths: Option<Vec<String>>,
     execution_prompt: Option<String>,
+    evidence_request: Option<ReviewEvidenceRequest>,
 ) -> Result<project::TestResult, String> {
     // 1.尝试 git diff --name-only 获取改动文件
     let files = git_changed_files(project_path);
@@ -792,12 +1241,13 @@ pub(crate) async fn check_subtask_with_context(
     };
 
     // 3.以 Git diff 为主证据，并为长文件提供显式标记的头尾上下文。
-    let identifiers = crate::plan_contract::acceptance_identifiers(
+    let evidence_request = evidence_request.unwrap_or_default();
+    let review_evidence = build_review_evidence_with_request(
+        project_path,
+        &files,
         acceptance_criteria.as_deref().unwrap_or_default(),
-    )
-    .into_iter()
-    .collect::<Vec<_>>();
-    let review_evidence = build_review_evidence(project_path, &files, &identifiers);
+        &evidence_request,
+    );
     // ===== 真测试：检测项目类型，执行对应的测试命令 =====
     let test_evidence = {
         let project_root = std::path::Path::new(project_path);
@@ -1006,7 +1456,25 @@ pub(crate) async fn check_subtask_with_context(
     let acceptance_section = acceptance_criteria
         .as_ref()
         .filter(|items| !items.is_empty())
-        .map(|items| format!("## 验收标准\n- {}\n\n", items.join("\n- ")))
+        .map(|items| {
+            let indices = criterion_indices(items, &evidence_request);
+            let rendered = indices
+                .iter()
+                .filter_map(|index| {
+                    items
+                        .get(*index as usize - 1)
+                        .map(|criterion| format!("{index}. {criterion}"))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let instruction =
+                if evidence_request.strategy == project::ReviewEvidenceStrategy::Standard {
+                    "必须逐项覆盖以下全部验收标准"
+                } else {
+                    "这是定向补证，只返回以下请求编号的逐项结论"
+                };
+            format!("## 验收标准\n{instruction}\n{rendered}\n\n")
+        })
         .unwrap_or_default();
     let execution_section = execution_prompt
         .as_deref()
@@ -1060,10 +1528,16 @@ pub(crate) async fn check_subtask_with_context(
         });
     // 解析 JSON 响应（带兜底）
     let mut test_result: project::TestResult =
-        match crate::json_utils::parse_json_with_retry::<project::TestResult>(&raw_reply).await {
-            Ok(mut result) => {
-                result.warnings.extend(diagnosis_warnings);
-                result
+        match crate::json_utils::parse_json_with_retry::<ModelReviewResponse>(&raw_reply).await {
+            Ok(mut response) => {
+                response.warnings.extend(diagnosis_warnings);
+                normalize_model_review(
+                    response,
+                    acceptance_criteria.as_deref().unwrap_or_default(),
+                    authorized_paths.as_deref().unwrap_or_default(),
+                    &evidence_request,
+                    &review_evidence,
+                )
             }
             Err(e) => {
                 eprintln!(
@@ -1075,20 +1549,22 @@ pub(crate) async fn check_subtask_with_context(
                     "TestResult JSON 解析失败：{}。原始内容（前200字符）：{}",
                     e, preview
                 ));
-                project::TestResult {
-                    passed: false,
-                    issues: vec![format!(
-                        "AI 返回格式异常，解析失败：{}。原始内容（前200字符）：{}",
-                        e, preview
-                    )],
-                    suggestion: "AI 返回格式异常，请人工审查".to_string(),
-                    warnings: diagnosis_warnings,
-                    ..Default::default()
-                }
+                let mut response = ModelReviewResponse::default();
+                response.issues.push(format!(
+                    "AI 返回格式异常，解析失败：{}。原始内容（前200字符）：{}",
+                    e, preview
+                ));
+                response.suggestion = "AI 返回格式异常，请人工审查".to_string();
+                response.warnings = diagnosis_warnings;
+                normalize_model_review(
+                    response,
+                    acceptance_criteria.as_deref().unwrap_or_default(),
+                    authorized_paths.as_deref().unwrap_or_default(),
+                    &evidence_request,
+                    &review_evidence,
+                )
             }
         };
-    let review_passed = test_result.passed;
-    test_result.review_passed = review_passed;
     test_result.test_command = test_evidence.command;
     test_result.test_exit_code = test_evidence.exit_code;
     test_result.test_output_summary = test_evidence.output_summary;

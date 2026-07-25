@@ -1,8 +1,8 @@
 // src/components/AutopilotControlBar.tsx — 全局自动驾驶控制条
 // 在所有 Console 页面顶部显示自动驾驶状态与操作入口
-import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle, GitBranch, CheckCircle, CircleSlash2 } from "lucide-react";
+import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle, GitBranch, CheckCircle, CircleSlash2, TestTube2, ScanSearch, FileQuestion } from "lucide-react";
 import type { Project, PipelineState, AutopilotRecoveryAction } from "../types";
-import { getAutopilotErrorActions } from "../autopilotPolicy";
+import { getAutopilotErrorActions, getQualityStatusPresentation, getRecoveryStatusLabel } from "../autopilotPolicy";
 import { getManagedFlowPresentation } from "../managedFlowPolicy";
 
 export interface AutopilotControlBarProps {
@@ -63,6 +63,20 @@ export function AutopilotControlBar({
   const waitingEngine = recovery?.phase === "WaitingEngine" || recovery?.error_kind === "EngineBlocked";
   const targetMs = project.milestones.find(m => m.id === project.workflow_state.autopilot_target_milestone_id);
   const targetLabel = targetMs?.title ?? project.workflow_state.autopilot_target_milestone_id;
+  const recoverySubtask = recovery
+    ? project.milestones
+      .flatMap(milestone => [
+        ...(milestone.subtasks ?? []),
+        ...milestone.mid_stages.flatMap(midStage => midStage.subtasks),
+      ])
+      .find(subtask => subtask.id === recovery.subtask_id)
+    : undefined;
+  const qualityStatuses = recoverySubtask
+    ? getQualityStatusPresentation(
+      recoverySubtask.test_result,
+      recoverySubtask.acceptance_ledger ?? [],
+    )
+    : [];
 
   // 先判断失败会话，再判断自动驾驶是否激活 — 手动模式也要看到恢复入口
   const session = project.execution_session;
@@ -194,37 +208,7 @@ export function AutopilotControlBar({
   );
   const showGenericResume = errorActions.canResume;
   const showRetryAdvance = errorActions.canRetryAdvance;
-  const lastAttempt = recovery?.attempt_history?.length
-    ? recovery.attempt_history[recovery.attempt_history.length - 1]
-    : undefined;
-  const recoveryStatus = recovery ? {
-    Diagnosing: recovery.replan_attempted && recovery.attempt === 0
-      ? "重规划完成，准备从基线重新执行"
-      : recovery.active_issues?.length
-      ? `正在分析 ${recovery.active_issues.length} 个未满足验收项`
-      : "正在诊断错误",
-    Repairing: recovery.replan_attempted
-      ? "正在执行重规划后的当前任务"
-      : `正在执行第 ${recovery.attempt}/${recovery.max_attempts} 次修复`,
-    Retesting: lastAttempt
-      ? `正在重新测试；上一轮解决 ${lastAttempt.resolved_issue_ids.length} 项，剩余 ${lastAttempt.remaining_issue_ids.length + lastAttempt.regressed_issue_ids.length} 项`
-      : "正在重新测试",
-    Replanning: "常规修复耗尽，正在重新规划当前任务",
-    WaitingEngine: ({
-      QuotaExceeded: "执行额度不足，代码恢复已停止",
-      AuthenticationError: "执行引擎认证失效，代码恢复已停止",
-      RateLimited: "执行引擎限流，代码恢复已停止",
-      ProviderUnavailable: "执行服务不可用，代码恢复已停止",
-      NetworkError: "执行引擎网络不可用，代码恢复已停止",
-      Timeout: "执行引擎超时，代码恢复已停止",
-      ProcessCrash: "执行进程异常，代码恢复已停止",
-      TaskExecutionError: "执行引擎未完成任务",
-    } as const)[recovery.engine_failure_kind ?? "TaskExecutionError"],
-    Recovered: "自动修复成功，继续执行",
-    WaitingHuman: recovery.error_kind === "TestUnavailable" && recovery.attempt === 0
-      ? "自动修复未启动：测试或审查不可用"
-      : "自动恢复已耗尽，等待人工处理",
-  }[recovery.phase] : "";
+  const recoveryStatus = recovery ? getRecoveryStatusLabel(recovery) : "";
 
   return (
     <div className={`autopilot-control-bar ${runStatus === "Running" || isExecuting ? "ap-running" : ""} ${runStatus === "ErrorStopped" ? "ap-error" : ""}`}>
@@ -251,6 +235,23 @@ export function AutopilotControlBar({
             {recoveryStatus || lastAction}
           </span>
         )}
+        {qualityStatuses.map(status => (
+          <span
+            key={status.key}
+            className="ap-bar-warning"
+            title={status.label}
+            style={{
+              color: status.tone === "success" ? "#1a7f37"
+                : status.tone === "error" ? "#cf222e"
+                  : status.tone === "warning" ? "#9a6700" : "#656d76",
+            }}
+          >
+            {status.key === "automated-test" ? <TestTube2 size={13} />
+              : status.key === "code-review" ? <ScanSearch size={13} />
+                : <FileQuestion size={13} />}
+            {" "}{status.label}
+          </span>
+        ))}
         {errorMessage && runStatus === "ErrorStopped" && (
           <span className="ap-bar-error" title={errorMessage}>{errorMessage.slice(0, 80)}{errorMessage.length > 80 ? "…" : ""}</span>
         )}

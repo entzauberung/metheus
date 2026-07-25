@@ -128,7 +128,19 @@ cd metheus
 npm install && npm run tauri dev
 ```
 
-在“应用设置”中配置决策模型。使用 Grok Build 内置模式时，另行选择接口后端、地址和模型，将 API Key 保存到系统凭据库或仅用于本次会话，然后依次执行“测试模型连接”和“运行时自检”。API Key 不写入项目或应用设置 JSON。
+在“应用设置”中配置决策模型。在显式包含 `full-product` 的产品构建中使用 Grok Build 内置模式时，另行选择接口后端、地址和模型，将 API Key 保存到系统凭据库或仅用于本次会话，然后依次执行“测试模型连接”和“运行时自检”。API Key 不写入项目或应用设置 JSON。
+
+### 开发构建与验证
+
+日常开发默认不编译预装 Grok Build：Cargo 默认特性为空，Claude Code、Codex、Kimi 和 Grok Build CLI 插件仍可使用。轻量构建读取到已选择内置 Grok Build 的旧项目时会保留项目设置，但明确阻止执行，不会静默切换引擎。
+
+```bash
+npm run verify:core-light   # Core 格式与库目标类型检查
+npm run verify:quality      # 定向 Rust 测试、TypeScript 和前端策略测试
+npm run verify:grok-check   # 单任务检查内置 Grok 特性，不做最终链接
+```
+
+`builtin-grok` 只启用内置运行时，`full-product` 是包含该能力的产品特性。正式发布必须在高资源环境中显式传入 `full-product`，例如 `npm run tauri -- build --features full-product`；不能用轻量检查结果代替发布打包验收。Core 与 Grok 专项分别使用 `.build/core` 和 `.build/grok-full`，不得共享缓存。
 
 ### 首次使用的路径
 

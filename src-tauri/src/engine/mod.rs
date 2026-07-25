@@ -1,3 +1,7 @@
+#[cfg(feature = "builtin-grok")]
+mod builtin;
+#[cfg(not(feature = "builtin-grok"))]
+#[path = "builtin_disabled.rs"]
 mod builtin;
 mod claude_code;
 mod codex;
@@ -22,5 +26,18 @@ pub(crate) use service::{
 };
 
 pub(crate) async fn test_grok_build_runtime() -> EngineRuntimeSelfTestResult {
+    debug_assert_eq!(builtin_grok_compiled(), cfg!(feature = "builtin-grok"));
     builtin::test_runtime().await
+}
+
+pub(crate) async fn test_builtin_grok_model_connection() -> crate::settings::ConnectionTestResult {
+    builtin::test_model_connection().await
+}
+
+pub(crate) fn builtin_grok_source_revision() -> Option<String> {
+    builtin::source_revision()
+}
+
+pub(crate) const fn builtin_grok_compiled() -> bool {
+    builtin::is_compiled()
 }

@@ -5,7 +5,10 @@ use super::contract::{
 };
 use crate::pipeline::{append_runtime_log, PipelineState, PipelineStatus};
 use crate::project::{EngineFailureKind, ExecutionProvider, ExecutionResult, ExecutionRuntime};
-use crate::settings::{AppSettings, BuiltInGrokBuildSettings, GrokBuildApiBackend};
+use crate::settings::{
+    AppSettings, BuiltInGrokBuildSettings, ConnectionTestResult, GrokBuildApiBackend,
+    ModelConnectionErrorKind, ModelConnectionTarget,
+};
 use metheus_grok_engine::{
     GrokBuildExecutionConfig, GrokBuildExecutionRequest, GrokBuildRuntimeErrorKind,
     GrokBuildRuntimeEvent, RuntimeEventSink,
@@ -56,6 +59,14 @@ struct CachedSelfTest {
 }
 
 static SELF_TEST_CACHE: OnceLock<Mutex<Option<CachedSelfTest>>> = OnceLock::new();
+
+pub(super) const fn is_compiled() -> bool {
+    true
+}
+
+pub(super) fn source_revision() -> Option<String> {
+    Some(metheus_grok_engine::source_revision().to_string())
+}
 
 fn cached_self_test(settings: &AppSettings, api_key: &str) -> Option<EngineRuntimeSelfTestResult> {
     let identity = SelfTestCacheIdentity::new(settings, api_key);
@@ -214,6 +225,62 @@ pub(crate) async fn test_runtime() -> EngineRuntimeSelfTestResult {
     };
     cache_self_test(&settings, &snapshot.api_key, result.clone());
     result
+}
+
+pub(super) async fn test_model_connection() -> ConnectionTestResult {
+    let started = std::time::Instant::now();
+    let snapshot = match crate::settings::begin_built_in_grok_build_request() {
+        Ok(snapshot) => snapshot,
+        Err(message) => {
+            return ConnectionTestResult {
+                success: false,
+                target: ModelConnectionTarget::BuiltInGrokBuild,
+                model: String::new(),
+                latency_ms: elapsed_millis(started),
+                error_kind: Some(ModelConnectionErrorKind::MissingSecret),
+                message,
+            }
+        }
+    };
+    let result = metheus_grok_engine::test_model_connection(adapter_config(
+        &snapshot.settings,
+        &snapshot.api_key,
+    ))
+    .await;
+    ConnectionTestResult {
+        success: result.success,
+        target: ModelConnectionTarget::BuiltInGrokBuild,
+        model: result.model,
+        latency_ms: result.latency_ms,
+        error_kind: result.error_kind.map(map_connection_error),
+        message: result.message,
+    }
+}
+
+fn map_connection_error(kind: GrokBuildRuntimeErrorKind) -> ModelConnectionErrorKind {
+    match kind {
+        GrokBuildRuntimeErrorKind::InvalidConfiguration => {
+            ModelConnectionErrorKind::InvalidConfiguration
+        }
+        GrokBuildRuntimeErrorKind::Authentication => ModelConnectionErrorKind::Authentication,
+        GrokBuildRuntimeErrorKind::QuotaExceeded => ModelConnectionErrorKind::QuotaExceeded,
+        GrokBuildRuntimeErrorKind::RateLimited => ModelConnectionErrorKind::RateLimited,
+        GrokBuildRuntimeErrorKind::Network => ModelConnectionErrorKind::Network,
+        GrokBuildRuntimeErrorKind::ProviderUnavailable => {
+            ModelConnectionErrorKind::ProviderUnavailable
+        }
+        GrokBuildRuntimeErrorKind::Timeout => ModelConnectionErrorKind::Timeout,
+        GrokBuildRuntimeErrorKind::Cancelled
+        | GrokBuildRuntimeErrorKind::ToolRejected
+        | GrokBuildRuntimeErrorKind::ToolFailed
+        | GrokBuildRuntimeErrorKind::Protocol
+        | GrokBuildRuntimeErrorKind::MaxTurns
+        | GrokBuildRuntimeErrorKind::Runtime => ModelConnectionErrorKind::Protocol,
+    }
+}
+
+fn elapsed_millis(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn map_failure_kind(kind: GrokBuildRuntimeErrorKind) -> EngineFailureKind {

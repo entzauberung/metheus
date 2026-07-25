@@ -1,12 +1,13 @@
-use crate::AppState;
 use crate::pipeline::{self, PipelineState, PipelineStatus, SubtaskStatusItem};
 use crate::project;
+use crate::AppState;
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_DIAGNOSIS_CHARS: usize = 12_000;
 const MAX_EVIDENCE_CHARS: usize = 6_000;
 const MAX_FAILURE_HISTORY: usize = 4;
 const DEFAULT_MAX_ATTEMPTS: u32 = 2;
+const MAX_EVIDENCE_REBUILD_ATTEMPTS: u32 = 2;
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
@@ -81,6 +82,12 @@ fn actionable_recovery_issues(
             || issue.actual.trim().is_empty()
             || issue.suggested_change.trim().is_empty()
             || issue.confidence < 0.7
+            || issue.severity != Some(project::ReviewIssueSeverity::Blocking)
+            || issue.evidence_references.is_empty()
+            || issue.evidence_references.iter().any(|reference| {
+                reference.block_id.trim().is_empty()
+                    || !authorized.contains(reference.file.as_str())
+            })
         {
             continue;
         }
@@ -101,6 +108,8 @@ fn actionable_recovery_issues(
                 actual: issue.actual.clone(),
                 suggested_change: issue.suggested_change.clone(),
                 confidence: issue.confidence,
+                severity: issue.severity.clone(),
+                evidence_references: issue.evidence_references.clone(),
             },
         );
     }
@@ -129,6 +138,78 @@ fn recovery_issues(
             ..Default::default()
         })
         .collect()
+}
+
+fn pending_evidence_criteria(ledger: &[project::AcceptanceLedgerItem]) -> Vec<u32> {
+    ledger
+        .iter()
+        .filter(|item| item.status == project::AcceptanceStatus::Unknown)
+        .map(|item| item.criterion_index)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn next_evidence_strategy(
+    recovery: &project::RecoveryState,
+) -> Option<project::ReviewEvidenceStrategy> {
+    match recovery.evidence_rebuild_attempts {
+        0 => Some(project::ReviewEvidenceStrategy::Targeted),
+        1 => Some(project::ReviewEvidenceStrategy::ExpandedTargeted),
+        _ => None,
+    }
+}
+
+fn merge_targeted_review(
+    previous: Option<&project::TestResult>,
+    mut targeted: project::TestResult,
+    target_indices: &[u32],
+) -> project::TestResult {
+    let Some(previous) = previous else {
+        return targeted;
+    };
+    let targets = target_indices.iter().copied().collect::<BTreeSet<_>>();
+    let mut reviews = previous
+        .criterion_reviews
+        .iter()
+        .filter(|review| !targets.contains(&review.criterion_index))
+        .map(|review| (review.criterion_index, review.clone()))
+        .collect::<BTreeMap<_, _>>();
+    reviews.extend(
+        targeted
+            .criterion_reviews
+            .drain(..)
+            .map(|review| (review.criterion_index, review)),
+    );
+    targeted.criterion_reviews = reviews.into_values().collect();
+
+    let mut issues = previous
+        .review_issues
+        .iter()
+        .filter(|issue| {
+            issue
+                .criterion_index
+                .is_none_or(|index| !targets.contains(&index))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    issues.append(&mut targeted.review_issues);
+    targeted.review_issues = issues;
+
+    targeted.warnings = previous
+        .warnings
+        .iter()
+        .chain(targeted.warnings.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    targeted.review_evidence_summary = format!(
+        "原审查：{}；定向补证：{}",
+        previous.review_evidence_summary, targeted.review_evidence_summary
+    );
+    targeted.acceptance_results.clear();
+    targeted
 }
 
 fn issue_list_for_prompt(issues: &[project::RecoveryIssue]) -> String {
@@ -193,12 +274,6 @@ fn attempt_history_for_prompt(history: &[project::RecoveryAttemptRecord]) -> Str
         .join("\n")
 }
 
-fn has_review_transport_failure(test: &project::TestResult) -> bool {
-    test.warnings
-        .iter()
-        .any(|warning| warning.contains("AI API") || warning.contains("解析失败"))
-}
-
 fn touch(proj: &mut project::Project) {
     proj.workflow_state.data_revision = proj.workflow_state.data_revision.saturating_add(1);
     proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
@@ -250,45 +325,23 @@ pub(crate) fn classify_test_result_with_context(
     let Some(test) = test else {
         return project::RecoveryErrorKind::TestUnavailable;
     };
-    match test.automated_test_status {
-        project::AutomatedTestStatus::Failed => project::RecoveryErrorKind::TestFailure,
-        project::AutomatedTestStatus::Unavailable => project::RecoveryErrorKind::TestUnavailable,
-        project::AutomatedTestStatus::Passed
-        | project::AutomatedTestStatus::NotConfigured
-        | project::AutomatedTestStatus::Unknown => {
-            if has_review_transport_failure(test)
-                || test.review_evidence_status == project::ReviewEvidenceStatus::Unavailable
-            {
-                return project::RecoveryErrorKind::TestUnavailable;
-            }
-            match test.review_evidence_status {
-                project::ReviewEvidenceStatus::Complete => {
-                    if subtask.is_some_and(|subtask| {
-                        !actionable_recovery_issues(test, subtask, authorized_paths).is_empty()
-                    }) {
-                        project::RecoveryErrorKind::ReviewFailure
-                    } else if !test.review_issues.is_empty() || !test.issues.is_empty() {
-                        // A complete review that cannot bind its findings to the immutable
-                        // contract is a plan/contract mismatch, not a code repair target.
-                        project::RecoveryErrorKind::PlanFailure
-                    } else {
-                        project::RecoveryErrorKind::ValidationFailure
-                    }
-                }
-                project::ReviewEvidenceStatus::Partial
-                    if subtask.is_some_and(|subtask| {
-                        !actionable_recovery_issues(test, subtask, authorized_paths).is_empty()
-                    }) =>
-                {
-                    project::RecoveryErrorKind::ReviewFailure
-                }
-                project::ReviewEvidenceStatus::Partial
-                | project::ReviewEvidenceStatus::Unavailable => {
-                    project::RecoveryErrorKind::ValidationFailure
-                }
-            }
-        }
-    }
+    let (criterion_count, ledger) = if let Some(subtask) = subtask {
+        let ledger = if !test.acceptance_results.is_empty() {
+            test.acceptance_results.clone()
+        } else if !subtask.acceptance_ledger.is_empty() {
+            subtask.acceptance_ledger.clone()
+        } else {
+            crate::acceptance::build_ledger(&subtask.acceptance_criteria, test, authorized_paths)
+        };
+        (subtask.acceptance_criteria.len(), ledger)
+    } else {
+        (
+            test.acceptance_results.len(),
+            test.acceptance_results.clone(),
+        )
+    };
+    crate::quality_gate::evaluate(Some(test), &ledger, criterion_count, false)
+        .recovery_error_kind(Some(test))
 }
 
 /// 没有任务契约时，部分审查证据不会被误判为可执行。
@@ -336,6 +389,9 @@ fn create_recovery_state(
         checkpoint_id: String::new(),
         rollback_retest_pending: false,
         evidence_rebuild_attempted: false,
+        evidence_rebuild_attempts: 0,
+        pending_evidence_criteria: vec![],
+        evidence_strategies: vec![],
         pending_execution_result: None,
     }
 }
@@ -460,8 +516,36 @@ pub(crate) fn ensure_quality_recovery(
     if let Some(test) = subtask.test_result.as_ref() {
         recovery.active_issues = recovery_issues(test, subtask, &authorized_paths);
     }
-    let automatic = kind != project::RecoveryErrorKind::TestUnavailable;
-    if kind == project::RecoveryErrorKind::ValidationFailure {
+    if kind == project::RecoveryErrorKind::EvidenceInsufficient {
+        let ledger = if subtask.acceptance_ledger.is_empty() {
+            subtask
+                .test_result
+                .as_ref()
+                .map(|test| {
+                    crate::acceptance::build_ledger(
+                        &subtask.acceptance_criteria,
+                        test,
+                        &authorized_paths,
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            subtask.acceptance_ledger.clone()
+        };
+        recovery.pending_evidence_criteria = pending_evidence_criteria(&ledger);
+        recovery.active_issues.clear();
+    }
+    let automatic = !matches!(
+        kind,
+        project::RecoveryErrorKind::TestUnavailable
+            | project::RecoveryErrorKind::ContractContradiction
+            | project::RecoveryErrorKind::ValidationOscillation
+    );
+    if matches!(
+        kind,
+        project::RecoveryErrorKind::EvidenceInsufficient
+            | project::RecoveryErrorKind::ValidationFailure
+    ) {
         recovery.phase = project::RecoveryPhase::Retesting;
     } else if kind == project::RecoveryErrorKind::PlanFailure {
         recovery.phase = project::RecoveryPhase::Replanning;
@@ -481,7 +565,11 @@ pub(crate) fn ensure_quality_recovery(
     if automatic {
         set_autopilot_recovering(
             proj,
-            if kind == project::RecoveryErrorKind::ValidationFailure {
+            if matches!(
+                kind,
+                project::RecoveryErrorKind::EvidenceInsufficient
+                    | project::RecoveryErrorKind::ValidationFailure
+            ) {
                 "正在重建验收证据"
             } else if kind == project::RecoveryErrorKind::PlanFailure {
                 "当前任务契约与项目事实不一致，正在受限重规划"
@@ -1200,7 +1288,7 @@ async fn run_recovery_retest(
     session: &project::ExecutionSession,
     authorized_paths: &[String],
     execution_id: &str,
-    mark_evidence_rebuilt: bool,
+    evidence_request: Option<crate::test_runner::ReviewEvidenceRequest>,
 ) -> Result<project::Project, String> {
     {
         let mut pipeline_guard = state.pipeline_state.lock().await;
@@ -1229,6 +1317,14 @@ async fn run_recovery_retest(
     } else {
         subtask.execution_prompt.clone()
     };
+    let previous_test = subtask.test_result.clone();
+    let evidence_strategy = evidence_request
+        .as_ref()
+        .map(|request| request.strategy.clone());
+    let target_indices = evidence_request
+        .as_ref()
+        .map(|request| request.target_criterion_indices.clone())
+        .unwrap_or_default();
     let test = crate::test_runner::check_subtask_with_context(
         &project.project_path,
         if subtask.goal.is_empty() {
@@ -1242,6 +1338,7 @@ async fn run_recovery_retest(
         Some(subtask.acceptance_criteria.clone()),
         Some(authorized_paths.to_vec()),
         Some(prompt),
+        evidence_request,
     )
     .await
     .unwrap_or(project::TestResult {
@@ -1251,6 +1348,11 @@ async fn run_recovery_retest(
         automated_test_status: project::AutomatedTestStatus::Unavailable,
         ..Default::default()
     });
+    let test = if evidence_strategy.is_some() {
+        merge_targeted_review(previous_test.as_ref(), test, &target_indices)
+    } else {
+        test
+    };
 
     let mut pipeline_guard = state.pipeline_state.lock().await;
     let mut proj = crate::load_project(project_name)?;
@@ -1267,12 +1369,36 @@ async fn run_recovery_retest(
     if !still_current {
         return Ok(proj);
     }
-    if mark_evidence_rebuilt {
-        if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
-            recovery.evidence_rebuild_attempted = true;
+    let rolled_back = finish_retest(&mut proj, session, execution_id, test.clone())?;
+    if let Some(strategy) = evidence_strategy {
+        pipeline::write_execution_history(
+            &mut proj,
+            "info",
+            project::ExecutionEventType::EvidenceRebuildCompleted,
+            format!("验收证据补充完成：{:?}", strategy),
+            Some(&session.milestone_id),
+            Some(&session.mid_stage_id),
+            Some(&session.subtask_id),
+        );
+        if proj
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .is_some_and(|recovery| {
+                recovery.error_kind == project::RecoveryErrorKind::EvidenceInsufficient
+            })
+        {
+            pipeline::write_execution_history(
+                &mut proj,
+                "error",
+                project::ExecutionEventType::EvidenceStillInsufficient,
+                "定向补证后仍有验收项缺少有效证据".to_string(),
+                Some(&session.milestone_id),
+                Some(&session.mid_stage_id),
+                Some(&session.subtask_id),
+            );
         }
     }
-    let rolled_back = finish_retest(&mut proj, session, execution_id, test.clone())?;
     set_pipeline_retest_result(&mut pipeline_guard, execution_id, test, &proj, rolled_back);
     crate::save_project(&proj)?;
     crate::load_project(project_name)
@@ -1302,13 +1428,7 @@ pub(crate) async fn run_error_recovery(
         return Err("自动恢复已停止，等待人工处理。".to_string());
     }
     let authorized_paths = crate::plan_contract::validate_subtask(&subtask, "错误恢复任务")?;
-    if recovery.rollback_retest_pending
-        || (recovery.error_kind == project::RecoveryErrorKind::ValidationFailure
-            && !recovery.evidence_rebuild_attempted)
-    {
-        let rebuilding_validation_evidence = recovery.error_kind
-            == project::RecoveryErrorKind::ValidationFailure
-            && !recovery.evidence_rebuild_attempted;
+    if recovery.rollback_retest_pending {
         if let Some(current) = proj.workflow_state.recovery_state.as_mut() {
             current.phase = project::RecoveryPhase::Retesting;
             current.updated_at = chrono::Utc::now().to_rfc3339();
@@ -1326,7 +1446,80 @@ pub(crate) async fn run_error_recovery(
             &session,
             &authorized_paths,
             &recovery.execution_id,
-            rebuilding_validation_evidence,
+            None,
+        )
+        .await;
+    }
+    if recovery.error_kind == project::RecoveryErrorKind::EvidenceInsufficient {
+        let pending = if recovery.pending_evidence_criteria.is_empty() {
+            pending_evidence_criteria(&subtask.acceptance_ledger)
+        } else {
+            recovery.pending_evidence_criteria.clone()
+        };
+        let strategy = if recovery.evidence_rebuild_attempts >= MAX_EVIDENCE_REBUILD_ATTEMPTS
+            || pending.is_empty()
+        {
+            None
+        } else {
+            next_evidence_strategy(&recovery)
+        };
+        let Some(strategy) = strategy else {
+            let message = if pending.is_empty() {
+                "没有可定向补证的验收项，等待人工补充证据"
+            } else {
+                "两次定向补证后验收证据仍不足，等待人工处理"
+            };
+            mark_waiting_human(
+                &mut proj,
+                project::RecoveryErrorKind::EvidenceInsufficient,
+                message,
+            );
+            pipeline::write_execution_history(
+                &mut proj,
+                "error",
+                project::ExecutionEventType::EvidenceStillInsufficient,
+                message.to_string(),
+                Some(&session.milestone_id),
+                Some(&session.mid_stage_id),
+                Some(&session.subtask_id),
+            );
+            crate::save_project(&proj)?;
+            return crate::load_project(&project_name);
+        };
+        if let Some(current) = proj.workflow_state.recovery_state.as_mut() {
+            current.phase = project::RecoveryPhase::Retesting;
+            current.evidence_rebuild_attempted = true;
+            current.evidence_rebuild_attempts = current.evidence_rebuild_attempts.saturating_add(1);
+            current.pending_evidence_criteria = pending.clone();
+            current.evidence_strategies.push(strategy.clone());
+            current.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+        session.active = true;
+        session.status = "recovering".to_string();
+        proj.execution_session = Some(session.clone());
+        set_autopilot_recovering(&mut proj, "正在补充验收证据");
+        pipeline::write_execution_history(
+            &mut proj,
+            "info",
+            project::ExecutionEventType::EvidenceRebuildStarted,
+            format!("开始 {:?} 补证，验收项：{:?}", strategy, pending),
+            Some(&session.milestone_id),
+            Some(&session.mid_stage_id),
+            Some(&session.subtask_id),
+        );
+        touch(&mut proj);
+        crate::save_project(&proj)?;
+        drop(pipeline_guard);
+        return run_recovery_retest(
+            &state,
+            &project_name,
+            &session,
+            &authorized_paths,
+            &recovery.execution_id,
+            Some(crate::test_runner::ReviewEvidenceRequest {
+                strategy,
+                target_criterion_indices: pending,
+            }),
         )
         .await;
     }
@@ -1771,7 +1964,7 @@ pub(crate) async fn run_error_recovery(
         &session,
         &authorized_paths,
         &recovery_execution_id,
-        false,
+        None,
     )
     .await
 }
@@ -1963,14 +2156,14 @@ pub(crate) fn finish_retest(
 
     test.acceptance_results =
         crate::acceptance::build_ledger(&subtask.acceptance_criteria, &test, &authorized_paths);
-    let quality_passed = test.passed
-        && test.review_issues.is_empty()
-        && test.acceptance_results.iter().all(|item| {
-            matches!(
-                item.status,
-                project::AcceptanceStatus::Satisfied | project::AcceptanceStatus::AcceptedDeviation
-            )
-        });
+    let quality = crate::quality_gate::evaluate(
+        Some(&test),
+        &test.acceptance_results,
+        subtask.acceptance_criteria.len(),
+        false,
+    );
+    let quality_passed = quality.passed();
+    test.passed = quality_passed;
     let item = proj
         .milestones
         .iter_mut()
@@ -1993,12 +2186,26 @@ pub(crate) fn finish_retest(
     item.acceptance_ledger = test.acceptance_results.clone();
 
     let summary = test_failure_summary(Some(&test), "复测未通过");
+    let evidence_recovery = proj
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .is_some_and(|recovery| {
+            recovery.error_kind == project::RecoveryErrorKind::EvidenceInsufficient
+                || recovery.evidence_rebuild_attempts > 0
+        });
     pipeline::write_execution_history(
         proj,
         if quality_passed { "success" } else { "error" },
         project::ExecutionEventType::RetestCompleted,
         if quality_passed {
-            "自动修复复测通过".to_string()
+            if evidence_recovery {
+                "验收证据补充后质量门禁通过".to_string()
+            } else {
+                "自动修复复测通过".to_string()
+            }
+        } else if quality.outcome == crate::quality_gate::QualityGateOutcome::EvidenceInsufficient {
+            format!("验收证据仍不足：{}", truncate_chars(&summary, 1_000))
         } else {
             format!("自动修复复测未通过：{}", truncate_chars(&summary, 1_000))
         },
@@ -2053,13 +2260,21 @@ pub(crate) fn finish_retest(
             proj,
             "success",
             project::ExecutionEventType::RecoverySucceeded,
-            "自动修复成功，恢复正常自动驾驶".to_string(),
+            if evidence_recovery {
+                "验收证据补齐，恢复正常自动驾驶".to_string()
+            } else {
+                "自动修复成功，恢复正常自动驾驶".to_string()
+            },
             Some(&session.milestone_id),
             Some(&session.mid_stage_id),
             Some(&session.subtask_id),
         );
         if let Some(completed_recovery) = proj.workflow_state.recovery_state.clone() {
-            let strategy = if completed_recovery.replan_attempted {
+            let strategy = if completed_recovery.evidence_rebuild_attempts > 0
+                && completed_recovery.attempt == 0
+            {
+                "按未知验收项执行两级定向补证"
+            } else if completed_recovery.replan_attempted {
                 "受限计划补丁后从基线完整重执行"
             } else {
                 "按验收差异执行受限代码修复"
@@ -2080,7 +2295,11 @@ pub(crate) fn finish_retest(
         proj.workflow_state.recovery_state = None;
         if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
             autopilot.run_status = project::AutopilotRunStatus::Running;
-            autopilot.last_action = "自动修复成功，继续执行".to_string();
+            autopilot.last_action = if evidence_recovery {
+                "验收证据补齐，继续执行".to_string()
+            } else {
+                "自动修复成功，继续执行".to_string()
+            };
             autopilot.last_action_at = chrono::Utc::now().to_rfc3339();
             autopilot.error_message.clear();
             autopilot.recovery_action = project::AutopilotRecoveryAction::None;
@@ -2089,8 +2308,51 @@ pub(crate) fn finish_retest(
         return Ok(false);
     }
 
-    let mut next_kind =
-        classify_test_result_with_context(Some(&test), Some(&subtask), &authorized_paths);
+    if quality.outcome == crate::quality_gate::QualityGateOutcome::EvidenceInsufficient {
+        let pending = pending_evidence_criteria(&test.acceptance_results);
+        let evidence_attempts = proj
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .map(|recovery| recovery.evidence_rebuild_attempts)
+            .unwrap_or_default();
+        let evidence_exhausted =
+            pending.is_empty() || evidence_attempts >= MAX_EVIDENCE_REBUILD_ATTEMPTS;
+        if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
+            recovery.error_kind = project::RecoveryErrorKind::EvidenceInsufficient;
+            recovery.phase = if evidence_exhausted {
+                project::RecoveryPhase::WaitingHuman
+            } else {
+                project::RecoveryPhase::Retesting
+            };
+            recovery.pending_evidence_criteria = pending;
+            recovery.active_issues.clear();
+            recovery.rollback_retest_pending = false;
+            recovery.original_test_failure = truncate_chars(&summary, 4_000);
+            append_failure_history(recovery, &summary);
+            recovery.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+        if let Some(current_session) = proj.execution_session.as_mut() {
+            current_session.execution_id = execution_id.to_string();
+            current_session.active = true;
+            current_session.status = if evidence_exhausted {
+                "quality_blocked".to_string()
+            } else {
+                "recovering".to_string()
+            };
+            current_session.failure_message = truncate_chars(&summary, 2_048);
+            current_session.state_entered_at = chrono::Utc::now().to_rfc3339();
+        }
+        if evidence_exhausted {
+            set_autopilot_waiting(proj, "验收证据仍不足，等待人工处理");
+        } else {
+            set_autopilot_recovering(proj, "验收证据仍不足，准备定向补证");
+        }
+        touch(proj);
+        return Ok(false);
+    }
+
+    let mut next_kind = quality.recovery_error_kind(Some(&test));
     let next_issues = recovery_issues(&test, &subtask, &authorized_paths);
     let changed_files = proj
         .workflow_state
@@ -2134,7 +2396,7 @@ pub(crate) fn finish_retest(
             .cloned()
             .collect::<BTreeSet<_>>();
         if !oscillating_ids.is_empty() {
-            next_kind = project::RecoveryErrorKind::ValidationFailure;
+            next_kind = project::RecoveryErrorKind::ValidationOscillation;
             contradictory_criteria.extend(
                 next_issues
                     .iter()
@@ -2251,7 +2513,10 @@ pub(crate) fn finish_retest(
         } else if matches!(
             next_kind,
             project::RecoveryErrorKind::TestUnavailable
+                | project::RecoveryErrorKind::EvidenceInsufficient
                 | project::RecoveryErrorKind::ValidationFailure
+                | project::RecoveryErrorKind::ContractContradiction
+                | project::RecoveryErrorKind::ValidationOscillation
         ) || recovery.replan_execution_attempted
         {
             project::RecoveryPhase::WaitingHuman
@@ -2305,6 +2570,14 @@ pub(crate) fn finish_retest(
     }
 
     if next_phase == project::RecoveryPhase::WaitingHuman {
+        let waiting_message = match next_kind {
+            project::RecoveryErrorKind::ContractContradiction => {
+                "验收结论与有效阻断证据冲突，等待人工判断"
+            }
+            project::RecoveryErrorKind::ValidationOscillation => "验收结论反复变化，已停止机械重试",
+            project::RecoveryErrorKind::TestUnavailable => "测试或代码审查服务不可用，等待人工处理",
+            _ => "代码自动恢复达到停止条件，等待人工处理",
+        };
         if let Some(failed_recovery) = proj.workflow_state.recovery_state.clone() {
             crate::recovery_learning::record(
                 proj,
@@ -2323,12 +2596,12 @@ pub(crate) fn finish_retest(
                 },
             );
         }
-        set_autopilot_waiting(proj, "自动修复未能通过复测，等待人工处理");
+        set_autopilot_waiting(proj, waiting_message);
         pipeline::write_execution_history(
             proj,
             "error",
             project::ExecutionEventType::RecoveryExhausted,
-            "自动修复达到停止条件，等待人工处理".to_string(),
+            waiting_message.to_string(),
             Some(&session.milestone_id),
             Some(&session.mid_stage_id),
             Some(&session.subtask_id),
@@ -2754,7 +3027,7 @@ pub(crate) async fn resolve_human_recovery(
             } else {
                 subtask.execution_prompt.clone()
             };
-            let test = crate::test_runner::check_subtask_with_context(
+            let mut test = crate::test_runner::check_subtask_with_context(
                 &proj.project_path,
                 if subtask.goal.is_empty() {
                     &subtask.title
@@ -2767,6 +3040,7 @@ pub(crate) async fn resolve_human_recovery(
                 Some(subtask.acceptance_criteria.clone()),
                 Some(authorized_paths.clone()),
                 Some(prompt),
+                None,
             )
             .await
             .unwrap_or(project::TestResult {
@@ -2776,8 +3050,20 @@ pub(crate) async fn resolve_human_recovery(
                 automated_test_status: project::AutomatedTestStatus::Unavailable,
                 ..Default::default()
             });
+            test.acceptance_results = crate::acceptance::build_ledger(
+                &subtask.acceptance_criteria,
+                &test,
+                &authorized_paths,
+            );
+            let quality = crate::quality_gate::evaluate(
+                Some(&test),
+                &test.acceptance_results,
+                subtask.acceptance_criteria.len(),
+                false,
+            );
+            test.passed = quality.passed();
             let mut proj = crate::load_project(&project_name)?;
-            if test.passed {
+            if quality.passed() {
                 let item = proj
                     .milestones
                     .iter_mut()
@@ -2797,6 +3083,11 @@ pub(crate) async fn resolve_human_recovery(
                     .ok_or_else(|| "复测完成后无法定位小阶段。".to_string())?;
                 item.status = project::SubtaskStatus::AwaitingConfirmation;
                 item.test_result = Some(test);
+                item.acceptance_ledger = item
+                    .test_result
+                    .as_ref()
+                    .map(|result| result.acceptance_results.clone())
+                    .unwrap_or_default();
                 if let Some(current_session) = proj.execution_session.as_mut() {
                     current_session.status = "awaiting_confirmation".to_string();
                     current_session.active = true;
@@ -2839,6 +3130,7 @@ pub(crate) async fn resolve_human_recovery(
                 {
                     item.status = project::SubtaskStatus::AwaitingConfirmation;
                     item.test_result = Some(test.clone());
+                    item.acceptance_ledger = test.acceptance_results.clone();
                 }
                 mark_waiting_human(
                     &mut proj,
@@ -2894,6 +3186,85 @@ mod tests {
         }
     }
 
+    fn evidence_reference(block_id: &str) -> project::ReviewEvidenceReference {
+        project::ReviewEvidenceReference {
+            block_id: block_id.to_string(),
+            source_kind: project::EvidenceSourceKind::CurrentFileSnippet,
+            file: "index.html".to_string(),
+            start_line: Some(1),
+            end_line: Some(3),
+        }
+    }
+
+    #[test]
+    fn evidence_strategies_are_bounded_and_do_not_spend_repair_attempts() {
+        let mut recovery = project::RecoveryState {
+            attempt: 2,
+            replan_attempted: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            next_evidence_strategy(&recovery),
+            Some(project::ReviewEvidenceStrategy::Targeted)
+        );
+        recovery.evidence_rebuild_attempts = 1;
+        assert_eq!(
+            next_evidence_strategy(&recovery),
+            Some(project::ReviewEvidenceStrategy::ExpandedTargeted)
+        );
+        recovery.evidence_rebuild_attempts = 2;
+        assert_eq!(next_evidence_strategy(&recovery), None);
+        assert_eq!(recovery.attempt, 2);
+        assert!(recovery.replan_attempted);
+    }
+
+    #[test]
+    fn targeted_review_replaces_only_requested_criteria() {
+        let previous = project::TestResult {
+            criterion_reviews: vec![
+                project::CriterionReviewResult {
+                    criterion_index: 1,
+                    conclusion: project::CriterionReviewConclusion::Satisfied,
+                    confidence: 0.9,
+                    evidence_references: vec![evidence_reference("E001")],
+                    ..Default::default()
+                },
+                project::CriterionReviewResult {
+                    criterion_index: 2,
+                    conclusion: project::CriterionReviewConclusion::EvidenceInsufficient,
+                    ..Default::default()
+                },
+            ],
+            review_evidence_summary: "standard".to_string(),
+            ..Default::default()
+        };
+        let targeted = project::TestResult {
+            criterion_reviews: vec![project::CriterionReviewResult {
+                criterion_index: 2,
+                conclusion: project::CriterionReviewConclusion::Satisfied,
+                confidence: 0.9,
+                evidence_references: vec![evidence_reference("E002")],
+                ..Default::default()
+            }],
+            review_evidence_summary: "targeted".to_string(),
+            ..Default::default()
+        };
+
+        let merged = merge_targeted_review(Some(&previous), targeted, &[2]);
+
+        assert_eq!(merged.criterion_reviews.len(), 2);
+        assert_eq!(
+            merged.criterion_reviews[0].conclusion,
+            project::CriterionReviewConclusion::Satisfied
+        );
+        assert_eq!(
+            merged.criterion_reviews[1].evidence_references[0].block_id,
+            "E002"
+        );
+        assert!(merged.review_evidence_summary.contains("standard"));
+        assert!(merged.review_evidence_summary.contains("targeted"));
+    }
+
     #[test]
     fn classifies_structured_test_failures_without_message_parsing() {
         let failed = project::TestResult {
@@ -2935,7 +3306,7 @@ mod tests {
         };
         assert_eq!(
             classify_test_result(Some(&partial_review)),
-            project::RecoveryErrorKind::ValidationFailure
+            project::RecoveryErrorKind::EvidenceInsufficient
         );
 
         let complete_review = project::TestResult {
@@ -2946,7 +3317,7 @@ mod tests {
         };
         assert_eq!(
             classify_test_result(Some(&complete_review)),
-            project::RecoveryErrorKind::ValidationFailure
+            project::RecoveryErrorKind::EvidenceInsufficient
         );
 
         let plan_failure = project::TestResult {
@@ -2957,7 +3328,7 @@ mod tests {
         };
         assert_eq!(
             classify_test_result(Some(&plan_failure)),
-            project::RecoveryErrorKind::PlanFailure
+            project::RecoveryErrorKind::EvidenceInsufficient
         );
     }
 
@@ -3113,6 +3484,8 @@ mod tests {
                 actual: "对象缺少 isDefault".to_string(),
                 suggested_change: "补充 isDefault".to_string(),
                 confidence: 0.9,
+                severity: Some(project::ReviewIssueSeverity::Blocking),
+                evidence_references: vec![evidence_reference("E001")],
             }],
             ..Default::default()
         };
@@ -3124,13 +3497,13 @@ mod tests {
         partial.review_issues[0].confidence = 0.6;
         assert_eq!(
             classify_test_result_with_context(Some(&partial), Some(&subtask), &authorized),
-            project::RecoveryErrorKind::ValidationFailure
+            project::RecoveryErrorKind::EvidenceInsufficient
         );
         partial.review_issues[0].confidence = 0.9;
         partial.review_issues[0].file = "outside.html".to_string();
         assert_eq!(
             classify_test_result_with_context(Some(&partial), Some(&subtask), &authorized),
-            project::RecoveryErrorKind::ValidationFailure
+            project::RecoveryErrorKind::EvidenceInsufficient
         );
     }
 
@@ -3257,6 +3630,8 @@ mod tests {
     #[test]
     fn built_in_recovery_requires_complete_model_and_endpoint_snapshot() {
         let settings = crate::settings::AppSettings::default();
+        let source_revision = crate::engine::builtin_grok_source_revision()
+            .unwrap_or_else(|| "builtin-grok-disabled-test".to_string());
         let mut profile = project::ExecutionProfile::default();
         profile.runtime = project::ExecutionRuntime::BuiltIn;
         profile.provider = project::ExecutionProvider::GrokBuild;
@@ -3271,14 +3646,14 @@ mod tests {
             supports_unattended: true,
             configuration_valid: true,
             capabilities: vec!["embedded".to_string()],
-            source_revision: Some(metheus_grok_engine::source_revision().to_string()),
+            source_revision: Some(source_revision.clone()),
             runtime_self_test: Default::default(),
             message: "ready".to_string(),
         };
         let mut session = project::ExecutionSession {
             engine_snapshot: profile,
             engine_settings_revision: settings.revision,
-            engine_source_revision: metheus_grok_engine::source_revision().to_string(),
+            engine_source_revision: source_revision,
             engine_api_backend: settings
                 .built_in_grok_build
                 .api_backend

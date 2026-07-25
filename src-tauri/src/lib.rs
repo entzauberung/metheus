@@ -23,6 +23,7 @@ mod plan_contract;
 mod project;
 mod project_facts;
 mod prompts;
+mod quality_gate;
 mod recovery;
 mod recovery_checkpoint;
 mod recovery_learning;

@@ -599,6 +599,7 @@ async fn execute_current_subtask_background(
         Some(acceptance_criteria.clone()),
         Some(authorized_paths.clone()),
         Some(approved_prompt),
+        None,
     )
     .await
     .unwrap_or(project::TestResult {
@@ -611,6 +612,13 @@ async fn execute_current_subtask_background(
     });
     test.acceptance_results =
         crate::acceptance::build_ledger(&acceptance_criteria, &test, &authorized_paths);
+    let quality = crate::quality_gate::evaluate(
+        Some(&test),
+        &test.acceptance_results,
+        acceptance_criteria.len(),
+        false,
+    );
+    test.passed = quality.passed();
 
     // 与暂停命令共用流水线锁，保证 execution_id 校验到项目保存之间不被旧任务穿透。
     let mut pipeline_guard = pipeline_state.lock().await;
@@ -705,22 +713,22 @@ async fn execute_current_subtask_background(
     );
     write_execution_history(
         &mut proj,
-        if test.passed { "success" } else { "error" },
+        if quality.passed() { "success" } else { "error" },
         project::ExecutionEventType::TestComplete,
-        if test.passed {
+        if quality.passed() {
             format!(
-                "🔍 测试通过 ({}/{})：{}",
+                "🔍 质量门禁通过 ({}/{})：{}",
                 subtask_idx + 1,
                 total,
                 subtask_title
             )
         } else {
             format!(
-                "🔍 测试未通过 ({}/{})：{} — {}",
+                "🔍 质量门禁阻断 ({}/{})：{} — {}",
                 subtask_idx + 1,
                 total,
                 subtask_title,
-                test.suggestion
+                quality.message
             )
         },
         Some(&milestone_id),
@@ -1018,33 +1026,14 @@ fn validate_subtask_quality_gate_with_session_statuses(
         .as_ref()
         .ok_or("缺少测试结果，无法确认。测试服务可能不可用。".to_string())?;
 
-    // 校验测试结果通过
-    if !test_result.passed {
-        return Err(format!(
-            "测试未通过：{}",
-            if test_result.suggestion.is_empty() {
-                "无详细说明"
-            } else {
-                &test_result.suggestion
-            }
-        ));
-    }
-
-    if crate::acceptance::needs_evidence(&subtask.acceptance_ledger) {
-        return Err("验收账本存在未证明项，无法确认；请先重建审查证据。".to_string());
-    }
-    if !subtask.acceptance_criteria.is_empty()
-        && subtask.acceptance_ledger.len() != subtask.acceptance_criteria.len()
-    {
-        return Err("验收账本不完整，无法确认；请先重建审查证据。".to_string());
-    }
-    if subtask.acceptance_ledger.iter().any(|item| {
-        !matches!(
-            item.status,
-            project::AcceptanceStatus::Satisfied | project::AcceptanceStatus::AcceptedDeviation
-        )
-    }) {
-        return Err("验收账本仍有未满足或矛盾项，无法确认。".to_string());
+    let quality = crate::quality_gate::evaluate(
+        Some(test_result),
+        &subtask.acceptance_ledger,
+        subtask.acceptance_criteria.len(),
+        false,
+    );
+    if !quality.passed() {
+        return Err(quality.message);
     }
 
     Ok(())
@@ -4764,7 +4753,11 @@ mod tests {
             &mut proj,
             "test failed"
         )?);
-        let recovery = proj.workflow_state.recovery_state.as_ref().unwrap();
+        let recovery = proj
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .ok_or_else(|| "质量恢复状态意外丢失".to_string())?;
         assert_eq!(recovery.error_kind, project::RecoveryErrorKind::TestFailure);
         assert_eq!(recovery.phase, project::RecoveryPhase::Diagnosing);
         assert_eq!(recovery.max_attempts, 2);
@@ -4987,7 +4980,11 @@ mod tests {
         assert!(subtask.test_result.is_none());
         assert!(subtask.acceptance_ledger.is_empty());
         assert!(subtask.human_verification.is_none());
-        let recovery = proj.workflow_state.recovery_state.as_ref().unwrap();
+        let recovery = proj
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .ok_or_else(|| "回归回滚恢复状态意外丢失".to_string())?;
         assert!(recovery.rollback_retest_pending);
         assert!(recovery.pending_execution_result.is_none());
         assert_eq!(recovery.active_issues, vec![original_issue]);
@@ -5016,6 +5013,79 @@ mod tests {
             subtask.test_result.as_ref().map(|result| &result.issues),
             Some(&vec!["original failure".to_string()])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_retest_does_not_spend_repair_or_replan_attempts() -> Result<(), String> {
+        let session = execution_session("recovering", "recovery-evidence", "abc123");
+        let mut proj = execution_project(
+            "recovery-evidence",
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(session.clone()),
+        );
+        let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+        subtask.acceptance_criteria = vec!["criterion".to_string()];
+        subtask.execution_result = Some(project::ExecutionResult {
+            success: true,
+            file_changes: vec!["tracked.txt".to_string()],
+            ..Default::default()
+        });
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::EvidenceInsufficient,
+            phase: project::RecoveryPhase::Retesting,
+            attempt: 1,
+            max_attempts: 2,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "recovery-evidence".to_string(),
+            ..Default::default()
+        });
+        let insufficient = project::TestResult {
+            automated_test_status: project::AutomatedTestStatus::Passed,
+            criterion_reviews: vec![project::CriterionReviewResult {
+                criterion_index: 1,
+                criterion: "criterion".to_string(),
+                conclusion: project::CriterionReviewConclusion::EvidenceInsufficient,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        crate::recovery::finish_retest(
+            &mut proj,
+            &session,
+            "recovery-evidence",
+            insufficient.clone(),
+        )?;
+        let recovery = proj
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .ok_or_else(|| "补证恢复状态意外丢失".to_string())?;
+        assert_eq!(recovery.phase, project::RecoveryPhase::Retesting);
+        assert_eq!(
+            recovery.error_kind,
+            project::RecoveryErrorKind::EvidenceInsufficient
+        );
+        assert_eq!(recovery.attempt, 1);
+        assert!(!recovery.replan_attempted);
+        assert_eq!(recovery.pending_evidence_criteria, vec![1]);
+
+        proj.workflow_state
+            .recovery_state
+            .as_mut()
+            .ok_or_else(|| "补证恢复状态意外丢失".to_string())?
+            .evidence_rebuild_attempts = 2;
+        crate::recovery::finish_retest(&mut proj, &session, "recovery-evidence", insufficient)?;
+        let recovery = proj
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .ok_or_else(|| "补证恢复状态意外丢失".to_string())?;
+        assert_eq!(recovery.phase, project::RecoveryPhase::WaitingHuman);
+        assert_eq!(recovery.attempt, 1);
+        assert!(!recovery.replan_attempted);
         Ok(())
     }
 

@@ -6,7 +6,7 @@
 // ...
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import { executionPollingOwnsNextAdvance } from "./autopilotPolicy";
+import { executionPollingOwnsNextAdvance, getQualityStatusPresentation } from "./autopilotPolicy";
 import { getWorkspaceAction } from "./workspacePolicy";
 import "./App.css";
 import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, AutopilotNextStep, TestResult } from "./types";
@@ -20,7 +20,7 @@ import { ActionButton } from "./components/ActionButton";
 import { Modal } from "./components/Modal";
 import { ConsoleStepShell } from "./components/ConsoleStepShell";
 import { WorkflowActionBar } from "./components/WorkflowActionBar";
-import { Check, GitBranch, ListTodo, Pause, Play, RefreshCw, RotateCcw, Search, Square, WandSparkles, X } from "lucide-react";
+import { Check, FileQuestion, GitBranch, ListTodo, Pause, Play, RefreshCw, RotateCcw, ScanSearch, Search, Square, TestTube2, WandSparkles, X } from "lucide-react";
 import { AutopilotControlBar } from "./components/AutopilotControlBar";
 import ExecutionTree from "./ExecutionTree";
 import ChatRoom from "./ChatRoom";
@@ -2242,6 +2242,12 @@ function V1ExecutionPanel({
     && Boolean(awaitingSubtask.human_verification.verification_reason.trim());
   const testOk = awaitingSubtask?.test_result?.passed === true || humanOverride;
   const canConfirm = execOk && testOk && isAwaiting;
+  const qualityStatuses = awaitingSubtask
+    ? getQualityStatusPresentation(
+      awaitingSubtask.test_result,
+      awaitingSubtask.acceptance_ledger ?? [],
+    )
+    : [];
   const failureReason = !canConfirm && isAwaiting
     ? (!execOk ? "执行未成功" : !testOk ? "核验未通过" : null)
     : null;
@@ -2364,9 +2370,23 @@ function V1ExecutionPanel({
                 </>
               )}
               {awaitingSubtask.test_result && (
-                <div style={{ marginTop: "4px", color: awaitingSubtask.test_result.passed ? "#1a7f37" : "#cf222e" }}>
-                  核验：{verificationLabel(awaitingSubtask.test_result)}
-                  {awaitingSubtask.test_result.suggestion && ` — ${awaitingSubtask.test_result.suggestion}`}
+                <div style={{ marginTop: "6px", display: "grid", gap: "4px" }}>
+                  {qualityStatuses.map(status => (
+                    <div key={status.key} style={{
+                      display: "flex", alignItems: "center", gap: "5px",
+                      color: status.tone === "success" ? "#1a7f37"
+                        : status.tone === "error" ? "#cf222e"
+                          : status.tone === "warning" ? "#9a6700" : "#656d76",
+                    }}>
+                      {status.key === "automated-test" ? <TestTube2 size={14} />
+                        : status.key === "code-review" ? <ScanSearch size={14} />
+                          : <FileQuestion size={14} />}
+                      {status.label}
+                    </div>
+                  ))}
+                  {awaitingSubtask.test_result.suggestion && (
+                    <div style={{ color: "#656d76" }}>建议：{awaitingSubtask.test_result.suggestion}</div>
+                  )}
                 </div>
               )}
               {awaitingSubtask.human_verification && (

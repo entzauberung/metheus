@@ -1,6 +1,6 @@
 [package]
 name = "metheus"
-version = "0.0.2"
+version = "0.0.3"
 description = "A Tauri App"
 authors = ["entzauberung"]
 edition = "2021"
@@ -18,6 +18,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = []
+builtin-grok = ["dep:metheus-grok-engine"]
+full-product = ["builtin-grok"]
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
@@ -31,9 +36,24 @@ dirs = "5"
 walkdir = "2"
 chrono = "0.4"
 sha2 = "0.10"
-metheus-grok-engine = { path = "crates/metheus-grok-engine" }
+metheus-grok-engine = { path = "crates/metheus-grok-engine", optional = true }
 keyring = "4.1.5"
 
 [workspace]
 members = [".", "crates/metheus-grok-engine"]
 resolver = "2"
+
+[profile.dev]
+codegen-units = 12          # 增加并行单元，虽然慢一丢丢，但大幅降低单次内存峰值
+incremental = false         # 暂时关闭增量编译，防止 target 再次迅速膨胀到 40G
+
+[profile.core-dev]
+inherits = "dev"
+debug = 0
+incremental = true
+
+[profile.grok-check]
+inherits = "dev"
+debug = 0
+incremental = false
+codegen-units = 1
