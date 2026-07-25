@@ -8,6 +8,7 @@
 use std::fs;
 mod acceptance;
 mod api;
+mod chat_runtime;
 mod commands;
 mod constants;
 mod constitution;
@@ -73,8 +74,15 @@ pub(crate) fn check_project_path(path: &str) -> project::PathValidationResult {
 
 ///保存项目数据到文件（原子写入：先写临时文件，再替换正式文件）
 pub(crate) fn save_project(project: &project::Project) -> Result<(), String> {
-    //1. 确保 .metheus 目录存在
     let path = project_data_path(&project.name)?;
+    save_project_to_path(project, &path)
+}
+
+pub(crate) fn save_project_to_path(
+    project: &project::Project,
+    path: &std::path::Path,
+) -> Result<(), String> {
+    //1. 确保目标目录存在
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{}", e))?;
     }
@@ -95,10 +103,12 @@ pub(crate) fn save_project(project: &project::Project) -> Result<(), String> {
 /// 根据项目名字，从硬盘文件里加载项目数据
 // 比如输入 "my_game"，就去 ~/.metheus/my_game.json 里读取，还原成 Project 对象
 pub(crate) fn load_project(name: &str) -> Result<project::Project, String> {
-    // 1. 根据名字生成文件路径（例如 "/home/张三/.metheus/my_game.json"）
     let path = project_data_path(name)?;
+    load_project_from_path(&path)
+}
 
-    // 2. 读取整个文件内容 → 得到一个 JSON 字符串
+pub(crate) fn load_project_from_path(path: &std::path::Path) -> Result<project::Project, String> {
+    // 读取整个文件内容，再还原成 Project
     //    如果文件不存在或无法读取，就返回错误
     let data = fs::read_to_string(&path).map_err(|e| format!("读取文件失败：{}", e))?;
 
@@ -141,6 +151,7 @@ pub fn run() {
         .manage(AppState {
             pipeline_state: Arc::new(Mutex::new(None)),
         })
+        .manage(crate::chat_runtime::ChatRuntimeState::default())
         .invoke_handler(tauri::generate_handler![
             crate::commands::chat::greet,
             crate::commands::chat::send_message,
@@ -155,6 +166,9 @@ pub fn run() {
             crate::commands::settings::test_model_connection,
             crate::commands::settings::test_grok_build_runtime,
             crate::commands::chat::chat_with_role,
+            crate::commands::chat::chat_with_role_stream,
+            crate::commands::chat::regenerate_chat_reply_stream,
+            crate::commands::chat::cancel_chat_stream,
             crate::commands::plan::generate_version_plan,
             crate::commands::plan::approve_version_plan,
             crate::commands::plan::reject_version_plan,

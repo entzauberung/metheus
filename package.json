@@ -9,6 +9,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "test:autopilot-policy": "vitest run src/autopilotPolicy.test.ts",
+    "test:chat-policy": "vitest run src/chatStreamPolicy.test.ts src/chatStreamController.test.ts src/chatScrollPolicy.test.ts src/chatComposerPolicy.test.ts src/ChatRoom.test.tsx",
+    "verify:chat-ux": "./scripts/verify-chat-ux.sh",
     "verify:core-light": "./scripts/verify-core-light.sh",
     "verify:quality": "./scripts/verify-quality.sh",
     "verify:grok-check": "./scripts/verify-grok-check.sh",
@@ -30,6 +32,7 @@
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^4.6.0",
+    "happy-dom": "^17.6.3",
     "typescript": "~5.8.3",
     "vite": "^7.0.4",
     "vitest": "^3.2.4"

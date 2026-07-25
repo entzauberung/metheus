@@ -4,9 +4,24 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // ...
-import { useState, useMemo } from "react";
-import { invokeWithTimeout } from "./utils/invokeWithTimeout"
-import { ChatMessage, Project } from "./types"
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ArrowDown, RotateCcw, Send, Square } from "lucide-react";
+import { ChatStreamController } from "./chatStreamController";
+import {
+  isChatStreamActive,
+  mergeChatMessages,
+  type ChatStreamSession,
+} from "./chatStreamPolicy";
+import { isNearChatBottom, nextUnreadState } from "./chatScrollPolicy";
+import {
+  canSubmitChatMessage,
+  CHAT_COMPOSER_MAX_HEIGHT_PX,
+  CHAT_COMPOSER_MIN_HEIGHT_PX,
+  CHAT_MESSAGE_MAX_CHARS,
+  clampComposerHeight,
+  shouldSendFromComposer,
+} from "./chatComposerPolicy";
+import type { ChatMessage, Project } from "./types";
 interface Props {
   messages: ChatMessage[];
   onAddMessage: (msg: ChatMessage) => void;
@@ -20,33 +35,85 @@ interface Props {
   hideInput?: boolean;
   hideInputReason?: string;
 }
-function ChatRoom({ messages, onAddMessage, projectName, currentRole, threadId, onViewDetailedReport, onProjectUpdated, hideInput, hideInputReason }: Props) {
+function ChatRoomSession({ messages, projectName, currentRole, threadId, onViewDetailedReport, onProjectUpdated, hideInput, hideInputReason }: Props) {
   const [inputValue, setInputValue] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
-  // 这是【发送消息】功能。当用户点击发送按钮时执行。
-  // 1. 如果输入框是空的，或者正在等待AI回复，直接退出。
-  // 2. 创建一条用户消息对象（带ID、角色"user"、当前时间戳）。
-  // 3. 把用户消息加到聊天记录（onAddMessage）。
-  // 4. 清空输入框，并将加载状态设为true（禁用发送按钮）。
-  // 5. 使用Tauri的invoke调用Rust后端的send_message函数，传入用户消息。
-  // 6. 等待结果：
-  //    - 成功 → 创建AI消息对象，加到聊天记录。
-  //    - 失败 → 创建错误消息对象，加到聊天记录。
-  // 7. 最后（无论成功失败）恢复加载状态为false（解锁发送按钮）。
-  const handleSend = async () => {
-    if (inputValue.trim() === "" || isLoading) return;
-    /**
-    * 解析输入中的 @角色 标记。
-    * 若包含 @策略 / @产品 / @技术 / @测试，则将目标角色映射为全称，
-    * 并将实际消息中的 @标记 移除并去除首尾空格。
-    *
-    * @param inputValue   - 用户输入的原始字符串
-    * @param currentRole  - 当前默认角色（fallback）
-    * @returns { targetRole, actualMessage }
-    *   - targetRole: 角色全称（或 currentRole）
-    *   - actualMessage: 去除 @标记 后的消息
-    */
+  const [streamSession, setStreamSession] = useState<ChatStreamSession | null>(null);
+  const controllerRef = useRef<ChatStreamController | null>(null);
+  const messagesRef = useRef<HTMLDivElement | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const followLatestRef = useRef(true);
+  const lastContentSizeRef = useRef(0);
+  const [hasUnread, setHasUnread] = useState(false);
+  const projectUpdatedRef = useRef(onProjectUpdated);
+  projectUpdatedRef.current = onProjectUpdated;
 
+  useEffect(() => {
+    const controller = new ChatStreamController({
+      onState: setStreamSession,
+      onProject: (project) => projectUpdatedRef.current?.(project),
+    });
+    controllerRef.current = controller;
+    return () => {
+      controller.dispose();
+      if (controllerRef.current === controller) controllerRef.current = null;
+    };
+  }, [projectName, threadId]);
+
+  const isLoading = isChatStreamActive(streamSession);
+  const displayedMessages = useMemo(
+    () => mergeChatMessages(messages, streamSession),
+    [messages, streamSession],
+  );
+  const displayedContentSize = useMemo(
+    () => displayedMessages.reduce((total, message) => total + message.content.length + 1, 0),
+    [displayedMessages],
+  );
+  const canSend = canSubmitChatMessage(inputValue, isLoading);
+
+  const resizeComposer = useCallback(() => {
+    const composer = composerRef.current;
+    if (!composer) return;
+    composer.style.height = `${CHAT_COMPOSER_MIN_HEIGHT_PX}px`;
+    const height = clampComposerHeight(composer.scrollHeight);
+    composer.style.height = `${height}px`;
+    composer.style.overflowY = composer.scrollHeight > CHAT_COMPOSER_MAX_HEIGHT_PX ? "auto" : "hidden";
+  }, []);
+
+  useLayoutEffect(() => {
+    resizeComposer();
+  }, [inputValue, resizeComposer]);
+
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const container = messagesRef.current;
+    if (!container) return;
+    followLatestRef.current = true;
+    setHasUnread(false);
+    container.scrollTo({ top: container.scrollHeight, behavior });
+  }, []);
+
+  useLayoutEffect(() => {
+    const addedContent = displayedContentSize > lastContentSizeRef.current;
+    lastContentSizeRef.current = displayedContentSize;
+    if (!addedContent) return;
+    if (followLatestRef.current) {
+      scrollToLatest("auto");
+    } else {
+      setHasUnread((current) => nextUnreadState(current, false));
+    }
+  }, [displayedContentSize, scrollToLatest]);
+
+  useEffect(() => {
+    const container = messagesRef.current;
+    if (!container || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (followLatestRef.current) scrollToLatest("auto");
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [scrollToLatest]);
+
+  const handleSend = useCallback(() => {
+    if (!canSend || !controllerRef.current) return;
     let targetRole = currentRole;
     let actualMessage = inputValue;
     const mentionRegex = /@(策略|产品|技术|测试|域)/;
@@ -62,35 +129,31 @@ function ChatRoom({ messages, onAddMessage, projectName, currentRole, threadId, 
       targetRole = roleMap[match[1]];
       actualMessage = inputValue.replace(match[0], "").trim();
     }
-    // 不再乐观插入用户消息 — 后端 chat_with_role 负责持久化所有消息
-    // 前端通过 onProjectUpdated 接收后端返回的完整 Project（含已持久化的消息列表）
-    // 即使 AI 失败，后端也返回含用户消息+失败提示的完整 Project
+    if (!actualMessage.trim()) return;
+    scrollToLatest("auto");
     setInputValue("");
-    setIsLoading(true);
-    try {
-      const updatedProject = await invokeWithTimeout<Project>("chat_with_role", {
-        projectName: projectName || "default",
-        message: actualMessage,
-        role: targetRole,
-        threadId: threadId,
-      });
-      // 将完整 Project 传回 App 以替换本地状态（用户消息已持久化，AI 回复或失败提示也在其中）
-      if (onProjectUpdated && updatedProject) {
-        onProjectUpdated(updatedProject);
-      }
-    } catch (error) {
-      // 仅在后端完全无法保存用户消息时才走到这里（网络断开等极端情况）
-      const errorMessage: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: "system",
-        content: `❌ 消息发送失败：${error}`,
-        timestamp: Date.now(),
-      };
-      onAddMessage(errorMessage);
-    } finally {
-      setIsLoading(false);
-    }
-  };
+    void controllerRef.current.start({
+      projectName: projectName || "default",
+      threadId,
+      role: targetRole,
+      content: actualMessage,
+    });
+  }, [canSend, currentRole, inputValue, projectName, scrollToLatest, threadId]);
+
+  const handleRetry = useCallback((message: ChatMessage) => {
+    if (isLoading || !controllerRef.current || !message.reply_to_message_id) return;
+    scrollToLatest("auto");
+    void controllerRef.current.start({
+      projectName: projectName || "default",
+      threadId,
+      role: message.role,
+      originalUserMessageId: message.reply_to_message_id,
+    });
+  }, [isLoading, projectName, scrollToLatest, threadId]);
+
+  const handleStop = useCallback(() => {
+    void controllerRef.current?.stop();
+  }, []);
   // 计算最新的版本方案消息时间戳，用于判定旧方案是否过期
   const latestVpTimestamp = useMemo(() => {
     const vpMessages = messages.filter(m => m.msg_type === "version_plan");
@@ -100,15 +163,23 @@ function ChatRoom({ messages, onAddMessage, projectName, currentRole, threadId, 
 
   return (
     <div className="chat-room">
-      <div className="chat-messages">
+      <div
+        className="chat-messages"
+        ref={messagesRef}
+        onScroll={(event) => {
+          const isFollowing = isNearChatBottom(event.currentTarget);
+          followLatestRef.current = isFollowing;
+          if (isFollowing) setHasUnread(false);
+        }}
+      >
         {/*
                 如果消息数组为空，显示空提示语；
                 否则，用 .map() 遍历每一条消息，生成对应的 DOM 元素。
                 */}
-        {messages.length === 0 ? (
+        {displayedMessages.length === 0 ? (
           <p className="empty-tip">开始讨论你的想法吧</p>
         ) : (
-          messages.map((msg) => {
+          displayedMessages.map((msg) => {
             // 版本方案消息：特殊渲染
             if (msg.msg_type === "version_plan") {
               const isExpired = msg.timestamp < latestVpTimestamp;
@@ -162,18 +233,80 @@ function ChatRoom({ messages, onAddMessage, projectName, currentRole, threadId, 
               );
             }
             // 普通消息：保持现有渲染逻辑
+            const isCancelled = msg.msg_type === "ai_cancelled";
+            const isInterrupted = msg.msg_type === "ai_interrupted" || msg.msg_type === "ai_failure";
             return (
-              <div key={msg.id} className={`message message-${msg.role === "user" ? "user" : "ai"}`}>
+              <div
+                key={msg.id}
+                className={`message message-${msg.role === "user" ? "user" : "ai"}${isCancelled || isInterrupted ? " message-terminal" : ""}`}
+              >
                 <div className="message-role">
                   {msg.role === "user" ? "你" : msg.role}
                 </div>
                 <div className="message-content">{msg.content}</div>
+                {(isCancelled || isInterrupted) && (
+                  <div className="message-status-row" role="status">
+                    <span className={`message-status ${isCancelled ? "is-cancelled" : "is-interrupted"}`}>
+                      {isCancelled ? "已停止" : "回复中断"}
+                    </span>
+                    {msg.reply_to_message_id && (
+                      <button
+                        type="button"
+                        className="message-retry-button"
+                        onClick={() => handleRetry(msg)}
+                        disabled={isLoading}
+                      >
+                        <RotateCcw size={14} aria-hidden="true" />
+                        重新生成
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })
         )}
-        {/* 如果正在等待 AI 回复，显示 "AI 正在输入..." 的提示 */}
-        {isLoading && <p className="loading-tip">AI 正在输入...</p>}
+        {streamSession?.optimisticReply?.content === "" && isLoading && (
+          <p className="loading-tip" aria-live="polite">AI 正在输入...</p>
+        )}
+        <div className="chat-live-region" aria-live="polite" aria-atomic="true">
+          {streamSession?.status === "starting" && "正在连接模型"}
+          {streamSession?.status === "streaming" && "正在生成回复"}
+          {streamSession?.status === "stopping" && "正在停止生成"}
+          {streamSession?.status === "cancelled" && "回复已停止"}
+        </div>
+        {streamSession?.status === "failed" && (
+          <div className="chat-stream-error" role="status">
+            <span>回复失败：{streamSession.error ?? "未知错误"}</span>
+            {streamSession.retryable && streamSession.originalUserMessageId && (
+              <button
+                type="button"
+                className="message-retry-button"
+                onClick={() => handleRetry({
+                  id: streamSession.optimisticReply?.id ?? streamSession.requestId,
+                  role: streamSession.role,
+                  content: streamSession.optimisticReply?.content ?? "",
+                  timestamp: Date.now(),
+                  reply_to_message_id: streamSession.originalUserMessageId,
+                })}
+              >
+                <RotateCcw size={14} aria-hidden="true" />
+                重新生成
+              </button>
+            )}
+          </div>
+        )}
+        {hasUnread && (
+          <button
+            type="button"
+            className="chat-latest-button"
+            onClick={() => scrollToLatest()}
+            aria-label="回到最新消息，有新内容"
+            title="回到最新消息"
+          >
+            <ArrowDown size={17} aria-hidden="true" />
+          </button>
+        )}
       </div>
       {/* 底部输入区域：方案已批准时隐藏 */}
       {hideInput ? (
@@ -191,22 +324,58 @@ function ChatRoom({ messages, onAddMessage, projectName, currentRole, threadId, 
         </footer>
       ) : (
         <footer className="input-area">
-          <input
+          <textarea
+            ref={composerRef}
             className="chat-input"
-            type="text"
             placeholder="输入你的想法..."
             value={inputValue}
+            rows={1}
+            maxLength={CHAT_MESSAGE_MAX_CHARS}
             onChange={(e) => setInputValue(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") handleSend();
+              if (shouldSendFromComposer({
+                key: e.key,
+                shiftKey: e.shiftKey,
+                isComposing: e.nativeEvent.isComposing,
+              })) {
+                e.preventDefault();
+                handleSend();
+              }
             }}
+            aria-label="聊天消息"
           />
-          <button className="send-button" onClick={handleSend}>
-            发送
-          </button>
+          {isLoading ? (
+            <button
+              type="button"
+              className="send-button stop-button"
+              onClick={handleStop}
+              disabled={streamSession?.status === "stopping"}
+              aria-label="停止生成"
+              title="停止生成"
+            >
+              <Square size={16} fill="currentColor" aria-hidden="true" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="send-button"
+              onClick={handleSend}
+              disabled={!canSend}
+              aria-label="发送消息"
+              title="发送"
+            >
+              <Send size={17} aria-hidden="true" />
+            </button>
+          )}
         </footer>
       )}
     </div>
   );
 }
+
+function ChatRoom(props: Props) {
+  const scopeKey = `${props.projectName || "default"}\0${props.threadId}`;
+  return <ChatRoomSession key={scopeKey} {...props} />;
+}
+
 export default ChatRoom;

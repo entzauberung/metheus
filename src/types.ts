@@ -730,8 +730,18 @@ export interface ChatMessage {
   approved?: boolean;
   rejected?: boolean;
   milestone_id?: string;   // 与 Rust Message.milestone_id 一致
+  reply_to_message_id?: string;
   timestamp: number;
 }
+
+export type ChatStreamEvent =
+  | { event: "started"; request_id: string; thread_id: string; role: string }
+  | { event: "user_saved"; request_id: string; thread_id: string; role: string; message: ChatMessage }
+  | { event: "reply_started"; request_id: string; thread_id: string; role: string; message_id: string; timestamp: number }
+  | { event: "delta"; request_id: string; thread_id: string; role: string; text: string }
+  | { event: "completed"; request_id: string; thread_id: string; role: string; message_id: string }
+  | { event: "cancelled"; request_id: string; thread_id: string; role: string; message_id: string | null }
+  | { event: "failed"; request_id: string; thread_id: string; role: string; message_id: string | null; error: string; retryable: boolean };
 
 export interface DiscussionThread {
   id: string;

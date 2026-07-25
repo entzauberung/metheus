@@ -1,6 +1,82 @@
 use crate::project;
+use serde::Serialize;
+use tauri::ipc::Channel;
+use tauri::State;
 
 const MAX_CONTEXT_MESSAGES: usize = 20;
+const MAX_CHAT_MESSAGE_CHARS: usize = 20_000;
+const CANCELLED_MESSAGE_TYPE: &str = "ai_cancelled";
+const INTERRUPTED_MESSAGE_TYPE: &str = "ai_interrupted";
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub(crate) enum ChatStreamEvent {
+    Started {
+        request_id: String,
+        thread_id: String,
+        role: String,
+    },
+    UserSaved {
+        request_id: String,
+        thread_id: String,
+        role: String,
+        message: project::Message,
+    },
+    ReplyStarted {
+        request_id: String,
+        thread_id: String,
+        role: String,
+        message_id: String,
+        timestamp: u64,
+    },
+    Delta {
+        request_id: String,
+        thread_id: String,
+        role: String,
+        text: String,
+    },
+    Completed {
+        request_id: String,
+        thread_id: String,
+        role: String,
+        message_id: String,
+    },
+    Cancelled {
+        request_id: String,
+        thread_id: String,
+        role: String,
+        message_id: Option<String>,
+    },
+    Failed {
+        request_id: String,
+        thread_id: String,
+        role: String,
+        message_id: Option<String>,
+        error: String,
+        retryable: bool,
+    },
+}
+
+#[derive(Debug)]
+struct PreparedChat {
+    user_message: project::Message,
+    context: String,
+    system_prompt: &'static str,
+}
+
+enum ChatInput {
+    NewMessage(String),
+    RetryUserMessage(String),
+}
+
+fn send_stream_event(
+    channel: &Channel<ChatStreamEvent>,
+    event: ChatStreamEvent,
+) -> Result<(), String> {
+    channel
+        .send(event)
+        .map_err(|error| format!("发送聊天流事件失败：{error}"))
+}
 
 #[tauri::command]
 pub(crate) fn greet(name: &str) -> String {
@@ -13,190 +89,869 @@ pub(crate) async fn send_message(message: String) -> Result<String, String> {
     crate::api::call_deepseek_api("", &message).await
 }
 
-/// 多角色对话命令（持久化版本）
-/// 加载项目 → 写入用户消息 → 调用 AI → 写入 AI 回复 → 返回完整 Project
-/// 前端应使用返回的完整 Project 替换本地状态，不再乐观插入消息。
+/// 多角色对话命令（保留兼容）。用户消息先落盘，AI 终态只落盘一次。
 #[tauri::command]
 pub(crate) async fn chat_with_role(
+    runtime: State<'_, crate::chat_runtime::ChatRuntimeState>,
     project_name: String,
     message: String,
     role: String,
     thread_id: String,
 ) -> Result<project::Project, String> {
-    // 1. Load project from disk
-    let mut proj = crate::load_project(&project_name)?;
+    let _lease = runtime.begin(
+        format!("compat-{}", uuid::Uuid::new_v4()),
+        project_name.clone(),
+        thread_id.clone(),
+        role.clone(),
+    )?;
+    let prepared = prepare_chat(
+        runtime.inner(),
+        &project_name,
+        &thread_id,
+        &role,
+        ChatInput::NewMessage(message),
+    )?;
+    match crate::api::call_deepseek_api(prepared.system_prompt, &prepared.context).await {
+        Ok(reply) => persist_reply(
+            runtime.inner(),
+            &project_name,
+            &thread_id,
+            new_reply_message(
+                &role,
+                reply,
+                None,
+                &prepared.user_message.id,
+                uuid::Uuid::new_v4().to_string(),
+                now_millis(),
+            ),
+        ),
+        Err(error) => persist_reply(
+            runtime.inner(),
+            &project_name,
+            &thread_id,
+            new_reply_message(
+                &role,
+                "本次回复未生成内容。".to_string(),
+                Some(INTERRUPTED_MESSAGE_TYPE),
+                &prepared.user_message.id,
+                uuid::Uuid::new_v4().to_string(),
+                now_millis(),
+            ),
+        )
+        .map_err(|save_error| format!("AI 调用失败（{error}），且中断状态保存失败：{save_error}")),
+    }
+}
 
-    // 1.5. 方案已批准时拒绝聊天（用户必须先选择"重新讨论方案"）
-    if proj.workflow_state.current_step == project::WorkflowStep::PlanApproval {
-        if let Some(ref draft) = proj.plan_draft {
-            if draft.draft_status == project::DraftStatus::Approved {
-                return Err(
-                    "方案已批准，聊天输入已锁定。如需修改方案，请使用「重新讨论方案」功能。"
-                        .to_string(),
-                );
-            }
+#[tauri::command]
+pub(crate) async fn chat_with_role_stream(
+    runtime: State<'_, crate::chat_runtime::ChatRuntimeState>,
+    project_name: String,
+    message: String,
+    role: String,
+    thread_id: String,
+    request_id: String,
+    on_event: Channel<ChatStreamEvent>,
+) -> Result<project::Project, String> {
+    run_chat_stream(
+        runtime.inner(),
+        project_name,
+        role,
+        thread_id,
+        request_id,
+        ChatInput::NewMessage(message),
+        on_event,
+    )
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn regenerate_chat_reply_stream(
+    runtime: State<'_, crate::chat_runtime::ChatRuntimeState>,
+    project_name: String,
+    user_message_id: String,
+    role: String,
+    thread_id: String,
+    request_id: String,
+    on_event: Channel<ChatStreamEvent>,
+) -> Result<project::Project, String> {
+    run_chat_stream(
+        runtime.inner(),
+        project_name,
+        role,
+        thread_id,
+        request_id,
+        ChatInput::RetryUserMessage(user_message_id),
+        on_event,
+    )
+    .await
+}
+
+async fn run_chat_stream(
+    runtime: &crate::chat_runtime::ChatRuntimeState,
+    project_name: String,
+    role: String,
+    thread_id: String,
+    request_id: String,
+    input: ChatInput,
+    on_event: Channel<ChatStreamEvent>,
+) -> Result<project::Project, String> {
+    let lease = runtime.begin(
+        request_id.clone(),
+        project_name.clone(),
+        thread_id.clone(),
+        role.clone(),
+    )?;
+    let active = lease.active().clone();
+    send_stream_event(
+        &on_event,
+        ChatStreamEvent::Started {
+            request_id: active.request_id.clone(),
+            thread_id: active.thread_id.clone(),
+            role: active.role.clone(),
+        },
+    )?;
+
+    let prepared = match prepare_chat(runtime, &project_name, &thread_id, &role, input) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let _ = send_stream_event(
+                &on_event,
+                ChatStreamEvent::Failed {
+                    request_id,
+                    thread_id,
+                    role,
+                    message_id: None,
+                    error: error.clone(),
+                    retryable: false,
+                },
+            );
+            return Err(error);
         }
+    };
+    let reply_id = uuid::Uuid::new_v4().to_string();
+    let reply_timestamp = now_millis();
+    if let Err(event_error) = send_stream_event(
+        &on_event,
+        ChatStreamEvent::UserSaved {
+            request_id: request_id.clone(),
+            thread_id: thread_id.clone(),
+            role: role.clone(),
+            message: prepared.user_message.clone(),
+        },
+    ) {
+        let project = persist_channel_interruption(
+            runtime,
+            &project_name,
+            &thread_id,
+            &role,
+            String::new(),
+            &prepared.user_message.id,
+            &reply_id,
+            reply_timestamp,
+            event_error,
+        )?;
+        lease.finish();
+        return Ok(project);
     }
 
-    // 2. Find thread
-    let thread_idx = proj
+    if let Err(event_error) = send_stream_event(
+        &on_event,
+        ChatStreamEvent::ReplyStarted {
+            request_id: request_id.clone(),
+            thread_id: thread_id.clone(),
+            role: role.clone(),
+            message_id: reply_id.clone(),
+            timestamp: reply_timestamp,
+        },
+    ) {
+        let project = persist_channel_interruption(
+            runtime,
+            &project_name,
+            &thread_id,
+            &role,
+            String::new(),
+            &prepared.user_message.id,
+            &reply_id,
+            reply_timestamp,
+            event_error,
+        )?;
+        lease.finish();
+        return Ok(project);
+    }
+
+    let cancellation = active.cancellation_flag();
+    let mut partial_reply = String::new();
+    let stream_result = crate::api::call_deepseek_api_stream(
+        prepared.system_prompt,
+        &prepared.context,
+        cancellation,
+        |delta| {
+            record_delta_before_emit(&mut partial_reply, delta, || {
+                send_stream_event(
+                    &on_event,
+                    ChatStreamEvent::Delta {
+                        request_id: request_id.clone(),
+                        thread_id: thread_id.clone(),
+                        role: role.clone(),
+                        text: delta.to_string(),
+                    },
+                )
+            })
+        },
+    )
+    .await;
+
+    match stream_result {
+        Ok(reply) => {
+            if active.is_cancelled() {
+                let project = persist_terminal_reply(
+                    runtime,
+                    &project_name,
+                    &thread_id,
+                    &role,
+                    partial_reply,
+                    CANCELLED_MESSAGE_TYPE,
+                    &prepared.user_message.id,
+                    &reply_id,
+                    reply_timestamp,
+                )?;
+                let _ = send_stream_event(
+                    &on_event,
+                    ChatStreamEvent::Cancelled {
+                        request_id,
+                        thread_id,
+                        role,
+                        message_id: Some(reply_id),
+                    },
+                );
+                lease.finish();
+                return Ok(project);
+            }
+            let project = persist_reply(
+                runtime,
+                &project_name,
+                &thread_id,
+                new_reply_message(
+                    &role,
+                    reply,
+                    None,
+                    &prepared.user_message.id,
+                    reply_id.clone(),
+                    reply_timestamp,
+                ),
+            )
+            .map_err(|error| {
+                let _ = send_stream_event(
+                    &on_event,
+                    ChatStreamEvent::Failed {
+                        request_id: request_id.clone(),
+                        thread_id: thread_id.clone(),
+                        role: role.clone(),
+                        message_id: Some(reply_id.clone()),
+                        error: format!("最终回复保存失败：{error}。请同步项目后重试。"),
+                        retryable: false,
+                    },
+                );
+                format!("最终回复保存失败：{error}")
+            })?;
+            let _ = send_stream_event(
+                &on_event,
+                ChatStreamEvent::Completed {
+                    request_id,
+                    thread_id,
+                    role,
+                    message_id: reply_id,
+                },
+            );
+            lease.finish();
+            Ok(project)
+        }
+        Err(crate::api::StreamResponseError::Cancelled) => {
+            let project = persist_terminal_reply(
+                runtime,
+                &project_name,
+                &thread_id,
+                &role,
+                partial_reply,
+                CANCELLED_MESSAGE_TYPE,
+                &prepared.user_message.id,
+                &reply_id,
+                reply_timestamp,
+            )?;
+            let _ = send_stream_event(
+                &on_event,
+                ChatStreamEvent::Cancelled {
+                    request_id,
+                    thread_id,
+                    role,
+                    message_id: Some(reply_id),
+                },
+            );
+            lease.finish();
+            Ok(project)
+        }
+        Err(crate::api::StreamResponseError::Failed(_)) if active.is_cancelled() => {
+            let project = persist_terminal_reply(
+                runtime,
+                &project_name,
+                &thread_id,
+                &role,
+                partial_reply,
+                CANCELLED_MESSAGE_TYPE,
+                &prepared.user_message.id,
+                &reply_id,
+                reply_timestamp,
+            )?;
+            let _ = send_stream_event(
+                &on_event,
+                ChatStreamEvent::Cancelled {
+                    request_id,
+                    thread_id,
+                    role,
+                    message_id: Some(reply_id),
+                },
+            );
+            lease.finish();
+            Ok(project)
+        }
+        Err(crate::api::StreamResponseError::Failed(error)) => {
+            let project = persist_terminal_reply(
+                runtime,
+                &project_name,
+                &thread_id,
+                &role,
+                partial_reply,
+                INTERRUPTED_MESSAGE_TYPE,
+                &prepared.user_message.id,
+                &reply_id,
+                reply_timestamp,
+            )
+            .map_err(|save_error| {
+                format!("AI 回复失败（{error}），且中断状态保存失败：{save_error}")
+            })?;
+            let _ = send_stream_event(
+                &on_event,
+                ChatStreamEvent::Failed {
+                    request_id,
+                    thread_id,
+                    role,
+                    message_id: Some(reply_id),
+                    error,
+                    retryable: true,
+                },
+            );
+            lease.finish();
+            Ok(project)
+        }
+    }
+}
+
+#[tauri::command]
+pub(crate) fn cancel_chat_stream(
+    runtime: State<'_, crate::chat_runtime::ChatRuntimeState>,
+    request_id: String,
+    thread_id: String,
+) -> Result<bool, String> {
+    runtime.cancel(&request_id, &thread_id)
+}
+
+fn prepare_chat(
+    runtime: &crate::chat_runtime::ChatRuntimeState,
+    project_name: &str,
+    thread_id: &str,
+    role: &str,
+    input: ChatInput,
+) -> Result<PreparedChat, String> {
+    let system_prompt = system_prompt_for_role(role)?;
+    runtime.with_project_mutation(project_name, || {
+        let mut project = crate::load_project(project_name)?;
+        ensure_chat_is_unlocked(&project)?;
+        let thread_idx = find_thread_index(&project, thread_id)?;
+
+        let (user_message, context_end_message_id) = match input {
+            ChatInput::NewMessage(message) => {
+                let content = message.trim();
+                if content.is_empty() {
+                    return Err("消息内容不能为空".to_string());
+                }
+                if content.chars().count() > MAX_CHAT_MESSAGE_CHARS {
+                    return Err(format!(
+                        "消息内容超过 {MAX_CHAT_MESSAGE_CHARS} 个字符的上限"
+                    ));
+                }
+                let user_message = project::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: "user".to_string(),
+                    content: content.to_string(),
+                    timestamp: now_millis(),
+                    msg_type: None,
+                    approved: None,
+                    rejected: None,
+                    milestone_id: None,
+                    reply_to_message_id: None,
+                };
+                project.discussion_threads[thread_idx]
+                    .messages
+                    .push(user_message.clone());
+                project.discussion_revision = project.discussion_revision.saturating_add(1);
+                project.workflow_state.data_revision =
+                    project.workflow_state.data_revision.saturating_add(1);
+                invalidate_discussion_derivatives(&mut project);
+                (user_message, None)
+            }
+            ChatInput::RetryUserMessage(user_message_id) => {
+                let message = project.discussion_threads[thread_idx]
+                    .messages
+                    .iter()
+                    .find(|message| message.id == user_message_id && message.role == "user")
+                    .cloned()
+                    .ok_or_else(|| format!("找不到可重新生成的用户消息: {user_message_id}"))?;
+                (message, Some(user_message_id))
+            }
+        };
+
+        let context = build_chat_context(&project, thread_idx, context_end_message_id.as_deref());
+        if context_end_message_id.is_none() {
+            crate::save_and_reload_project(&project)
+                .map_err(|error| format!("用户消息保存失败：{error}。请重试。"))?;
+        }
+
+        Ok(PreparedChat {
+            user_message,
+            context,
+            system_prompt,
+        })
+    })
+}
+
+fn ensure_chat_is_unlocked(project: &project::Project) -> Result<(), String> {
+    if project.workflow_state.current_step == project::WorkflowStep::PlanApproval
+        && project
+            .plan_draft
+            .as_ref()
+            .is_some_and(|draft| draft.draft_status == project::DraftStatus::Approved)
+    {
+        return Err(
+            "方案已批准，聊天输入已锁定。如需修改方案，请使用「重新讨论方案」功能。".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn system_prompt_for_role(role: &str) -> Result<&'static str, String> {
+    match role {
+        "策略产品经理" => Ok(crate::prompts::STRATEGY_PROMPT),
+        "产品经理" => Ok(crate::prompts::PM_PROMPT),
+        "域负责人" => Ok(crate::prompts::DOMAIN_LEAD_PROMPT),
+        "全栈技术顾问" => Ok(crate::prompts::TECH_PROMPT),
+        "测试工程师" => Ok(crate::prompts::TEST_PROMPT),
+        _ => Err(format!("未知角色: {role}")),
+    }
+}
+
+fn find_thread_index(project: &project::Project, thread_id: &str) -> Result<usize, String> {
+    project
         .discussion_threads
         .iter()
-        .position(|t| t.id == thread_id)
-        .ok_or_else(|| format!("讨论线程不存在: {}", thread_id))?;
+        .position(|thread| thread.id == thread_id)
+        .ok_or_else(|| format!("讨论线程不存在: {thread_id}"))
+}
 
-    // 3. Select system prompt
-    let system_prompt = match role.as_str() {
-        "策略产品经理" => crate::prompts::STRATEGY_PROMPT,
-        "产品经理" => crate::prompts::PM_PROMPT,
-        "域负责人" => crate::prompts::DOMAIN_LEAD_PROMPT,
-        "全栈技术顾问" => crate::prompts::TECH_PROMPT,
-        "测试工程师" => crate::prompts::TEST_PROMPT,
-        _ => return Err(format!("未知角色: {}", role)),
-    };
-
-    // 4. Create and persist user message (only user messages increment revision)
-    let user_msg = project::Message {
-        id: uuid::Uuid::new_v4().to_string(),
-        role: "user".to_string(),
-        content: message.clone(),
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-        msg_type: None,
-        approved: None,
-        rejected: None,
-        milestone_id: None,
-    };
-
-    proj.discussion_threads[thread_idx].messages.push(user_msg);
-    // 只有用户有效需求消息递增 discussion_revision
-    // AI、系统和总结消息不得增加修订号（用于检测检查/方案是否过期）
-    proj.discussion_revision += 1;
-    proj.workflow_state.data_revision += 1;
-
-    // 用户发送新需求 → 标记旧检查结果为过期
+fn invalidate_discussion_derivatives(project: &mut project::Project) {
     let now = chrono::Utc::now().to_rfc3339();
-    for result in &mut proj.preflight_results {
+    for result in &mut project.preflight_results {
         if !result.stale {
             result.stale = true;
             result.expired_at = Some(now.clone());
         }
     }
-
-    // 用户发送新需求 → 将待审批草稿标记为过期并移入历史
-    if let Some(ref draft) = proj.plan_draft {
-        if draft.draft_status == project::DraftStatus::Pending {
-            if let Some(mut expired_draft) = proj.plan_draft.take() {
-                expired_draft.draft_status = project::DraftStatus::Expired;
-                expired_draft.expired_at = Some(now);
-                proj.draft_history.push(expired_draft);
-            }
+    if project
+        .plan_draft
+        .as_ref()
+        .is_some_and(|draft| draft.draft_status == project::DraftStatus::Pending)
+    {
+        if let Some(mut expired_draft) = project.plan_draft.take() {
+            expired_draft.draft_status = project::DraftStatus::Expired;
+            expired_draft.expired_at = Some(now);
+            project.draft_history.push(expired_draft);
         }
     }
+}
 
-    // 5. Build AI context: 统一上下文注入链 + 聊天元数据 + 完整消息历史
-    let thread = &proj.discussion_threads[thread_idx];
-    let recent_messages: Vec<&project::Message> = thread
-        .messages
+fn build_chat_context(
+    project: &project::Project,
+    thread_idx: usize,
+    end_message_id: Option<&str>,
+) -> String {
+    let thread = &project.discussion_threads[thread_idx];
+    let end_index = end_message_id
+        .and_then(|id| thread.messages.iter().position(|message| message.id == id))
+        .map(|index| index + 1)
+        .unwrap_or(thread.messages.len());
+    let recent_messages = thread.messages[..end_index]
         .iter()
+        .filter(|message| message_is_context_eligible(message))
         .rev()
         .take(MAX_CONTEXT_MESSAGES)
         .collect::<Vec<_>>()
         .into_iter()
-        .rev()
+        .rev();
+
+    // The shared injection includes a discussion summary, so give it the same
+    // filtered snapshot used below. Otherwise interrupted or post-retry messages
+    // could leak back into the model context through the summary.
+    let mut context_project = project.clone();
+    let mut context_thread = thread.clone();
+    context_thread.messages = thread.messages[..end_index]
+        .iter()
+        .filter(|message| message_is_context_eligible(message))
+        .cloned()
         .collect();
+    context_project.discussion_threads = vec![context_thread];
 
-    let context = {
-        let mut c = String::new();
+    let mut context = String::new();
+    context.push_str(&format!("[项目: {}]\n", project.name));
+    context.push_str(&format!(
+        "[工作流步骤: {:?}]\n",
+        project.workflow_state.current_step
+    ));
+    context.push_str(&format!(
+        "[讨论范围: {:?}]\n",
+        project.workflow_state.discussion_scope
+    ));
+    let injection = crate::constitution_context::build_context_injection(&context_project);
+    if !injection.is_empty() {
+        context.push_str(&injection);
+        context.push('\n');
+    }
+    context.push_str("## 讨论历史\n");
+    for message in recent_messages {
+        let display_role = if message.role == "user" {
+            "用户"
+        } else {
+            &message.role
+        };
+        context.push_str(&format!("{}: {}\n", display_role, message.content));
+    }
+    context
+}
 
-        // 聊天元数据（轻量，仅标识当前会话位置）
-        c.push_str(&format!("[项目: {}]\n", proj.name));
-        c.push_str(&format!(
-            "[工作流步骤: {:?}]\n",
-            proj.workflow_state.current_step
-        ));
-        c.push_str(&format!(
-            "[讨论范围: {:?}]\n",
-            proj.workflow_state.discussion_scope
-        ));
+fn message_is_context_eligible(message: &project::Message) -> bool {
+    !matches!(
+        message.msg_type.as_deref(),
+        Some(CANCELLED_MESSAGE_TYPE | INTERRUPTED_MESSAGE_TYPE | "ai_failure")
+    )
+}
 
-        // 统一上下文注入链：项目事实（宪法、基线、方案、讨论摘要等）
-        // 与 milestone / mid-stage / plan 生成共用同一来源
-        let injection = crate::constitution_context::build_context_injection(&proj);
-        if !injection.is_empty() {
-            c.push_str(&injection);
-            c.push('\n');
-        }
-
-        // 完整讨论历史（覆盖 build_context_injection 中的摘要版本）
-        c.push_str("## 讨论历史\n");
-        for msg in &recent_messages {
-            let display_role = if msg.role == "user" {
-                "用户"
-            } else {
-                &msg.role
-            };
-            c.push_str(&format!("{}: {}\n", display_role, msg.content));
-        }
-        c
+fn persist_terminal_reply(
+    runtime: &crate::chat_runtime::ChatRuntimeState,
+    project_name: &str,
+    thread_id: &str,
+    role: &str,
+    content: String,
+    message_type: &str,
+    user_message_id: &str,
+    reply_id: &str,
+    timestamp: u64,
+) -> Result<project::Project, String> {
+    let content = if content.is_empty() {
+        "本次回复未生成内容。".to_string()
+    } else {
+        content
     };
+    persist_reply(
+        runtime,
+        project_name,
+        thread_id,
+        new_reply_message(
+            role,
+            content,
+            Some(message_type),
+            user_message_id,
+            reply_id.to_string(),
+            timestamp,
+        ),
+    )
+}
 
-    // 5.5. 用户消息已写入内存 → 立即保存并重读 Project（用户消息落盘后再调用 AI）
-    proj = crate::save_and_reload_project(&proj)
-        .map_err(|e| format!("用户消息保存失败：{}。请重试。", e))?;
+#[allow(clippy::too_many_arguments)]
+fn persist_channel_interruption(
+    runtime: &crate::chat_runtime::ChatRuntimeState,
+    project_name: &str,
+    thread_id: &str,
+    role: &str,
+    content: String,
+    user_message_id: &str,
+    reply_id: &str,
+    timestamp: u64,
+    event_error: String,
+) -> Result<project::Project, String> {
+    persist_terminal_reply(
+        runtime,
+        project_name,
+        thread_id,
+        role,
+        content,
+        INTERRUPTED_MESSAGE_TYPE,
+        user_message_id,
+        reply_id,
+        timestamp,
+    )
+    .map_err(|save_error| format!("{event_error}，且 Channel 中断状态保存失败：{save_error}"))
+}
 
-    // 6. Call AI
-    let reply = match crate::api::call_deepseek_api(system_prompt, &context).await {
-        Ok(r) => r,
-        Err(e) => {
-            // AI 失败 — 用户消息已保存，写入系统失败提示后返回完整 Project
-            let failure_msg = project::Message {
-                id: uuid::Uuid::new_v4().to_string(),
-                role: "system".to_string(),
-                content: format!(
-                    "⚠️ 用户消息已保存，但 AI（{}）本次回复失败：{}。请稍后重试。",
-                    role, e
-                ),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0),
-                msg_type: Some("ai_failure".to_string()),
-                approved: None,
-                rejected: None,
-                milestone_id: None,
-            };
-            proj.discussion_threads[thread_idx]
-                .messages
-                .push(failure_msg);
-            // 保存并返回完整 Project（用户消息 + 失败提示均已持久化）
-            return crate::save_and_reload_project(&proj).map_err(|save_err| {
-                format!("AI 调用失败（{}），且保存失败提示时也失败：{}", e, save_err)
-            });
-        }
-    };
+fn record_delta_before_emit(
+    partial_reply: &mut String,
+    delta: &str,
+    emit: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    partial_reply.push_str(delta);
+    emit()
+}
 
-    // 7. Create and persist AI reply
-    let ai_message = project::Message {
-        id: uuid::Uuid::new_v4().to_string(),
-        role: role.clone(),
-        content: reply,
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0),
-        msg_type: None,
+fn new_reply_message(
+    role: &str,
+    content: String,
+    message_type: Option<&str>,
+    user_message_id: &str,
+    reply_id: String,
+    timestamp: u64,
+) -> project::Message {
+    project::Message {
+        id: reply_id,
+        role: role.to_string(),
+        content,
+        timestamp,
+        msg_type: message_type.map(str::to_string),
         approved: None,
         rejected: None,
         milestone_id: None,
-    };
+        reply_to_message_id: Some(user_message_id.to_string()),
+    }
+}
 
-    proj.discussion_threads[thread_idx]
+fn persist_reply(
+    runtime: &crate::chat_runtime::ChatRuntimeState,
+    project_name: &str,
+    thread_id: &str,
+    reply: project::Message,
+) -> Result<project::Project, String> {
+    runtime.with_project_mutation(project_name, || {
+        let mut latest = crate::load_project(project_name)?;
+        append_reply_to_project(&mut latest, thread_id, reply)?;
+        crate::save_and_reload_project(&latest)
+    })
+}
+
+fn append_reply_to_project(
+    latest: &mut project::Project,
+    thread_id: &str,
+    reply: project::Message,
+) -> Result<(), String> {
+    let thread_idx = find_thread_index(latest, thread_id)?;
+    let user_message_id = reply
+        .reply_to_message_id
+        .as_deref()
+        .ok_or_else(|| "AI 回复缺少原用户消息引用".to_string())?;
+    if !latest.discussion_threads[thread_idx]
         .messages
-        .push(ai_message);
+        .iter()
+        .any(|message| message.id == user_message_id && message.role == "user")
+    {
+        return Err("原用户消息已不存在，拒绝保存 AI 回复".to_string());
+    }
+    if latest.discussion_threads[thread_idx]
+        .messages
+        .iter()
+        .any(|message| message.id == reply.id)
+    {
+        return Err(format!("AI 回复消息标识已存在: {}", reply.id));
+    }
+    latest.discussion_threads[thread_idx].messages.push(reply);
+    latest.workflow_state.data_revision = latest.workflow_state.data_revision.saturating_add(1);
+    Ok(())
+}
 
-    // 8. Save and reload project, return disk-verified Project
-    crate::save_and_reload_project(&proj)
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(
+        id: &str,
+        role: &str,
+        content: &str,
+        message_type: Option<&str>,
+    ) -> project::Message {
+        project::Message {
+            id: id.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: 1,
+            msg_type: message_type.map(str::to_string),
+            approved: None,
+            rejected: None,
+            milestone_id: None,
+            reply_to_message_id: None,
+        }
+    }
+
+    #[test]
+    fn interrupted_messages_are_excluded_from_future_context() {
+        let mut project = project::Project::new("context-test");
+        project.discussion_threads[0].messages = vec![
+            message("u1", "user", "first", None),
+            message(
+                "a1",
+                "产品经理",
+                "partial secret",
+                Some(INTERRUPTED_MESSAGE_TYPE),
+            ),
+            message("u2", "user", "second", None),
+        ];
+
+        let context = build_chat_context(&project, 0, None);
+        assert!(context.contains("first"));
+        assert!(context.contains("second"));
+        assert!(!context.contains("partial secret"));
+    }
+
+    #[test]
+    fn retry_context_stops_at_original_user_message() {
+        let mut project = project::Project::new("retry-test");
+        project.discussion_threads[0].messages = vec![
+            message("u1", "user", "retry this", None),
+            message("u2", "user", "later request", None),
+        ];
+
+        let context = build_chat_context(&project, 0, Some("u1"));
+        assert!(context.contains("retry this"));
+        assert!(!context.contains("later request"));
+    }
+
+    #[test]
+    fn context_summary_uses_the_selected_thread_only() {
+        let mut project = project::Project::new("thread-test");
+        project.discussion_threads[0].messages =
+            vec![message("u1", "user", "other thread content", None)];
+        project.discussion_threads.push(project::DiscussionThread {
+            id: "thread-second".to_string(),
+            title: "second".to_string(),
+            node_id: "node".to_string(),
+            messages: vec![message("u2", "user", "selected thread content", None)],
+        });
+
+        let context = build_chat_context(&project, 1, None);
+        assert!(context.contains("selected thread content"));
+        assert!(!context.contains("other thread content"));
+    }
+
+    #[test]
+    fn records_a_delta_before_reporting_channel_failure() {
+        let mut partial = String::from("first");
+        let result =
+            record_delta_before_emit(
+                &mut partial,
+                " second",
+                || Err("channel closed".to_string()),
+            );
+
+        assert_eq!(result, Err("channel closed".to_string()));
+        assert_eq!(partial, "first second");
+    }
+
+    #[test]
+    fn cancelled_partial_reply_round_trips_through_project_storage() -> Result<(), String> {
+        let temp_root =
+            std::env::temp_dir().join(format!("metheus-chat-cancelled-{}", uuid::Uuid::new_v4()));
+        let path = temp_root.join("project.json");
+        let mut value = project::Project::new("cancelled-persistence-test");
+        let thread_id = value.discussion_threads[0].id.clone();
+        value.discussion_threads[0]
+            .messages
+            .push(message("user-1", "user", "question", None));
+        let reply = new_reply_message(
+            "产品经理",
+            "partial answer".to_string(),
+            Some(CANCELLED_MESSAGE_TYPE),
+            "user-1",
+            "reply-1".to_string(),
+            2,
+        );
+        append_reply_to_project(&mut value, &thread_id, reply)?;
+
+        crate::save_project_to_path(&value, &path)?;
+        let stored = crate::load_project_from_path(&path)?;
+        let stored_reply = stored.discussion_threads[0]
+            .messages
+            .last()
+            .ok_or_else(|| "取消回复未保存".to_string())?;
+        assert_eq!(stored_reply.content, "partial answer");
+        assert_eq!(
+            stored_reply.msg_type.as_deref(),
+            Some(CANCELLED_MESSAGE_TYPE)
+        );
+        assert_eq!(stored_reply.reply_to_message_id.as_deref(), Some("user-1"));
+
+        std::fs::remove_dir_all(&temp_root)
+            .map_err(|error| format!("清理聊天测试目录失败：{error}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_duplicate_reply_ids_without_duplicating_the_user_message() {
+        let mut value = project::Project::new("retry-persistence-test");
+        let thread_id = value.discussion_threads[0].id.clone();
+        value.discussion_threads[0]
+            .messages
+            .push(message("user-1", "user", "retry this", None));
+        let reply = new_reply_message(
+            "产品经理",
+            "first reply".to_string(),
+            None,
+            "user-1",
+            "reply-1".to_string(),
+            2,
+        );
+        append_reply_to_project(&mut value, &thread_id, reply.clone()).unwrap();
+
+        let error = append_reply_to_project(&mut value, &thread_id, reply)
+            .expect_err("重复回复标识必须被拒绝");
+        assert!(error.contains("AI 回复消息标识已存在"));
+        assert_eq!(
+            value.discussion_threads[0]
+                .messages
+                .iter()
+                .filter(|item| item.id == "user-1")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn project_storage_surfaces_a_final_atomic_replace_failure() -> Result<(), String> {
+        let temp_root = std::env::temp_dir().join(format!(
+            "metheus-chat-save-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let blocked_path = temp_root.join("project.json");
+        std::fs::create_dir_all(&blocked_path)
+            .map_err(|error| format!("创建聊天保存失败测试目录失败：{error}"))?;
+
+        let value = project::Project::new("save-failure-test");
+        let error = crate::save_project_to_path(&value, &blocked_path)
+            .expect_err("目录目标必须导致原子替换失败");
+        assert!(error.contains("替换项目文件失败"));
+        assert!(!blocked_path.with_extension("json.tmp").exists());
+
+        std::fs::remove_dir_all(&temp_root)
+            .map_err(|cleanup_error| format!("清理聊天保存失败测试目录失败：{cleanup_error}"))?;
+        Ok(())
+    }
 }

@@ -4,7 +4,9 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // ...
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ArrowDown, MessageCircle, X } from "lucide-react";
+import { isNearChatBottom, nextUnreadState } from "./chatScrollPolicy";
 import { ChatMessage } from "./types";
 
 interface Props {
@@ -13,17 +15,48 @@ interface Props {
 
 function FloatingChatBalloon({ messages }: Props) {
   const [isOpen, setIsOpen] = useState(false);
+  const [hasUnread, setHasUnread] = useState(false);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const followLatestRef = useRef(true);
+  const contentSize = useMemo(
+    () => messages.reduce((total, message) => total + message.content.length + 1, 0),
+    [messages],
+  );
+  const previousContentSizeRef = useRef(contentSize);
+
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = "smooth") => {
+    const container = contentRef.current;
+    if (!container) return;
+    followLatestRef.current = true;
+    setHasUnread(false);
+    container.scrollTo({ top: container.scrollHeight, behavior });
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    requestAnimationFrame(() => scrollToLatest("auto"));
+  }, [isOpen, scrollToLatest]);
+
+  useEffect(() => {
+    const addedContent = contentSize > previousContentSizeRef.current;
+    previousContentSizeRef.current = contentSize;
+    if (!isOpen || !addedContent) return;
+    if (followLatestRef.current) scrollToLatest("auto");
+    else setHasUnread((current) => nextUnreadState(current, false));
+  }, [contentSize, isOpen, scrollToLatest]);
 
   return (
     <div className="floating-balloon-wrapper">
       {/* 悬浮球 */}
-      <div
+      <button
+        type="button"
         className="floating-balloon"
         onClick={() => setIsOpen(!isOpen)}
         title={isOpen ? "关闭聊天记录" : "查看阶段一讨论记录"}
+        aria-label={isOpen ? "关闭聊天记录" : "查看阶段一讨论记录"}
       >
-        💬
-      </div>
+        <MessageCircle size={22} aria-hidden="true" />
+      </button>
 
       {/* 聊天记录浮窗 */}
       {isOpen && (
@@ -34,16 +67,26 @@ function FloatingChatBalloon({ messages }: Props) {
           {/* 浮窗 */}
           <div className="floating-balloon-window">
             <div className="floating-window-header">
-              <span>💬 阶段一讨论记录</span>
+              <span>阶段一讨论记录</span>
               <button
                 className="floating-window-close"
                 onClick={() => setIsOpen(false)}
+                aria-label="关闭聊天记录"
+                title="关闭"
               >
-                ✕
+                <X size={17} aria-hidden="true" />
               </button>
             </div>
 
-            <div className="floating-window-content">
+            <div
+              className="floating-window-content"
+              ref={contentRef}
+              onScroll={(event) => {
+                const isFollowing = isNearChatBottom(event.currentTarget);
+                followLatestRef.current = isFollowing;
+                if (isFollowing) setHasUnread(false);
+              }}
+            >
               {messages.length === 0 ? (
                 <div className="floating-empty">暂无讨论记录</div>
               ) : (
@@ -58,6 +101,17 @@ function FloatingChatBalloon({ messages }: Props) {
                     <div className="floating-message-content">{msg.content}</div>
                   </div>
                 ))
+              )}
+              {hasUnread && (
+                <button
+                  type="button"
+                  className="floating-latest-button"
+                  onClick={() => scrollToLatest()}
+                  aria-label="回到最新消息，有新内容"
+                  title="回到最新消息"
+                >
+                  <ArrowDown size={16} aria-hidden="true" />
+                </button>
               )}
             </div>
 

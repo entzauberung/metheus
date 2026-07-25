@@ -10,6 +10,7 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   // 聊天/讨论类 — 用户可感知，不宜过长
   send_message: 60,
   chat_with_role: 60,
+  cancel_chat_stream: 10,
 
   // 方案生成类 — 大模型计算密集，给充裕时间
   generate_version_plan: 180,

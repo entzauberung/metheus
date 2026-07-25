@@ -1173,6 +1173,9 @@ pub struct Message {
     ///关联的大阶段 ID（仅 msg_type="milestone_summary" 时使用）
     #[serde(default)]
     pub milestone_id: Option<String>,
+    /// AI 回复所对应的用户消息 ID；旧消息保持为空。
+    #[serde(default)]
+    pub reply_to_message_id: Option<String>,
 }
 ///讨论线程
 #[derive(Debug, Clone, Serialize, Deserialize)]
