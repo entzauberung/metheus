@@ -109,7 +109,7 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   stop_managed_flow: 15,
   toggle_autopilot: 15,
   autopilot_pause: 120,  // 可能涉及 In Stop kill 子进程
-  autopilot_next_step: 15,
+  autopilot_resume: 15,
   start_preflight_check: 15,
   return_to_discussion: 15,
   resume_plan_approval: 15,

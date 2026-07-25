@@ -8,6 +8,9 @@
 use std::fs;
 mod acceptance;
 mod api;
+mod autopilot_failure;
+mod autopilot_policy;
+mod autopilot_runtime;
 mod chat_runtime;
 mod commands;
 mod constants;
@@ -135,7 +138,8 @@ fn load_env() {
 }
 
 pub struct AppState {
-    pub pipeline_state: Arc<Mutex<Option<PipelineState>>>,
+    pub(crate) pipeline_state: Arc<Mutex<Option<PipelineState>>>,
+    pub(crate) autopilot_runtime: Arc<crate::autopilot_runtime::AutopilotRuntime>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -150,6 +154,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             pipeline_state: Arc::new(Mutex::new(None)),
+            autopilot_runtime: Arc::new(crate::autopilot_runtime::AutopilotRuntime::default()),
         })
         .manage(crate::chat_runtime::ChatRuntimeState::default())
         .invoke_handler(tauri::generate_handler![

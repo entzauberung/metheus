@@ -14,6 +14,7 @@
     "verify:chat-ux": "./scripts/verify-chat-ux.sh",
     "verify:core-light": "./scripts/verify-core-light.sh",
     "verify:git-confirmation": "./scripts/verify-git-confirmation.sh",
+    "verify:autopilot-unattended": "./scripts/verify-autopilot-unattended.sh",
     "verify:quality": "./scripts/verify-quality.sh",
     "verify:grok-check": "./scripts/verify-grok-check.sh",
     "preview": "vite preview",

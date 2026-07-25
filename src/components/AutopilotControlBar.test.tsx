@@ -106,4 +106,53 @@ describe("AutopilotControlBar Git confirmation recovery", () => {
     expect(buttons).not.toContain("恢复基线并继续");
     expect(buttons).not.toContain("恢复基线并重试");
   });
+
+  it("shows backend action and heartbeat without human recovery during automatic retry", () => {
+    const project = blockedProject("CommitFailed");
+    project.execution_session!.status = "execution_failed";
+    project.workflow_state.recovery_state = {
+      phase: "WaitingEngine",
+      error_kind: "EngineBlocked",
+    } as Project["workflow_state"]["recovery_state"];
+    Object.assign(project.workflow_state.autopilot_state!, {
+      run_status: "Running",
+      recovery_action: "RestoreExecutionBaseline",
+      current_action_kind: "execute_current_subtask",
+      heartbeat_at: "2026-07-25T00:00:10Z",
+      transient_retry_count: 2,
+      next_retry_at: "2026-07-25T00:00:30Z",
+      last_failure_kind: "ProviderUnavailable",
+    });
+    const noop = vi.fn(async () => undefined);
+
+    act(() => {
+      root.render(
+        <AutopilotControlBar
+          project={project}
+          executionStatus={null}
+          busy={false}
+          onToggle={noop}
+          onStopManagedFlow={noop}
+          onPauseNow={noop}
+          onPauseAfterCurrent={noop}
+          onResume={noop}
+          onSync={noop}
+          onAcknowledgeRecovery={noop}
+          onRetryCurrent={noop}
+          onResolveHumanRecovery={noop}
+        />,
+      );
+    });
+
+    const text = host.textContent ?? "";
+    const buttons = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
+    expect(text).toContain("等待自动重试");
+    expect(text).toContain("当前：执行当前任务");
+    expect(text).toContain("重试 2/3");
+    expect(text).toContain("心跳");
+    expect(buttons).toContain("暂停自动驾驶");
+    expect(buttons).not.toContain("检查引擎并重试");
+    expect(buttons).not.toContain("恢复基线并继续");
+    expect(buttons).not.toContain("恢复基线并重试");
+  });
 });

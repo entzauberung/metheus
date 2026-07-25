@@ -177,6 +177,13 @@ pub(crate) async fn calibrate_next_subtask_command(
     state: tauri::State<'_, AppState>,
     project_name: String,
 ) -> Result<project::Project, String> {
+    calibrate_next_subtask_with_pipeline(state.pipeline_state.clone(), project_name).await
+}
+
+pub(crate) async fn calibrate_next_subtask_with_pipeline(
+    pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<crate::pipeline::PipelineState>>>,
+    project_name: String,
+) -> Result<project::Project, String> {
     let initial = crate::load_project(&project_name)?;
     let initial_revision = initial.workflow_state.data_revision;
     let initial_milestone = initial.current_milestone_id.clone();
@@ -214,7 +221,7 @@ pub(crate) async fn calibrate_next_subtask_command(
     let changed = calibrate_next_subtask(&mut candidate).await?;
     let candidate_mutated = candidate.workflow_state.data_revision != initial_revision;
 
-    let _pipeline_guard = state.pipeline_state.lock().await;
+    let _pipeline_guard = pipeline_state.lock().await;
     let latest = crate::load_project(&project_name)?;
     if latest.workflow_state.data_revision != initial_revision
         || latest.current_milestone_id != initial_milestone

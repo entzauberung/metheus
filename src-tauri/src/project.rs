@@ -226,6 +226,35 @@ pub enum AutopilotRecoveryAction {
     RetryGitConfirmation,
 }
 
+/// 自动驾驶作业当前由谁驱动。旧项目默认没有运行器所有者。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum AutopilotJobOwner {
+    #[default]
+    None,
+    BackendRuntime,
+}
+
+/// 自动驾驶基础设施失败分类。规划收敛失败使用草稿/计划自己的计数，不写入此计数器。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum AutopilotFailureKind {
+    #[default]
+    None,
+    Network,
+    RateLimited,
+    ProviderUnavailable,
+    Timeout,
+    RevisionConflict,
+    ProcessCrash,
+    Authentication,
+    Quota,
+    WorkspaceChanged,
+    StateConflict,
+    ScopeViolation,
+    ContractContradiction,
+    GitIntegrity,
+    Permanent,
+}
+
 /// autopilot 持久化状态（写入 WorkflowState，用于刷新恢复）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutopilotState {
@@ -244,6 +273,34 @@ pub struct AutopilotState {
     /// 出错后的恢复动作分类；旧项目默认无需恢复
     #[serde(default)]
     pub recovery_action: AutopilotRecoveryAction,
+    /// 当前后端作业标识；一次启动/恢复对应一个新值。
+    #[serde(default)]
+    pub job_id: String,
+    /// 作业代次；暂停、恢复和关闭均递增，用于拒绝旧任务回写。
+    #[serde(default)]
+    pub job_generation: u64,
+    #[serde(default)]
+    pub job_owner: AutopilotJobOwner,
+    /// 当前原子动作标识与类型。
+    #[serde(default)]
+    pub current_action_id: String,
+    #[serde(default)]
+    pub current_action_kind: String,
+    #[serde(default)]
+    pub action_started_at: String,
+    #[serde(default)]
+    pub heartbeat_at: String,
+    /// 仅用于网络、限流、服务暂不可用等基础设施重试。
+    #[serde(default)]
+    pub transient_retry_count: u32,
+    #[serde(default)]
+    pub next_retry_at: Option<String>,
+    #[serde(default)]
+    pub last_failure_kind: AutopilotFailureKind,
+    #[serde(default)]
+    pub last_failure_fingerprint: String,
+    #[serde(default)]
+    pub consecutive_no_progress: u32,
 }
 
 impl Default for AutopilotState {
@@ -256,6 +313,18 @@ impl Default for AutopilotState {
             last_action_at: String::new(),
             error_message: String::new(),
             recovery_action: AutopilotRecoveryAction::None,
+            job_id: String::new(),
+            job_generation: 0,
+            job_owner: AutopilotJobOwner::None,
+            current_action_id: String::new(),
+            current_action_kind: String::new(),
+            action_started_at: String::new(),
+            heartbeat_at: String::new(),
+            transient_retry_count: 0,
+            next_retry_at: None,
+            last_failure_kind: AutopilotFailureKind::None,
+            last_failure_fingerprint: String::new(),
+            consecutive_no_progress: 0,
         }
     }
 }
@@ -947,6 +1016,12 @@ pub struct MidStage {
     /// 执行计划成功重新生成次数
     #[serde(default)]
     pub plan_regeneration_count: u32,
+    #[serde(default)]
+    pub last_plan_failure_fingerprint: String,
+    #[serde(default)]
+    pub last_plan_issue_count: u32,
+    #[serde(default)]
+    pub plan_no_progress_count: u32,
 }
 /// 执行引擎返回的统一结果。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1586,6 +1661,12 @@ pub struct MidStageDraft {
     pub last_regeneration_reason: Option<String>,
     #[serde(default)]
     pub source_data_revision: u64,
+    #[serde(default)]
+    pub last_check_failure_fingerprint: String,
+    #[serde(default)]
+    pub last_candidate_fingerprint: String,
+    #[serde(default)]
+    pub no_progress_count: u32,
 }
 
 impl Default for MidStageDraft {
@@ -1603,6 +1684,9 @@ impl Default for MidStageDraft {
             previous_draft_id: None,
             last_regeneration_reason: None,
             source_data_revision: 0,
+            last_check_failure_fingerprint: String::new(),
+            last_candidate_fingerprint: String::new(),
+            no_progress_count: 0,
         }
     }
 }
@@ -2508,16 +2592,41 @@ mod tests {
             last_action_at: "2026-07-20T00:00:00Z".to_string(),
             error_message: "err".to_string(),
             recovery_action: AutopilotRecoveryAction::RestoreExecutionBaseline,
+            ..Default::default()
         };
         let mut ap_value = serde_json::to_value(ap)
             .map_err(|error| format!("序列化自动驾驶状态失败：{}", error))?;
-        ap_value
+        let ap_object = ap_value
             .as_object_mut()
-            .ok_or("自动驾驶状态未序列化为对象".to_string())?
-            .remove("recovery_action");
+            .ok_or("自动驾驶状态未序列化为对象".to_string())?;
+        for field in [
+            "recovery_action",
+            "job_id",
+            "job_generation",
+            "job_owner",
+            "current_action_id",
+            "current_action_kind",
+            "action_started_at",
+            "heartbeat_at",
+            "transient_retry_count",
+            "next_retry_at",
+            "last_failure_kind",
+            "last_failure_fingerprint",
+            "consecutive_no_progress",
+        ] {
+            ap_object.remove(field);
+        }
         let restored_ap: AutopilotState = serde_json::from_value(ap_value)
             .map_err(|error| format!("反序列化旧自动驾驶状态失败：{}", error))?;
         assert_eq!(restored_ap.recovery_action, AutopilotRecoveryAction::None);
+        assert!(restored_ap.job_id.is_empty());
+        assert_eq!(restored_ap.job_generation, 0);
+        assert_eq!(restored_ap.job_owner, AutopilotJobOwner::None);
+        assert!(restored_ap.current_action_id.is_empty());
+        assert!(restored_ap.heartbeat_at.is_empty());
+        assert_eq!(restored_ap.transient_retry_count, 0);
+        assert!(restored_ap.next_retry_at.is_none());
+        assert_eq!(restored_ap.last_failure_kind, AutopilotFailureKind::None);
 
         let mut workflow_value = serde_json::to_value(WorkflowState::default())
             .map_err(|error| format!("序列化工作流状态失败：{}", error))?;

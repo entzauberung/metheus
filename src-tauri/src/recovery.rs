@@ -1283,7 +1283,7 @@ fn merge_execution_result(
 }
 
 async fn run_recovery_retest(
-    state: &AppState,
+    pipeline_state: &std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
     project_name: &str,
     session: &project::ExecutionSession,
     authorized_paths: &[String],
@@ -1291,7 +1291,7 @@ async fn run_recovery_retest(
     evidence_request: Option<crate::test_runner::ReviewEvidenceRequest>,
 ) -> Result<project::Project, String> {
     {
-        let mut pipeline_guard = state.pipeline_state.lock().await;
+        let mut pipeline_guard = pipeline_state.lock().await;
         set_pipeline_retesting(&mut pipeline_guard, execution_id);
     }
     let project = crate::load_project(project_name)?;
@@ -1354,7 +1354,7 @@ async fn run_recovery_retest(
         test
     };
 
-    let mut pipeline_guard = state.pipeline_state.lock().await;
+    let mut pipeline_guard = pipeline_state.lock().await;
     let mut proj = crate::load_project(project_name)?;
     let still_current = proj
         .workflow_state
@@ -1409,7 +1409,14 @@ pub(crate) async fn run_error_recovery(
     state: tauri::State<'_, AppState>,
     project_name: String,
 ) -> Result<project::Project, String> {
-    let mut pipeline_guard = state.pipeline_state.lock().await;
+    run_error_recovery_with_pipeline(state.pipeline_state.clone(), project_name).await
+}
+
+pub(crate) async fn run_error_recovery_with_pipeline(
+    pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    project_name: String,
+) -> Result<project::Project, String> {
+    let mut pipeline_guard = pipeline_state.lock().await;
     if pipeline_guard
         .as_ref()
         .is_some_and(|pipeline| pipeline.status == PipelineStatus::Running)
@@ -1441,7 +1448,7 @@ pub(crate) async fn run_error_recovery(
         crate::save_project(&proj)?;
         drop(pipeline_guard);
         return run_recovery_retest(
-            &state,
+            &pipeline_state,
             &project_name,
             &session,
             &authorized_paths,
@@ -1511,7 +1518,7 @@ pub(crate) async fn run_error_recovery(
         crate::save_project(&proj)?;
         drop(pipeline_guard);
         return run_recovery_retest(
-            &state,
+            &pipeline_state,
             &project_name,
             &session,
             &authorized_paths,
@@ -1751,11 +1758,11 @@ pub(crate) async fn run_error_recovery(
             subtask_id: session.subtask_id.clone(),
             execution_id: recovery_execution_id.clone(),
         },
-        state.pipeline_state.clone(),
+        pipeline_state.clone(),
     )
     .await;
 
-    let mut pipeline_guard = state.pipeline_state.lock().await;
+    let mut pipeline_guard = pipeline_state.lock().await;
     let mut proj = crate::load_project(&project_name)?;
     let current_matches = proj
         .workflow_state
@@ -1959,7 +1966,7 @@ pub(crate) async fn run_error_recovery(
     crate::save_project(&proj)?;
     drop(pipeline_guard);
     run_recovery_retest(
-        &state,
+        &pipeline_state,
         &project_name,
         &session,
         &authorized_paths,
@@ -3144,14 +3151,25 @@ pub(crate) async fn resolve_human_recovery(
             }
             touch(&mut proj);
             crate::save_project(&proj)?;
-            return crate::load_project(&project_name);
+            let updated = crate::load_project(&project_name)?;
+            state
+                .autopilot_runtime
+                .start_if_active(state.pipeline_state.clone(), project_name)
+                .await?;
+            return Ok(updated);
         }
         _ => return Err(format!("未知的人工恢复动作：{}", resolution)),
     }
 
     touch(&mut proj);
     crate::save_project(&proj)?;
-    crate::load_project(&project_name)
+    let updated = crate::load_project(&project_name)?;
+    drop(_pipeline_guard);
+    state
+        .autopilot_runtime
+        .start_if_active(state.pipeline_state.clone(), project_name)
+        .await?;
+    Ok(updated)
 }
 
 #[cfg(test)]

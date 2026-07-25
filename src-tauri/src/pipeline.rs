@@ -177,8 +177,15 @@ pub(crate) async fn execute_current_subtask(
     state: tauri::State<'_, AppState>,
     project_name: String,
 ) -> Result<PipelineState, String> {
+    execute_current_subtask_with_pipeline(state.pipeline_state.clone(), project_name).await
+}
+
+pub(crate) async fn execute_current_subtask_with_pipeline(
+    pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    project_name: String,
+) -> Result<PipelineState, String> {
     // 以全局流水线锁串行化“校验 + Running 落盘 + 内存状态建立”，阻止重复启动。
-    let mut pipeline_guard = acquire_pipeline_start(&state.pipeline_state).await?;
+    let mut pipeline_guard = acquire_pipeline_start(&pipeline_state).await?;
 
     let mut proj = crate::load_project(&project_name)?;
     let project_path = proj.project_path.clone();
@@ -405,7 +412,6 @@ pub(crate) async fn execute_current_subtask(
     crate::save_project(&proj)?;
 
     // Initialize pipeline state, then return immediately after scheduling the background task.
-    let pipeline_state = state.pipeline_state.clone();
     let initial_state = PipelineState {
         execution_id: execution_id.clone(),
         mid_stage_id: mid_stage_id.clone(),
@@ -915,10 +921,45 @@ async fn finalize_background_execution_failure(
             session.failure_message = effective_message.clone();
         }
         if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+            let failure_kind = failure
+                .engine_failure_kind
+                .as_ref()
+                .map(crate::autopilot_failure::from_engine_failure)
+                .unwrap_or(project::AutopilotFailureKind::Permanent);
+            let next_attempt = autopilot.transient_retry_count.saturating_add(1);
+            let retry_delay = crate::autopilot_failure::is_transient(&failure_kind)
+                .then(|| crate::autopilot_failure::retry_delay_secs(next_attempt))
+                .flatten();
             autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
-            autopilot.last_action = "执行引擎不可用，代码恢复未启动".to_string();
             autopilot.error_message = effective_message.clone();
-            autopilot.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+            autopilot.last_failure_kind = failure_kind;
+            autopilot.last_failure_fingerprint =
+                crate::autopilot_policy::text_fingerprint(&effective_message);
+            if let Some(delay_secs) = retry_delay {
+                autopilot.transient_retry_count = next_attempt;
+                autopilot.next_retry_at = Some(
+                    (chrono::Utc::now() + chrono::Duration::seconds(delay_secs as i64))
+                        .to_rfc3339(),
+                );
+                autopilot.last_action = format!(
+                    "执行引擎暂时不可用；将在 {} 秒后自动重试（{}/{})",
+                    delay_secs,
+                    next_attempt,
+                    crate::autopilot_failure::MAX_TRANSIENT_RETRIES
+                );
+                autopilot.recovery_action =
+                    project::AutopilotRecoveryAction::RestoreExecutionBaseline;
+            } else {
+                autopilot.next_retry_at = None;
+                autopilot.last_action =
+                    if crate::autopilot_failure::is_transient(&autopilot.last_failure_kind) {
+                        "执行引擎自动重试已耗尽，等待人工处理".to_string()
+                    } else {
+                        "执行引擎错误不可自动重试，等待人工处理".to_string()
+                    };
+                autopilot.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+            }
+            autopilot.last_action_at = chrono::Utc::now().to_rfc3339();
         }
     }
     write_execution_history(
@@ -1377,7 +1418,7 @@ pub(crate) async fn confirm_subtask_result(
     confirm_subtask_result_with_pipeline(&state.pipeline_state, project_name).await
 }
 
-async fn confirm_subtask_result_with_pipeline(
+pub(crate) async fn confirm_subtask_result_with_pipeline(
     pipeline_state: &std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
     project_name: String,
 ) -> Result<project::Project, String> {
@@ -2013,7 +2054,34 @@ pub(crate) async fn retry_git_confirmation(
                 .to_string(),
         );
     }
-    confirm_subtask_result_with_pipeline(&state.pipeline_state, project_name).await
+    let updated =
+        retry_git_confirmation_with_pipeline(&state.pipeline_state, project_name.clone()).await?;
+    state
+        .autopilot_runtime
+        .start_if_active(state.pipeline_state.clone(), project_name)
+        .await?;
+    Ok(updated)
+}
+
+pub(crate) async fn retry_git_confirmation_with_pipeline(
+    pipeline_state: &std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    project_name: String,
+) -> Result<project::Project, String> {
+    let proj = crate::load_project(&project_name)?;
+    let session = proj
+        .execution_session
+        .as_ref()
+        .filter(|session| {
+            session.parsed_status() == project::ExecutionSessionStatus::ConfirmationBlocked
+        })
+        .ok_or("当前没有受阻的 Git 确认事务。".to_string())?;
+    if !confirmation_failure_is_retryable(session.confirmation_failure_kind.as_ref()) {
+        return Err(
+            "当前 Git 确认阻断属于不可变标签或事务完整性问题，需要人工核对，禁止机械重试。"
+                .to_string(),
+        );
+    }
+    confirm_subtask_result_with_pipeline(pipeline_state, project_name).await
 }
 
 /// V1 驳回小阶段执行结果（用户点击"发现问题"）
@@ -2268,6 +2336,18 @@ pub(crate) async fn get_execution_workspace_status(
 /// 准备执行工作区：在批准前或执行阶段由用户显式初始化 Git 并创建首次提交。
 #[tauri::command]
 pub(crate) async fn prepare_execution_workspace(
+    state: tauri::State<'_, AppState>,
+    project_name: String,
+) -> Result<project::ExecutionWorkspaceStatus, String> {
+    let status = prepare_execution_workspace_inner(project_name.clone()).await?;
+    state
+        .autopilot_runtime
+        .start_if_active(state.pipeline_state.clone(), project_name)
+        .await?;
+    Ok(status)
+}
+
+pub(crate) async fn prepare_execution_workspace_inner(
     project_name: String,
 ) -> Result<project::ExecutionWorkspaceStatus, String> {
     let mut proj = crate::load_project(&project_name)?;
@@ -2448,6 +2528,18 @@ pub(crate) async fn prepare_execution_workspace(
 /// 用户在应用外处理完 Git 变更后只刷新事实，不执行 git init/add/commit。
 #[tauri::command]
 pub(crate) async fn refresh_execution_workspace(
+    state: tauri::State<'_, AppState>,
+    project_name: String,
+) -> Result<project::ExecutionWorkspaceStatus, String> {
+    let status = refresh_execution_workspace_inner(project_name.clone()).await?;
+    state
+        .autopilot_runtime
+        .start_if_active(state.pipeline_state.clone(), project_name)
+        .await?;
+    Ok(status)
+}
+
+pub(crate) async fn refresh_execution_workspace_inner(
     project_name: String,
 ) -> Result<project::ExecutionWorkspaceStatus, String> {
     let mut proj = crate::load_project(&project_name)?;
@@ -3976,23 +4068,43 @@ pub(crate) async fn reconcile_on_startup(
     // 先取锁，再 load：与后台完成/ED Stop 同一互斥周期，杜绝旧快照覆盖新结果。
     let guard = state.pipeline_state.lock().await;
     let mut proj = crate::load_project(&project_name)?;
-    let modified = reconcile_loaded_project_under_pipeline_lock(&mut proj, guard.as_ref());
+    let mut modified = reconcile_loaded_project_under_pipeline_lock(&mut proj, guard.as_ref());
+    crate::commands::workflow::reconcile_autopilot_in_migration(&mut proj);
+    let should_start_autopilot = crate::autopilot_runtime::reconcile_startup_job(&mut proj);
+    modified |= proj.workflow_state.autopilot_state.is_some();
 
-    if modified {
+    let result = if modified {
         crate::save_project(&proj)?;
         // 仍在锁内重读，保证返回值与磁盘最终事实一致
-        let reloaded = crate::load_project(&project_name)?;
-        drop(guard);
-        Ok(reloaded)
+        crate::load_project(&project_name)?
     } else {
-        drop(guard);
-        Ok(proj)
+        proj
+    };
+    drop(guard);
+    if should_start_autopilot {
+        state
+            .autopilot_runtime
+            .start(state.pipeline_state.clone(), project_name)
+            .await?;
     }
+    Ok(result)
 }
 
 /// 应用启动恢复确认：实际恢复 Git 基线；失败时保留会话与证据，禁止谎称已恢复
 #[tauri::command]
 pub(crate) async fn acknowledge_execution_recovery(
+    state: tauri::State<'_, AppState>,
+    project_name: String,
+) -> Result<project::Project, String> {
+    let updated = acknowledge_execution_recovery_inner(project_name.clone()).await?;
+    state
+        .autopilot_runtime
+        .start_if_active(state.pipeline_state.clone(), project_name)
+        .await?;
+    Ok(updated)
+}
+
+pub(crate) async fn acknowledge_execution_recovery_inner(
     project_name: String,
 ) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
@@ -4355,6 +4467,9 @@ mod tests {
             plan_draft_revision: 1,
             plan_generated_at: Some("2026-07-20T00:00:00Z".to_string()),
             plan_regeneration_count: 0,
+            last_plan_failure_fingerprint: String::new(),
+            last_plan_issue_count: 0,
+            plan_no_progress_count: 0,
         }
     }
 
@@ -4635,6 +4750,7 @@ mod tests {
             last_action_at: String::new(),
             error_message: String::new(),
             recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+            ..Default::default()
         });
         proj.workflow_state.recovery_state = Some(project::RecoveryState {
             error_kind: project::RecoveryErrorKind::TestFailure,
@@ -5053,6 +5169,7 @@ mod tests {
             last_action_at: "2026-07-20T00:00:00Z".to_string(),
             error_message: "执行超时".to_string(),
             recovery_action: project::AutopilotRecoveryAction::RestoreExecutionBaseline,
+            ..Default::default()
         });
         crate::save_project(&proj)?;
 
@@ -5111,10 +5228,11 @@ mod tests {
             last_action_at: "2026-07-20T00:00:00Z".to_string(),
             error_message: "失联".to_string(),
             recovery_action: project::AutopilotRecoveryAction::RestoreExecutionBaseline,
+            ..Default::default()
         });
         crate::save_project(&proj)?;
 
-        let updated = acknowledge_execution_recovery(project_name).await?;
+        let updated = acknowledge_execution_recovery_inner(project_name).await?;
         assert!(updated.execution_session.is_none());
         assert_eq!(repo.head()?, baseline);
         let workspace = get_execution_workspace_status_inner(&repo.path_string())?;
@@ -5150,10 +5268,11 @@ mod tests {
             last_action_at: String::new(),
             error_message: "dirty".to_string(),
             recovery_action: project::AutopilotRecoveryAction::ResolveWorkspaceChanges,
+            ..Default::default()
         });
         crate::save_project(&proj)?;
 
-        let status = refresh_execution_workspace(project_name.clone()).await?;
+        let status = refresh_execution_workspace_inner(project_name.clone()).await?;
         assert!(status.ready);
         let updated = crate::load_project(&project_name)?;
         let autopilot = updated.workflow_state.autopilot_state.unwrap();
@@ -5179,7 +5298,7 @@ mod tests {
         proj.project_path = path.to_string_lossy().to_string();
         crate::save_project(&proj)?;
 
-        let status = refresh_execution_workspace(project_name).await?;
+        let status = refresh_execution_workspace_inner(project_name).await?;
         assert!(!status.is_git_repo);
         assert!(!path.join(".git").exists());
         std::fs::remove_dir_all(&path)
@@ -5208,6 +5327,7 @@ mod tests {
             last_action_at: String::new(),
             error_message: String::new(),
             recovery_action: project::AutopilotRecoveryAction::None,
+            ..Default::default()
         });
         let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
         subtask.execution_result = Some(project::ExecutionResult {
@@ -5267,6 +5387,7 @@ mod tests {
             last_action_at: String::new(),
             error_message: String::new(),
             recovery_action: project::AutopilotRecoveryAction::None,
+            ..Default::default()
         });
         let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
         subtask.execution_result = Some(project::ExecutionResult {
@@ -5322,6 +5443,7 @@ mod tests {
             last_action_at: String::new(),
             error_message: String::new(),
             recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+            ..Default::default()
         });
         proj.workflow_state.recovery_state = Some(project::RecoveryState {
             error_kind: project::RecoveryErrorKind::TestFailure,
@@ -5582,6 +5704,7 @@ mod tests {
             last_action_at: String::new(),
             error_message: String::new(),
             recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+            ..Default::default()
         });
         proj.workflow_state.recovery_state = Some(project::RecoveryState {
             error_kind: project::RecoveryErrorKind::TestFailure,
@@ -5897,6 +6020,7 @@ mod tests {
             last_action_at: String::new(),
             error_message: String::new(),
             recovery_action: project::AutopilotRecoveryAction::None,
+            ..Default::default()
         });
         let mut pipeline = Some(pipeline_state("execution-x", PipelineStatus::Running));
         finalize_execution_failure(&mut proj, &mut pipeline, 0, "timeout", None);
@@ -6023,6 +6147,7 @@ mod tests {
             last_action_at: String::new(),
             error_message: String::new(),
             recovery_action: project::AutopilotRecoveryAction::None,
+            ..Default::default()
         });
         crate::save_project(&proj)?;
         let pipeline = Arc::new(Mutex::new(Some(pipeline_state(

@@ -700,6 +700,9 @@ async fn generate_mid_stage_candidates(
                 plan_draft_revision: 0,
                 plan_generated_at: None,
                 plan_regeneration_count: 0,
+                last_plan_failure_fingerprint: String::new(),
+                last_plan_issue_count: 0,
+                plan_no_progress_count: 0,
             })
         })
         .collect()
@@ -732,6 +735,8 @@ pub(crate) async fn generate_mid_stage_draft(
     {
         return Err("生成期间项目事实已变化，未写入中阶段草稿。请同步后重试。".to_string());
     }
+    let candidate_fingerprint =
+        crate::autopilot_policy::mid_stage_candidate_fingerprint(&candidates);
     let draft = project::MidStageDraft {
         draft_id: uuid::Uuid::new_v4().to_string(),
         milestone_id: milestone_id.clone(),
@@ -745,6 +750,9 @@ pub(crate) async fn generate_mid_stage_draft(
         previous_draft_id: None,
         last_regeneration_reason: None,
         source_data_revision: initial_revision,
+        last_check_failure_fingerprint: String::new(),
+        last_candidate_fingerprint: candidate_fingerprint,
+        no_progress_count: 0,
     };
 
     proj.mid_stage_draft = Some(draft);
@@ -814,8 +822,18 @@ pub(crate) async fn regenerate_mid_stage_draft(
     let milestone_id = initial.current_milestone_id.clone();
     let initial_plan = initial.version_plan.clone();
     let old_count = old_draft.regeneration_count;
+    let old_failure_fingerprint = old_draft.last_check_failure_fingerprint.clone();
+    let old_candidate_fingerprint = if old_draft.last_candidate_fingerprint.is_empty() {
+        crate::autopilot_policy::mid_stage_candidate_fingerprint(&old_draft.candidate_mid_stages)
+    } else {
+        old_draft.last_candidate_fingerprint.clone()
+    };
+    let old_no_progress_count = old_draft.no_progress_count;
     let candidates =
         generate_mid_stage_candidates(&initial, &milestone_id, Some(&effective_feedback)).await?;
+    let candidate_fingerprint =
+        crate::autopilot_policy::mid_stage_candidate_fingerprint(&candidates);
+    let candidate_unchanged = candidate_fingerprint == old_candidate_fingerprint;
 
     let mut latest = crate::load_project(&project_name)?;
     let latest_draft = latest
@@ -858,6 +876,13 @@ pub(crate) async fn regenerate_mid_stage_draft(
         previous_draft_id: Some(current_draft_id),
         last_regeneration_reason: Some(effective_feedback),
         source_data_revision: expected_data_revision,
+        last_check_failure_fingerprint: old_failure_fingerprint,
+        last_candidate_fingerprint: candidate_fingerprint,
+        no_progress_count: if candidate_unchanged {
+            old_no_progress_count.saturating_add(1)
+        } else {
+            old_no_progress_count
+        },
     });
     latest.workflow_state.current_step = project::WorkflowStep::MidStageCheck;
     latest.workflow_state.data_revision += 1;
@@ -940,6 +965,24 @@ pub(crate) async fn check_mid_stage_draft(
         } else {
             project::MidStageDraftStatus::CheckFailed
         };
+        if passed {
+            d.last_check_failure_fingerprint.clear();
+            d.no_progress_count = 0;
+        } else {
+            let fingerprint = crate::autopilot_policy::text_fingerprint(&summary);
+            if !d.last_check_failure_fingerprint.is_empty()
+                && d.last_check_failure_fingerprint == fingerprint
+            {
+                d.no_progress_count = d.no_progress_count.saturating_add(1);
+            }
+            d.last_check_failure_fingerprint = fingerprint;
+            if d.last_candidate_fingerprint.is_empty() {
+                d.last_candidate_fingerprint =
+                    crate::autopilot_policy::mid_stage_candidate_fingerprint(
+                        &d.candidate_mid_stages,
+                    );
+            }
+        }
     }
 
     proj.workflow_state.current_step = if passed {
@@ -1361,6 +1404,9 @@ pub(crate) async fn generate_execution_plan(
     mid.plan_revision = 0;
     mid.plan_draft_revision += 1;
     mid.plan_generated_at = Some(chrono::Utc::now().to_rfc3339());
+    mid.last_plan_failure_fingerprint.clear();
+    mid.last_plan_issue_count = 0;
+    mid.plan_no_progress_count = 0;
 
     proj.workflow_state.current_step = project::WorkflowStep::PlanCheck;
     proj.workflow_state.data_revision += 1;
@@ -1517,14 +1563,18 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
             .iter_mut()
             .find(|m| m.id == *mid_stage_id)
             .ok_or("中阶段不存在。")?;
-        mid.plan_check_result = Some(project::StagePlanCheckResult {
+        let result = project::StagePlanCheckResult {
             passed: false,
             omissions: vec![],
             out_of_scope: vec![],
             not_executable: vec![error],
             suggestions: vec!["请重新生成执行计划并补全合法的文件范围。".to_string()],
             checked_at: chrono::Utc::now().to_rfc3339(),
-        });
+        };
+        mid.last_plan_failure_fingerprint =
+            crate::autopilot_policy::plan_failure_fingerprint(&result);
+        mid.last_plan_issue_count = crate::autopilot_policy::blocking_plan_issue_count(&result);
+        mid.plan_check_result = Some(result);
         proj.workflow_state.data_revision += 1;
         proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
         return crate::save_and_reload_project(&proj);
@@ -1601,14 +1651,32 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
         .iter_mut()
         .find(|m| m.id == *mid_stage_id)
         .ok_or("中阶段不存在。")?;
-    mid.plan_check_result = Some(project::StagePlanCheckResult {
+    let result = project::StagePlanCheckResult {
         passed,
         omissions: arr_str(&check["omissions"]),
         out_of_scope: arr_str(&check["out_of_scope"]),
         not_executable: arr_str(&check["not_executable"]),
         suggestions: arr_str(&check["suggestions"]),
         checked_at: chrono::Utc::now().to_rfc3339(),
-    });
+    };
+    if passed {
+        mid.last_plan_failure_fingerprint.clear();
+        mid.last_plan_issue_count = 0;
+        mid.plan_no_progress_count = 0;
+    } else {
+        let fingerprint = crate::autopilot_policy::plan_failure_fingerprint(&result);
+        let issue_count = crate::autopilot_policy::blocking_plan_issue_count(&result);
+        let repeated = !mid.last_plan_failure_fingerprint.is_empty()
+            && mid.last_plan_failure_fingerprint == fingerprint;
+        let did_not_improve = mid.last_plan_issue_count > 0
+            && (issue_count >= mid.last_plan_issue_count || !result.out_of_scope.is_empty());
+        if repeated || did_not_improve {
+            mid.plan_no_progress_count = mid.plan_no_progress_count.saturating_add(1);
+        }
+        mid.last_plan_failure_fingerprint = fingerprint;
+        mid.last_plan_issue_count = issue_count;
+    }
+    mid.plan_check_result = Some(result);
 
     proj.workflow_state.current_step = if passed {
         project::WorkflowStep::PlanApproving
@@ -1768,9 +1836,7 @@ pub(crate) async fn enter_milestone_review(
     crate::save_and_reload_project(&proj)
 }
 
-/// 大阶段审阅决策：A（继续）/ B（修正过去）/ C（调整未来）
-#[tauri::command]
-pub(crate) async fn approve_milestone_outcome(
+async fn approve_milestone_outcome_state(
     project_name: String,
     branch: String,
 ) -> Result<project::Project, String> {
@@ -1877,6 +1943,30 @@ pub(crate) async fn approve_milestone_outcome(
     proj.workflow_state.last_transition_at = now;
 
     crate::save_and_reload_project(&proj)
+}
+
+/// 大阶段审阅决策：A（继续）/ B（修正过去）/ C（调整未来）。
+/// A 分支进入下一大阶段时重新接续后端自动驾驶作业。
+#[tauri::command]
+pub(crate) async fn approve_milestone_outcome(
+    state: tauri::State<'_, crate::AppState>,
+    project_name: String,
+    branch: String,
+) -> Result<project::Project, String> {
+    let project = approve_milestone_outcome_state(project_name.clone(), branch).await?;
+    let should_start = project.workflow_state.autopilot_active
+        && project
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .is_some_and(|autopilot| autopilot.run_status == project::AutopilotRunStatus::Running);
+    if should_start {
+        state
+            .autopilot_runtime
+            .start(state.pipeline_state.clone(), project_name)
+            .await?;
+    }
+    Ok(project)
 }
 
 /// B 分支：AI 生成回退建议（基于失败证据、测试结果、稳定标签、用户反馈）
@@ -2618,6 +2708,9 @@ pub(crate) async fn generate_mid_stages(
             plan_draft_revision: 0,
             plan_generated_at: None,
             plan_regeneration_count: 0,
+            last_plan_failure_fingerprint: String::new(),
+            last_plan_issue_count: 0,
+            plan_no_progress_count: 0,
         });
     }
     Ok(mid_stages)
@@ -3045,6 +3138,9 @@ mod tests {
             plan_draft_revision: 0,
             plan_generated_at: None,
             plan_regeneration_count: 0,
+            last_plan_failure_fingerprint: String::new(),
+            last_plan_issue_count: 0,
+            plan_no_progress_count: 0,
         }
     }
 
@@ -3092,6 +3188,7 @@ mod tests {
             last_action_at: String::new(),
             error_message: String::new(),
             recovery_action: project::AutopilotRecoveryAction::None,
+            ..Default::default()
         });
         proj.current_milestone_id = "milestone-1".to_string();
         proj.current_mid_stage_id = "mid-1".to_string();
@@ -3283,7 +3380,7 @@ mod tests {
         let _guard = ProjectDataGuard::new(&project_name)?;
         crate::save_project(&review_project(&project_name, true))?;
 
-        let updated = approve_milestone_outcome(project_name, "A".to_string()).await?;
+        let updated = approve_milestone_outcome_state(project_name, "A".to_string()).await?;
         assert_eq!(
             updated.workflow_state.current_step,
             project::WorkflowStep::MilestoneSelection
@@ -3314,7 +3411,7 @@ mod tests {
         let _guard = ProjectDataGuard::new(&project_name)?;
         crate::save_project(&review_project(&project_name, false))?;
 
-        let updated = approve_milestone_outcome(project_name, "A".to_string()).await?;
+        let updated = approve_milestone_outcome_state(project_name, "A".to_string()).await?;
         assert_eq!(
             updated.workflow_state.current_step,
             project::WorkflowStep::Completed
@@ -3349,7 +3446,7 @@ mod tests {
             crate::save_project(&review_project(&project_name, true))?;
 
             let updated =
-                approve_milestone_outcome(project_name.clone(), branch.to_string()).await?;
+                approve_milestone_outcome_state(project_name.clone(), branch.to_string()).await?;
             assert_eq!(
                 updated.workflow_state.current_step,
                 project::WorkflowStep::BranchDiscussion
@@ -3369,7 +3466,7 @@ mod tests {
                 project::AutopilotRunStatus::Paused
             );
 
-            let duplicate = approve_milestone_outcome(project_name, branch.to_string()).await;
+            let duplicate = approve_milestone_outcome_state(project_name, branch.to_string()).await;
             assert!(duplicate.is_err());
         }
         Ok(())

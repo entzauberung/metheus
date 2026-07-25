@@ -6,10 +6,10 @@
 // ...
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import { executionPollingOwnsNextAdvance, getGitConfirmationBlockPresentation, getQualityStatusPresentation } from "./autopilotPolicy";
+import { getGitConfirmationBlockPresentation, getQualityStatusPresentation } from "./autopilotPolicy";
 import { getWorkspaceAction } from "./workspacePolicy";
 import "./App.css";
-import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, AutopilotNextStep, TestResult } from "./types";
+import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, TestResult } from "./types";
 import { ProjectEntry } from "./ProjectEntry";
 import { ExistingBaselinePanel } from "./ExistingBaselinePanel";
 import { PreflightPanel } from "./PreflightPanel";
@@ -47,11 +47,12 @@ const WORKFLOW_STEPS = new Set<WorkflowStep>([
   "MilestoneReview", "Completed",
 ]);
 
-/** 自动驾驶两个原子动作之间的等待周期（ms） */
-const AUTOPILOT_STEP_DELAY_MS = 1000;
-
 /** 执行状态轮询周期（ms） */
 const EXECUTION_POLL_INTERVAL_MS = 1500;
+
+/** 后端自动驾驶运行时与空闲时的项目事实同步周期。 */
+const PROJECT_SYNC_ACTIVE_INTERVAL_MS = 1000;
+const PROJECT_SYNC_IDLE_INTERVAL_MS = 5000;
 
 /** 连续轮询失败最大次数，防止界面无限静默等待 */
 const EXECUTION_POLL_MAX_FAILURES = 10;
@@ -378,13 +379,6 @@ function App() {
       .catch(() => setWorkspaceStatus(null));
   }, [project?.name, project?.workflow_state.current_step, project?.workflow_state.data_revision]);
 
-  // === 自动驾驶驱动循环 — 使用 autopilot_next_step 逐步推进 ===
-  // 覆盖范围：大阶段内部所有步骤（中阶段规划、执行计划、执行、确认）
-  // 停止条件：大阶段边界（MilestoneReview）、出错、暂停
-  const autopilotLoopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const autopilotActiveRef = useRef(false);
-  // 单飞锁：同一项目同一时刻只允许一个自动动作在途
-  const autopilotGenerationRef = useRef(0);
   // 执行状态轮询失败计数器
   const executionPollFailuresRef = useRef(0);
   // 执行状态轮询定时器
@@ -397,221 +391,15 @@ function App() {
   const managedLoopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const managedActiveRef = useRef(false);
 
-  /** 自动驾驶唯一驱动入口：建立代次和单飞锁，阻止重复循环和旧循环回写 */
-  const driveAutopilot = useCallback(async (proj: Project) => {
-    // 递增代次，使旧循环失效
-    autopilotGenerationRef.current += 1;
-    const myGen = autopilotGenerationRef.current;
-
-    // 检查是否已有人在飞
-    if (autopilotLoopRef.current) {
-      clearTimeout(autopilotLoopRef.current);
-      autopilotLoopRef.current = null;
-    }
-
-    const cycle = async (p: Project): Promise<void> => {
-      // 代次失效检查
-      if (autopilotGenerationRef.current !== myGen) return;
-      if (!autopilotActiveRef.current) return;
-
-      await runAutopilotCycle(p, myGen);
-    };
-
-    await cycle(proj);
-  }, []);
-
-  const runAutopilotCycle = useCallback(async (proj: Project, generation: number) => {
-    if (!proj.workflow_state.autopilot_active) return;
-    if (proj.workflow_state.top_level_phase !== "Console") return;
-
-    const autopilotState = proj.workflow_state.autopilot_state;
-    if (autopilotState) {
-      if (autopilotState.run_status === "Paused") return;
-      if (autopilotState.run_status === "WaitingMilestoneReview") return;
-      if (autopilotState.run_status === "ErrorStopped") return;
-    }
-
-    const reschedule = (nextProj: Project) => {
-      if (
-        autopilotGenerationRef.current === generation &&
-        autopilotActiveRef.current &&
-        nextProj.workflow_state.autopilot_active &&
-        nextProj.workflow_state.autopilot_state?.run_status === "Running" &&
-        nextProj.workflow_state.top_level_phase === "Console"
-      ) {
-        autopilotLoopRef.current = setTimeout(() => {
-          runAutopilotCycle(nextProj, generation);
-        }, AUTOPILOT_STEP_DELAY_MS);
-      }
-    };
-
-    try {
-      const next = await invokeWithTimeout<AutopilotNextStep>("autopilot_next_step", { projectName: proj.name });
-
-      // 代次失效检查
-      if (autopilotGenerationRef.current !== generation) return;
-
-      if (next.waiting_for_execution) {
-        setIsExecuting(true);
-        startExecutionPolling(proj.name, generation);
-        return;
-      }
-
-      // 终止字段是后端强制契约，必须先于 result_kind 处理。
-      if (next.is_error || !next.command) {
-        const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-        if (autopilotGenerationRef.current !== generation) return;
-        handleChatComplete(latest);
-        if (next.is_error) {
-          setFeedbackMsg({
-            type: "error",
-            message: next.error_message || next.description || "自动驾驶已因未知错误停止。",
-          });
-        } else if (next.at_milestone_boundary) {
-          setFeedbackMsg({
-            type: "warning",
-            message: next.description || "已到达大阶段边界，请完成人工审阅。",
-          });
-        } else {
-          setFeedbackMsg({
-            type: "info",
-            message: next.description || "自动驾驶已暂停。",
-          });
-        }
-        return;
-      }
-
-      // 与人工确认/执行/驳回共用 consoleAction 在途锁，禁止并发提交
-      if (!beginConsoleAction(`autopilot:${next.command}`)) {
-        reschedule(proj);
-        return;
-      }
-
-      try {
-        if (next.command === "run_error_recovery") {
-          setFeedbackMsg({ type: "info", message: next.description || "正在执行自动修复。" });
-        }
-        switch (next.result_kind) {
-          case "ProjectState": {
-            if (!next.command) {
-              const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-              handleChatComplete(latest);
-              return;
-            }
-            const updated = await invokeWithTimeout<Project>(next.command, {
-              ...next.args,
-              projectName: proj.name,
-            });
-            if (autopilotGenerationRef.current !== generation) return;
-            if (updated.workflow_state.data_revision >= (proj.workflow_state.data_revision ?? 0)) {
-              handleChatComplete(updated);
-            } else {
-              const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-              handleChatComplete(latest);
-            }
-            break;
-          }
-
-          case "PipelineState": {
-            if (!next.command) return;
-            const pipelineState = await invokeWithTimeout<PipelineState>(next.command, {
-              ...next.args,
-              projectName: proj.name,
-            });
-            setExecutionStatus(pipelineState);
-            setIsExecuting(pipelineState.status === "Running");
-            if (
-              executionPollingOwnsNextAdvance(pipelineState)
-              && autopilotGenerationRef.current === generation
-            ) {
-              startExecutionPolling(proj.name, generation);
-              return;
-            }
-            if (pipelineState.status !== "Running") {
-              const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-              handleChatComplete(latest);
-            }
-            break;
-          }
-
-          case "WorkspaceState": {
-            if (!next.command) return;
-            const wsStatus = await invokeWithTimeout<ExecutionWorkspaceStatus>(next.command, {
-              ...next.args,
-              projectName: proj.name,
-            });
-            setWorkspaceStatus(wsStatus);
-            const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-            handleChatComplete(latest);
-            break;
-          }
-
-          case "NoResult": {
-            const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-            handleChatComplete(latest);
-            return;
-          }
-        }
-
-        if (
-          autopilotGenerationRef.current === generation &&
-          autopilotActiveRef.current
-        ) {
-          const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-          if (
-            latest.workflow_state.autopilot_active &&
-            latest.workflow_state.autopilot_state?.run_status === "Running" &&
-            latest.workflow_state.top_level_phase === "Console"
-          ) {
-            reschedule(latest);
-          } else {
-            handleChatComplete(latest);
-          }
-        }
-      } finally {
-        endConsoleAction();
-      }
-    } catch (error) {
-      console.warn("[autopilot] Cycle error:", error);
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      try {
-        const updated = await invokeWithTimeout<Project>("autopilot_mark_error", {
-          projectName: proj.name,
-          actionDescription: "自动驾驶循环异常",
-          errorDetail: errorMsg.slice(0, 2048),
-        });
-        handleChatComplete(updated);
-        setFeedbackMsg({ type: "error", message: `自动驾驶已停止：${errorMsg}` });
-      } catch (markError) {
-        console.error("[autopilot] Failed to persist error state:", markError);
-        try {
-          const latest = await invokeWithTimeout<Project>("get_project", { projectName: proj.name });
-          handleChatComplete(latest);
-          setFeedbackMsg({ type: "error", message: "自动驾驶错误状态可能未落盘，请手动同步项目。" });
-        } catch (_) {
-          setFeedbackMsg({ type: "error", message: "自动驾驶异常且无法同步项目，请检查后端连接。" });
-        }
-      }
-    }
-  }, [beginConsoleAction, endConsoleAction]);
-
-  /** 手动执行和自动驾驶共用的唯一执行状态轮询入口。 */
-  const startExecutionPolling = useCallback(async (projectName: string, generation?: number) => {
+  /** 执行状态轮询只负责展示，不拥有自动驾驶推进权。 */
+  const startExecutionPolling = useCallback(async (projectName: string) => {
     if (executionPollingActiveRef.current) return;
     executionPollingActiveRef.current = true;
     executionPollFailuresRef.current = 0;
 
     const poll = async () => {
-      if (generation !== undefined && autopilotGenerationRef.current !== generation) {
-        executionPollingActiveRef.current = false;
-        return;
-      }
       try {
         const status = await invokeWithTimeout<PipelineState | null>("get_execution_status", {});
-        if (generation !== undefined && autopilotGenerationRef.current !== generation) {
-          executionPollingActiveRef.current = false;
-          return;
-        }
         if (!status) {
           executionPollingActiveRef.current = false;
           setIsExecuting(false);
@@ -657,17 +445,6 @@ function App() {
               type: "error",
               message: status.last_error || "后台执行失败，请查看阶段日志后重试。",
             });
-          }
-          if (
-            generation !== undefined &&
-            autopilotGenerationRef.current === generation &&
-            autopilotActiveRef.current &&
-            latest.workflow_state.autopilot_active &&
-            latest.workflow_state.autopilot_state?.run_status === "Running"
-          ) {
-            autopilotLoopRef.current = setTimeout(() => {
-              runAutopilotCycle(latest, generation);
-            }, AUTOPILOT_STEP_DELAY_MS);
           }
         }
       } catch (error) {
@@ -816,43 +593,37 @@ function App() {
     }
   }, []);
 
-  // Start/stop autopilot loop when autopilot state changes
+  // React 只同步后端磁盘事实；自动驾驶的动作选择和派发均由 Rust 作业运行器负责。
   useEffect(() => {
-    if (!project) return;
-    const active = project.workflow_state.autopilot_active === true;
-    autopilotActiveRef.current = active;
+    const projectName = project?.name;
+    if (!projectName) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
-    // Clear any pending loop and poll timer
-    if (autopilotLoopRef.current) {
-      clearTimeout(autopilotLoopRef.current);
-      autopilotLoopRef.current = null;
-    }
-    if (executionPollTimerRef.current) {
-      clearTimeout(executionPollTimerRef.current);
-      executionPollTimerRef.current = null;
-    }
+    const syncProject = async () => {
+      try {
+        const latest = await invokeWithTimeout<Project>("get_project", { projectName });
+        if (!cancelled) handleChatComplete(latest);
+      } catch (error) {
+        if (!cancelled) console.warn("项目状态同步失败:", error);
+      }
+      if (cancelled) return;
+      const current = projectRef.current;
+      const running = current?.name === projectName
+        && current.workflow_state.autopilot_active === true
+        && current.workflow_state.autopilot_state?.run_status === "Running";
+      timer = setTimeout(
+        syncProject,
+        running ? PROJECT_SYNC_ACTIVE_INTERVAL_MS : PROJECT_SYNC_IDLE_INTERVAL_MS,
+      );
+    };
 
-    if (!active) return;
-    if (project.workflow_state.top_level_phase !== "Console") return;
-
-    // Check if should start
-    const apState = project.workflow_state.autopilot_state;
-    if (apState) {
-      if (apState.run_status === "Paused") return;
-      if (apState.run_status === "WaitingMilestoneReview") return;
-      if (apState.run_status === "ErrorStopped") return;
-    }
-
-    // Start the drive loop via the unique entry point
-    autopilotLoopRef.current = setTimeout(() => {
-      driveAutopilot(project);
-    }, 500);
-  }, [
-    project?.workflow_state?.autopilot_active,
-    project?.workflow_state?.autopilot_state?.run_status,
-    project?.workflow_state?.top_level_phase,
-    project?.workflow_state?.current_step, // Re-check when step changes (e.g., PauseDecision → Execution)
-  ]);
+    timer = setTimeout(syncProject, PROJECT_SYNC_ACTIVE_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [project?.name, handleChatComplete]);
 
   // Start/stop managed flow loop when managed_flow_state changes
   useEffect(() => {

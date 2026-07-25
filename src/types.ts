@@ -47,6 +47,25 @@ export type AutopilotRecoveryAction =
   | "RunAutomaticRecovery"
   | "RetryGitConfirmation";
 
+export type AutopilotJobOwner = "None" | "BackendRuntime";
+
+export type AutopilotFailureKind =
+  | "None"
+  | "Network"
+  | "RateLimited"
+  | "ProviderUnavailable"
+  | "Timeout"
+  | "RevisionConflict"
+  | "ProcessCrash"
+  | "Authentication"
+  | "Quota"
+  | "WorkspaceChanged"
+  | "StateConflict"
+  | "ScopeViolation"
+  | "ContractContradiction"
+  | "GitIntegrity"
+  | "Permanent";
+
 export type RecoveryErrorKind =
   | "WorkspaceError"
   | "TransientError"
@@ -192,9 +211,6 @@ export interface RecoveryState {
   pending_execution_result?: ExecutionResult;
 }
 
-/** 自动驾驶命令返回类别 */
-export type AutopilotCommandResultKind = "ProjectState" | "PipelineState" | "WorkspaceState" | "NoResult";
-
 export interface AutopilotState {
   active: boolean;
   target_milestone_id: string;
@@ -204,18 +220,18 @@ export interface AutopilotState {
   error_message: string;
   /** 出错后的恢复动作；旧项目默认 None */
   recovery_action?: AutopilotRecoveryAction;
-}
-
-export interface AutopilotNextStep {
-  command: string;
-  args: Record<string, unknown>;
-  description: string;
-  at_milestone_boundary: boolean;
-  is_error: boolean;
-  error_message: string;
-  result_kind: AutopilotCommandResultKind;
-  /** 已有匹配的执行会话，前端只应恢复执行轮询 */
-  waiting_for_execution: boolean;
+  job_id?: string;
+  job_generation?: number;
+  job_owner?: AutopilotJobOwner;
+  current_action_id?: string;
+  current_action_kind?: string;
+  action_started_at?: string;
+  heartbeat_at?: string;
+  transient_retry_count?: number;
+  next_retry_at?: string;
+  last_failure_kind?: AutopilotFailureKind;
+  last_failure_fingerprint?: string;
+  consecutive_no_progress?: number;
 }
 
 // ========== V2 托管层 ==========
@@ -490,6 +506,9 @@ export interface MidStageDraft {
   previous_draft_id?: string;
   last_regeneration_reason?: string;
   source_data_revision: number;
+  last_check_failure_fingerprint?: string;
+  last_candidate_fingerprint?: string;
+  no_progress_count?: number;
 }
 
 // ========== 方案草稿 ==========
@@ -678,6 +697,9 @@ export interface MidStage {
   plan_draft_revision: number;
   plan_generated_at?: string;
   plan_regeneration_count: number;
+  last_plan_failure_fingerprint?: string;
+  last_plan_issue_count?: number;
+  plan_no_progress_count?: number;
 }
 
 export type StageMode = "Quick" | "Professional";
