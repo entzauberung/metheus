@@ -32,8 +32,8 @@ pub(crate) fn detect_changes(
 mod change_detection_tests {
     use super::{
         build_review_evidence_with_request, detect_changes, git_changed_files,
-        normalize_model_review, truncate_head_tail, FileSnapshot, ReviewEvidence,
-        ReviewEvidenceRequest,
+        normalize_model_review, truncate_head_tail, AutomatedTestEvidence, FileSnapshot,
+        ReviewEvidence, ReviewEvidenceRequest,
     };
     use crate::project::ReviewEvidenceStatus;
     use crate::review_protocol::{ModelCriterionReview, ModelReviewIssue, ModelReviewResponse};
@@ -56,6 +56,27 @@ mod change_detection_tests {
             detect_changes(&before, &after, "/project"),
             vec!["added.rs", "deleted.rs", "modified.rs"]
         );
+    }
+
+    #[test]
+    fn review_retry_reuses_automated_test_facts() {
+        let previous = crate::project::TestResult {
+            test_command: "cargo test --lib".to_string(),
+            test_exit_code: Some(0),
+            test_output_summary: "12 passed".to_string(),
+            automated_test_status: crate::project::AutomatedTestStatus::Passed,
+            ..Default::default()
+        };
+
+        let reused = AutomatedTestEvidence::from_previous(&previous);
+        assert_eq!(reused.command, previous.test_command);
+        assert_eq!(reused.exit_code, previous.test_exit_code);
+        assert_eq!(reused.output_summary, previous.test_output_summary);
+        assert_eq!(reused.status, previous.automated_test_status);
+        assert!(reused
+            .rendered
+            .as_deref()
+            .is_some_and(|value| value.contains("12 passed")));
     }
 
     #[test]
@@ -1014,6 +1035,37 @@ impl AutomatedTestEvidence {
             status: project::AutomatedTestStatus::Unavailable,
         }
     }
+
+    fn from_previous(previous: &project::TestResult) -> Self {
+        let rendered = match previous.automated_test_status {
+            project::AutomatedTestStatus::Passed | project::AutomatedTestStatus::Failed => {
+                let exit_code = previous.test_exit_code.unwrap_or_else(|| {
+                    if previous.automated_test_status == project::AutomatedTestStatus::Passed {
+                        0
+                    } else {
+                        1
+                    }
+                });
+                Some(format_test_result(
+                    "已保留的自动化测试",
+                    &previous.test_command,
+                    exit_code,
+                    &previous.test_output_summary,
+                ))
+            }
+            project::AutomatedTestStatus::Unavailable => Some(previous.test_output_summary.clone()),
+            project::AutomatedTestStatus::NotConfigured | project::AutomatedTestStatus::Unknown => {
+                None
+            }
+        };
+        Self {
+            rendered,
+            command: previous.test_command.clone(),
+            exit_code: previous.test_exit_code,
+            output_summary: previous.test_output_summary.clone(),
+            status: previous.automated_test_status.clone(),
+        }
+    }
 }
 
 fn resolve_evidence_references(
@@ -1206,6 +1258,60 @@ pub(crate) async fn check_subtask_with_context(
     execution_prompt: Option<String>,
     evidence_request: Option<ReviewEvidenceRequest>,
 ) -> Result<project::TestResult, String> {
+    check_subtask_with_context_inner(
+        project_path,
+        subtask_goal,
+        _subtask_id,
+        _milestone_id,
+        _mid_stage_id,
+        acceptance_criteria,
+        authorized_paths,
+        execution_prompt,
+        evidence_request,
+        None,
+    )
+    .await
+}
+
+/// 只重新请求 AI 审查，沿用此前自动化测试事实，不再次执行测试命令。
+pub(crate) async fn retry_subtask_review_with_context(
+    project_path: &str,
+    subtask_goal: &str,
+    subtask_id: &str,
+    milestone_id: &str,
+    mid_stage_id: &str,
+    acceptance_criteria: Option<Vec<String>>,
+    authorized_paths: Option<Vec<String>>,
+    execution_prompt: Option<String>,
+    previous_test: &project::TestResult,
+) -> Result<project::TestResult, String> {
+    check_subtask_with_context_inner(
+        project_path,
+        subtask_goal,
+        subtask_id,
+        milestone_id,
+        mid_stage_id,
+        acceptance_criteria,
+        authorized_paths,
+        execution_prompt,
+        None,
+        Some(previous_test),
+    )
+    .await
+}
+
+async fn check_subtask_with_context_inner(
+    project_path: &str,
+    subtask_goal: &str,
+    _subtask_id: &str,
+    _milestone_id: &str,
+    _mid_stage_id: &str,
+    acceptance_criteria: Option<Vec<String>>,
+    authorized_paths: Option<Vec<String>>,
+    execution_prompt: Option<String>,
+    evidence_request: Option<ReviewEvidenceRequest>,
+    previous_test: Option<&project::TestResult>,
+) -> Result<project::TestResult, String> {
     // 1.尝试 git diff --name-only 获取改动文件
     let files = git_changed_files(project_path);
 
@@ -1245,7 +1351,9 @@ pub(crate) async fn check_subtask_with_context(
         &evidence_request,
     );
     // ===== 真测试：检测项目类型，执行对应的测试命令 =====
-    let test_evidence = {
+    let test_evidence = if let Some(previous) = previous_test {
+        AutomatedTestEvidence::from_previous(previous)
+    } else {
         let project_root = std::path::Path::new(project_path);
 
         // 优先检测自定义测试命令文件 .metheus-test

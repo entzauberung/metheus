@@ -5429,6 +5429,152 @@ mod tests {
     }
 
     #[test]
+    fn review_protocol_failure_initializes_bounded_validation_recovery() -> Result<(), String> {
+        let mut proj = execution_project(
+            "quality-review-protocol",
+            Path::new(""),
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(execution_session(
+                "awaiting_confirmation",
+                "review-protocol",
+                "abc123",
+            )),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            run_status: project::AutopilotRunStatus::Running,
+            ..Default::default()
+        });
+        let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+        subtask.execution_result = Some(project::ExecutionResult {
+            success: true,
+            file_changes: vec!["tracked.txt".to_string()],
+            ..Default::default()
+        });
+        subtask.test_result = Some(project::TestResult {
+            automated_test_status: project::AutomatedTestStatus::Passed,
+            review_status: project::ReviewStatus::Failed,
+            review_failure_kind: Some(project::ReviewFailureKind::FieldTypeMismatch),
+            review_protocol_attempts: 1,
+            review_diagnostic_summary: "$.review_issues[0].actual type mismatch".to_string(),
+            ..Default::default()
+        });
+
+        assert!(crate::recovery::ensure_quality_recovery(
+            &mut proj,
+            "review protocol failed"
+        )?);
+        let recovery = proj.workflow_state.recovery_state.as_ref().unwrap();
+        assert_eq!(
+            recovery.error_kind,
+            project::RecoveryErrorKind::ReviewProtocolFailure
+        );
+        assert_eq!(recovery.phase, project::RecoveryPhase::Retesting);
+        assert_eq!(recovery.attempt, 0);
+        assert_eq!(recovery.validation_retry_count, 0);
+        assert_eq!(recovery.max_validation_retries, 2);
+        assert!(recovery.next_validation_retry_at.is_some());
+        assert_eq!(
+            recovery.validation_strategies,
+            vec![
+                project::ValidationRetryStrategy::DeterministicNormalization,
+                project::ValidationRetryStrategy::ProtocolRepair,
+            ]
+        );
+
+        proj.workflow_state.recovery_state = None;
+        proj.milestones[0].mid_stages[0].subtasks[0]
+            .test_result
+            .as_mut()
+            .unwrap()
+            .review_failure_kind = Some(project::ReviewFailureKind::Authentication);
+        assert!(!crate::recovery::ensure_quality_recovery(
+            &mut proj,
+            "review authentication failed"
+        )?);
+        let blocked = proj.workflow_state.recovery_state.as_ref().unwrap();
+        assert_eq!(
+            blocked.error_kind,
+            project::RecoveryErrorKind::ReviewServiceBlocked
+        );
+        assert_eq!(blocked.phase, project::RecoveryPhase::WaitingHuman);
+        assert_eq!(blocked.validation_retry_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn review_retry_failure_never_spends_code_repair_attempts() -> Result<(), String> {
+        let session = execution_session("recovering", "review-retry", "abc123");
+        let mut proj = execution_project(
+            "review-retry",
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(session.clone()),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            run_status: project::AutopilotRunStatus::Running,
+            recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+            ..Default::default()
+        });
+        let pending_execution = project::ExecutionResult {
+            success: true,
+            output: "pending repair result".to_string(),
+            file_changes: vec!["tracked.txt".to_string()],
+            ..Default::default()
+        };
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::ReviewTransientFailure,
+            phase: project::RecoveryPhase::Retesting,
+            attempt: 1,
+            max_attempts: 2,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "review-retry".to_string(),
+            validation_retry_count: 1,
+            max_validation_retries: 3,
+            pending_execution_result: Some(pending_execution.clone()),
+            ..Default::default()
+        });
+        let failed_review = project::TestResult {
+            automated_test_status: project::AutomatedTestStatus::Passed,
+            review_status: project::ReviewStatus::Failed,
+            review_failure_kind: Some(project::ReviewFailureKind::Network),
+            review_diagnostic_summary: "network unavailable".to_string(),
+            ..Default::default()
+        };
+
+        crate::recovery::finish_retest(&mut proj, &session, "review-retry", failed_review.clone())?;
+        let recovery = proj.workflow_state.recovery_state.as_ref().unwrap();
+        assert_eq!(recovery.phase, project::RecoveryPhase::Retesting);
+        assert_eq!(recovery.attempt, 1);
+        assert_eq!(recovery.validation_retry_count, 1);
+        assert!(recovery.attempt_history.is_empty());
+        let preserved_execution = recovery.pending_execution_result.as_ref().unwrap();
+        assert_eq!(preserved_execution.output, pending_execution.output);
+        assert_eq!(
+            preserved_execution.file_changes,
+            pending_execution.file_changes
+        );
+        assert!(recovery.next_validation_retry_at.is_some());
+
+        proj.workflow_state
+            .recovery_state
+            .as_mut()
+            .unwrap()
+            .validation_retry_count = 3;
+        crate::recovery::finish_retest(&mut proj, &session, "review-retry", failed_review)?;
+        let recovery = proj.workflow_state.recovery_state.as_ref().unwrap();
+        assert_eq!(recovery.phase, project::RecoveryPhase::WaitingHuman);
+        assert_eq!(recovery.attempt, 1);
+        assert!(!recovery.replan_attempted);
+        assert!(recovery.attempt_history.is_empty());
+        assert!(recovery.next_validation_retry_at.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn successful_retest_clears_recovery_and_returns_to_autopilot() -> Result<(), String> {
         let session = execution_session("recovering", "recovery-success", "abc123");
         let mut proj = execution_project(
@@ -5480,6 +5626,79 @@ mod tests {
             proj.milestones[0].mid_stages[0].subtasks[0].status,
             project::SubtaskStatus::AwaitingConfirmation
         );
+        assert_eq!(
+            proj.workflow_state
+                .autopilot_state
+                .as_ref()
+                .map(|state| &state.recovery_action),
+            Some(&project::AutopilotRecoveryAction::None)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn successful_review_retry_preserves_execution_without_code_repair() -> Result<(), String> {
+        let session = execution_session("recovering", "review-recovery-success", "abc123");
+        let mut proj = execution_project(
+            "review-recovery-success",
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(session.clone()),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            run_status: project::AutopilotRunStatus::Running,
+            recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+            ..Default::default()
+        });
+        let original_execution = project::ExecutionResult {
+            success: true,
+            output: "original successful execution".to_string(),
+            file_changes: vec!["tracked.txt".to_string()],
+            ..Default::default()
+        };
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::ReviewTransientFailure,
+            phase: project::RecoveryPhase::Retesting,
+            attempt: 0,
+            max_attempts: 2,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "review-recovery-success".to_string(),
+            validation_retry_count: 2,
+            max_validation_retries: 3,
+            pending_execution_result: Some(original_execution.clone()),
+            ..Default::default()
+        });
+        let test = project::TestResult {
+            passed: true,
+            review_passed: true,
+            review_status: project::ReviewStatus::Completed,
+            automated_test_status: project::AutomatedTestStatus::Passed,
+            verification_kind: project::VerificationKind::AutomatedTestAndReview,
+            ..Default::default()
+        };
+
+        crate::recovery::finish_retest(&mut proj, &session, "review-recovery-success", test)?;
+
+        assert!(proj.workflow_state.recovery_state.is_none());
+        let subtask = &proj.milestones[0].mid_stages[0].subtasks[0];
+        assert_eq!(subtask.status, project::SubtaskStatus::AwaitingConfirmation);
+        let preserved_execution = subtask.execution_result.as_ref().unwrap();
+        assert_eq!(preserved_execution.output, original_execution.output);
+        assert_eq!(
+            preserved_execution.file_changes,
+            original_execution.file_changes
+        );
+        assert!(preserved_execution.success);
+        let current_session = proj.execution_session.as_ref().unwrap();
+        assert_eq!(current_session.status, "awaiting_confirmation");
+        assert!(current_session.active);
+        assert!(!proj.execution_history.iter().any(|entry| matches!(
+            entry.event_type,
+            project::ExecutionEventType::RepairAttemptStarted
+                | project::ExecutionEventType::RepairAttemptCompleted
+        )));
         assert_eq!(
             proj.workflow_state
                 .autopilot_state

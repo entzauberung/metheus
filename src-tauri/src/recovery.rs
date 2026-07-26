@@ -8,6 +8,65 @@ const MAX_EVIDENCE_CHARS: usize = 6_000;
 const MAX_FAILURE_HISTORY: usize = 4;
 const DEFAULT_MAX_ATTEMPTS: u32 = 2;
 const MAX_EVIDENCE_REBUILD_ATTEMPTS: u32 = 2;
+const MAX_TRANSIENT_REVIEW_RETRIES: u32 = 3;
+const MAX_PROTOCOL_REVIEW_RETRIES: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryRetestKind {
+    Full,
+    ReviewOnly,
+}
+
+fn validation_retry_limit(kind: &project::RecoveryErrorKind) -> Option<u32> {
+    match kind {
+        project::RecoveryErrorKind::ReviewTransientFailure => Some(MAX_TRANSIENT_REVIEW_RETRIES),
+        project::RecoveryErrorKind::ReviewProtocolFailure => Some(MAX_PROTOCOL_REVIEW_RETRIES),
+        _ => None,
+    }
+}
+
+fn validation_retry_delay_seconds(completed_retries: u32) -> i64 {
+    match completed_retries {
+        0 => 2,
+        1 => 5,
+        _ => 10,
+    }
+}
+
+fn schedule_next_validation_retry(recovery: &mut project::RecoveryState) {
+    recovery.next_validation_retry_at = Some(
+        (chrono::Utc::now()
+            + chrono::Duration::seconds(validation_retry_delay_seconds(
+                recovery.validation_retry_count,
+            )))
+        .to_rfc3339(),
+    );
+}
+
+fn validation_retry_due(recovery: &project::RecoveryState) -> bool {
+    recovery
+        .next_validation_retry_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_none_or(|deadline| deadline <= chrono::Utc::now())
+}
+
+fn record_review_protocol_strategies(
+    recovery: &mut project::RecoveryState,
+    test: &project::TestResult,
+) {
+    let mut record = |strategy| {
+        if !recovery.validation_strategies.contains(&strategy) {
+            recovery.validation_strategies.push(strategy);
+        }
+    };
+    if test.review_failure_kind == Some(project::ReviewFailureKind::FieldTypeMismatch) {
+        record(project::ValidationRetryStrategy::DeterministicNormalization);
+    }
+    if test.review_protocol_attempts > 0 {
+        record(project::ValidationRetryStrategy::ProtocolRepair);
+    }
+}
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
@@ -310,6 +369,12 @@ fn test_failure_summary(test: Option<&project::TestResult>, fallback: &str) -> S
             truncate_chars(&test.review_evidence_summary, 2_000)
         ));
     }
+    if !test.review_diagnostic_summary.is_empty() {
+        parts.push(format!(
+            "review_diagnostic={}",
+            truncate_chars(&test.review_diagnostic_summary, 1_000)
+        ));
+    }
     if parts.is_empty() {
         fallback.to_string()
     } else {
@@ -539,9 +604,22 @@ pub(crate) fn ensure_quality_recovery(
         recovery.pending_evidence_criteria = pending_evidence_criteria(&ledger);
         recovery.active_issues.clear();
     }
+    if let Some(limit) = validation_retry_limit(&kind) {
+        recovery.phase = project::RecoveryPhase::Retesting;
+        recovery.max_validation_retries = limit;
+        recovery.active_issues.clear();
+        if kind == project::RecoveryErrorKind::ReviewProtocolFailure {
+            if let Some(test) = subtask.test_result.as_ref() {
+                record_review_protocol_strategies(&mut recovery, test);
+            }
+        }
+        schedule_next_validation_retry(&mut recovery);
+    }
     let automatic = !matches!(
         kind,
         project::RecoveryErrorKind::TestUnavailable
+            | project::RecoveryErrorKind::AutomatedTestUnavailable
+            | project::RecoveryErrorKind::ReviewServiceBlocked
             | project::RecoveryErrorKind::ContractContradiction
             | project::RecoveryErrorKind::ValidationOscillation
     );
@@ -573,8 +651,18 @@ pub(crate) fn ensure_quality_recovery(
                 kind,
                 project::RecoveryErrorKind::EvidenceInsufficient
                     | project::RecoveryErrorKind::ValidationFailure
+                    | project::RecoveryErrorKind::ReviewTransientFailure
+                    | project::RecoveryErrorKind::ReviewProtocolFailure
             ) {
-                "正在重建验收证据"
+                if matches!(
+                    kind,
+                    project::RecoveryErrorKind::ReviewTransientFailure
+                        | project::RecoveryErrorKind::ReviewProtocolFailure
+                ) {
+                    "正在等待重新请求 AI 审查"
+                } else {
+                    "正在重建验收证据"
+                }
             } else if kind == project::RecoveryErrorKind::PlanFailure {
                 "当前任务契约与项目事实不一致，正在受限重规划"
             } else {
@@ -582,7 +670,16 @@ pub(crate) fn ensure_quality_recovery(
             },
         );
     } else {
-        set_autopilot_waiting(proj, "验收证据不可用或不足，需要重建证据后再判断");
+        let message = match kind {
+            project::RecoveryErrorKind::ReviewServiceBlocked => {
+                "AI 审查认证或额度异常，需要人工处理后重新验证"
+            }
+            project::RecoveryErrorKind::AutomatedTestUnavailable => {
+                "自动化测试环境不可用，需要人工恢复测试环境"
+            }
+            _ => "验收证据不可用或不足，需要重建证据后再判断",
+        };
+        set_autopilot_waiting(proj, message);
         if let Some(current) = proj.execution_session.as_mut() {
             current.status = "quality_blocked".to_string();
             current.failure_message = gate_reason.to_string();
@@ -1293,6 +1390,7 @@ async fn run_recovery_retest(
     authorized_paths: &[String],
     execution_id: &str,
     evidence_request: Option<crate::test_runner::ReviewEvidenceRequest>,
+    retest_kind: RecoveryRetestKind,
 ) -> Result<project::Project, String> {
     {
         let mut pipeline_guard = pipeline_state.lock().await;
@@ -1329,22 +1427,44 @@ async fn run_recovery_retest(
         .as_ref()
         .map(|request| request.target_criterion_indices.clone())
         .unwrap_or_default();
-    let test = crate::test_runner::check_subtask_with_context(
-        &project.project_path,
-        if subtask.goal.is_empty() {
-            &subtask.title
-        } else {
-            &subtask.goal
-        },
-        &session.subtask_id,
-        &session.milestone_id,
-        &session.mid_stage_id,
-        Some(subtask.acceptance_criteria.clone()),
-        Some(authorized_paths.to_vec()),
-        Some(prompt),
-        evidence_request,
-    )
-    .await
+    let goal = if subtask.goal.is_empty() {
+        &subtask.title
+    } else {
+        &subtask.goal
+    };
+    let mut test = match retest_kind {
+        RecoveryRetestKind::Full => {
+            crate::test_runner::check_subtask_with_context(
+                &project.project_path,
+                goal,
+                &session.subtask_id,
+                &session.milestone_id,
+                &session.mid_stage_id,
+                Some(subtask.acceptance_criteria.clone()),
+                Some(authorized_paths.to_vec()),
+                Some(prompt),
+                evidence_request,
+            )
+            .await
+        }
+        RecoveryRetestKind::ReviewOnly => {
+            let previous = previous_test
+                .as_ref()
+                .ok_or_else(|| "重新审查缺少可复用的自动化测试结果。".to_string())?;
+            crate::test_runner::retry_subtask_review_with_context(
+                &project.project_path,
+                goal,
+                &session.subtask_id,
+                &session.milestone_id,
+                &session.mid_stage_id,
+                Some(subtask.acceptance_criteria.clone()),
+                Some(authorized_paths.to_vec()),
+                Some(prompt),
+                previous,
+            )
+            .await
+        }
+    }
     .unwrap_or(project::TestResult {
         passed: false,
         issues: vec!["测试服务不可用".to_string()],
@@ -1352,6 +1472,14 @@ async fn run_recovery_retest(
         automated_test_status: project::AutomatedTestStatus::Unavailable,
         ..Default::default()
     });
+    if retest_kind == RecoveryRetestKind::ReviewOnly {
+        test.review_protocol_attempts = test.review_protocol_attempts.saturating_add(
+            previous_test
+                .as_ref()
+                .map(|previous| previous.review_protocol_attempts)
+                .unwrap_or_default(),
+        );
+    }
     let test = if evidence_strategy.is_some() {
         merge_targeted_review(previous_test.as_ref(), test, &target_indices)
     } else {
@@ -1458,6 +1586,7 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             &authorized_paths,
             &recovery.execution_id,
             None,
+            RecoveryRetestKind::Full,
         )
         .await;
     }
@@ -1531,6 +1660,56 @@ pub(crate) async fn run_error_recovery_with_pipeline(
                 strategy,
                 target_criterion_indices: pending,
             }),
+            RecoveryRetestKind::Full,
+        )
+        .await;
+    }
+    if matches!(
+        recovery.error_kind,
+        project::RecoveryErrorKind::ReviewTransientFailure
+            | project::RecoveryErrorKind::ReviewProtocolFailure
+    ) {
+        if !validation_retry_due(&recovery) {
+            return Ok(proj);
+        }
+        if recovery.validation_retry_count >= recovery.max_validation_retries {
+            mark_waiting_human(&mut proj, recovery.error_kind, "AI 审查验证重试次数已用尽");
+            crate::save_project(&proj)?;
+            return crate::load_project(&project_name);
+        }
+        if let Some(current) = proj.workflow_state.recovery_state.as_mut() {
+            current.validation_retry_count = current.validation_retry_count.saturating_add(1);
+            current.next_validation_retry_at = None;
+            current.phase = project::RecoveryPhase::Retesting;
+            current
+                .validation_strategies
+                .push(project::ValidationRetryStrategy::ReviewRequestRetry);
+            current.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+        session.active = true;
+        session.status = "recovering".to_string();
+        session.verification_stage = project::VerificationStage::ReviewRetry;
+        session.state_entered_at = chrono::Utc::now().to_rfc3339();
+        proj.execution_session = Some(session.clone());
+        set_autopilot_recovering(
+            &mut proj,
+            &format!(
+                "正在重新请求 AI 审查（{}/{}）",
+                recovery.validation_retry_count.saturating_add(1),
+                recovery.max_validation_retries
+            ),
+        );
+        touch(&mut proj);
+        crate::save_project(&proj)?;
+        drop(pipeline_guard);
+        return run_recovery_retest(
+            &pipeline_state,
+            &project_name,
+            &session,
+            &authorized_paths,
+            &recovery.execution_id,
+            None,
+            RecoveryRetestKind::ReviewOnly,
         )
         .await;
     }
@@ -1976,6 +2155,7 @@ pub(crate) async fn run_error_recovery_with_pipeline(
         &authorized_paths,
         &recovery_execution_id,
         None,
+        RecoveryRetestKind::Full,
     )
     .await
 }
@@ -2205,6 +2385,11 @@ pub(crate) fn finish_retest(
             recovery.error_kind == project::RecoveryErrorKind::EvidenceInsufficient
                 || recovery.evidence_rebuild_attempts > 0
         });
+    let validation_recovery = proj
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .is_some_and(|recovery| recovery.validation_retry_count > 0);
     pipeline::write_execution_history(
         proj,
         if quality_passed { "success" } else { "error" },
@@ -2212,11 +2397,20 @@ pub(crate) fn finish_retest(
         if quality_passed {
             if evidence_recovery {
                 "验收证据补充后质量门禁通过".to_string()
+            } else if validation_recovery {
+                "AI 审查验证重试后质量门禁通过".to_string()
             } else {
                 "自动修复复测通过".to_string()
             }
         } else if quality.outcome == crate::quality_gate::QualityGateOutcome::EvidenceInsufficient {
             format!("验收证据仍不足：{}", truncate_chars(&summary, 1_000))
+        } else if matches!(
+            quality.outcome,
+            crate::quality_gate::QualityGateOutcome::ReviewTransientFailure
+                | crate::quality_gate::QualityGateOutcome::ReviewProtocolFailure
+                | crate::quality_gate::QualityGateOutcome::ReviewServiceBlocked
+        ) {
+            format!("AI 审查验证未通过：{}", truncate_chars(&summary, 1_000))
         } else {
             format!("自动修复复测未通过：{}", truncate_chars(&summary, 1_000))
         },
@@ -2273,6 +2467,8 @@ pub(crate) fn finish_retest(
             project::ExecutionEventType::RecoverySucceeded,
             if evidence_recovery {
                 "验收证据补齐，恢复正常自动驾驶".to_string()
+            } else if validation_recovery {
+                "AI 审查恢复成功，继续正常自动驾驶".to_string()
             } else {
                 "自动修复成功，恢复正常自动驾驶".to_string()
             },
@@ -2281,7 +2477,11 @@ pub(crate) fn finish_retest(
             Some(&session.subtask_id),
         );
         if let Some(completed_recovery) = proj.workflow_state.recovery_state.clone() {
-            let strategy = if completed_recovery.evidence_rebuild_attempts > 0
+            let strategy = if completed_recovery.validation_retry_count > 0
+                && completed_recovery.attempt == 0
+            {
+                "沿用代码、测试事实和验收契约，仅重新请求 AI 审查"
+            } else if completed_recovery.evidence_rebuild_attempts > 0
                 && completed_recovery.attempt == 0
             {
                 "按未知验收项执行两级定向补证"
@@ -2308,12 +2508,101 @@ pub(crate) fn finish_retest(
             autopilot.run_status = project::AutopilotRunStatus::Running;
             autopilot.last_action = if evidence_recovery {
                 "验收证据补齐，继续执行".to_string()
+            } else if validation_recovery {
+                "AI 审查恢复成功，继续执行".to_string()
             } else {
                 "自动修复成功，继续执行".to_string()
             };
             autopilot.last_action_at = chrono::Utc::now().to_rfc3339();
             autopilot.error_message.clear();
             autopilot.recovery_action = project::AutopilotRecoveryAction::None;
+        }
+        touch(proj);
+        return Ok(false);
+    }
+
+    if matches!(
+        quality.outcome,
+        crate::quality_gate::QualityGateOutcome::ReviewTransientFailure
+            | crate::quality_gate::QualityGateOutcome::ReviewProtocolFailure
+            | crate::quality_gate::QualityGateOutcome::ReviewServiceBlocked
+            | crate::quality_gate::QualityGateOutcome::AutomatedTestUnavailable
+            | crate::quality_gate::QualityGateOutcome::TestUnavailable
+    ) {
+        let next_kind = quality.recovery_error_kind(Some(&test));
+        let retry_limit = validation_retry_limit(&next_kind);
+        let mut retry_scheduled = false;
+        if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
+            recovery.error_kind = next_kind.clone();
+            recovery.error_signature = normalized_signature(&next_kind, &summary);
+            recovery.original_test_failure = truncate_chars(&summary, 4_000);
+            recovery.active_issues.clear();
+            recovery.rollback_retest_pending = false;
+            append_failure_history(recovery, &summary);
+            if next_kind == project::RecoveryErrorKind::ReviewProtocolFailure {
+                record_review_protocol_strategies(recovery, &test);
+            }
+            if let Some(limit) = retry_limit {
+                recovery.max_validation_retries = limit;
+                if recovery.validation_retry_count < limit {
+                    recovery.phase = project::RecoveryPhase::Retesting;
+                    schedule_next_validation_retry(recovery);
+                    retry_scheduled = true;
+                } else {
+                    recovery.phase = project::RecoveryPhase::WaitingHuman;
+                    recovery.next_validation_retry_at = None;
+                }
+            } else {
+                recovery.phase = project::RecoveryPhase::WaitingHuman;
+                recovery.next_validation_retry_at = None;
+            }
+            recovery.updated_at = chrono::Utc::now().to_rfc3339();
+        }
+        if let Some(current_session) = proj.execution_session.as_mut() {
+            current_session.execution_id = execution_id.to_string();
+            current_session.active = true;
+            current_session.status = if retry_scheduled {
+                "recovering".to_string()
+            } else {
+                "quality_blocked".to_string()
+            };
+            current_session.verification_stage = test.verification_stage.clone();
+            current_session.failure_message = truncate_chars(&summary, 2_048);
+            current_session.state_entered_at = chrono::Utc::now().to_rfc3339();
+        }
+        if retry_scheduled {
+            let (count, limit) = proj
+                .workflow_state
+                .recovery_state
+                .as_ref()
+                .map(|recovery| {
+                    (
+                        recovery.validation_retry_count,
+                        recovery.max_validation_retries,
+                    )
+                })
+                .unwrap_or_default();
+            set_autopilot_recovering(
+                proj,
+                &format!("AI 审查仍不可用，等待第 {}/{} 次验证重试", count + 1, limit),
+            );
+        } else {
+            let message = match next_kind {
+                project::RecoveryErrorKind::ReviewServiceBlocked => {
+                    "AI 审查认证或额度异常，等待人工处理"
+                }
+                project::RecoveryErrorKind::ReviewProtocolFailure => {
+                    "AI 审查结果格式持续异常，验证重试已耗尽"
+                }
+                project::RecoveryErrorKind::ReviewTransientFailure => {
+                    "AI 审查服务连续不可用，验证重试已耗尽"
+                }
+                project::RecoveryErrorKind::AutomatedTestUnavailable => {
+                    "自动化测试环境不可用，等待人工处理"
+                }
+                _ => "验证服务不可用，等待人工处理",
+            };
+            set_autopilot_waiting(proj, message);
         }
         touch(proj);
         return Ok(false);
