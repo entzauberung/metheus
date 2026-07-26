@@ -163,6 +163,15 @@ export function ApplicationSettings({ project, pipeline, className }: Props) {
   };
 
   useEffect(() => {
+    const openDecisionSettings = () => {
+      setTab("decision");
+      setOpen(true);
+    };
+    window.addEventListener("metheus:open-decision-settings", openDecisionSettings);
+    return () => window.removeEventListener("metheus:open-decision-settings", openDecisionSettings);
+  }, []);
+
+  useEffect(() => {
     if (!open) return;
     const currentRequest = ++requestId.current;
     setLoading(true);

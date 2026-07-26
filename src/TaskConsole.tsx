@@ -2,8 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
 import { ArrowDown, CheckCircle2, FileDiff, FileText, History, Layers, Milestone, Tags } from "lucide-react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import type { ChangeHistoryEntry, ConstitutionChangeHistory, ExecutionHistoryEntry, GitTagTree, PipelineState, TestLog } from "./types";
+import type { ChangeHistoryEntry, ConstitutionChangeHistory, ExecutionHistoryEntry, GitTagTree, PipelineState, TestLog, VerificationStage } from "./types";
 import { mergeExecutionLogs } from "./logPolicy";
+import { getVerificationStageLabel } from "./autopilotPolicy";
 
 const LOG_LEVEL_ICON: Record<string, string> = {
   info: "ℹ",
@@ -58,6 +59,10 @@ interface TaskConsoleProps {
   workspaceReady?: boolean;
   /** 持久化执行操作历史（刷新不丢） */
   executionHistory?: ExecutionHistoryEntry[];
+  verificationStage?: VerificationStage;
+  validationRetryCount?: number;
+  validationRetryLimit?: number;
+  nextValidationRetryAt?: string;
 }
 
 export default function TaskConsole({
@@ -67,6 +72,10 @@ export default function TaskConsole({
   testLogs: _testLogs,
   workspaceReady = false,
   executionHistory,
+  verificationStage,
+  validationRetryCount,
+  validationRetryLimit,
+  nextValidationRetryAt,
 }: TaskConsoleProps) {
   const [activeTab, setActiveTab] = useState("logs");
   const [currentDiff, setCurrentDiff] = useState("");
@@ -141,6 +150,17 @@ export default function TaskConsole({
 
         <Tabs.Content className="task-tab-content" value="logs">
           <div className="execution-log-panel">
+            {verificationStage && verificationStage !== "NotStarted" && (
+              <div className="task-console-validation-strip">
+                <span>验证阶段：{getVerificationStageLabel(verificationStage)}</span>
+                {validationRetryLimit !== undefined && (
+                  <span>审查重试：{validationRetryCount ?? 0}/{validationRetryLimit}</span>
+                )}
+                {nextValidationRetryAt && (
+                  <span>下一次：{formatLogTime(nextValidationRetryAt)}</span>
+                )}
+              </div>
+            )}
             <div
               ref={logRef}
               className="execution-log-list"

@@ -1,8 +1,8 @@
 // src/components/AutopilotControlBar.tsx — 全局自动驾驶控制条
 // 在所有 Console 页面顶部显示自动驾驶状态与操作入口
-import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle, GitBranch, CheckCircle, CircleSlash2, TestTube2, ScanSearch, FileQuestion, Activity, Clock3 } from "lucide-react";
+import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle, GitBranch, CheckCircle, CircleSlash2, TestTube2, ScanSearch, FileQuestion, Activity, Clock3, Settings2 } from "lucide-react";
 import type { Project, PipelineState, AutopilotRecoveryAction } from "../types";
-import { getAutopilotErrorActions, getGitConfirmationBlockPresentation, getQualityStatusPresentation, getRecoveryStatusLabel } from "../autopilotPolicy";
+import { getAutopilotErrorActions, getGitConfirmationBlockPresentation, getQualityStatusPresentation, getRecoveryStatusLabel, getVerificationStageLabel, isHeartbeatStale, isValidationRecovery } from "../autopilotPolicy";
 import { getManagedFlowPresentation } from "../managedFlowPolicy";
 
 export interface AutopilotControlBarProps {
@@ -22,7 +22,7 @@ export interface AutopilotControlBarProps {
   onRefreshWorkspace?: () => Promise<void>;
   onRetryGitConfirmation?: () => Promise<void>;
   onResolveHumanRecovery?: (
-    resolution: "retest" | "restore_and_retry" | "regenerate_plan" | "confirm_actual_pass" | "accept_deviation" | "skip_task",
+    resolution: "retest" | "revalidate" | "restore_and_retry" | "regenerate_plan" | "confirm_actual_pass" | "accept_deviation" | "skip_task",
   ) => Promise<void>;
 }
 
@@ -94,6 +94,7 @@ export function AutopilotControlBar({
   const errorMessage = apState?.error_message;
   const recoveryAction: AutopilotRecoveryAction = apState?.recovery_action ?? "None";
   const recovery = project.workflow_state.recovery_state;
+  const session = project.execution_session;
   const waitingEngine = recovery?.phase === "WaitingEngine" || recovery?.error_kind === "EngineBlocked";
   const transientFailureKinds = new Set([
     "Network", "RateLimited", "ProviderUnavailable", "Timeout", "RevisionConflict", "ProcessCrash",
@@ -101,15 +102,27 @@ export function AutopilotControlBar({
   const automaticRetryPending = retryCount > 0
     && Boolean(apState?.next_retry_at)
     && transientFailureKinds.has(apState?.last_failure_kind ?? "None");
+  const validationRetryPending = recovery?.phase === "Retesting"
+    && isValidationRecovery(recovery)
+    && (recovery.validation_retry_count ?? 0) < (recovery.max_validation_retries ?? 0);
+  const validationRetryAt = formatStateTime(recovery?.next_validation_retry_at);
+  const validationStage = session?.verification_stage;
+  const validating = Boolean(validationStage && !["NotStarted", "Completed"].includes(validationStage));
+  const validationHumanBoundary = recovery?.phase === "WaitingHuman" && isValidationRecovery(recovery);
+  const reviewServiceBlocked = recovery?.error_kind === "ReviewServiceBlocked";
+  const heartbeatStale = isHeartbeatStale(
+    apState?.heartbeat_at,
+    apActive && runStatus === "Running" && !validationRetryPending,
+  );
   const targetMs = project.milestones.find(m => m.id === project.workflow_state.autopilot_target_milestone_id);
   const targetLabel = targetMs?.title ?? project.workflow_state.autopilot_target_milestone_id;
-  const recoverySubtask = recovery
+  const recoverySubtask = recovery || session
     ? project.milestones
       .flatMap(milestone => [
         ...(milestone.subtasks ?? []),
         ...milestone.mid_stages.flatMap(midStage => midStage.subtasks),
       ])
-      .find(subtask => subtask.id === recovery.subtask_id)
+      .find(subtask => subtask.id === (recovery?.subtask_id ?? session?.subtask_id))
     : undefined;
   const qualityStatuses = recoverySubtask
     ? getQualityStatusPresentation(
@@ -119,7 +132,6 @@ export function AutopilotControlBar({
     : [];
 
   // 先判断失败会话，再判断自动驾驶是否激活 — 手动模式也要看到恢复入口
-  const session = project.execution_session;
   const sessionKey = sessionStatusKey(session?.status);
   const sessionLost = sessionKey === "session_lost";
   const stopFailed = sessionKey === "stop_failed";
@@ -127,7 +139,7 @@ export function AutopilotControlBar({
   const confirmationPresentation = getGitConfirmationBlockPresentation(
     session?.confirmation_failure_kind,
   );
-  const needsBaselineRecovery = !automaticRetryPending && !waitingEngine
+  const needsBaselineRecovery = !automaticRetryPending && !validationRetryPending && !waitingEngine
     && (recoveryAction === "RestoreExecutionBaseline" || (!recovery && isRecoverableSession(project)));
 
   // 恢复入口条（手动 / 自动驾驶共用）
@@ -293,7 +305,9 @@ export function AutopilotControlBar({
            runStatus === "WaitingMilestoneReview" ? <Square size={16} /> :
            <WandSparkles size={16} />}
           {" "}
-          {isExecuting ? "执行中" :
+          {validationRetryPending ? "等待验证重试" :
+           validating ? "验证中" :
+           isExecuting ? "执行中" :
            automaticRetryPending ? "等待自动重试" :
            runStatus === "Running" ? "自动推进中" :
            runStatus === "Paused" ? "已暂停" :
@@ -312,11 +326,22 @@ export function AutopilotControlBar({
             <Clock3 size={13} /> 重试 {retryCount}/3 · {retryAt}
           </span>
         )}
+        {validationRetryAt && (
+          <span className="ap-bar-warning" title={recovery?.next_validation_retry_at}>
+            <Clock3 size={13} /> 审查重试 {recovery?.validation_retry_count ?? 0}/{recovery?.max_validation_retries ?? 0} · {validationRetryAt}
+          </span>
+        )}
+        {validationStage && (
+          <span className="ap-bar-action" title={validationStage}>
+            <ScanSearch size={13} /> 验证阶段：{getVerificationStageLabel(validationStage)}
+          </span>
+        )}
         {heartbeatAt && (
           <span className="ap-bar-target" title={apState?.heartbeat_at}>
             心跳 {heartbeatAt}
           </span>
         )}
+        {heartbeatStale && <span className="ap-bar-error">心跳异常：后台验证可能已停止更新</span>}
         {(recoveryStatus || lastAction) && (
           <span className="ap-bar-action" title={recoveryStatus || lastAction}>
             {recoveryStatus || lastAction}
@@ -335,7 +360,8 @@ export function AutopilotControlBar({
           >
             {status.key === "automated-test" ? <TestTube2 size={13} />
               : status.key === "code-review" ? <ScanSearch size={13} />
-                : <FileQuestion size={13} />}
+                : status.key === "review-protocol" ? <Activity size={13} />
+                  : <FileQuestion size={13} />}
             {" "}{status.label}
           </span>
         ))}
@@ -355,7 +381,7 @@ export function AutopilotControlBar({
         </button>
 
         {/* 真实执行中：In Stop + 完成后暂停 */}
-        {isExecuting && (
+        {isExecuting && !validationRetryPending && (
           <>
             <button className="ap-bar-btn ap-bar-btn-danger" disabled={busy} onClick={onPauseNow}>
               <Square size={14} /> 立即暂停
@@ -366,8 +392,14 @@ export function AutopilotControlBar({
           </>
         )}
 
+        {(validationRetryPending || (!isExecuting && runStatus === "Running" && validating)) && (
+          <button className="ap-bar-btn" disabled={busy} onClick={onPauseNow}>
+            <Pause size={14} /> 暂停验证
+          </button>
+        )}
+
         {/* 规划推进中只提供普通暂停，不触发 Git 回退。 */}
-        {!isExecuting && runStatus === "Running" && (
+        {!isExecuting && runStatus === "Running" && !validating && !validationRetryPending && (
           <button className="ap-bar-btn" disabled={busy} onClick={onPauseNow}>
             <Pause size={14} /> 暂停自动驾驶
           </button>
@@ -410,7 +442,25 @@ export function AutopilotControlBar({
           </button>
         )}
 
-        {recovery?.phase === "WaitingHuman" && !automaticRetryPending && onResolveHumanRecovery && (
+        {validationHumanBoundary && onResolveHumanRecovery && (
+          <>
+            {reviewServiceBlocked && (
+              <button
+                className="ap-bar-btn ap-bar-btn-primary"
+                disabled={busy}
+                onClick={() => window.dispatchEvent(new Event("metheus:open-decision-settings"))}
+              >
+                <Settings2 size={14} /> 打开决策模型设置
+              </button>
+            )}
+            <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy}
+              onClick={() => onResolveHumanRecovery("revalidate")}>
+              <RotateCcw size={14} /> 重新验证
+            </button>
+          </>
+        )}
+
+        {recovery?.phase === "WaitingHuman" && !validationHumanBoundary && !automaticRetryPending && onResolveHumanRecovery && (
           <>
             <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy}
               onClick={() => onResolveHumanRecovery("retest")}>
@@ -445,7 +495,7 @@ export function AutopilotControlBar({
           </>
         )}
 
-        {errorActions.canClose && (
+        {errorActions.canClose && !validationRetryPending && (
           <button className="ap-bar-btn" disabled={busy} onClick={() => onToggle(false)}>
             <Square size={14} /> 关闭
           </button>

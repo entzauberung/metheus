@@ -20,7 +20,7 @@ import { ActionButton } from "./components/ActionButton";
 import { Modal } from "./components/Modal";
 import { ConsoleStepShell } from "./components/ConsoleStepShell";
 import { WorkflowActionBar } from "./components/WorkflowActionBar";
-import { Check, FileQuestion, GitBranch, ListTodo, Pause, Play, RefreshCw, RotateCcw, ScanSearch, Search, Square, TestTube2, WandSparkles, X } from "lucide-react";
+import { Activity, Check, FileQuestion, GitBranch, ListTodo, Pause, Play, RefreshCw, RotateCcw, ScanSearch, Search, Square, TestTube2, WandSparkles, X } from "lucide-react";
 import { AutopilotControlBar } from "./components/AutopilotControlBar";
 import ExecutionTree from "./ExecutionTree";
 import ChatRoom from "./ChatRoom";
@@ -1457,7 +1457,7 @@ function App() {
   };
 
   const handleResolveHumanRecovery = async (
-    resolution: "retest" | "restore_and_retry" | "regenerate_plan" | "confirm_actual_pass" | "accept_deviation" | "skip_task",
+    resolution: "retest" | "revalidate" | "restore_and_retry" | "regenerate_plan" | "confirm_actual_pass" | "accept_deviation" | "skip_task",
   ) => {
     if (!project || !beginConsoleAction(`human_recovery:${resolution}`)) return;
     try {
@@ -1500,6 +1500,9 @@ function App() {
         retest: updated.workflow_state.recovery_state
           ? "重新测试仍未通过，继续等待人工处理。"
           : "重新测试通过，自动驾驶将继续执行。",
+        revalidate: updated.workflow_state.recovery_state
+          ? "重新验证仍未通过，继续等待人工处理。"
+          : "重新验证通过，自动驾驶将继续执行。",
         restore_and_retry: "已恢复执行基线，将重新执行当前小阶段。",
         regenerate_plan: "已安排重新规划当前任务，自动驾驶将继续处理。",
         confirm_actual_pass: "人工通过证据已单独记录，自动驾驶将继续执行。",
@@ -1867,6 +1870,10 @@ function App() {
                     testLogs={testLogs}
                     workspaceReady={workspaceStatus?.git_metadata_ready === true}
                     executionHistory={project.execution_history}
+                    verificationStage={project.execution_session?.verification_stage}
+                    validationRetryCount={project.workflow_state.recovery_state?.validation_retry_count}
+                    validationRetryLimit={project.workflow_state.recovery_state?.max_validation_retries}
+                    nextValidationRetryAt={project.workflow_state.recovery_state?.next_validation_retry_at}
                   />
                 </>
               )}
@@ -2225,7 +2232,8 @@ function V1ExecutionPanel({
                     }}>
                       {status.key === "automated-test" ? <TestTube2 size={14} />
                         : status.key === "code-review" ? <ScanSearch size={14} />
-                          : <FileQuestion size={14} />}
+                          : status.key === "review-protocol" ? <Activity size={14} />
+                            : <FileQuestion size={14} />}
                       {status.label}
                     </div>
                   ))}

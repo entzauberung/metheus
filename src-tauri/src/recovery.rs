@@ -3172,7 +3172,7 @@ pub(crate) async fn resolve_human_recovery(
 ) -> Result<project::Project, String> {
     let _pipeline_guard = state.pipeline_state.lock().await;
     let mut proj = crate::load_project(&project_name)?;
-    let (recovery, session, subtask) = current_recovery_context(&proj)?;
+    let (recovery, mut session, subtask) = current_recovery_context(&proj)?;
     if recovery.phase == project::RecoveryPhase::WaitingEngine
         || recovery.error_kind == project::RecoveryErrorKind::EngineBlocked
     {
@@ -3443,6 +3443,50 @@ pub(crate) async fn resolve_human_recovery(
                 Some(&session.mid_stage_id),
                 Some(&session.subtask_id),
             );
+        }
+        "revalidate" => {
+            if !matches!(
+                recovery.error_kind,
+                project::RecoveryErrorKind::ReviewServiceBlocked
+                    | project::RecoveryErrorKind::ReviewProtocolFailure
+                    | project::RecoveryErrorKind::ReviewTransientFailure
+            ) {
+                return Err("当前阻断不是可单独重新验证的 AI 审查服务问题。".to_string());
+            }
+            if let Some(current) = proj.workflow_state.recovery_state.as_mut() {
+                current.phase = project::RecoveryPhase::Retesting;
+                current.next_validation_retry_at = None;
+                current.updated_at = chrono::Utc::now().to_rfc3339();
+            }
+            session.active = true;
+            session.status = "recovering".to_string();
+            session.verification_stage = project::VerificationStage::ReviewRetry;
+            session.state_entered_at = chrono::Utc::now().to_rfc3339();
+            proj.execution_session = Some(session.clone());
+            set_autopilot_recovering(&mut proj, "人工请求重新验证 AI 审查");
+            pipeline::write_execution_history_with_source(
+                &mut proj,
+                "info",
+                project::ExecutionEventType::ReviewRequested,
+                project::OperationSource::User,
+                "人工请求重新验证 AI 审查；沿用既有代码、测试事实和验收契约".to_string(),
+                Some(&session.milestone_id),
+                Some(&session.mid_stage_id),
+                Some(&session.subtask_id),
+            );
+            touch(&mut proj);
+            crate::save_project(&proj)?;
+            drop(_pipeline_guard);
+            return run_recovery_retest(
+                &state.pipeline_state,
+                &project_name,
+                &session,
+                &authorized_paths,
+                &recovery.execution_id,
+                None,
+                RecoveryRetestKind::ReviewOnly,
+            )
+            .await;
         }
         "retest" => {
             let changes = changed_paths(&proj.project_path)?;

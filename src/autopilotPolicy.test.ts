@@ -5,6 +5,7 @@ import {
   getGitConfirmationBlockPresentation,
   getQualityStatusPresentation,
   getRecoveryStatusLabel,
+  isHeartbeatStale,
 } from "./autopilotPolicy";
 import type { PipelineState, RecoveryState } from "./types";
 
@@ -193,8 +194,46 @@ describe("autopilot scheduling policy", () => {
     expect(presentation.map(item => item.label)).toEqual([
       "自动化测试：未配置",
       "代码审查：通过",
+      "审查协议：未请求",
       "验收证据：充分",
     ]);
     expect(presentation.some(item => item.tone === "error")).toBe(false);
+  });
+
+  it("keeps review protocol failures separate from AI review failures", () => {
+    const presentation = getQualityStatusPresentation({
+      passed: false,
+      issues: [],
+      suggestion: "",
+      automated_test_status: "Passed",
+      review_status: "Failed",
+      review_failure_kind: "FieldTypeMismatch",
+    }, []);
+    expect(presentation.map(item => item.label)).toEqual([
+      "自动化测试：通过",
+      "代码审查：待确认",
+      "审查协议：格式异常",
+      "验收证据：无逐项标准",
+    ]);
+  });
+
+  it("describes validation retry boundaries without code-recovery wording", () => {
+    expect(getRecoveryStatusLabel(recovery({
+      phase: "Retesting",
+      error_kind: "ReviewProtocolFailure",
+      validation_retry_count: 1,
+      next_validation_retry_at: "2026-07-26T00:00:05Z",
+    }))).toContain("审查协议重试");
+    expect(getRecoveryStatusLabel(recovery({
+      phase: "WaitingHuman",
+      error_kind: "ReviewServiceBlocked",
+    }))).toContain("认证或额度");
+  });
+
+  it("flags a stalled heartbeat only for active runs", () => {
+    const now = Date.parse("2026-07-26T00:00:30Z");
+    expect(isHeartbeatStale("2026-07-26T00:00:00Z", true, now)).toBe(true);
+    expect(isHeartbeatStale("2026-07-26T00:00:25Z", true, now)).toBe(false);
+    expect(isHeartbeatStale("2026-07-26T00:00:00Z", false, now)).toBe(false);
   });
 });
