@@ -928,11 +928,13 @@ export type ExecutionEventType =
   | "WorkspaceReady"
   | "WorkspacePrepareFailed"
   | "UserExecute"
+  | "AutopilotExecute"
   | "SubtaskExecuting"
   | "ExecutorComplete"
   | "TestComplete"
   | "AwaitingConfirmation"
   | "UserConfirm"
+  | "AutopilotConfirm"
   | "UserReject"
   | "UserInStop"
   | "UserEdStop"
@@ -960,6 +962,11 @@ export type ExecutionEventType =
   | "EvidenceStillInsufficient"
   | "RecoverySucceeded"
   | "RecoveryExhausted"
+  | "ReviewRequested"
+  | "ProtocolNormalized"
+  | "ProtocolRepairAttempted"
+  | "ValidationRetryScheduled"
+  | "ValidationRecoverySucceeded"
   | "HumanVerificationAccepted"
   | "ReplanStarted"
   | "ReplanCompleted"
@@ -968,11 +975,14 @@ export type ExecutionEventType =
   | "TaskSkipped"
   | "EngineProfileChanged";
 
+export type OperationSource = "User" | "Autopilot" | "Recovery" | "System";
+
 /** 执行历史条目 — 持久化到 Project 中，刷新不丢 */
 export interface ExecutionHistoryEntry {
   timestamp: string;
   level: string;           // "info" | "success" | "error" | "pause"
   event_type: ExecutionEventType;
+  source?: OperationSource;
   text: string;
   milestone_id?: string;
   mid_stage_id?: string;

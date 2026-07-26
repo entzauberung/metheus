@@ -331,9 +331,10 @@ async fn recover_stopped_action(
             if state.transient_retry_count >= MAX_GIT_CONFIRMATION_RETRIES {
                 return Ok(false);
             }
-            crate::pipeline::retry_git_confirmation_with_pipeline(
+            crate::pipeline::retry_git_confirmation_with_source(
                 pipeline_state,
                 project.name.clone(),
+                project::OperationSource::Autopilot,
             )
             .await?;
         }
@@ -667,16 +668,18 @@ async fn dispatch_action(
             .await?;
         }
         "execute_current_subtask" => {
-            crate::pipeline::execute_current_subtask_with_pipeline(
+            crate::pipeline::execute_current_subtask_with_source(
                 pipeline_state.clone(),
                 project_name.to_string(),
+                project::OperationSource::Autopilot,
             )
             .await?;
         }
         "confirm_subtask_result" => {
-            crate::pipeline::confirm_subtask_result_with_pipeline(
+            crate::pipeline::confirm_subtask_result_with_source(
                 pipeline_state,
                 project_name.to_string(),
+                project::OperationSource::Autopilot,
             )
             .await?;
         }

@@ -2359,6 +2359,16 @@ impl Default for ExecutionSession {
     }
 }
 
+/// 执行操作来源。旧历史缺少该字段时必须保守归为系统历史。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OperationSource {
+    User,
+    Autopilot,
+    Recovery,
+    #[default]
+    System,
+}
+
 /// 执行事件类型 — 用于持久化执行操作历史
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ExecutionEventType {
@@ -2370,6 +2380,8 @@ pub enum ExecutionEventType {
     WorkspacePrepareFailed,
     /// 用户点击执行当前小阶段
     UserExecute,
+    /// 自动驾驶触发执行当前小阶段
+    AutopilotExecute,
     /// 小阶段进入执行中
     SubtaskExecuting,
     /// 执行器完成
@@ -2380,6 +2392,8 @@ pub enum ExecutionEventType {
     AwaitingConfirmation,
     /// 用户确认通过
     UserConfirm,
+    /// 自动驾驶确认通过
+    AutopilotConfirm,
     /// 用户驳回
     UserReject,
     /// 用户点击立即暂停 (In Stop)
@@ -2427,6 +2441,11 @@ pub enum ExecutionEventType {
     ReplanExecutionStarted,
     RecoverySucceeded,
     RecoveryExhausted,
+    ReviewRequested,
+    ProtocolNormalized,
+    ProtocolRepairAttempted,
+    ValidationRetryScheduled,
+    ValidationRecoverySucceeded,
     HumanVerificationAccepted,
     PlanCalibrationApplied,
     TaskSkipped,
@@ -2448,6 +2467,9 @@ pub struct ExecutionHistoryEntry {
     pub level: String,
     /// 事件类型
     pub event_type: ExecutionEventType,
+    /// 操作来源；旧历史缺失时不得推断为用户。
+    #[serde(default)]
+    pub source: OperationSource,
     /// 事件描述文本
     pub text: String,
     /// 关联大阶段 ID（可选）
@@ -2506,6 +2528,19 @@ mod tests {
         assert!(pc.resume_step.is_none());
         // autopilot_was_active should default to false
         assert!(!pc.autopilot_was_active);
+    }
+
+    #[test]
+    fn old_execution_history_without_source_defaults_to_system() {
+        let json = r#"{
+            "timestamp": "2026-07-26T00:00:00Z",
+            "level": "info",
+            "event_type": "UserExecute",
+            "text": "legacy"
+        }"#;
+        let entry: ExecutionHistoryEntry =
+            serde_json::from_str(json).expect("should deserialize old execution history");
+        assert_eq!(entry.source, OperationSource::System);
     }
 
     #[test]

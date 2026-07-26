@@ -17,6 +17,28 @@ enum RecoveryRetestKind {
     ReviewOnly,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_recovery_history(
+    proj: &mut project::Project,
+    level: &str,
+    event_type: project::ExecutionEventType,
+    text: String,
+    milestone_id: Option<&str>,
+    mid_stage_id: Option<&str>,
+    subtask_id: Option<&str>,
+) {
+    pipeline::write_execution_history_with_source(
+        proj,
+        level,
+        event_type,
+        project::OperationSource::Recovery,
+        text,
+        milestone_id,
+        mid_stage_id,
+        subtask_id,
+    );
+}
+
 fn validation_retry_limit(kind: &project::RecoveryErrorKind) -> Option<u32> {
     match kind {
         project::RecoveryErrorKind::ReviewTransientFailure => Some(MAX_TRANSIENT_REVIEW_RETRIES),
@@ -518,7 +540,7 @@ pub(crate) fn begin_execution_recovery(
         truncate_chars(failure, 4_000),
     );
     proj.workflow_state.recovery_state = Some(state);
-    pipeline::write_execution_history(
+    write_recovery_history(
         proj,
         "error",
         project::ExecutionEventType::RecoveryStarted,
@@ -648,7 +670,7 @@ pub(crate) fn ensure_quality_recovery(
         recovery.phase = project::RecoveryPhase::WaitingHuman;
     }
     proj.workflow_state.recovery_state = Some(recovery);
-    pipeline::write_execution_history(
+    write_recovery_history(
         proj,
         "error",
         project::ExecutionEventType::RecoveryStarted,
@@ -657,6 +679,54 @@ pub(crate) fn ensure_quality_recovery(
         Some(&session.mid_stage_id),
         Some(&session.subtask_id),
     );
+    let validation_audit = proj.workflow_state.recovery_state.as_ref().map(|state| {
+        (
+            state.validation_strategies.clone(),
+            state.validation_retry_count,
+            state.max_validation_retries,
+            state.next_validation_retry_at.clone(),
+        )
+    });
+    if let Some((strategies, completed, limit, retry_at)) = validation_audit {
+        if strategies.contains(&project::ValidationRetryStrategy::DeterministicNormalization) {
+            write_recovery_history(
+                proj,
+                "info",
+                project::ExecutionEventType::ProtocolNormalized,
+                "审查协议已执行确定性归一化，未修改代码或执行基线".to_string(),
+                Some(&session.milestone_id),
+                Some(&session.mid_stage_id),
+                Some(&session.subtask_id),
+            );
+        }
+        if strategies.contains(&project::ValidationRetryStrategy::ProtocolRepair) {
+            write_recovery_history(
+                proj,
+                "info",
+                project::ExecutionEventType::ProtocolRepairAttempted,
+                "审查协议已执行一次带 Schema 的格式修复".to_string(),
+                Some(&session.milestone_id),
+                Some(&session.mid_stage_id),
+                Some(&session.subtask_id),
+            );
+        }
+        if let Some(retry_at) = retry_at {
+            write_recovery_history(
+                proj,
+                "info",
+                project::ExecutionEventType::ValidationRetryScheduled,
+                format!(
+                    "验证重试已安排：第 {}/{} 次，最早执行时间 {}",
+                    completed.saturating_add(1),
+                    limit,
+                    retry_at
+                ),
+                Some(&session.milestone_id),
+                Some(&session.mid_stage_id),
+                Some(&session.subtask_id),
+            );
+        }
+    }
     if automatic {
         set_autopilot_recovering(
             proj,
@@ -729,7 +799,7 @@ pub(crate) fn begin_rejected_recovery(
         current_session.failure_message = reason.to_string();
         current_session.state_entered_at = chrono::Utc::now().to_rfc3339();
     }
-    pipeline::write_execution_history(
+    write_recovery_history(
         proj,
         "error",
         project::ExecutionEventType::RecoveryStarted,
@@ -871,7 +941,7 @@ fn wait_for_engine_snapshot_confirmation(
         current_session.failure_message = truncate_chars(message, 2_048);
     }
     set_autopilot_waiting(proj, message);
-    pipeline::write_execution_history(
+    write_recovery_history(
         proj,
         "error",
         project::ExecutionEventType::ExecutionFailed,
@@ -1158,7 +1228,7 @@ async fn replan_current_subtask(
         current_session.failure_message.clear();
         current_session.state_entered_at = now;
     }
-    pipeline::write_execution_history(
+    write_recovery_history(
         proj,
         "success",
         project::ExecutionEventType::ReplanCompleted,
@@ -1528,7 +1598,7 @@ async fn run_recovery_retest(
     }
     let rolled_back = finish_retest(&mut proj, session, execution_id, test.clone())?;
     if let Some(strategy) = evidence_strategy {
-        pipeline::write_execution_history(
+        write_recovery_history(
             &mut proj,
             "info",
             project::ExecutionEventType::EvidenceRebuildCompleted,
@@ -1545,7 +1615,7 @@ async fn run_recovery_retest(
                 recovery.error_kind == project::RecoveryErrorKind::EvidenceInsufficient
             })
         {
-            pipeline::write_execution_history(
+            write_recovery_history(
                 &mut proj,
                 "error",
                 project::ExecutionEventType::EvidenceStillInsufficient,
@@ -1639,7 +1709,7 @@ pub(crate) async fn run_error_recovery_with_pipeline(
                 project::RecoveryErrorKind::EvidenceInsufficient,
                 message,
             );
-            pipeline::write_execution_history(
+            write_recovery_history(
                 &mut proj,
                 "error",
                 project::ExecutionEventType::EvidenceStillInsufficient,
@@ -1663,7 +1733,7 @@ pub(crate) async fn run_error_recovery_with_pipeline(
         session.status = "recovering".to_string();
         proj.execution_session = Some(session.clone());
         set_autopilot_recovering(&mut proj, "正在补充验收证据");
-        pipeline::write_execution_history(
+        write_recovery_history(
             &mut proj,
             "info",
             project::ExecutionEventType::EvidenceRebuildStarted,
@@ -1724,6 +1794,19 @@ pub(crate) async fn run_error_recovery_with_pipeline(
                 recovery.max_validation_retries
             ),
         );
+        write_recovery_history(
+            &mut proj,
+            "info",
+            project::ExecutionEventType::ReviewRequested,
+            format!(
+                "重新请求 AI 审查：第 {}/{} 次；沿用既有代码、测试事实和验收契约",
+                recovery.validation_retry_count.saturating_add(1),
+                recovery.max_validation_retries
+            ),
+            Some(&session.milestone_id),
+            Some(&session.mid_stage_id),
+            Some(&session.subtask_id),
+        );
         touch(&mut proj);
         crate::save_project(&proj)?;
         drop(pipeline_guard);
@@ -1745,7 +1828,7 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             Ok(()) => {}
             Err(error) => {
                 mark_waiting_human(&mut proj, project::RecoveryErrorKind::HumanRequired, &error);
-                pipeline::write_execution_history(
+                write_recovery_history(
                     &mut proj,
                     "error",
                     project::ExecutionEventType::RecoveryExhausted,
@@ -1775,7 +1858,7 @@ pub(crate) async fn run_error_recovery_with_pipeline(
     recovery.last_diagnosis = diagnosis.clone();
     recovery.updated_at = chrono::Utc::now().to_rfc3339();
 
-    pipeline::write_execution_history(
+    write_recovery_history(
         &mut proj,
         "info",
         project::ExecutionEventType::ErrorDiagnosed,
@@ -1818,7 +1901,7 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             recovery.error_kind,
             "该错误已完成安全收尾，需要人工处理后继续",
         );
-        pipeline::write_execution_history(
+        write_recovery_history(
             &mut proj,
             "error",
             project::ExecutionEventType::RecoveryExhausted,
@@ -1900,7 +1983,7 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             recovery.attempt, recovery.max_attempts
         ),
     );
-    pipeline::write_execution_history(
+    write_recovery_history(
         &mut proj,
         "info",
         if replan_execution {
@@ -2105,7 +2188,7 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             project::RecoveryErrorKind::ScopeViolation,
             &message,
         );
-        pipeline::write_execution_history(
+        write_recovery_history(
             &mut proj,
             "error",
             project::ExecutionEventType::RecoveryExhausted,
@@ -2160,7 +2243,7 @@ pub(crate) async fn run_error_recovery_with_pipeline(
     if let Some(current) = proj.workflow_state.recovery_state.as_mut() {
         current.pending_execution_result = Some(merged_execution);
     }
-    pipeline::write_execution_history(
+    write_recovery_history(
         &mut proj,
         "success",
         project::ExecutionEventType::RepairAttemptCompleted,
@@ -2248,7 +2331,7 @@ fn handle_repair_engine_block(
         current_session.failure_message = truncate_chars(&detail, 2_048);
     }
     set_autopilot_waiting(proj, &detail);
-    pipeline::write_execution_history(
+    write_recovery_history(
         proj,
         "error",
         project::ExecutionEventType::ExecutionFailed,
@@ -2305,7 +2388,7 @@ fn handle_repair_execution_failure(
             recovery.error_kind = project::RecoveryErrorKind::ExecutionError;
         }
         mark_waiting_human(proj, project::RecoveryErrorKind::ExecutionError, &detail);
-        pipeline::write_execution_history(
+        write_recovery_history(
             proj,
             "error",
             project::ExecutionEventType::RecoveryExhausted,
@@ -2415,7 +2498,7 @@ pub(crate) fn finish_retest(
         .recovery_state
         .as_ref()
         .is_some_and(|recovery| recovery.validation_retry_count > 0);
-    pipeline::write_execution_history(
+    write_recovery_history(
         proj,
         if quality_passed { "success" } else { "error" },
         project::ExecutionEventType::RetestCompleted,
@@ -2486,7 +2569,7 @@ pub(crate) fn finish_retest(
                 item.execution_result = pending_execution;
             }
         }
-        pipeline::write_execution_history(
+        write_recovery_history(
             proj,
             "success",
             project::ExecutionEventType::RecoverySucceeded,
@@ -2501,6 +2584,17 @@ pub(crate) fn finish_retest(
             Some(&session.mid_stage_id),
             Some(&session.subtask_id),
         );
+        if validation_recovery {
+            write_recovery_history(
+                proj,
+                "success",
+                project::ExecutionEventType::ValidationRecoverySucceeded,
+                "AI 审查验证恢复成功；代码修复次数和 Git 基线保持不变".to_string(),
+                Some(&session.milestone_id),
+                Some(&session.mid_stage_id),
+                Some(&session.subtask_id),
+            );
+        }
         if let Some(completed_recovery) = proj.workflow_state.recovery_state.clone() {
             let strategy = if completed_recovery.validation_retry_count > 0
                 && completed_recovery.attempt == 0
@@ -2596,7 +2690,7 @@ pub(crate) fn finish_retest(
             current_session.state_entered_at = chrono::Utc::now().to_rfc3339();
         }
         if retry_scheduled {
-            let (count, limit) = proj
+            let (count, limit, retry_at) = proj
                 .workflow_state
                 .recovery_state
                 .as_ref()
@@ -2604,6 +2698,7 @@ pub(crate) fn finish_retest(
                     (
                         recovery.validation_retry_count,
                         recovery.max_validation_retries,
+                        recovery.next_validation_retry_at.clone(),
                     )
                 })
                 .unwrap_or_default();
@@ -2611,6 +2706,22 @@ pub(crate) fn finish_retest(
                 proj,
                 &format!("AI 审查仍不可用，等待第 {}/{} 次验证重试", count + 1, limit),
             );
+            if let Some(retry_at) = retry_at {
+                write_recovery_history(
+                    proj,
+                    "info",
+                    project::ExecutionEventType::ValidationRetryScheduled,
+                    format!(
+                        "验证重试已重新安排：第 {}/{} 次，最早执行时间 {}",
+                        count.saturating_add(1),
+                        limit,
+                        retry_at
+                    ),
+                    Some(&session.milestone_id),
+                    Some(&session.mid_stage_id),
+                    Some(&session.subtask_id),
+                );
+            }
         } else {
             let message = match next_kind {
                 project::RecoveryErrorKind::ReviewServiceBlocked => {
@@ -2922,7 +3033,7 @@ pub(crate) fn finish_retest(
             );
         }
         set_autopilot_waiting(proj, waiting_message);
-        pipeline::write_execution_history(
+        write_recovery_history(
             proj,
             "error",
             project::ExecutionEventType::RecoveryExhausted,
@@ -2933,7 +3044,7 @@ pub(crate) fn finish_retest(
         );
     } else if next_phase == project::RecoveryPhase::Replanning {
         set_autopilot_recovering(proj, "常规修复耗尽，正在重新规划当前任务");
-        pipeline::write_execution_history(
+        write_recovery_history(
             proj,
             "info",
             project::ExecutionEventType::ReplanStarted,
@@ -3139,10 +3250,11 @@ pub(crate) async fn resolve_human_recovery(
                 current_session.active = true;
                 current_session.failure_message.clear();
             }
-            pipeline::write_execution_history(
+            pipeline::write_execution_history_with_source(
                 &mut proj,
                 "success",
                 project::ExecutionEventType::HumanVerificationAccepted,
+                project::OperationSource::User,
                 format!(
                     "{}：{}",
                     if human_resolution == project::HumanResolution::AcceptDeviation {
@@ -3258,10 +3370,11 @@ pub(crate) async fn resolve_human_recovery(
                 autopilot.error_message.clear();
                 autopilot.recovery_action = project::AutopilotRecoveryAction::None;
             }
-            pipeline::write_execution_history(
+            pipeline::write_execution_history_with_source(
                 &mut proj,
                 "pause",
                 project::ExecutionEventType::TaskSkipped,
+                project::OperationSource::User,
                 format!("跳过任务：{}；{}", subtask.title, reason.trim()),
                 Some(&session.milestone_id),
                 Some(&session.mid_stage_id),
@@ -3279,10 +3392,11 @@ pub(crate) async fn resolve_human_recovery(
                 &session.mid_stage_id,
             );
             if mid_completed {
-                pipeline::write_execution_history(
+                pipeline::write_execution_history_with_source(
                     &mut proj,
                     "success",
                     project::ExecutionEventType::MidStageComplete,
+                    project::OperationSource::User,
                     "中阶段所有任务已达到终态".to_string(),
                     Some(&session.milestone_id),
                     Some(&session.mid_stage_id),
@@ -3290,10 +3404,11 @@ pub(crate) async fn resolve_human_recovery(
                 );
             }
             if milestone_completed {
-                pipeline::write_execution_history(
+                pipeline::write_execution_history_with_source(
                     &mut proj,
                     "success",
                     project::ExecutionEventType::AdvanceMilestoneReview,
+                    project::OperationSource::User,
                     "所有中阶段已完成，进入大阶段审阅".to_string(),
                     Some(&session.milestone_id),
                     None,
@@ -3318,10 +3433,11 @@ pub(crate) async fn resolve_human_recovery(
                 current_session.state_entered_at = chrono::Utc::now().to_rfc3339();
             }
             set_autopilot_recovering(&mut proj, "正在重新规划当前任务");
-            pipeline::write_execution_history(
+            pipeline::write_execution_history_with_source(
                 &mut proj,
                 "info",
                 project::ExecutionEventType::ReplanStarted,
+                project::OperationSource::User,
                 "人工请求当前小阶段受限重规划".to_string(),
                 Some(&session.milestone_id),
                 Some(&session.mid_stage_id),
@@ -3426,10 +3542,11 @@ pub(crate) async fn resolve_human_recovery(
                     autopilot.error_message.clear();
                     autopilot.recovery_action = project::AutopilotRecoveryAction::None;
                 }
-                pipeline::write_execution_history(
+                pipeline::write_execution_history_with_source(
                     &mut proj,
                     "success",
                     project::ExecutionEventType::RecoverySucceeded,
+                    project::OperationSource::User,
                     "人工修复复测通过".to_string(),
                     Some(&session.milestone_id),
                     Some(&session.mid_stage_id),

@@ -39,4 +39,28 @@ describe("execution log merge policy", () => {
     );
     expect(merged.map(entry => entry.text)).toEqual(["first", "second", "invalid"]);
   });
+
+  it("defaults old persisted history and runtime logs to system source", () => {
+    const merged = mergeExecutionLogs(
+      [history("2026-07-22T12:00:00Z", "legacy")],
+      [runtime("2026-07-22T12:00:01Z", "runtime")],
+    );
+    expect(merged.map(entry => entry.operationSource)).toEqual(["System", "System"]);
+  });
+
+  it("preserves all persisted operation sources independently from the log channel", () => {
+    const sources = ["User", "Autopilot", "Recovery", "System"] as const;
+    const entries = sources.map((source, index) => ({
+      ...history(`2026-07-22T12:00:0${index}Z`, source),
+      source,
+    }));
+    const merged = mergeExecutionLogs(entries, []);
+    expect(merged.map(entry => entry.source)).toEqual([
+      "history",
+      "history",
+      "history",
+      "history",
+    ]);
+    expect(merged.map(entry => entry.operationSource)).toEqual(sources);
+  });
 });

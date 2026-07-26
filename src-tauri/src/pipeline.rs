@@ -101,10 +101,68 @@ pub(crate) fn write_execution_history(
     mid_stage_id: Option<&str>,
     subtask_id: Option<&str>,
 ) {
+    let source = match &event_type {
+        project::ExecutionEventType::UserExecute
+        | project::ExecutionEventType::UserConfirm
+        | project::ExecutionEventType::UserReject
+        | project::ExecutionEventType::UserInStop
+        | project::ExecutionEventType::UserEdStop
+        | project::ExecutionEventType::UserContinue
+        | project::ExecutionEventType::UserAdjust
+        | project::ExecutionEventType::UserRollback
+        | project::ExecutionEventType::HumanVerificationAccepted
+        | project::ExecutionEventType::TaskSkipped => project::OperationSource::User,
+        project::ExecutionEventType::RecoveryStarted
+        | project::ExecutionEventType::ErrorDiagnosed
+        | project::ExecutionEventType::RepairAttemptStarted
+        | project::ExecutionEventType::RepairAttemptCompleted
+        | project::ExecutionEventType::RetestCompleted
+        | project::ExecutionEventType::EvidenceRebuildStarted
+        | project::ExecutionEventType::EvidenceRebuildCompleted
+        | project::ExecutionEventType::EvidenceStillInsufficient
+        | project::ExecutionEventType::ReplanStarted
+        | project::ExecutionEventType::ReplanCompleted
+        | project::ExecutionEventType::ReplanExecutionStarted
+        | project::ExecutionEventType::RecoverySucceeded
+        | project::ExecutionEventType::RecoveryExhausted
+        | project::ExecutionEventType::ReviewRequested
+        | project::ExecutionEventType::ProtocolNormalized
+        | project::ExecutionEventType::ProtocolRepairAttempted
+        | project::ExecutionEventType::ValidationRetryScheduled
+        | project::ExecutionEventType::ValidationRecoverySucceeded => {
+            project::OperationSource::Recovery
+        }
+        _ => project::OperationSource::System,
+    };
+    write_execution_history_with_source(
+        proj,
+        level,
+        event_type,
+        source,
+        text,
+        milestone_id,
+        mid_stage_id,
+        subtask_id,
+    );
+}
+
+/// 显式记录动作来源。后台动作和跨异步边界的生命周期事件必须使用此入口。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_execution_history_with_source(
+    proj: &mut project::Project,
+    level: &str,
+    event_type: project::ExecutionEventType,
+    source: project::OperationSource,
+    text: String,
+    milestone_id: Option<&str>,
+    mid_stage_id: Option<&str>,
+    subtask_id: Option<&str>,
+) {
     let entry = project::ExecutionHistoryEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         level: level.to_string(),
         event_type,
+        source,
         text,
         milestone_id: milestone_id.map(|s| s.to_string()),
         mid_stage_id: mid_stage_id.map(|s| s.to_string()),
@@ -115,6 +173,58 @@ pub(crate) fn write_execution_history(
     if proj.execution_history.len() > project::MAX_EXECUTION_HISTORY {
         let excess = proj.execution_history.len() - project::MAX_EXECUTION_HISTORY;
         proj.execution_history.drain(0..excess);
+    }
+}
+
+fn execution_request_audit(
+    source: project::OperationSource,
+    position: usize,
+    total: usize,
+    title: &str,
+    provider: &str,
+) -> (project::ExecutionEventType, String) {
+    match source {
+        project::OperationSource::User => (
+            project::ExecutionEventType::UserExecute,
+            format!(
+                "用户点击执行 ({}/{}): {}（{}）",
+                position, total, title, provider
+            ),
+        ),
+        project::OperationSource::Autopilot => (
+            project::ExecutionEventType::AutopilotExecute,
+            format!(
+                "自动驾驶触发执行 ({}/{}): {}（{}）",
+                position, total, title, provider
+            ),
+        ),
+        _ => (
+            project::ExecutionEventType::SystemAdvance,
+            format!(
+                "系统触发执行 ({}/{}): {}（{}）",
+                position, total, title, provider
+            ),
+        ),
+    }
+}
+
+fn confirmation_audit(
+    source: project::OperationSource,
+    title: &str,
+) -> (project::ExecutionEventType, String) {
+    match source {
+        project::OperationSource::User => (
+            project::ExecutionEventType::UserConfirm,
+            format!("用户确认通过：{}", title),
+        ),
+        project::OperationSource::Autopilot => (
+            project::ExecutionEventType::AutopilotConfirm,
+            format!("自动驾驶确认通过：{}", title),
+        ),
+        _ => (
+            project::ExecutionEventType::SystemAdvance,
+            format!("系统确认通过：{}", title),
+        ),
     }
 }
 
@@ -241,6 +351,19 @@ pub(crate) async fn execute_current_subtask(
 pub(crate) async fn execute_current_subtask_with_pipeline(
     pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
     project_name: String,
+) -> Result<PipelineState, String> {
+    execute_current_subtask_with_source(
+        pipeline_state,
+        project_name,
+        project::OperationSource::User,
+    )
+    .await
+}
+
+pub(crate) async fn execute_current_subtask_with_source(
+    pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    project_name: String,
+    operation_source: project::OperationSource,
 ) -> Result<PipelineState, String> {
     // 以全局流水线锁串行化“校验 + Running 落盘 + 内存状态建立”，阻止重复启动。
     let mut pipeline_guard = acquire_pipeline_start(&pipeline_state).await?;
@@ -379,17 +502,19 @@ pub(crate) async fn execute_current_subtask_with_pipeline(
     let now = chrono::Utc::now().to_rfc3339();
 
     // 执行事实和启动历史使用同一个项目对象并在同一事务边界保存。
-    write_execution_history(
+    let (request_event, request_text) = execution_request_audit(
+        operation_source,
+        next_idx + 1,
+        total,
+        &subtask_title,
+        execution_profile.provider.display_name(),
+    );
+    write_execution_history_with_source(
         &mut proj,
         "info",
-        project::ExecutionEventType::UserExecute,
-        format!(
-            "👆 用户点击执行 ({}/{})：{}（{}）",
-            next_idx + 1,
-            total,
-            subtask_title,
-            execution_profile.provider.display_name(),
-        ),
+        request_event,
+        operation_source,
+        request_text,
         Some(&milestone_id),
         Some(&mid_stage_id),
         Some(&subtask_id),
@@ -459,10 +584,11 @@ pub(crate) async fn execute_current_subtask_with_pipeline(
         });
     }
 
-    write_execution_history(
+    write_execution_history_with_source(
         &mut proj,
         "info",
         project::ExecutionEventType::SubtaskExecuting,
+        operation_source,
         format!("▶ 开始执行 ({}/{})：{}", next_idx + 1, total, subtask_title),
         Some(&milestone_id),
         Some(&mid_stage_id),
@@ -520,6 +646,7 @@ pub(crate) async fn execute_current_subtask_with_pipeline(
             execution_profile,
             prepared_engine,
             background_pipeline_state.clone(),
+            operation_source,
         )
         .await;
         if let Err(error) = result {
@@ -534,6 +661,7 @@ pub(crate) async fn execute_current_subtask_with_pipeline(
                 &failure_execution_id,
                 &error,
                 background_pipeline_state.clone(),
+                operation_source,
             )
             .await
             {
@@ -572,6 +700,7 @@ async fn execute_current_subtask_background(
     execution_profile: project::ExecutionProfile,
     prepared_engine: crate::engine::PreparedEngine,
     pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    operation_source: project::OperationSource,
 ) -> Result<(), BackgroundExecutionFailure> {
     let exec_result = match crate::engine::execute(
         prepared_engine,
@@ -784,10 +913,11 @@ async fn execute_current_subtask_background(
         endpoint_fingerprint: session.endpoint_fingerprint,
         engine_executable_path: session.engine_executable_path,
     });
-    write_execution_history(
+    write_execution_history_with_source(
         &mut proj,
         "info",
         project::ExecutionEventType::ExecutorComplete,
+        operation_source,
         format!(
             "✅ 执行完成 ({}/{})：{}",
             subtask_idx + 1,
@@ -798,10 +928,11 @@ async fn execute_current_subtask_background(
         Some(&mid_stage_id),
         Some(&subtask_id),
     );
-    write_execution_history(
+    write_execution_history_with_source(
         &mut proj,
         if quality.passed() { "success" } else { "error" },
         project::ExecutionEventType::TestComplete,
+        operation_source,
         if quality.passed() {
             format!(
                 "🔍 质量门禁通过 ({}/{})：{}",
@@ -822,10 +953,11 @@ async fn execute_current_subtask_background(
         Some(&mid_stage_id),
         Some(&subtask_id),
     );
-    write_execution_history(
+    write_execution_history_with_source(
         &mut proj,
         "info",
         project::ExecutionEventType::AwaitingConfirmation,
+        operation_source,
         format!(
             "⏳ 待确认 ({}/{})：{}",
             subtask_idx + 1,
@@ -915,6 +1047,7 @@ async fn finalize_background_execution_failure(
     execution_id: &str,
     failure: &BackgroundExecutionFailure,
     pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    operation_source: project::OperationSource,
 ) -> Result<(), String> {
     let mut pipeline_guard = pipeline_state.lock().await;
     let pipeline_matches = pipeline_guard
@@ -1033,10 +1166,11 @@ async fn finalize_background_execution_failure(
             autopilot.last_action_at = chrono::Utc::now().to_rfc3339();
         }
     }
-    write_execution_history(
+    write_execution_history_with_source(
         &mut proj,
         "error",
         project::ExecutionEventType::ExecutionFailed,
+        operation_source,
         format!(
             "❌ 执行失败 ({}/{}): {} - {}",
             subtask_idx + 1,
@@ -1445,6 +1579,20 @@ fn mark_confirmation_blocked(
     failure_kind: project::GitConfirmationFailureKind,
     message: String,
 ) {
+    mark_confirmation_blocked_with_source(
+        proj,
+        failure_kind,
+        message,
+        project::OperationSource::System,
+    );
+}
+
+fn mark_confirmation_blocked_with_source(
+    proj: &mut project::Project,
+    failure_kind: project::GitConfirmationFailureKind,
+    message: String,
+    operation_source: project::OperationSource,
+) {
     let now = chrono::Utc::now().to_rfc3339();
     if let Some(session) = proj.execution_session.as_mut() {
         session.active = false;
@@ -1468,10 +1616,11 @@ fn mark_confirmation_blocked(
         )
     });
     if let Some((milestone_id, mid_stage_id, subtask_id)) = ids {
-        write_execution_history(
+        write_execution_history_with_source(
             proj,
             "error",
             project::ExecutionEventType::GitConfirmationBlocked,
+            operation_source,
             format!("Git 确认受阻：{}；代码与质量结果已保留", message),
             Some(&milestone_id),
             Some(&mid_stage_id),
@@ -1492,6 +1641,15 @@ pub(crate) async fn confirm_subtask_result(
 pub(crate) async fn confirm_subtask_result_with_pipeline(
     pipeline_state: &std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
     project_name: String,
+) -> Result<project::Project, String> {
+    confirm_subtask_result_with_source(pipeline_state, project_name, project::OperationSource::User)
+        .await
+}
+
+pub(crate) async fn confirm_subtask_result_with_source(
+    pipeline_state: &std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    project_name: String,
+    operation_source: project::OperationSource,
 ) -> Result<project::Project, String> {
     // 与后台完成/启动对账共用流水线锁做 CAS 认领，关闭自动确认与人工确认的并发窗口。
     {
@@ -1514,10 +1672,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
     // 质量门禁：在创建 Git 标签之前校验执行/测试/证据完整性
     // 认领后 session 为 confirming，质量门禁仍按子任务状态判定
     if let Err(gate_reason) = validate_subtask_quality_gate_allowing_claim(&proj) {
-        write_execution_history(
+        write_execution_history_with_source(
             &mut proj,
             "error",
             project::ExecutionEventType::QualityGateBlocked,
+            operation_source,
             format!("🚫 质量门禁阻断：{}", gate_reason),
             Some(&milestone_id),
             Some(&mid_stage_id),
@@ -1604,10 +1763,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
     let ws = match get_execution_workspace_status_inner(&project_path) {
         Ok(ws) => ws,
         Err(e) => {
-            mark_confirmation_blocked(
+            mark_confirmation_blocked_with_source(
                 &mut proj,
                 project::GitConfirmationFailureKind::GitMetadataUnavailable,
                 e.clone(),
+                operation_source,
             );
             crate::save_project(&proj)?;
             return Err(e);
@@ -1621,10 +1781,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
         && ws.git_email_available;
     if !git_metadata_ready {
         let message = format!("Git 工作区不可用，无法标记确认：{}", ws.status_message);
-        mark_confirmation_blocked(
+        mark_confirmation_blocked_with_source(
             &mut proj,
             project::GitConfirmationFailureKind::GitMetadataUnavailable,
             message.clone(),
+            operation_source,
         );
         crate::save_project(&proj)?;
         return Err(message);
@@ -1699,10 +1860,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
     let mut generated_file = match generated_file_result {
         Ok(generated_file) => generated_file,
         Err(message) => {
-            mark_confirmation_blocked(
+            mark_confirmation_blocked_with_source(
                 &mut proj,
                 project::GitConfirmationFailureKind::CommitFailed,
                 message.clone(),
+                operation_source,
             );
             crate::save_project(&proj)?;
             return Err(format!("确认提交失败：{}。代码与质量结果已保留。", message));
@@ -1710,10 +1872,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
     };
 
     if confirmation_phase == project::ConfirmationPhase::Preparing {
-        write_execution_history(
+        write_execution_history_with_source(
             &mut proj,
             "info",
             project::ExecutionEventType::GitConfirmationStarted,
+            operation_source,
             format!("开始 Git 确认事务：{}", candidate_tag),
             Some(&milestone_id),
             Some(&mid_stage_id),
@@ -1748,10 +1911,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
                     session.confirmation_candidate_tag = tag;
                     session.confirmation_failure_kind = None;
                 }
-                write_execution_history(
+                write_execution_history_with_source(
                     &mut proj,
                     "info",
                     project::ExecutionEventType::GitConfirmationCommitCreated,
+                    operation_source,
                     format!("Git 确认提交已创建：{}", commit),
                     Some(&milestone_id),
                     Some(&mid_stage_id),
@@ -1759,10 +1923,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
                 );
                 if let Err(error) = crate::save_project(&proj) {
                     let message = format!("确认提交已创建，但事务阶段保存失败：{}", error);
-                    mark_confirmation_blocked(
+                    mark_confirmation_blocked_with_source(
                         &mut proj,
                         project::GitConfirmationFailureKind::ProjectFinalizationFailed,
                         message.clone(),
+                        operation_source,
                     );
                     let _ = crate::save_project(&proj);
                     return Err(message);
@@ -1779,10 +1944,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
                 }
                 if let Err(error) = crate::save_project(&proj) {
                     let message = format!("确认标签已创建，但事务阶段保存失败：{}", error);
-                    mark_confirmation_blocked(
+                    mark_confirmation_blocked_with_source(
                         &mut proj,
                         project::GitConfirmationFailureKind::ProjectFinalizationFailed,
                         message.clone(),
+                        operation_source,
                     );
                     let _ = crate::save_project(&proj);
                     return Err(message);
@@ -1791,7 +1957,12 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
             }
             Err(error) => {
                 let message = error.message;
-                mark_confirmation_blocked(&mut proj, error.kind, message.clone());
+                mark_confirmation_blocked_with_source(
+                    &mut proj,
+                    error.kind,
+                    message.clone(),
+                    operation_source,
+                );
                 crate::save_project(&proj)?;
                 return Err(format!("确认提交失败：{}。代码与质量结果已保留。", message));
             }
@@ -1807,10 +1978,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
             Ok(diff) => diff,
             Err(error) => {
                 let message = format!("确认标签已创建，但读取提交差异失败：{}", error);
-                mark_confirmation_blocked(
+                mark_confirmation_blocked_with_source(
                     &mut proj,
                     project::GitConfirmationFailureKind::ProjectFinalizationFailed,
                     message.clone(),
+                    operation_source,
                 );
                 crate::save_project(&proj)?;
                 return Err(message);
@@ -1825,10 +1997,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
         Ok(changed) => changed,
         Err(error) => {
             let message = format!("确认标签已创建，但读取收口文件失败：{}", error);
-            mark_confirmation_blocked(
+            mark_confirmation_blocked_with_source(
                 &mut proj,
                 project::GitConfirmationFailureKind::ProjectFinalizationFailed,
                 message.clone(),
+                operation_source,
             );
             crate::save_project(&proj)?;
             return Err(message);
@@ -1861,10 +2034,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
     }
     if let Err(error) = crate::save_project(&proj) {
         let message = format!("Git 标签已创建，但项目收口准备失败：{}", error);
-        mark_confirmation_blocked(
+        mark_confirmation_blocked_with_source(
             &mut proj,
             project::GitConfirmationFailureKind::ProjectFinalizationFailed,
             message.clone(),
+            operation_source,
         );
         let _ = crate::save_project(&proj);
         return Err(message);
@@ -1942,10 +2116,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
         reconcile_terminal_stage(&mut proj, &milestone_id, &mid_stage_id);
 
     if all_subtasks_passed {
-        write_execution_history(
+        write_execution_history_with_source(
             &mut proj,
             "success",
             project::ExecutionEventType::MidStageComplete,
+            operation_source,
             format!(
                 "✅ 中阶段完成：{} (v{})",
                 mid_title_for_node_tag, mid_version_for_node_tag
@@ -1955,20 +2130,22 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
             None,
         );
         if milestone_completed {
-            write_execution_history(
+            write_execution_history_with_source(
                 &mut proj,
                 "success",
                 project::ExecutionEventType::AdvanceMilestoneReview,
+                operation_source,
                 format!("📋 推进到大阶段审阅：{}", milestone_title),
                 Some(&milestone_id),
                 None,
                 None,
             );
         } else {
-            write_execution_history(
+            write_execution_history_with_source(
                 &mut proj,
                 "success",
                 project::ExecutionEventType::AdvanceNextMidStage,
+                operation_source,
                 "➡ 推进到下一中阶段选择".to_string(),
                 Some(&milestone_id),
                 None,
@@ -1977,20 +2154,22 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
         }
     }
 
-    // Write execution history: user confirmed
-    write_execution_history(
+    let (confirm_event, confirm_text) = confirmation_audit(operation_source, &subtask_title);
+    write_execution_history_with_source(
         &mut proj,
         "success",
-        project::ExecutionEventType::UserConfirm,
-        format!("✅ 用户确认通过：{}", subtask_title),
+        confirm_event,
+        operation_source,
+        confirm_text,
         Some(&milestone_id),
         Some(&mid_stage_id),
         Some(&subtask_id),
     );
-    write_execution_history(
+    write_execution_history_with_source(
         &mut proj,
         "success",
         project::ExecutionEventType::GitConfirmationCompleted,
+        operation_source,
         format!("Git 确认事务完成：{}", transaction_id),
         Some(&milestone_id),
         Some(&mid_stage_id),
@@ -2045,10 +2224,11 @@ pub(crate) async fn confirm_subtask_result_with_pipeline(
         Err(error) => {
             let message = format!("Git 标签已创建，但项目收口失败：{}", error);
             if let Ok(mut persisted) = crate::load_project(&project_name) {
-                mark_confirmation_blocked(
+                mark_confirmation_blocked_with_source(
                     &mut persisted,
                     project::GitConfirmationFailureKind::ProjectFinalizationFailed,
                     message.clone(),
+                    operation_source,
                 );
                 let _ = crate::save_project(&persisted);
             }
@@ -2138,6 +2318,15 @@ pub(crate) async fn retry_git_confirmation_with_pipeline(
     pipeline_state: &std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
     project_name: String,
 ) -> Result<project::Project, String> {
+    retry_git_confirmation_with_source(pipeline_state, project_name, project::OperationSource::User)
+        .await
+}
+
+pub(crate) async fn retry_git_confirmation_with_source(
+    pipeline_state: &std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    project_name: String,
+    operation_source: project::OperationSource,
+) -> Result<project::Project, String> {
     let proj = crate::load_project(&project_name)?;
     let session = proj
         .execution_session
@@ -2152,7 +2341,7 @@ pub(crate) async fn retry_git_confirmation_with_pipeline(
                 .to_string(),
         );
     }
-    confirm_subtask_result_with_pipeline(pipeline_state, project_name).await
+    confirm_subtask_result_with_source(pipeline_state, project_name, operation_source).await
 }
 
 /// V1 驳回小阶段执行结果（用户点击"发现问题"）
@@ -4418,6 +4607,50 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    #[test]
+    fn operation_source_is_preserved_and_legacy_writer_is_conservative() {
+        let mut project = project::Project::new("audit");
+        write_execution_history_with_source(
+            &mut project,
+            "info",
+            project::ExecutionEventType::AutopilotExecute,
+            project::OperationSource::Autopilot,
+            "auto".to_string(),
+            None,
+            None,
+            None,
+        );
+        write_execution_history(
+            &mut project,
+            "info",
+            project::ExecutionEventType::SystemAdvance,
+            "system".to_string(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            project.execution_history[0].source,
+            project::OperationSource::Autopilot
+        );
+        assert_eq!(
+            project.execution_history[1].source,
+            project::OperationSource::System
+        );
+    }
+
+    #[test]
+    fn autopilot_operation_source_is_not_attributed_to_user() {
+        let (execute_event, execute_text) =
+            execution_request_audit(project::OperationSource::Autopilot, 1, 2, "task", "engine");
+        let (confirm_event, confirm_text) =
+            confirmation_audit(project::OperationSource::Autopilot, "task");
+        assert_eq!(execute_event, project::ExecutionEventType::AutopilotExecute);
+        assert_eq!(confirm_event, project::ExecutionEventType::AutopilotConfirm);
+        assert!(!execute_text.contains("用户"));
+        assert!(!confirm_text.contains("用户"));
+    }
+
     struct ProjectDataGuard {
         path: PathBuf,
     }
@@ -4981,6 +5214,7 @@ mod tests {
             "execution-stale",
             &failure,
             pipeline,
+            project::OperationSource::User,
         )
         .await?;
 
@@ -6484,6 +6718,7 @@ mod tests {
             "execution-quota",
             &failure,
             pipeline,
+            project::OperationSource::Autopilot,
         )
         .await?;
 
@@ -6553,6 +6788,7 @@ mod tests {
             "execution-auto",
             &failure,
             pipeline,
+            project::OperationSource::Autopilot,
         )
         .await?;
 

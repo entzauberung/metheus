@@ -12,6 +12,13 @@ const LOG_LEVEL_ICON: Record<string, string> = {
   pause: "⏸",
 };
 
+const OPERATION_SOURCE_LABEL = {
+  User: "用户",
+  Autopilot: "自动驾驶",
+  Recovery: "恢复器",
+  System: "系统历史",
+} as const;
+
 function formatLogTime(iso: string): string {
   try {
     const d = new Date(iso);
@@ -143,6 +150,9 @@ export default function TaskConsole({
                 <div key={entry.key} className={`execution-log-entry log-${entry.level}${entry.source === "runtime" ? " log-runtime" : ""}`}>
                   <span className="execution-log-time">{formatLogTime(entry.timestamp)}</span>
                   <span className="execution-log-level">{LOG_LEVEL_ICON[entry.level] || (entry.source === "runtime" ? "⚡" : "")}</span>
+                  <span className={`execution-log-source source-${entry.operationSource.toLowerCase()}`}>
+                    {OPERATION_SOURCE_LABEL[entry.operationSource]}
+                  </span>
                   <span className="execution-log-text">{entry.text}</span>
                 </div>
               ))}
@@ -154,6 +164,7 @@ export default function TaskConsole({
                 <div className="execution-log-entry log-live">
                   <span className="execution-log-time">现在</span>
                   <span className="execution-log-level">⚡</span>
+                  <span className="execution-log-source source-system">系统历史</span>
                   <span className="execution-log-text">{executionStatus.current_log}</span>
                 </div>
               )}
