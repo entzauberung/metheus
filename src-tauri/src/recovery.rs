@@ -43,12 +43,25 @@ fn schedule_next_validation_retry(recovery: &mut project::RecoveryState) {
     );
 }
 
-fn validation_retry_due(recovery: &project::RecoveryState) -> bool {
+pub(crate) fn is_review_validation_recovery(recovery: &project::RecoveryState) -> bool {
+    matches!(
+        recovery.error_kind,
+        project::RecoveryErrorKind::ReviewTransientFailure
+            | project::RecoveryErrorKind::ReviewProtocolFailure
+    ) && recovery.phase == project::RecoveryPhase::Retesting
+}
+
+pub(crate) fn validation_retry_due(recovery: &project::RecoveryState) -> bool {
     recovery
         .next_validation_retry_at
         .as_deref()
         .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
         .is_none_or(|deadline| deadline <= chrono::Utc::now())
+}
+
+pub(crate) fn validation_retry_can_resume(recovery: &project::RecoveryState) -> bool {
+    is_review_validation_recovery(recovery)
+        && recovery.validation_retry_count < recovery.max_validation_retries
 }
 
 fn record_review_protocol_strategies(
@@ -1432,9 +1445,19 @@ async fn run_recovery_retest(
     } else {
         &subtask.goal
     };
+    let progress_project_name = project_name.to_string();
+    let progress_execution_id = execution_id.to_string();
+    let progress: crate::test_runner::VerificationProgressReporter =
+        std::sync::Arc::new(move |stage| {
+            let _ = crate::pipeline::persist_verification_progress(
+                &progress_project_name,
+                &progress_execution_id,
+                stage,
+            );
+        });
     let mut test = match retest_kind {
         RecoveryRetestKind::Full => {
-            crate::test_runner::check_subtask_with_context(
+            crate::test_runner::check_subtask_with_context_and_progress(
                 &project.project_path,
                 goal,
                 &session.subtask_id,
@@ -1444,6 +1467,7 @@ async fn run_recovery_retest(
                 Some(authorized_paths.to_vec()),
                 Some(prompt),
                 evidence_request,
+                progress.clone(),
             )
             .await
         }
@@ -1461,6 +1485,7 @@ async fn run_recovery_retest(
                 Some(authorized_paths.to_vec()),
                 Some(prompt),
                 previous,
+                progress,
             )
             .await
         }

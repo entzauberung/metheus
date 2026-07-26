@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::{sleep, Duration};
+use tokio::time::{interval, sleep, Duration};
 
 const MAX_GIT_CONFIRMATION_RETRIES: u32 = 2;
 
@@ -109,6 +109,11 @@ impl AutopilotRuntime {
 /// Tauri 进程重启后，为仍可安全续跑的活动项目创建新一代作业身份。
 /// 返回 true 表示调用方应在项目落盘并释放流水线锁后启动运行器。
 pub(crate) fn reconcile_startup_job(project: &mut project::Project) -> bool {
+    let resumable_validation_recovery = project
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .is_some_and(crate::recovery::validation_retry_can_resume);
     let Some(state) = project.workflow_state.autopilot_state.as_mut() else {
         return false;
     };
@@ -119,7 +124,9 @@ pub(crate) fn reconcile_startup_job(project: &mut project::Project) -> bool {
             | project::AutopilotRecoveryAction::RetryGitConfirmation
     ) || (state.recovery_action
         == project::AutopilotRecoveryAction::RestoreExecutionBaseline
-        && crate::autopilot_failure::is_transient(&state.last_failure_kind));
+        && crate::autopilot_failure::is_transient(&state.last_failure_kind))
+        || (state.recovery_action == project::AutopilotRecoveryAction::RunAutomaticRecovery
+            && resumable_validation_recovery);
     let should_run = project.workflow_state.autopilot_active
         && state.active
         && (state.run_status == project::AutopilotRunStatus::Running
@@ -191,6 +198,80 @@ fn persist_heartbeat(project: &mut project::Project) -> Result<(), String> {
         state.job_owner = project::AutopilotJobOwner::BackendRuntime;
     }
     crate::save_project(project)
+}
+
+fn validation_retry_waiting(project: &project::Project) -> Option<String> {
+    let recovery = project.workflow_state.recovery_state.as_ref()?;
+    if !crate::recovery::validation_retry_can_resume(recovery)
+        || crate::recovery::validation_retry_due(recovery)
+    {
+        return None;
+    }
+    Some(format!(
+        "等待第 {}/{} 次 AI 审查验证重试",
+        recovery.validation_retry_count.saturating_add(1),
+        recovery.max_validation_retries
+    ))
+}
+
+fn action_claim_matches(
+    project: &project::Project,
+    job_id: &str,
+    generation: u64,
+    action_id: &str,
+    action_kind: &str,
+) -> bool {
+    job_matches(project, job_id, generation)
+        && project
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .is_some_and(|state| {
+                state.current_action_id == action_id && state.current_action_kind == action_kind
+            })
+}
+
+enum DispatchOutcome {
+    Completed(Result<(), String>),
+    Superseded,
+}
+
+async fn dispatch_action_with_heartbeat(
+    pipeline_state: &Arc<Mutex<Option<PipelineState>>>,
+    project_name: &str,
+    next: &workflow::AutopilotNextStep,
+    job_id: &str,
+    generation: u64,
+    action_id: &str,
+) -> DispatchOutcome {
+    let dispatch = dispatch_action(pipeline_state, project_name, next);
+    tokio::pin!(dispatch);
+    let mut heartbeat = interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            result = &mut dispatch => return DispatchOutcome::Completed(result),
+            _ = heartbeat.tick() => {
+                let mut latest = match crate::load_project(project_name) {
+                    Ok(project) => project,
+                    Err(error) => return DispatchOutcome::Completed(Err(error)),
+                };
+                if !action_claim_matches(
+                    &latest,
+                    job_id,
+                    generation,
+                    action_id,
+                    &next.command,
+                ) {
+                    return DispatchOutcome::Superseded;
+                }
+                if persist_heartbeat(&mut latest).is_err() {
+                    return DispatchOutcome::Completed(Err(
+                        "自动驾驶动作心跳持久化失败。".to_string(),
+                    ));
+                }
+            }
+        }
+    }
 }
 
 async fn recover_stopped_action(
@@ -362,6 +443,17 @@ async fn drive_project(
         if run_status != project::AutopilotRunStatus::Running {
             break;
         }
+        if let Some(description) = validation_retry_waiting(&project) {
+            if let Some(state) = project.workflow_state.autopilot_state.as_mut() {
+                if state.last_action != description {
+                    state.last_action = description;
+                    state.last_action_at = chrono::Utc::now().to_rfc3339();
+                }
+            }
+            let _ = persist_heartbeat(&mut project);
+            sleep(Duration::from_secs(1)).await;
+            continue;
+        }
         if !retry_due(project.workflow_state.autopilot_state.as_ref().unwrap()) {
             let _ = persist_heartbeat(&mut project);
             sleep(Duration::from_secs(1)).await;
@@ -405,6 +497,7 @@ async fn drive_project(
         if !job_matches(&claimed, &job_id, generation) {
             break;
         }
+        let action_id = uuid::Uuid::new_v4().to_string();
         if let Some(state) = claimed.workflow_state.autopilot_state.as_mut() {
             // 执行引擎重试已经成功推进到确认阶段时，Git 确认必须拥有独立的两次额度。
             // Git 自身重试会保留 RetryGitConfirmation，因此不会在每轮确认前被重置。
@@ -416,7 +509,7 @@ async fn drive_project(
                 state.last_failure_kind = project::AutopilotFailureKind::None;
                 state.last_failure_fingerprint.clear();
             }
-            state.current_action_id = uuid::Uuid::new_v4().to_string();
+            state.current_action_id = action_id.clone();
             state.current_action_kind = next.command.clone();
             state.action_started_at = chrono::Utc::now().to_rfc3339();
             state.heartbeat_at = state.action_started_at.clone();
@@ -427,10 +520,20 @@ async fn drive_project(
             break;
         }
 
-        match dispatch_action(&pipeline_state, &project_name, &next).await {
-            Ok(()) => {
+        match dispatch_action_with_heartbeat(
+            &pipeline_state,
+            &project_name,
+            &next,
+            &job_id,
+            generation,
+            &action_id,
+        )
+        .await
+        {
+            DispatchOutcome::Completed(Ok(())) => {
                 if let Ok(mut latest) = crate::load_project(&project_name) {
-                    if job_matches(&latest, &job_id, generation) {
+                    if action_claim_matches(&latest, &job_id, generation, &action_id, &next.command)
+                    {
                         if let Some(state) = latest.workflow_state.autopilot_state.as_mut() {
                             // 执行命令只负责派发后台任务。基础设施重试状态必须保留到
                             // 执行真正完成并进入确认，否则第二次失败会被误判为首次失败。
@@ -445,7 +548,21 @@ async fn drive_project(
                     }
                 }
             }
-            Err(error) => {
+            DispatchOutcome::Completed(Err(error)) => {
+                let still_current = crate::load_project(&project_name)
+                    .ok()
+                    .is_some_and(|latest| {
+                        action_claim_matches(
+                            &latest,
+                            &job_id,
+                            generation,
+                            &action_id,
+                            &next.command,
+                        )
+                    });
+                if !still_current {
+                    break;
+                }
                 if schedule_git_retry(&project_name, &error)
                     .await
                     .unwrap_or(false)
@@ -457,6 +574,7 @@ async fn drive_project(
                     workflow::autopilot_mark_error(project_name.clone(), next.description, error)
                         .await;
             }
+            DispatchOutcome::Superseded => break,
         }
         sleep(Duration::from_secs(1)).await;
     }
@@ -649,6 +767,69 @@ mod tests {
                 .job_generation,
             8
         );
+    }
+
+    #[test]
+    fn startup_resumes_bounded_validation_retry() {
+        let mut project = active_project(project::AutopilotRunStatus::ErrorStopped);
+        project
+            .workflow_state
+            .autopilot_state
+            .as_mut()
+            .unwrap()
+            .recovery_action = project::AutopilotRecoveryAction::RunAutomaticRecovery;
+        project.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::ReviewTransientFailure,
+            phase: project::RecoveryPhase::Retesting,
+            validation_retry_count: 1,
+            max_validation_retries: 3,
+            next_validation_retry_at: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        });
+
+        assert!(reconcile_startup_job(&mut project));
+        let state = project.workflow_state.autopilot_state.unwrap();
+        assert_eq!(state.job_generation, 8);
+        assert!(state.current_action_id.is_empty());
+        assert_eq!(state.job_owner, project::AutopilotJobOwner::BackendRuntime);
+    }
+
+    #[test]
+    fn validation_retry_waits_for_deadline_and_action_claim_is_exact() {
+        let mut project = active_project(project::AutopilotRunStatus::Running);
+        project.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::ReviewProtocolFailure,
+            phase: project::RecoveryPhase::Retesting,
+            validation_retry_count: 1,
+            max_validation_retries: 2,
+            next_validation_retry_at: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        });
+        assert!(validation_retry_waiting(&project)
+            .as_deref()
+            .is_some_and(|message| message.contains("2/2")));
+        assert!(action_claim_matches(
+            &project,
+            "old-job",
+            7,
+            "old-action",
+            "generate_execution_plan"
+        ));
+        assert!(!action_claim_matches(
+            &project,
+            "old-job",
+            7,
+            "stale-action",
+            "generate_execution_plan"
+        ));
+
+        project
+            .workflow_state
+            .recovery_state
+            .as_mut()
+            .unwrap()
+            .next_validation_retry_at = Some("2020-01-01T00:00:00Z".to_string());
+        assert!(validation_retry_waiting(&project).is_none());
     }
 
     #[test]

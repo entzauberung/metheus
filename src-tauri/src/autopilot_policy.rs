@@ -347,12 +347,32 @@ pub(crate) fn decide_next_step(
                 | project::RecoveryPhase::Retesting
                 | project::RecoveryPhase::Replanning
         ) {
+            if crate::recovery::is_review_validation_recovery(recovery)
+                && !crate::recovery::validation_retry_due(recovery)
+            {
+                let mut decision = waiting(format!(
+                    "等待第 {}/{} 次 AI 审查验证重试",
+                    recovery.validation_retry_count.saturating_add(1),
+                    recovery.max_validation_retries
+                ));
+                decision.kind = AutopilotDecisionKind::RetryAfter;
+                return decision;
+            }
             let recovery_is_running = proj.execution_session.as_ref().is_some_and(|session| {
                 session.active
                     && session.status.eq_ignore_ascii_case("recovering")
                     && session.execution_id == recovery.execution_id
             });
+            let recovery_action_is_claimed = proj
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .is_some_and(|state| {
+                    !state.current_action_id.is_empty()
+                        && state.current_action_kind == "run_error_recovery"
+                });
             if recovery_is_running
+                && recovery_action_is_claimed
                 && matches!(
                     recovery.phase,
                     project::RecoveryPhase::Repairing

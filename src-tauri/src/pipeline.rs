@@ -118,6 +118,64 @@ pub(crate) fn write_execution_history(
     }
 }
 
+fn verification_stage_description(stage: &project::VerificationStage) -> &'static str {
+    match stage {
+        project::VerificationStage::NotStarted => "等待验证",
+        project::VerificationStage::AutomatedTests => "正在运行自动化测试",
+        project::VerificationStage::PreparingEvidence => "正在准备验收证据",
+        project::VerificationStage::RequestingReview => "正在请求 AI 审查",
+        project::VerificationStage::ParsingReview => "正在解析审查结果",
+        project::VerificationStage::DeterministicNormalization => "正在确定性归一化审查协议",
+        project::VerificationStage::ProtocolRepair => "正在按 Schema 修复审查协议",
+        project::VerificationStage::ReviewRetry => "正在重新请求 AI 审查",
+        project::VerificationStage::TargetedEvidence => "正在定向补充验收证据",
+        project::VerificationStage::Completed => "验证已完成",
+    }
+}
+
+/// 按 execution_id 写入验证进度；旧执行或已结束会话不能覆盖当前项目状态。
+pub(crate) fn persist_verification_progress(
+    project_name: &str,
+    execution_id: &str,
+    stage: project::VerificationStage,
+) -> Result<bool, String> {
+    let mut proj = crate::load_project(project_name)?;
+    let Some(session) = proj.execution_session.as_mut().filter(|session| {
+        session.active
+            && session.execution_id == execution_id
+            && matches!(session.status.as_str(), "executing" | "recovering")
+    }) else {
+        return Ok(false);
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    if session.verification_stage != stage {
+        session.verification_stage = stage.clone();
+        session.state_entered_at = now.clone();
+    }
+    if proj.workflow_state.autopilot_active {
+        if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+            let retry = proj
+                .workflow_state
+                .recovery_state
+                .as_ref()
+                .filter(|recovery| crate::recovery::is_review_validation_recovery(recovery))
+                .map(|recovery| {
+                    format!(
+                        "（验证重试 {}/{}）",
+                        recovery.validation_retry_count, recovery.max_validation_retries
+                    )
+                })
+                .unwrap_or_default();
+            autopilot.last_action = format!("{}{}", verification_stage_description(&stage), retry);
+            autopilot.last_action_at = now.clone();
+            autopilot.heartbeat_at = now;
+            autopilot.job_owner = project::AutopilotJobOwner::BackendRuntime;
+        }
+    }
+    crate::save_project(&proj)?;
+    Ok(true)
+}
+
 /// Acquire the pipeline lock for a new execution while rejecting an existing
 /// running session. Keeping this check and the subsequent state reservation
 /// under one guard prevents two callers from launching the same subtask.
@@ -602,7 +660,17 @@ async fn execute_current_subtask_background(
         }
     }
 
-    let mut test = crate::test_runner::check_subtask_with_context(
+    let progress_project_name = project_name.clone();
+    let progress_execution_id = execution_id.clone();
+    let progress: crate::test_runner::VerificationProgressReporter =
+        std::sync::Arc::new(move |stage| {
+            let _ = persist_verification_progress(
+                &progress_project_name,
+                &progress_execution_id,
+                stage,
+            );
+        });
+    let mut test = crate::test_runner::check_subtask_with_context_and_progress(
         &project_path,
         &subtask_goal,
         &subtask_id,
@@ -612,6 +680,7 @@ async fn execute_current_subtask_background(
         Some(authorized_paths.clone()),
         Some(approved_prompt),
         None,
+        progress,
     )
     .await
     .unwrap_or(project::TestResult {
@@ -3731,6 +3800,19 @@ pub fn reconcile_execution_state(
     if queued_recovery {
         return ExecutionReconciliation::AwaitingConfirmation;
     }
+    let queued_validation_retry = session.status.eq_ignore_ascii_case("recovering")
+        && proj
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .is_some_and(|recovery| {
+                recovery.subtask_id == session.subtask_id
+                    && recovery.execution_id == session.execution_id
+                    && crate::recovery::validation_retry_can_resume(recovery)
+            });
+    if queued_validation_retry {
+        return ExecutionReconciliation::AwaitingConfirmation;
+    }
 
     // Check session validity after recognizing persisted recovery queue states.
     if !session.active {
@@ -6123,7 +6205,7 @@ mod tests {
     }
 
     #[test]
-    fn running_recovery_session_survives_startup_reconciliation() {
+    fn validation_retry_and_running_recovery_survive_startup_reconciliation() {
         let proj = execution_project(
             "recovering-session",
             Path::new(""),
@@ -6139,6 +6221,85 @@ mod tests {
             reconcile_execution_state(&proj, Some(&pipeline)),
             ExecutionReconciliation::Executing
         ));
+
+        let mut queued_retry = proj.clone();
+        queued_retry.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::ReviewTransientFailure,
+            phase: project::RecoveryPhase::Retesting,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "recovery-current".to_string(),
+            validation_retry_count: 1,
+            max_validation_retries: 3,
+            next_validation_retry_at: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        });
+        let reconciliation = reconcile_execution_state(&queued_retry, None);
+        assert!(matches!(
+            reconciliation,
+            ExecutionReconciliation::AwaitingConfirmation
+        ));
+        assert!(!apply_execution_reconciliation(
+            &mut queued_retry,
+            &reconciliation
+        ));
+        assert_eq!(
+            queued_retry
+                .workflow_state
+                .recovery_state
+                .as_ref()
+                .map(|recovery| recovery.error_kind.clone()),
+            Some(project::RecoveryErrorKind::ReviewTransientFailure)
+        );
+    }
+
+    #[test]
+    fn validation_progress_rejects_stale_execution_and_updates_heartbeat() -> Result<(), String> {
+        let project_name = unique_project_name("verification-progress");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let session = execution_session("executing", "verification-current", "abc123");
+        let mut proj = execution_project(
+            &project_name,
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(session),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            run_status: project::AutopilotRunStatus::Running,
+            ..Default::default()
+        });
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::ReviewProtocolFailure,
+            phase: project::RecoveryPhase::Retesting,
+            validation_retry_count: 1,
+            max_validation_retries: 2,
+            ..Default::default()
+        });
+        crate::save_project(&proj)?;
+
+        assert!(!persist_verification_progress(
+            &project_name,
+            "verification-stale",
+            project::VerificationStage::ProtocolRepair,
+        )?);
+        assert!(persist_verification_progress(
+            &project_name,
+            "verification-current",
+            project::VerificationStage::ProtocolRepair,
+        )?);
+
+        let persisted = crate::load_project(&project_name)?;
+        let session = persisted.execution_session.as_ref().unwrap();
+        assert_eq!(
+            session.verification_stage,
+            project::VerificationStage::ProtocolRepair
+        );
+        let autopilot = persisted.workflow_state.autopilot_state.as_ref().unwrap();
+        assert!(!autopilot.heartbeat_at.is_empty());
+        assert!(autopilot.last_action.contains("Schema"));
+        assert!(autopilot.last_action.contains("1/2"));
+        Ok(())
     }
 
     #[tokio::test]

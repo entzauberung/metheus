@@ -2,8 +2,20 @@ use crate::project;
 use crate::review_protocol::ModelReviewResponse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::Arc;
 
 pub(crate) type FileSnapshot = BTreeMap<String, u64>;
+pub(crate) type VerificationProgressReporter =
+    Arc<dyn Fn(project::VerificationStage) + Send + Sync>;
+
+fn report_verification_progress(
+    reporter: Option<&VerificationProgressReporter>,
+    stage: project::VerificationStage,
+) {
+    if let Some(reporter) = reporter {
+        reporter(stage);
+    }
+}
 
 fn display_path(path: &str, project_path: &str) -> String {
     std::path::Path::new(path)
@@ -1269,6 +1281,35 @@ pub(crate) async fn check_subtask_with_context(
         execution_prompt,
         evidence_request,
         None,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn check_subtask_with_context_and_progress(
+    project_path: &str,
+    subtask_goal: &str,
+    subtask_id: &str,
+    milestone_id: &str,
+    mid_stage_id: &str,
+    acceptance_criteria: Option<Vec<String>>,
+    authorized_paths: Option<Vec<String>>,
+    execution_prompt: Option<String>,
+    evidence_request: Option<ReviewEvidenceRequest>,
+    progress: VerificationProgressReporter,
+) -> Result<project::TestResult, String> {
+    check_subtask_with_context_inner(
+        project_path,
+        subtask_goal,
+        subtask_id,
+        milestone_id,
+        mid_stage_id,
+        acceptance_criteria,
+        authorized_paths,
+        execution_prompt,
+        evidence_request,
+        None,
+        Some(progress),
     )
     .await
 }
@@ -1284,6 +1325,7 @@ pub(crate) async fn retry_subtask_review_with_context(
     authorized_paths: Option<Vec<String>>,
     execution_prompt: Option<String>,
     previous_test: &project::TestResult,
+    progress: VerificationProgressReporter,
 ) -> Result<project::TestResult, String> {
     check_subtask_with_context_inner(
         project_path,
@@ -1296,6 +1338,7 @@ pub(crate) async fn retry_subtask_review_with_context(
         execution_prompt,
         None,
         Some(previous_test),
+        Some(progress),
     )
     .await
 }
@@ -1311,7 +1354,17 @@ async fn check_subtask_with_context_inner(
     execution_prompt: Option<String>,
     evidence_request: Option<ReviewEvidenceRequest>,
     previous_test: Option<&project::TestResult>,
+    progress: Option<VerificationProgressReporter>,
 ) -> Result<project::TestResult, String> {
+    let preparing_stage = if evidence_request
+        .as_ref()
+        .is_some_and(|request| request.strategy != project::ReviewEvidenceStrategy::Standard)
+    {
+        project::VerificationStage::TargetedEvidence
+    } else {
+        project::VerificationStage::PreparingEvidence
+    };
+    report_verification_progress(progress.as_ref(), preparing_stage);
     // 1.尝试 git diff --name-only 获取改动文件
     let files = git_changed_files(project_path);
 
@@ -1352,8 +1405,13 @@ async fn check_subtask_with_context_inner(
     );
     // ===== 真测试：检测项目类型，执行对应的测试命令 =====
     let test_evidence = if let Some(previous) = previous_test {
+        report_verification_progress(progress.as_ref(), project::VerificationStage::ReviewRetry);
         AutomatedTestEvidence::from_previous(previous)
     } else {
+        report_verification_progress(
+            progress.as_ref(),
+            project::VerificationStage::AutomatedTests,
+        );
         let project_root = std::path::Path::new(project_path);
 
         // 优先检测自定义测试命令文件 .metheus-test
@@ -1622,11 +1680,24 @@ async fn check_subtask_with_context_inner(
     //     test_output.as_ref().map(|s| s.len()).unwrap_or(0));
     // 调用 AI（强制 JSON 模式）
     let mut diagnosis_warnings: Vec<String> = Vec::new();
+    report_verification_progress(
+        progress.as_ref(),
+        project::VerificationStage::RequestingReview,
+    );
     let review_reply =
         crate::api::call_deepseek_api_json_typed(crate::prompts::TEST_PROMPT, &user_message).await;
     let mut test_result: project::TestResult = match review_reply {
         Ok(raw_reply) => {
-            match crate::review_protocol::parse_review_response_with_repair(&raw_reply).await {
+            report_verification_progress(
+                progress.as_ref(),
+                project::VerificationStage::ParsingReview,
+            );
+            match crate::review_protocol::parse_review_response_with_repair_and_progress(
+                &raw_reply,
+                progress.as_deref(),
+            )
+            .await
+            {
                 Ok(normalized) => {
                     let mut response = normalized.response;
                     if normalized.normalized_field_count > 0 {
@@ -1737,6 +1808,8 @@ async fn check_subtask_with_context_inner(
         }
         _ => {}
     }
+
+    report_verification_progress(progress.as_ref(), test_result.verification_stage.clone());
 
     Ok(test_result)
 }

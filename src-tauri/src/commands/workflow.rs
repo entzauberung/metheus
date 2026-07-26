@@ -2395,6 +2395,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_retry_is_dispatched_only_after_deadline() -> Result<(), String> {
+        let project_name = unique_project_name("ap-validation-retry-deadline");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        activate_autopilot(&mut proj, "milestone-1");
+        proj.execution_session = Some(project::ExecutionSession {
+            execution_id: "review-retry-1".to_string(),
+            active: true,
+            subtask_id: "subtask-1".to_string(),
+            status: "recovering".to_string(),
+            ..Default::default()
+        });
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::ReviewTransientFailure,
+            phase: project::RecoveryPhase::Retesting,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "review-retry-1".to_string(),
+            validation_retry_count: 1,
+            max_validation_retries: 3,
+            next_validation_retry_at: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        });
+        crate::save_project(&proj)?;
+
+        let waiting = autopilot_next_step(project_name.clone()).await?;
+        assert!(waiting.waiting_for_execution);
+        assert!(waiting.command.is_empty());
+        assert!(waiting.description.contains("2/3"));
+
+        let mut due = crate::load_project(&project_name)?;
+        due.workflow_state
+            .recovery_state
+            .as_mut()
+            .unwrap()
+            .next_validation_retry_at = Some("2020-01-01T00:00:00Z".to_string());
+        crate::save_project(&due)?;
+        let ready = autopilot_next_step(project_name.clone()).await?;
+        assert_eq!(ready.command, "run_error_recovery");
+
+        let mut claimed = crate::load_project(&project_name)?;
+        let state = claimed.workflow_state.autopilot_state.as_mut().unwrap();
+        state.current_action_id = "current-recovery-action".to_string();
+        state.current_action_kind = "run_error_recovery".to_string();
+        crate::save_project(&claimed)?;
+        let in_flight = autopilot_next_step(project_name).await?;
+        assert!(in_flight.waiting_for_execution);
+        assert!(in_flight.command.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn toggle_autopilot_requires_console_phase() -> Result<(), String> {
         let project_name = unique_project_name("ap-phase");
         let _guard = ProjectDataGuard::new(&project_name)?;

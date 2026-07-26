@@ -546,10 +546,11 @@ pub(crate) fn parse_review_response(
     })
 }
 
-pub(crate) async fn parse_review_response_with_repair(
+pub(crate) async fn parse_review_response_with_repair_and_progress(
     raw: &str,
+    progress: Option<&(dyn Fn(project::VerificationStage) + Send + Sync)>,
 ) -> Result<NormalizedReviewResponse, ReviewProtocolError> {
-    parse_review_response_with_repair_using(raw, |response_text, error| async move {
+    parse_review_response_with_repair_using(raw, progress, |response_text, error| async move {
         crate::json_utils::repair_json_once_with_contract(
             &response_text,
             crate::prompts::REVIEW_SCHEMA_CONTRACT,
@@ -574,18 +575,25 @@ pub(crate) async fn parse_review_response_with_repair(
 
 async fn parse_review_response_with_repair_using<F, Fut>(
     raw: &str,
+    progress: Option<&(dyn Fn(project::VerificationStage) + Send + Sync)>,
     repair: F,
 ) -> Result<NormalizedReviewResponse, ReviewProtocolError>
 where
     F: FnOnce(String, ReviewProtocolError) -> Fut,
     Fut: Future<Output = Result<String, ReviewProtocolError>>,
 {
+    if let Some(progress) = progress {
+        progress(project::VerificationStage::DeterministicNormalization);
+    }
     let initial_error = match parse_review_response(raw) {
         Ok(response) => return Ok(response),
         Err(error) => error,
     };
     if initial_error.kind == project::ReviewFailureKind::EmptyResponse {
         return Err(initial_error);
+    }
+    if let Some(progress) = progress {
+        progress(project::VerificationStage::ProtocolRepair);
     }
     let repaired = repair(raw.to_string(), initial_error.clone()).await?;
     match parse_review_response(&repaired) {
@@ -604,7 +612,7 @@ where
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn normalizes_common_review_type_drift_deterministically() -> Result<(), String> {
@@ -689,6 +697,7 @@ mod tests {
         let observed = calls.clone();
         let error = parse_review_response_with_repair_using(
             r#"{"passed":"yes"}"#,
+            None,
             move |_raw, first_error| {
                 observed.fetch_add(1, Ordering::SeqCst);
                 async move {
@@ -705,8 +714,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_protocol_progress_reports_normalization_and_schema_repair_stages() {
+        let stages = Arc::new(Mutex::new(Vec::new()));
+        let observed = stages.clone();
+        let reporter = move |stage| observed.lock().unwrap().push(stage);
+        let normalized = parse_review_response_with_repair_using(
+            r#"{"passed":"yes"}"#,
+            Some(&reporter),
+            |_raw, _error| async move { Ok(r#"{"passed":true}"#.to_string()) },
+        )
+        .await
+        .unwrap();
+
+        assert!(normalized.response.passed);
+        assert_eq!(
+            *stages.lock().unwrap(),
+            vec![
+                project::VerificationStage::DeterministicNormalization,
+                project::VerificationStage::ProtocolRepair,
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn empty_response_skips_protocol_repair() {
-        let error = parse_review_response_with_repair_using("", |_raw, _error| async move {
+        let error = parse_review_response_with_repair_using("", None, |_raw, _error| async move {
             panic!("empty responses must be reviewed again, not synthesized")
         })
         .await
