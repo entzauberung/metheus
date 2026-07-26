@@ -26,12 +26,31 @@ pub(crate) async fn call_deepseek_api_json(
     call_deepseek_api_inner(system_prompt, user_message, true, 0.5).await
 }
 
+/// 审查链路使用的结构化入口。其他业务继续接收字符串错误，避免改变既有行为。
+pub(crate) async fn call_deepseek_api_json_typed(
+    system_prompt: &str,
+    user_message: &str,
+) -> Result<String, ApiRequestError> {
+    call_deepseek_api_inner_typed(system_prompt, user_message, true, 0.5).await
+}
+
 pub(crate) async fn call_deepseek_api_inner(
     system_prompt: &str,
     user_message: &str,
     force_json: bool,
     temperature: f64,
 ) -> Result<String, String> {
+    call_deepseek_api_inner_typed(system_prompt, user_message, force_json, temperature)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn call_deepseek_api_inner_typed(
+    system_prompt: &str,
+    user_message: &str,
+    force_json: bool,
+    temperature: f64,
+) -> Result<String, ApiRequestError> {
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if !system_prompt.is_empty() {
         messages.push(serde_json::json!({
@@ -44,7 +63,18 @@ pub(crate) async fn call_deepseek_api_inner(
         "content": user_message
     }));
 
-    call_deepseek_api_messages(messages, force_json, temperature).await
+    let snapshot = crate::settings::begin_decision_request().map_err(|message| {
+        ApiRequestError::new(ModelConnectionErrorKind::MissingSecret, message)
+    })?;
+    let _settings_revision = snapshot.settings_revision;
+    send_openai_compatible(
+        &snapshot.settings,
+        &snapshot.api_key,
+        messages,
+        force_json,
+        temperature,
+    )
+    .await
 }
 
 pub(crate) async fn call_deepseek_api_messages(
@@ -116,7 +146,7 @@ where
 }
 
 #[derive(Debug, Clone)]
-struct ApiRequestError {
+pub(crate) struct ApiRequestError {
     kind: ModelConnectionErrorKind,
     message: String,
 }
@@ -127,6 +157,31 @@ impl ApiRequestError {
             kind,
             message: message.into(),
         }
+    }
+
+    pub(crate) fn review_failure_kind(&self) -> crate::project::ReviewFailureKind {
+        match self.kind {
+            ModelConnectionErrorKind::Network => crate::project::ReviewFailureKind::Network,
+            ModelConnectionErrorKind::Timeout => crate::project::ReviewFailureKind::Timeout,
+            ModelConnectionErrorKind::RateLimited => crate::project::ReviewFailureKind::RateLimited,
+            ModelConnectionErrorKind::Authentication
+            | ModelConnectionErrorKind::MissingSecret
+            | ModelConnectionErrorKind::InvalidConfiguration => {
+                crate::project::ReviewFailureKind::Authentication
+            }
+            ModelConnectionErrorKind::QuotaExceeded => {
+                crate::project::ReviewFailureKind::QuotaExceeded
+            }
+            ModelConnectionErrorKind::ProviderUnavailable
+            | ModelConnectionErrorKind::Protocol
+            | ModelConnectionErrorKind::HttpStatus => {
+                crate::project::ReviewFailureKind::ServiceUnavailable
+            }
+        }
+    }
+
+    pub(crate) fn diagnostic_summary(&self) -> &str {
+        &self.message
     }
 }
 

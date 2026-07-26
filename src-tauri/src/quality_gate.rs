@@ -7,6 +7,11 @@ pub(crate) enum QualityGateOutcome {
     EvidenceInsufficient,
     ContractConflict,
     ReviewOscillation,
+    AutomatedTestUnavailable,
+    ReviewTransientFailure,
+    ReviewProtocolFailure,
+    ReviewServiceBlocked,
+    /// 旧结果缺少结构化状态时的兼容值。
     TestUnavailable,
 }
 
@@ -44,6 +49,18 @@ impl QualityGateEvaluation {
             QualityGateOutcome::ReviewOscillation => {
                 project::RecoveryErrorKind::ValidationOscillation
             }
+            QualityGateOutcome::AutomatedTestUnavailable => {
+                project::RecoveryErrorKind::AutomatedTestUnavailable
+            }
+            QualityGateOutcome::ReviewTransientFailure => {
+                project::RecoveryErrorKind::ReviewTransientFailure
+            }
+            QualityGateOutcome::ReviewProtocolFailure => {
+                project::RecoveryErrorKind::ReviewProtocolFailure
+            }
+            QualityGateOutcome::ReviewServiceBlocked => {
+                project::RecoveryErrorKind::ReviewServiceBlocked
+            }
             QualityGateOutcome::TestUnavailable => project::RecoveryErrorKind::TestUnavailable,
         }
     }
@@ -54,14 +71,6 @@ fn evaluation(outcome: QualityGateOutcome, message: impl Into<String>) -> Qualit
         outcome,
         message: message.into(),
     }
-}
-
-fn review_service_unavailable(test: &project::TestResult) -> bool {
-    test.review_evidence_status == project::ReviewEvidenceStatus::Unavailable
-        || test
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("AI API") || warning.contains("解析失败"))
 }
 
 pub(crate) fn evaluate(
@@ -83,12 +92,48 @@ pub(crate) fn evaluate(
             "自动化测试明确失败，质量门禁阻断",
         );
     }
-    if test.automated_test_status == project::AutomatedTestStatus::Unavailable
-        || review_service_unavailable(test)
-    {
+    if test.automated_test_status == project::AutomatedTestStatus::Unavailable {
         return evaluation(
-            QualityGateOutcome::TestUnavailable,
-            "测试或代码审查服务不可用",
+            QualityGateOutcome::AutomatedTestUnavailable,
+            "自动化测试环境不可用",
+        );
+    }
+    if test.review_status == project::ReviewStatus::Failed {
+        return match test.review_failure_kind.as_ref() {
+            Some(
+                project::ReviewFailureKind::Network
+                | project::ReviewFailureKind::Timeout
+                | project::ReviewFailureKind::RateLimited
+                | project::ReviewFailureKind::ServiceUnavailable,
+            ) => evaluation(
+                QualityGateOutcome::ReviewTransientFailure,
+                "AI 审查服务暂时不可用",
+            ),
+            Some(
+                project::ReviewFailureKind::EmptyResponse
+                | project::ReviewFailureKind::InvalidJson
+                | project::ReviewFailureKind::FieldTypeMismatch,
+            ) => evaluation(
+                QualityGateOutcome::ReviewProtocolFailure,
+                "AI 审查结果未通过协议校验",
+            ),
+            Some(
+                project::ReviewFailureKind::Authentication
+                | project::ReviewFailureKind::QuotaExceeded,
+            ) => evaluation(
+                QualityGateOutcome::ReviewServiceBlocked,
+                "AI 审查服务因认证或额度问题阻断",
+            ),
+            None => evaluation(
+                QualityGateOutcome::TestUnavailable,
+                "旧审查结果缺少结构化失败分类",
+            ),
+        };
+    }
+    if test.review_evidence_status == project::ReviewEvidenceStatus::Unavailable {
+        return evaluation(
+            QualityGateOutcome::EvidenceInsufficient,
+            "代码审查证据不可用",
         );
     }
     if review_oscillation {
@@ -170,8 +215,75 @@ mod tests {
             automated_test_status: project::AutomatedTestStatus::NotConfigured,
             verification_kind: project::VerificationKind::CodeReviewOnly,
             review_evidence_status: project::ReviewEvidenceStatus::Partial,
+            review_status: project::ReviewStatus::Completed,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn structured_review_failures_do_not_parse_warning_text() {
+        let mut test = reviewed_test();
+        test.warnings
+            .push("AI API 调用失败：仅为旧诊断文本".to_string());
+        assert!(evaluate(
+            Some(&test),
+            &ledger(project::AcceptanceStatus::Satisfied),
+            1,
+            false,
+        )
+        .passed());
+
+        test.review_status = project::ReviewStatus::Failed;
+        for kind in [
+            project::ReviewFailureKind::Network,
+            project::ReviewFailureKind::Timeout,
+            project::ReviewFailureKind::RateLimited,
+            project::ReviewFailureKind::ServiceUnavailable,
+        ] {
+            test.review_failure_kind = Some(kind);
+            assert_eq!(
+                evaluate(Some(&test), &[], 0, false).outcome,
+                QualityGateOutcome::ReviewTransientFailure
+            );
+        }
+        for kind in [
+            project::ReviewFailureKind::EmptyResponse,
+            project::ReviewFailureKind::InvalidJson,
+            project::ReviewFailureKind::FieldTypeMismatch,
+        ] {
+            test.review_failure_kind = Some(kind);
+            assert_eq!(
+                evaluate(Some(&test), &[], 0, false).outcome,
+                QualityGateOutcome::ReviewProtocolFailure
+            );
+        }
+        for kind in [
+            project::ReviewFailureKind::Authentication,
+            project::ReviewFailureKind::QuotaExceeded,
+        ] {
+            test.review_failure_kind = Some(kind);
+            assert_eq!(
+                evaluate(Some(&test), &[], 0, false).outcome,
+                QualityGateOutcome::ReviewServiceBlocked
+            );
+        }
+    }
+
+    #[test]
+    fn automated_test_unavailable_is_distinct_from_review_evidence() {
+        let mut test = reviewed_test();
+        test.automated_test_status = project::AutomatedTestStatus::Unavailable;
+        assert_eq!(
+            evaluate(Some(&test), &[], 0, false).outcome,
+            QualityGateOutcome::AutomatedTestUnavailable
+        );
+
+        test.automated_test_status = project::AutomatedTestStatus::NotConfigured;
+        test.review_evidence_status = project::ReviewEvidenceStatus::Unavailable;
+        assert_eq!(
+            evaluate(Some(&test), &[], 0, false).outcome,
+            QualityGateOutcome::EvidenceInsufficient
+        );
     }
 
     #[test]

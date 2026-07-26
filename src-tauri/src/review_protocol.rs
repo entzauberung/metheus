@@ -558,6 +558,16 @@ pub(crate) async fn parse_review_response_with_repair(
             &error.actual,
         )
         .await
+        .map_err(|repair_error| ReviewProtocolError {
+            kind: repair_error.review_failure_kind(),
+            path: error.path.clone(),
+            expected: error.expected.clone(),
+            actual: format!(
+                "protocol repair request failed: {}",
+                truncate_chars(repair_error.diagnostic_summary(), 300)
+            ),
+            protocol_repair_attempted: true,
+        })
     })
     .await
 }
@@ -568,7 +578,7 @@ async fn parse_review_response_with_repair_using<F, Fut>(
 ) -> Result<NormalizedReviewResponse, ReviewProtocolError>
 where
     F: FnOnce(String, ReviewProtocolError) -> Fut,
-    Fut: Future<Output = Result<String, String>>,
+    Fut: Future<Output = Result<String, ReviewProtocolError>>,
 {
     let initial_error = match parse_review_response(raw) {
         Ok(response) => return Ok(response),
@@ -577,18 +587,7 @@ where
     if initial_error.kind == project::ReviewFailureKind::EmptyResponse {
         return Err(initial_error);
     }
-    let repaired = repair(raw.to_string(), initial_error.clone())
-        .await
-        .map_err(|repair_error| ReviewProtocolError {
-            kind: initial_error.kind,
-            path: initial_error.path,
-            expected: initial_error.expected,
-            actual: format!(
-                "protocol repair request failed: {}",
-                truncate_chars(&repair_error, 300)
-            ),
-            protocol_repair_attempted: true,
-        })?;
+    let repaired = repair(raw.to_string(), initial_error.clone()).await?;
     match parse_review_response(&repaired) {
         Ok(mut response) => {
             response.protocol_repair_attempted = true;

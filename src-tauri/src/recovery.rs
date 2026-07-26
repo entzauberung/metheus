@@ -3306,7 +3306,7 @@ mod tests {
         };
         assert_eq!(
             classify_test_result(Some(&unavailable)),
-            project::RecoveryErrorKind::TestUnavailable
+            project::RecoveryErrorKind::AutomatedTestUnavailable
         );
 
         let failed_with_unavailable_review = project::TestResult {
@@ -3318,6 +3318,27 @@ mod tests {
         assert_eq!(
             classify_test_result(Some(&failed_with_unavailable_review)),
             project::RecoveryErrorKind::TestFailure
+        );
+
+        let mut review_failure = project::TestResult {
+            review_status: project::ReviewStatus::Failed,
+            warnings: vec!["AI API 和解析失败文本不得参与分类".to_string()],
+            ..Default::default()
+        };
+        review_failure.review_failure_kind = Some(project::ReviewFailureKind::FieldTypeMismatch);
+        assert_eq!(
+            classify_test_result(Some(&review_failure)),
+            project::RecoveryErrorKind::ReviewProtocolFailure
+        );
+        review_failure.review_failure_kind = Some(project::ReviewFailureKind::Network);
+        assert_eq!(
+            classify_test_result(Some(&review_failure)),
+            project::RecoveryErrorKind::ReviewTransientFailure
+        );
+        review_failure.review_failure_kind = Some(project::ReviewFailureKind::Authentication);
+        assert_eq!(
+            classify_test_result(Some(&review_failure)),
+            project::RecoveryErrorKind::ReviewServiceBlocked
         );
 
         let partial_review = project::TestResult {

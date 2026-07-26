@@ -1514,72 +1514,82 @@ pub(crate) async fn check_subtask_with_context(
     //     test_output.as_ref().map(|s| s.len()).unwrap_or(0));
     // 调用 AI（强制 JSON 模式）
     let mut diagnosis_warnings: Vec<String> = Vec::new();
-    let raw_reply = crate::api::call_deepseek_api_json(crate::prompts::TEST_PROMPT, &user_message)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("[check_subtask] AI API 调用失败：{}，返回兜底 JSON", e);
-            diagnosis_warnings.push(format!("AI API 调用失败：{}", e));
-            r#"{"passed": false, "issues": ["AI API 调用失败"], "suggestion": "", "warnings": []}"#
-                .to_string()
-        });
-    // 解析 JSON 响应（带兜底）
-    let mut test_result: project::TestResult =
-        match crate::review_protocol::parse_review_response_with_repair(&raw_reply).await {
-            Ok(normalized) => {
-                let mut response = normalized.response;
-                if normalized.normalized_field_count > 0 {
-                    response.warnings.push(format!(
-                        "审查协议已确定性归一化 {} 个字段",
-                        normalized.normalized_field_count
-                    ));
-                }
-                response.warnings.extend(diagnosis_warnings);
-                let mut result = normalize_model_review(
-                    response,
-                    acceptance_criteria.as_deref().unwrap_or_default(),
-                    authorized_paths.as_deref().unwrap_or_default(),
-                    &evidence_request,
-                    &review_evidence,
-                );
-                result.review_protocol_attempts = u32::from(normalized.normalized_field_count > 0)
-                    + u32::from(normalized.protocol_repair_attempted);
-                result
-            }
-            Err(e) => {
-                eprintln!(
-                    "[check_subtask] 审查协议解析失败：{}，使用结构化失败结果",
-                    e
-                );
-                diagnosis_warnings.push(format!("审查协议解析失败：{}", e));
-                let mut response = ModelReviewResponse::default();
-                response.issues.push("AI 审查结果协议异常".to_string());
-                response.suggestion = "重新请求代码审查".to_string();
-                response.warnings = diagnosis_warnings;
-                let mut result = normalize_model_review(
-                    response,
-                    acceptance_criteria.as_deref().unwrap_or_default(),
-                    authorized_paths.as_deref().unwrap_or_default(),
-                    &evidence_request,
-                    &review_evidence,
-                );
-                result.verification_stage = if e.protocol_repair_attempted {
-                    project::VerificationStage::ProtocolRepair
-                } else {
-                    match &e.kind {
-                        project::ReviewFailureKind::InvalidJson
-                        | project::ReviewFailureKind::EmptyResponse => {
-                            project::VerificationStage::ParsingReview
-                        }
-                        _ => project::VerificationStage::DeterministicNormalization,
+    let review_reply =
+        crate::api::call_deepseek_api_json_typed(crate::prompts::TEST_PROMPT, &user_message).await;
+    let mut test_result: project::TestResult = match review_reply {
+        Ok(raw_reply) => {
+            match crate::review_protocol::parse_review_response_with_repair(&raw_reply).await {
+                Ok(normalized) => {
+                    let mut response = normalized.response;
+                    if normalized.normalized_field_count > 0 {
+                        response.warnings.push(format!(
+                            "审查协议已确定性归一化 {} 个字段",
+                            normalized.normalized_field_count
+                        ));
                     }
-                };
-                result.review_diagnostic_summary = e.to_string();
-                result.review_status = project::ReviewStatus::Failed;
-                result.review_protocol_attempts = u32::from(e.protocol_repair_attempted);
-                result.review_failure_kind = Some(e.kind);
-                result
+                    response.warnings.extend(diagnosis_warnings);
+                    let mut result = normalize_model_review(
+                        response,
+                        acceptance_criteria.as_deref().unwrap_or_default(),
+                        authorized_paths.as_deref().unwrap_or_default(),
+                        &evidence_request,
+                        &review_evidence,
+                    );
+                    result.review_protocol_attempts =
+                        u32::from(normalized.normalized_field_count > 0)
+                            + u32::from(normalized.protocol_repair_attempted);
+                    result
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[check_subtask] 审查协议解析失败：{}，使用结构化失败结果",
+                        e
+                    );
+                    diagnosis_warnings.push(format!("审查协议解析失败：{}", e));
+                    let mut response = ModelReviewResponse::default();
+                    response.issues.push("AI 审查结果协议异常".to_string());
+                    response.suggestion = "重新请求代码审查".to_string();
+                    response.warnings = diagnosis_warnings;
+                    let mut result = normalize_model_review(
+                        response,
+                        acceptance_criteria.as_deref().unwrap_or_default(),
+                        authorized_paths.as_deref().unwrap_or_default(),
+                        &evidence_request,
+                        &review_evidence,
+                    );
+                    result.verification_stage = if e.protocol_repair_attempted {
+                        project::VerificationStage::ProtocolRepair
+                    } else {
+                        match &e.kind {
+                            project::ReviewFailureKind::InvalidJson
+                            | project::ReviewFailureKind::EmptyResponse => {
+                                project::VerificationStage::ParsingReview
+                            }
+                            _ => project::VerificationStage::DeterministicNormalization,
+                        }
+                    };
+                    result.review_diagnostic_summary = e.to_string();
+                    result.review_status = project::ReviewStatus::Failed;
+                    result.review_protocol_attempts = u32::from(e.protocol_repair_attempted);
+                    result.review_failure_kind = Some(e.kind);
+                    result
+                }
             }
-        };
+        }
+        Err(error) => {
+            eprintln!("[check_subtask] AI 审查请求失败：{}", error);
+            project::TestResult {
+                passed: false,
+                review_passed: false,
+                review_status: project::ReviewStatus::Failed,
+                review_failure_kind: Some(error.review_failure_kind()),
+                review_diagnostic_summary: error.diagnostic_summary().to_string(),
+                verification_stage: project::VerificationStage::RequestingReview,
+                warnings: vec!["AI 审查请求失败".to_string()],
+                ..Default::default()
+            }
+        }
+    };
     test_result.test_command = test_evidence.command;
     test_result.test_exit_code = test_evidence.exit_code;
     test_result.test_output_summary = test_evidence.output_summary;

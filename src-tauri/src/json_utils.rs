@@ -80,10 +80,11 @@ pub(crate) async fn repair_json_once_with_contract(
     error_path: &str,
     expected: &str,
     actual: &str,
-) -> Result<String, String> {
+) -> Result<String, crate::api::ApiRequestError> {
     let user_message =
         schema_repair_user_message(response_text, schema_contract, error_path, expected, actual);
-    call_deepseek_api_inner(SCHEMA_REPAIR_SYSTEM_PROMPT, &user_message, true, 0.0).await
+    crate::api::call_deepseek_api_inner_typed(SCHEMA_REPAIR_SYSTEM_PROMPT, &user_message, true, 0.0)
+        .await
 }
 
 /// 带重试的 JSON 解析
