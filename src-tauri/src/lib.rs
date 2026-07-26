@@ -31,6 +31,7 @@ mod quality_gate;
 mod recovery;
 mod recovery_checkpoint;
 mod recovery_learning;
+mod review_protocol;
 mod settings;
 mod snapshot;
 mod test_runner;

@@ -1,4 +1,5 @@
 use crate::project;
+use crate::review_protocol::ModelReviewResponse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -31,10 +32,11 @@ pub(crate) fn detect_changes(
 mod change_detection_tests {
     use super::{
         build_review_evidence_with_request, detect_changes, git_changed_files,
-        normalize_model_review, truncate_head_tail, FileSnapshot, ModelCriterionReview,
-        ModelReviewIssue, ModelReviewResponse, ReviewEvidence, ReviewEvidenceRequest,
+        normalize_model_review, truncate_head_tail, FileSnapshot, ReviewEvidence,
+        ReviewEvidenceRequest,
     };
     use crate::project::ReviewEvidenceStatus;
+    use crate::review_protocol::{ModelCriterionReview, ModelReviewIssue, ModelReviewResponse};
     use std::process::Command;
 
     #[test]
@@ -258,6 +260,46 @@ mod change_detection_tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("总体结论")));
+    }
+
+    #[test]
+    fn review_protocol_removes_invalid_ids_without_relaxing_authorized_evidence() {
+        let reference = crate::project::ReviewEvidenceReference {
+            block_id: "E001".to_string(),
+            source_kind: crate::project::EvidenceSourceKind::CurrentFileSnippet,
+            file: "index.html".to_string(),
+            start_line: Some(1),
+            end_line: Some(3),
+        };
+        let evidence = ReviewEvidence {
+            rendered: String::new(),
+            status: crate::project::ReviewEvidenceStatus::Complete,
+            summary: String::new(),
+            blocks: std::collections::BTreeMap::from([("E001".to_string(), reference)]),
+        };
+        let response = ModelReviewResponse {
+            passed: true,
+            criterion_reviews: Some(vec![ModelCriterionReview {
+                criterion_index: 1,
+                conclusion: crate::project::CriterionReviewConclusion::Satisfied,
+                confidence: 0.9,
+                evidence_block_ids: vec!["UNKNOWN".to_string(), "E001".to_string()],
+            }]),
+            ..Default::default()
+        };
+        let result = normalize_model_review(
+            response,
+            &["按钮可点击".to_string()],
+            &["index.html".to_string()],
+            &ReviewEvidenceRequest::default(),
+            &evidence,
+        );
+        assert!(result.review_passed);
+        assert_eq!(result.criterion_reviews[0].evidence_references.len(), 1);
+        assert_eq!(
+            result.criterion_reviews[0].evidence_references[0].block_id,
+            "E001"
+        );
     }
 }
 /// 调用方（如 check_subtask）
@@ -974,56 +1016,6 @@ impl AutomatedTestEvidence {
     }
 }
 
-#[derive(Debug, Default, serde::Deserialize)]
-struct ModelCriterionReview {
-    #[serde(default)]
-    criterion_index: u32,
-    #[serde(default)]
-    conclusion: project::CriterionReviewConclusion,
-    #[serde(default)]
-    confidence: f64,
-    #[serde(default)]
-    evidence_block_ids: Vec<String>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct ModelReviewIssue {
-    #[serde(default)]
-    criterion_index: Option<u32>,
-    #[serde(default)]
-    criterion: String,
-    #[serde(default)]
-    file: String,
-    #[serde(default)]
-    expected: String,
-    #[serde(default)]
-    actual: String,
-    #[serde(default)]
-    suggested_change: String,
-    #[serde(default)]
-    confidence: f64,
-    #[serde(default)]
-    severity: Option<project::ReviewIssueSeverity>,
-    #[serde(default)]
-    evidence_block_ids: Vec<String>,
-}
-
-#[derive(Debug, Default, serde::Deserialize)]
-struct ModelReviewResponse {
-    #[serde(default)]
-    passed: bool,
-    #[serde(default)]
-    issues: Vec<String>,
-    #[serde(default)]
-    suggestion: String,
-    #[serde(default)]
-    review_issues: Vec<ModelReviewIssue>,
-    #[serde(default)]
-    warnings: Vec<String>,
-    #[serde(default)]
-    criterion_reviews: Option<Vec<ModelCriterionReview>>,
-}
-
 fn resolve_evidence_references(
     block_ids: &[String],
     evidence: &ReviewEvidence,
@@ -1042,9 +1034,11 @@ fn resolve_evidence_references(
         if !seen.insert(block_id) {
             continue;
         }
-        let reference = evidence.blocks.get(block_id)?;
+        let Some(reference) = evidence.blocks.get(block_id) else {
+            continue;
+        };
         if !authorized.is_empty() && !authorized.contains(reference.file.as_str()) {
-            return None;
+            continue;
         }
         references.push(reference.clone());
     }
@@ -1172,6 +1166,8 @@ fn normalize_model_review(
         criterion_reviews,
         warnings,
         review_passed,
+        verification_stage: project::VerificationStage::Completed,
+        review_status: project::ReviewStatus::Completed,
         ..Default::default()
     }
 }
@@ -1528,41 +1524,54 @@ pub(crate) async fn check_subtask_with_context(
         });
     // 解析 JSON 响应（带兜底）
     let mut test_result: project::TestResult =
-        match crate::json_utils::parse_json_with_retry::<ModelReviewResponse>(&raw_reply).await {
-            Ok(mut response) => {
+        match crate::review_protocol::parse_review_response(&raw_reply) {
+            Ok(normalized) => {
+                let mut response = normalized.response;
+                if normalized.normalized_field_count > 0 {
+                    response.warnings.push(format!(
+                        "审查协议已确定性归一化 {} 个字段",
+                        normalized.normalized_field_count
+                    ));
+                }
                 response.warnings.extend(diagnosis_warnings);
-                normalize_model_review(
+                let mut result = normalize_model_review(
                     response,
                     acceptance_criteria.as_deref().unwrap_or_default(),
                     authorized_paths.as_deref().unwrap_or_default(),
                     &evidence_request,
                     &review_evidence,
-                )
+                );
+                result.review_protocol_attempts = u32::from(normalized.normalized_field_count > 0);
+                result
             }
             Err(e) => {
                 eprintln!(
-                    "[check_subtask] TestResult JSON 解析失败：{}，使用默认失败结果",
+                    "[check_subtask] 审查协议解析失败：{}，使用结构化失败结果",
                     e
                 );
-                let preview: String = raw_reply.chars().take(200).collect();
-                diagnosis_warnings.push(format!(
-                    "TestResult JSON 解析失败：{}。原始内容（前200字符）：{}",
-                    e, preview
-                ));
+                diagnosis_warnings.push(format!("审查协议解析失败：{}", e));
                 let mut response = ModelReviewResponse::default();
-                response.issues.push(format!(
-                    "AI 返回格式异常，解析失败：{}。原始内容（前200字符）：{}",
-                    e, preview
-                ));
-                response.suggestion = "AI 返回格式异常，请人工审查".to_string();
+                response.issues.push("AI 审查结果协议异常".to_string());
+                response.suggestion = "重新请求代码审查".to_string();
                 response.warnings = diagnosis_warnings;
-                normalize_model_review(
+                let mut result = normalize_model_review(
                     response,
                     acceptance_criteria.as_deref().unwrap_or_default(),
                     authorized_paths.as_deref().unwrap_or_default(),
                     &evidence_request,
                     &review_evidence,
-                )
+                );
+                result.verification_stage = match e.kind {
+                    project::ReviewFailureKind::InvalidJson
+                    | project::ReviewFailureKind::EmptyResponse => {
+                        project::VerificationStage::ParsingReview
+                    }
+                    _ => project::VerificationStage::DeterministicNormalization,
+                };
+                result.review_diagnostic_summary = e.to_string();
+                result.review_status = project::ReviewStatus::Failed;
+                result.review_failure_kind = Some(e.kind);
+                result
             }
         };
     test_result.test_command = test_evidence.command;
