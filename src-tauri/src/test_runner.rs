@@ -1524,7 +1524,7 @@ pub(crate) async fn check_subtask_with_context(
         });
     // 解析 JSON 响应（带兜底）
     let mut test_result: project::TestResult =
-        match crate::review_protocol::parse_review_response(&raw_reply) {
+        match crate::review_protocol::parse_review_response_with_repair(&raw_reply).await {
             Ok(normalized) => {
                 let mut response = normalized.response;
                 if normalized.normalized_field_count > 0 {
@@ -1541,7 +1541,8 @@ pub(crate) async fn check_subtask_with_context(
                     &evidence_request,
                     &review_evidence,
                 );
-                result.review_protocol_attempts = u32::from(normalized.normalized_field_count > 0);
+                result.review_protocol_attempts = u32::from(normalized.normalized_field_count > 0)
+                    + u32::from(normalized.protocol_repair_attempted);
                 result
             }
             Err(e) => {
@@ -1561,15 +1562,20 @@ pub(crate) async fn check_subtask_with_context(
                     &evidence_request,
                     &review_evidence,
                 );
-                result.verification_stage = match e.kind {
-                    project::ReviewFailureKind::InvalidJson
-                    | project::ReviewFailureKind::EmptyResponse => {
-                        project::VerificationStage::ParsingReview
+                result.verification_stage = if e.protocol_repair_attempted {
+                    project::VerificationStage::ProtocolRepair
+                } else {
+                    match &e.kind {
+                        project::ReviewFailureKind::InvalidJson
+                        | project::ReviewFailureKind::EmptyResponse => {
+                            project::VerificationStage::ParsingReview
+                        }
+                        _ => project::VerificationStage::DeterministicNormalization,
                     }
-                    _ => project::VerificationStage::DeterministicNormalization,
                 };
                 result.review_diagnostic_summary = e.to_string();
                 result.review_status = project::ReviewStatus::Failed;
+                result.review_protocol_attempts = u32::from(e.protocol_repair_attempted);
                 result.review_failure_kind = Some(e.kind);
                 result
             }

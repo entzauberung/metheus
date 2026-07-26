@@ -22,12 +22,23 @@ pub(crate) const TECH_PROMPT: &str = "\
 每个小阶段控制在 10-30 行代码以内，确保可以被一次性正确执行。\
 回答风格：精确、技术向，输出可直接执行的提示词。\
 请严格按 JSON 格式输出，不要包含 markdown 代码块标记：\n{\"title\": \"子任务标题\", \"prompt\": \"可执行的编码任务提示词\"}\n\n**重要约束：**\n- 不得在提示词中包含完整的代码块\n- 提示词应描述「做什么」（功能目标），而不是「写什么」（具体代码实现）\n- 必须指定要操作的文件路径（相对于项目根目录）\n- 涉及修改已有函数时，需要提供现有函数签名作为参考";
-pub(crate) const TEST_PROMPT: &str = "\
+macro_rules! review_schema_contract {
+    () => {
+        "{\"passed\":true或false,\"issues\":[\"兼容摘要\"],\"suggestion\":\"总体建议\",\"criterion_reviews\":[{\"criterion_index\":1,\"conclusion\":\"Satisfied\",\"confidence\":0.0,\"evidence_block_ids\":[\"E001\"]}],\"review_issues\":[{\"criterion_index\":1或null,\"criterion\":\"验收标准原文\",\"file\":\"相对路径\",\"expected\":\"预期\",\"actual\":\"实际\",\"suggested_change\":\"修复目标\",\"confidence\":0.0,\"severity\":\"Blocking或Warning或Suggestion\",\"evidence_block_ids\":[\"E001\"]}],\"warnings\":[]}"
+    };
+}
+
+pub(crate) const REVIEW_SCHEMA_CONTRACT: &str = review_schema_contract!();
+
+pub(crate) const TEST_PROMPT: &str = concat!("\
 你是测试工程师，角色名「测试工程师」。必须为请求中的每条验收标准返回唯一逐项结论。\
 逐项 conclusion 只能是 Satisfied、Unsatisfied、EvidenceInsufficient；Satisfied 和 Unsatisfied 都必须引用本次请求中真实存在的证据块编号。\
 只有明确的验收失败、功能错误、安全问题、运行错误或范围越界可以生成 Blocking 问题；风格、命名、现代语法和可选优化只能是 Warning 或 Suggestion。\
 Unsatisfied 必须同时提供同一验收项的 Blocking 问题；信息不足时必须返回 EvidenceInsufficient，不得把省略区域当作代码不存在。\
-请严格按 JSON 格式输出，不要包含 markdown：\n{\"passed\":true或false,\"issues\":[\"兼容摘要\"],\"suggestion\":\"总体建议\",\"criterion_reviews\":[{\"criterion_index\":1,\"conclusion\":\"Satisfied\",\"confidence\":0.0,\"evidence_block_ids\":[\"E001\"]}],\"review_issues\":[{\"criterion_index\":1或null,\"criterion\":\"验收标准原文\",\"file\":\"相对路径\",\"expected\":\"预期\",\"actual\":\"实际\",\"suggested_change\":\"修复目标\",\"confidence\":0.0,\"severity\":\"Blocking或Warning或Suggestion\",\"evidence_block_ids\":[\"E001\"]}],\"warnings\":[]}\n\n若自动化测试未配置，不得因此判定代码失败。总体 passed 仅为兼容字段，后端会根据逐项结果和有效 Blocking 问题重新计算。";
+请严格按 JSON 格式输出，不要包含 markdown：\n",
+review_schema_contract!(),
+"\n\n若自动化测试未配置，不得因此判定代码失败。总体 passed 仅为兼容字段，后端会根据逐项结果和有效 Blocking 问题重新计算。"
+);
 
 /// 常规修复耗尽后，只重写当前小阶段完整执行提示的受限重规划协议。
 pub(crate) const RECOVERY_REPLAN_PROMPT: &str = "\

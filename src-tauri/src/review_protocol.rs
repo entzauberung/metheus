@@ -1,6 +1,7 @@
 use crate::project;
 use serde_json::{Map, Value};
 use std::fmt;
+use std::future::Future;
 
 const MAX_DIAGNOSTIC_TEXT_CHARS: usize = 500;
 const MAX_SIMPLE_OBJECT_FIELDS: usize = 12;
@@ -59,6 +60,7 @@ pub(crate) struct ModelReviewResponse {
 pub(crate) struct NormalizedReviewResponse {
     pub(crate) response: ModelReviewResponse,
     pub(crate) normalized_field_count: u32,
+    pub(crate) protocol_repair_attempted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +69,7 @@ pub(crate) struct ReviewProtocolError {
     pub(crate) path: String,
     pub(crate) expected: String,
     pub(crate) actual: String,
+    pub(crate) protocol_repair_attempted: bool,
 }
 
 impl fmt::Display for ReviewProtocolError {
@@ -96,6 +99,7 @@ fn field_error(path: impl Into<String>, expected: &str, value: &Value) -> Review
         path: path.into(),
         expected: expected.to_string(),
         actual: value_kind(value).to_string(),
+        protocol_repair_attempted: false,
     }
 }
 
@@ -483,6 +487,7 @@ pub(crate) fn parse_review_response(
             path: "$".to_string(),
             expected: "non-empty JSON object".to_string(),
             actual: "empty response".to_string(),
+            protocol_repair_attempted: false,
         });
     }
     let cleaned = crate::json_utils::sanitize_json_response(raw);
@@ -496,6 +501,7 @@ pub(crate) fn parse_review_response(
                 error.line(),
                 error.column()
             ),
+            protocol_repair_attempted: false,
         })?;
     if !value.is_object() {
         return Err(field_error("$", "JSON object", &value));
@@ -530,17 +536,76 @@ pub(crate) fn parse_review_response(
             path: "$".to_string(),
             expected: "review response schema".to_string(),
             actual: format!("strict schema mismatch: {error}"),
+            protocol_repair_attempted: false,
         }
     })?;
     Ok(NormalizedReviewResponse {
         response,
         normalized_field_count: normalized,
+        protocol_repair_attempted: false,
     })
+}
+
+pub(crate) async fn parse_review_response_with_repair(
+    raw: &str,
+) -> Result<NormalizedReviewResponse, ReviewProtocolError> {
+    parse_review_response_with_repair_using(raw, |response_text, error| async move {
+        crate::json_utils::repair_json_once_with_contract(
+            &response_text,
+            crate::prompts::REVIEW_SCHEMA_CONTRACT,
+            &error.path,
+            &error.expected,
+            &error.actual,
+        )
+        .await
+    })
+    .await
+}
+
+async fn parse_review_response_with_repair_using<F, Fut>(
+    raw: &str,
+    repair: F,
+) -> Result<NormalizedReviewResponse, ReviewProtocolError>
+where
+    F: FnOnce(String, ReviewProtocolError) -> Fut,
+    Fut: Future<Output = Result<String, String>>,
+{
+    let initial_error = match parse_review_response(raw) {
+        Ok(response) => return Ok(response),
+        Err(error) => error,
+    };
+    if initial_error.kind == project::ReviewFailureKind::EmptyResponse {
+        return Err(initial_error);
+    }
+    let repaired = repair(raw.to_string(), initial_error.clone())
+        .await
+        .map_err(|repair_error| ReviewProtocolError {
+            kind: initial_error.kind,
+            path: initial_error.path,
+            expected: initial_error.expected,
+            actual: format!(
+                "protocol repair request failed: {}",
+                truncate_chars(&repair_error, 300)
+            ),
+            protocol_repair_attempted: true,
+        })?;
+    match parse_review_response(&repaired) {
+        Ok(mut response) => {
+            response.protocol_repair_attempted = true;
+            Ok(response)
+        }
+        Err(mut error) => {
+            error.protocol_repair_attempted = true;
+            Err(error)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn normalizes_common_review_type_drift_deterministically() -> Result<(), String> {
@@ -617,5 +682,37 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.path, "$.criterion_reviews[0].evidence_block_ids");
+    }
+
+    #[tokio::test]
+    async fn protocol_repair_is_attempted_only_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let error = parse_review_response_with_repair_using(
+            r#"{"passed":"yes"}"#,
+            move |_raw, first_error| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_eq!(first_error.path, "$.passed");
+                    Ok(r#"{"passed":"still wrong"}"#.to_string())
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(error.protocol_repair_attempted);
+        assert_eq!(error.path, "$.passed");
+    }
+
+    #[tokio::test]
+    async fn empty_response_skips_protocol_repair() {
+        let error = parse_review_response_with_repair_using("", |_raw, _error| async move {
+            panic!("empty responses must be reviewed again, not synthesized")
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, project::ReviewFailureKind::EmptyResponse);
+        assert!(!error.protocol_repair_attempted);
     }
 }

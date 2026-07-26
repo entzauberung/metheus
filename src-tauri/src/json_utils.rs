@@ -59,6 +59,33 @@ pub(crate) fn sanitize_json_response(raw: &str) -> String {
     }
 }
 
+const SCHEMA_REPAIR_SYSTEM_PROMPT: &str = "你是确定性的 JSON 协议修复器。只能修复用户提供的 JSON，使其符合给定契约；不得补写代码事实、验收结论或证据编号。只输出一个 JSON 对象，不要 Markdown 或解释。";
+
+pub(crate) fn schema_repair_user_message(
+    response_text: &str,
+    schema_contract: &str,
+    error_path: &str,
+    expected: &str,
+    actual: &str,
+) -> String {
+    let cleaned = sanitize_json_response(response_text);
+    format!(
+        "以下审查 JSON 未通过协议校验。只修复格式和字段类型，不得改变语义或添加原文中不存在的事实。\n\nJSON Schema 契约：\n{schema_contract}\n\n真实校验错误：\n- 字段路径：{error_path}\n- 期望类型或枚举：{expected}\n- 实际类型：{actual}\n\n待修复 JSON：\n{cleaned}\n\n只输出修复后的 JSON 对象。"
+    )
+}
+
+pub(crate) async fn repair_json_once_with_contract(
+    response_text: &str,
+    schema_contract: &str,
+    error_path: &str,
+    expected: &str,
+    actual: &str,
+) -> Result<String, String> {
+    let user_message =
+        schema_repair_user_message(response_text, schema_contract, error_path, expected, actual);
+    call_deepseek_api_inner(SCHEMA_REPAIR_SYSTEM_PROMPT, &user_message, true, 0.0).await
+}
+
 /// 带重试的 JSON 解析
 /// 第 1 次：sanitize → 直接解析
 /// 第 2 次：把错误发给 AI 修正 → sanitize → 解析
@@ -128,5 +155,49 @@ pub(crate) async fn parse_json_with_retry<T: serde::de::DeserializeOwned>(
             );
             Err(format!("AI 修正请求在 3 次重试后仍然失败：{}", e))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_repair_prompt_contains_exact_contract_and_error_path() {
+        let message = schema_repair_user_message(
+            r#"{"review_issues":[{"actual":{"found":false}}]}"#,
+            crate::prompts::REVIEW_SCHEMA_CONTRACT,
+            "$.review_issues[0].actual",
+            "string、number、boolean 或 simple object",
+            "object",
+        );
+        assert!(message.contains(crate::prompts::REVIEW_SCHEMA_CONTRACT));
+        assert!(message.contains("$.review_issues[0].actual"));
+        assert!(message.contains("string、number、boolean 或 simple object"));
+        assert!(message.contains("实际类型：object"));
+        assert!(!message.contains("请检查 JSON 格式是否正确"));
+    }
+
+    #[test]
+    fn review_prompt_and_repair_use_the_same_schema_contract() {
+        assert!(crate::prompts::TEST_PROMPT.contains(crate::prompts::REVIEW_SCHEMA_CONTRACT));
+    }
+
+    #[tokio::test]
+    async fn generic_json_parser_still_accepts_valid_planning_json_without_repair() {
+        #[derive(Debug, serde::Deserialize, PartialEq)]
+        struct PlanningOutput {
+            title: String,
+        }
+
+        let parsed: PlanningOutput = parse_json_with_retry(r#"{"title":"stable"}"#)
+            .await
+            .expect("valid planning JSON should parse directly");
+        assert_eq!(
+            parsed,
+            PlanningOutput {
+                title: "stable".to_string()
+            }
+        );
     }
 }
