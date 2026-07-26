@@ -79,6 +79,10 @@ export type RecoveryErrorKind =
   | "ScopeViolation"
   | "TestFailure"
   | "ReviewFailure"
+  | "AutomatedTestUnavailable"
+  | "ReviewTransientFailure"
+  | "ReviewProtocolFailure"
+  | "ReviewServiceBlocked"
   | "TestUnavailable"
   | "StateConflict"
   | "HumanRequired";
@@ -100,6 +104,33 @@ export type ReviewIssueSeverity = "Blocking" | "Warning" | "Suggestion";
 export type EvidenceSourceKind = "GitDiff" | "IdentifierContext" | "CurrentFileSnippet";
 export type CriterionReviewConclusion = "Satisfied" | "Unsatisfied" | "EvidenceInsufficient";
 export type ReviewEvidenceStrategy = "Standard" | "Targeted" | "ExpandedTargeted";
+export type VerificationStage =
+  | "NotStarted"
+  | "AutomatedTests"
+  | "PreparingEvidence"
+  | "RequestingReview"
+  | "ParsingReview"
+  | "DeterministicNormalization"
+  | "ProtocolRepair"
+  | "ReviewRetry"
+  | "TargetedEvidence"
+  | "Completed";
+export type ReviewStatus = "NotRequested" | "InProgress" | "Completed" | "Failed";
+export type ReviewFailureKind =
+  | "Network"
+  | "Timeout"
+  | "RateLimited"
+  | "ServiceUnavailable"
+  | "Authentication"
+  | "QuotaExceeded"
+  | "EmptyResponse"
+  | "InvalidJson"
+  | "FieldTypeMismatch";
+export type ValidationRetryStrategy =
+  | "DeterministicNormalization"
+  | "ProtocolRepair"
+  | "ReviewRequestRetry"
+  | "TargetedEvidence";
 
 export interface ReviewEvidenceReference {
   block_id: string;
@@ -208,6 +239,10 @@ export interface RecoveryState {
   evidence_rebuild_attempts: number;
   pending_evidence_criteria: number[];
   evidence_strategies: ReviewEvidenceStrategy[];
+  validation_retry_count: number;
+  max_validation_retries: number;
+  next_validation_retry_at?: string;
+  validation_strategies: ValidationRetryStrategy[];
   pending_execution_result?: ExecutionResult;
 }
 
@@ -622,6 +657,11 @@ export interface TestResult {
   review_evidence_status?: ReviewEvidenceStatus;
   review_evidence_summary?: string;
   acceptance_results?: AcceptanceLedgerItem[];
+  verification_stage?: VerificationStage;
+  review_status?: ReviewStatus;
+  review_failure_kind?: ReviewFailureKind;
+  review_protocol_attempts?: number;
+  review_diagnostic_summary?: string;
 }
 
 export type ReviewEvidenceStatus = "Complete" | "Partial" | "Unavailable";
@@ -843,6 +883,7 @@ export interface ExecutionSession {
   base_commit: string;   // 执行前的 Git commit，用于回退基线
   /** 失败原因；旧项目默认空 */
   failure_message?: string;
+  verification_stage?: VerificationStage;
   confirmation_transaction_id?: string;
   confirmation_phase?: ConfirmationPhase;
   confirmation_candidate_tag?: string;

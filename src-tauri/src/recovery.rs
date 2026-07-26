@@ -392,6 +392,10 @@ fn create_recovery_state(
         evidence_rebuild_attempts: 0,
         pending_evidence_criteria: vec![],
         evidence_strategies: vec![],
+        validation_retry_count: 0,
+        max_validation_retries: 3,
+        next_validation_retry_at: None,
+        validation_strategies: vec![],
         pending_execution_result: None,
     }
 }

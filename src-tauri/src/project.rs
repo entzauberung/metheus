@@ -350,6 +350,15 @@ pub enum RecoveryErrorKind {
     ScopeViolation,
     TestFailure,
     ReviewFailure,
+    /// 自动化测试环境本身不可用，不代表 AI 审查服务失败。
+    AutomatedTestUnavailable,
+    /// AI 审查请求遇到可重试的网络、超时、限流或服务不可用错误。
+    ReviewTransientFailure,
+    /// AI 审查返回无法通过确定性归一化或契约修复的协议错误。
+    ReviewProtocolFailure,
+    /// AI 审查因认证或额度问题阻断，机械重试没有意义。
+    ReviewServiceBlocked,
+    /// 旧项目兼容值；新验证流程不得再写入此分类。
     TestUnavailable,
     StateConflict,
     #[default]
@@ -571,6 +580,59 @@ pub enum ReviewEvidenceStrategy {
     ExpandedTargeted,
 }
 
+/// 质量验证的当前子阶段。旧项目默认尚未开始验证。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum VerificationStage {
+    #[default]
+    NotStarted,
+    AutomatedTests,
+    PreparingEvidence,
+    RequestingReview,
+    ParsingReview,
+    DeterministicNormalization,
+    ProtocolRepair,
+    ReviewRetry,
+    TargetedEvidence,
+    Completed,
+}
+
+/// AI 审查调用与协议处理的结构化状态。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ReviewStatus {
+    #[default]
+    NotRequested,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+/// AI 审查失败的稳定分类。诊断必须依据此字段，不得解析警告文本。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ReviewFailureKind {
+    Network,
+    Timeout,
+    RateLimited,
+    ServiceUnavailable,
+    Authentication,
+    QuotaExceeded,
+    EmptyResponse,
+    InvalidJson,
+    FieldTypeMismatch,
+}
+
+/// 与代码修复完全独立的验证恢复策略。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ValidationRetryStrategy {
+    DeterministicNormalization,
+    ProtocolRepair,
+    ReviewRequestRetry,
+    TargetedEvidence,
+}
+
+fn default_validation_retry_limit() -> u32 {
+    3
+}
+
 /// 当前小阶段的有限恢复循环状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoveryState {
@@ -629,6 +691,18 @@ pub struct RecoveryState {
     /// Evidence strategies already used by this recovery session.
     #[serde(default)]
     pub evidence_strategies: Vec<ReviewEvidenceStrategy>,
+    /// 验证服务或协议恢复次数；不得计入代码修复 attempt。
+    #[serde(default)]
+    pub validation_retry_count: u32,
+    /// 当前验证恢复允许的独立重试上限。
+    #[serde(default = "default_validation_retry_limit")]
+    pub max_validation_retries: u32,
+    /// 尚未到点时后台运行器只能等待，不得重复派发验证动作。
+    #[serde(default)]
+    pub next_validation_retry_at: Option<String>,
+    /// 本轮验证恢复已经使用过的策略。
+    #[serde(default)]
+    pub validation_strategies: Vec<ValidationRetryStrategy>,
     /// Repair execution evidence is committed to the task only after retest accepts it.
     #[serde(default)]
     pub pending_execution_result: Option<ExecutionResult>,
@@ -663,6 +737,10 @@ impl Default for RecoveryState {
             evidence_rebuild_attempts: 0,
             pending_evidence_criteria: vec![],
             evidence_strategies: vec![],
+            validation_retry_count: 0,
+            max_validation_retries: default_validation_retry_limit(),
+            next_validation_retry_at: None,
+            validation_strategies: vec![],
             pending_execution_result: None,
         }
     }
@@ -1110,6 +1188,21 @@ pub struct TestResult {
     pub review_evidence_summary: String,
     #[serde(default)]
     pub acceptance_results: Vec<AcceptanceLedgerItem>,
+    /// 本次结果结束时所处的验证子阶段。
+    #[serde(default)]
+    pub verification_stage: VerificationStage,
+    /// AI 审查调用与协议处理的结构化状态。
+    #[serde(default)]
+    pub review_status: ReviewStatus,
+    /// AI 审查失败的稳定分类；成功时为空。
+    #[serde(default)]
+    pub review_failure_kind: Option<ReviewFailureKind>,
+    /// 确定性归一化或协议修复的累计处理次数。
+    #[serde(default)]
+    pub review_protocol_attempts: u32,
+    /// 脱敏、截断后的诊断摘要；禁止保存原始模型响应。
+    #[serde(default)]
+    pub review_diagnostic_summary: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -2144,6 +2237,9 @@ pub struct ExecutionSession {
     /// 失败原因；旧项目默认空
     #[serde(default)]
     pub failure_message: String,
+    /// 当前验证子阶段；执行与 Git 确认期间保持 NotStarted 或 Completed。
+    #[serde(default)]
+    pub verification_stage: VerificationStage,
     /// 一次确认事务的稳定身份；重试必须复用，重新执行任务才会生成新身份。
     #[serde(default)]
     pub confirmation_transaction_id: String,
@@ -2241,6 +2337,7 @@ impl Default for ExecutionSession {
             status: String::new(),
             base_commit: String::new(),
             failure_message: String::new(),
+            verification_stage: VerificationStage::NotStarted,
             confirmation_transaction_id: String::new(),
             confirmation_phase: ConfirmationPhase::NotStarted,
             confirmation_candidate_tag: String::new(),
@@ -2478,6 +2575,7 @@ mod tests {
             .ok_or("执行会话未序列化为对象".to_string())?;
         for field in [
             "execution_id",
+            "verification_stage",
             "confirmation_transaction_id",
             "confirmation_phase",
             "confirmation_candidate_tag",
@@ -2495,6 +2593,7 @@ mod tests {
         let restored: ExecutionSession = serde_json::from_value(value)
             .map_err(|error| format!("反序列化旧执行会话失败：{}", error))?;
         assert!(restored.execution_id.is_empty());
+        assert_eq!(restored.verification_stage, VerificationStage::NotStarted);
         assert!(restored.confirmation_transaction_id.is_empty());
         assert_eq!(restored.confirmation_phase, ConfirmationPhase::NotStarted);
         assert!(restored.confirmation_candidate_tag.is_empty());
@@ -2653,6 +2752,11 @@ mod tests {
             "automated_test_status",
             "review_passed",
             "verification_kind",
+            "verification_stage",
+            "review_status",
+            "review_failure_kind",
+            "review_protocol_attempts",
+            "review_diagnostic_summary",
         ] {
             test_value
                 .as_object_mut()
@@ -2665,6 +2769,14 @@ mod tests {
             restored_test.automated_test_status,
             AutomatedTestStatus::Unknown
         );
+        assert_eq!(
+            restored_test.verification_stage,
+            VerificationStage::NotStarted
+        );
+        assert_eq!(restored_test.review_status, ReviewStatus::NotRequested);
+        assert!(restored_test.review_failure_kind.is_none());
+        assert_eq!(restored_test.review_protocol_attempts, 0);
+        assert!(restored_test.review_diagnostic_summary.is_empty());
         Ok(())
     }
 
@@ -2755,11 +2867,19 @@ mod tests {
         recovery_object.remove("evidence_rebuild_attempts");
         recovery_object.remove("pending_evidence_criteria");
         recovery_object.remove("evidence_strategies");
+        recovery_object.remove("validation_retry_count");
+        recovery_object.remove("max_validation_retries");
+        recovery_object.remove("next_validation_retry_at");
+        recovery_object.remove("validation_strategies");
         let recovery: RecoveryState =
             serde_json::from_value(recovery_value).map_err(|error| error.to_string())?;
         assert_eq!(recovery.evidence_rebuild_attempts, 0);
         assert!(recovery.pending_evidence_criteria.is_empty());
         assert!(recovery.evidence_strategies.is_empty());
+        assert_eq!(recovery.validation_retry_count, 0);
+        assert_eq!(recovery.max_validation_retries, 3);
+        assert!(recovery.next_validation_retry_at.is_none());
+        assert!(recovery.validation_strategies.is_empty());
         Ok(())
     }
 }

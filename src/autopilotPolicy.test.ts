@@ -54,6 +54,9 @@ function recovery(overrides: Partial<RecoveryState>): RecoveryState {
     evidence_rebuild_attempts: 0,
     pending_evidence_criteria: [1],
     evidence_strategies: [],
+    validation_retry_count: 0,
+    max_validation_retries: 3,
+    validation_strategies: [],
     ...overrides,
   };
 }
