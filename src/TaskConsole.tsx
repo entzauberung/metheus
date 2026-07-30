@@ -63,6 +63,8 @@ interface TaskConsoleProps {
   validationRetryCount?: number;
   validationRetryLimit?: number;
   nextValidationRetryAt?: string;
+  selectedTaskId?: string;
+  onOpenTask?: (taskId: string) => void;
 }
 
 export default function TaskConsole({
@@ -76,6 +78,8 @@ export default function TaskConsole({
   validationRetryCount,
   validationRetryLimit,
   nextValidationRetryAt,
+  selectedTaskId,
+  onOpenTask,
 }: TaskConsoleProps) {
   const [activeTab, setActiveTab] = useState("logs");
   const [currentDiff, setCurrentDiff] = useState("");
@@ -167,13 +171,35 @@ export default function TaskConsole({
               onScroll={handleLogScroll}
             >
               {mergedLogs.map((entry) => (
-                <div key={entry.key} className={`execution-log-entry log-${entry.level}${entry.source === "runtime" ? " log-runtime" : ""}`}>
+                <div
+                  key={entry.key}
+                  className={`execution-log-entry log-${entry.level}${entry.source === "runtime" ? " log-runtime" : ""}${entry.taskId ? " has-task-link" : ""}`}
+                  role={entry.taskId ? "button" : undefined}
+                  tabIndex={entry.taskId ? 0 : undefined}
+                  aria-current={entry.taskId && entry.taskId === selectedTaskId ? "true" : undefined}
+                  onClick={() => {
+                    if (!entry.taskId) return;
+                    onOpenTask?.(entry.taskId);
+                  }}
+                  onKeyDown={event => {
+                    if (!entry.taskId || (event.key !== "Enter" && event.key !== " ")) return;
+                    event.preventDefault();
+                    onOpenTask?.(entry.taskId);
+                  }}
+                >
                   <span className="execution-log-time">{formatLogTime(entry.timestamp)}</span>
                   <span className="execution-log-level">{LOG_LEVEL_ICON[entry.level] || (entry.source === "runtime" ? "⚡" : "")}</span>
                   <span className={`execution-log-source source-${entry.operationSource.toLowerCase()}`}>
                     {OPERATION_SOURCE_LABEL[entry.operationSource]}
                   </span>
                   <span className="execution-log-text">{entry.text}</span>
+                  {(entry.criterionIndex || entry.actionId || entry.modelCallId) && (
+                    <span className="execution-log-links">
+                      {entry.criterionIndex ? `验收 #${entry.criterionIndex}` : ""}
+                      {entry.actionId ? ` · 动作 ${entry.actionId}` : ""}
+                      {entry.modelCallId ? ` · 调用 ${entry.modelCallId}` : ""}
+                    </span>
+                  )}
                 </div>
               ))}
               {!hasAnyLog && (

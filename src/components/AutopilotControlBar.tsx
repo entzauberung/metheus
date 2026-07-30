@@ -4,6 +4,7 @@ import { Pause, Play, RotateCcw, Square, WandSparkles, AlertTriangle, GitBranch,
 import type { Project, PipelineState, AutopilotRecoveryAction } from "../types";
 import { getAutopilotErrorActions, getGitConfirmationBlockPresentation, getQualityStatusPresentation, getRecoveryStatusLabel, getVerificationStageLabel, isHeartbeatStale, isValidationRecovery } from "../autopilotPolicy";
 import { getManagedFlowPresentation } from "../managedFlowPolicy";
+import { findProjectSubtaskById, isSubtaskLeaf } from "../taskTreePolicy";
 
 export interface AutopilotControlBarProps {
   project: Project;
@@ -116,14 +117,13 @@ export function AutopilotControlBar({
   );
   const targetMs = project.milestones.find(m => m.id === project.workflow_state.autopilot_target_milestone_id);
   const targetLabel = targetMs?.title ?? project.workflow_state.autopilot_target_milestone_id;
-  const recoverySubtask = recovery || session
-    ? project.milestones
-      .flatMap(milestone => [
-        ...(milestone.subtasks ?? []),
-        ...milestone.mid_stages.flatMap(midStage => midStage.subtasks),
-      ])
-      .find(subtask => subtask.id === (recovery?.subtask_id ?? session?.subtask_id))
-    : undefined;
+  const targetSubtask = findProjectSubtaskById(
+    project,
+    recovery?.subtask_id ?? session?.subtask_id ?? "",
+  );
+  const recoverySubtask = targetSubtask && isSubtaskLeaf(targetSubtask)
+    ? targetSubtask
+    : null;
   const qualityStatuses = recoverySubtask
     ? getQualityStatusPresentation(
       recoverySubtask.test_result,
@@ -260,6 +260,12 @@ export function AutopilotControlBar({
           </span>
           {mfState?.last_action && (
             <span className="ap-bar-action" title={mfState.last_action}>{mfState.last_action}</span>
+          )}
+          <span className="ap-bar-target">目标：{managed.targetLabel}</span>
+          <span className="ap-bar-target">动作：{managed.actionLabel}</span>
+          <span className="ap-bar-target">心跳：{managed.heartbeatLabel}</span>
+          {managed.detail && managed.detail !== mfState?.last_action && (
+            <span className="ap-bar-error" title={managed.detail}>{managed.detail}</span>
           )}
           <button className="ap-bar-btn" disabled={busy} onClick={onStopManagedFlow} title="停止托管并转为手动处理">
             <Square size={14} /> 停止托管

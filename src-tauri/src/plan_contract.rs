@@ -101,6 +101,16 @@ pub(crate) fn hydrate_subtask_contract(subtask: &mut project::Subtask) {
             })
             .collect();
     }
+    if subtask.contract_snapshot.is_none()
+        && !matches!(
+            subtask.status,
+            project::SubtaskStatus::Passed
+                | project::SubtaskStatus::AcceptedDeviation
+                | project::SubtaskStatus::Skipped
+        )
+    {
+        subtask.contract_snapshot = Some(crate::task_contract::compile_subtask(subtask, None, 0));
+    }
 }
 
 pub(crate) fn validate_execution_prompt(

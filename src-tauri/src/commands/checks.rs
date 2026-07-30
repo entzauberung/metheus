@@ -147,14 +147,25 @@ pub(crate) async fn run_preflight_check(
     };
 
     // === 5. 调用 AI（失败不按通过处理） ===
-    let result_str = match crate::api::call_deepseek_api_json(prompt, &context).await {
-        Ok(s) => s,
+    let model_context = crate::cost_ledger::ModelCallContext::for_project(
+        &proj,
+        crate::cost_ledger::ModelCallPurpose::PreflightCheck,
+    );
+    let response = match crate::api::call_deepseek_api_json_with_context(
+        prompt,
+        &context,
+        model_context,
+    )
+    .await
+    {
+        Ok(response) => response,
         Err(e) => {
             return Err(format!("三项检查 AI 调用失败（{}）：{}", check_type, e));
         }
     };
+    let result_str = response.content.as_str();
 
-    let result: serde_json::Value = serde_json::from_str(&result_str)
+    let result: serde_json::Value = serde_json::from_str(result_str)
         .map_err(|e| format!("解析检查结果 JSON 失败（{}）：{}", check_type, e))?;
 
     // === 6. 提取字段（不使用 unwrap_or — 缺失字段按错误处理） ===
@@ -227,7 +238,29 @@ pub(crate) async fn run_preflight_check(
     proj.preflight_results
         .retain(|r| r.check_type != check_type);
     proj.preflight_results.push(check_result);
+    let all_checks_passed = CHECK_ORDER.iter().all(|required| {
+        proj.preflight_results.iter().any(|result| {
+            result.check_type == *required
+                && result.passed
+                && !result.stale
+                && result.discussion_revision == proj.discussion_revision
+        })
+    });
+    if all_checks_passed {
+        proj.workflow_state.current_step = project::WorkflowStep::ProjectPlanGeneration;
+        proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+    }
     proj.workflow_state.data_revision += 1;
 
-    crate::save_and_reload_project(&proj)
+    let saved = crate::save_and_reload_project(&proj)?;
+    crate::cost_ledger::mark_call_outcome_best_effort(
+        &project_name,
+        &response.metadata.call_id,
+        crate::cost_ledger::ModelCallOutcome {
+            produced_evidence: true,
+            produced_fact: true,
+            ..Default::default()
+        },
+    );
+    Ok(saved)
 }

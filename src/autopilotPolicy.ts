@@ -31,7 +31,11 @@ export function getQualityStatusPresentation(
   const hasBlockingReview = test?.review_issues?.some(issue => issue.severity === "Blocking") === true;
   const reviewServiceFailure = test?.review_failure_kind !== undefined
     && !["InvalidJson", "FieldTypeMismatch"].includes(test.review_failure_kind);
-  const codeReview = reviewServiceFailure || test?.review_evidence_status === "Unavailable"
+  const codeReview = test?.verification_kind === "DeterministicLocal"
+    ? test.passed
+      ? { label: "本地确定性验证：通过", tone: "success" as const }
+      : { label: "本地确定性验证：未通过", tone: "error" as const }
+    : reviewServiceFailure || test?.review_evidence_status === "Unavailable"
     ? { label: "代码审查：不可用", tone: "warning" as const }
     : test?.review_passed === true
       ? { label: "代码审查：通过", tone: "success" as const }

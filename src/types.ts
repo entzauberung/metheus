@@ -10,6 +10,7 @@ export type WorkflowStep =
   | "BaselineApproval"
   | "Discussion"
   | "ThreeChecks"
+  | "ProjectPlanGeneration"
   | "PlanApproval"
   | "MilestoneGeneration"
   | "MilestoneCheck"
@@ -101,7 +102,14 @@ export type EngineFailureKind =
 
 export type AcceptanceStatus = "Satisfied" | "Unsatisfied" | "Unknown" | "Contradictory" | "AcceptedDeviation";
 export type ReviewIssueSeverity = "Blocking" | "Warning" | "Suggestion";
-export type EvidenceSourceKind = "GitDiff" | "IdentifierContext" | "CurrentFileSnippet";
+export type EvidenceSourceKind =
+  | "GitDiff"
+  | "GitDiffHunk"
+  | "IdentifierContext"
+  | "SymbolDefinition"
+  | "SymbolReference"
+  | "LifecycleContext"
+  | "CurrentFileSnippet";
 export type CriterionReviewConclusion = "Satisfied" | "Unsatisfied" | "EvidenceInsufficient";
 export type ReviewEvidenceStrategy = "Standard" | "Targeted" | "ExpandedTargeted";
 export type VerificationStage =
@@ -281,6 +289,13 @@ export interface ManagedFlowState {
   last_action_at: string;
   run_status: ManagedRunStatus;
   error_message: string;
+  job_id: string;
+  job_generation: number;
+  current_action: string;
+  current_action_id: string;
+  heartbeat_at: string;
+  retry_count: number;
+  last_completed_action: string;
 }
 
 export type DiscussionScope = "FirstDiscussion" | "PauseAdjustment" | "FixPast" | "AdjustFuture";
@@ -291,6 +306,7 @@ export interface WorkflowState {
   pause_reason: PauseReason;
   data_revision: number;
   discussion_scope: DiscussionScope;
+  active_discussion_thread_id: string;
   review_node_id: string;
   last_transition_at: string;
   autopilot_active: boolean;
@@ -503,6 +519,11 @@ export interface MilestoneDraft {
   check_result?: string;
   generation_revision: number;
   source_plan_revision: number;
+  source_thread_id: string;
+  source_thread_revision: number;
+  source_data_revision: number;
+  expired: boolean;
+  expiration_reason?: string;
   generated_at: string;
   approved_at?: string;
   regeneration_count: number;
@@ -527,6 +548,7 @@ export interface MilestoneDraft {
 // ========== 中阶段草稿 ==========
 
 export type MidStageDraftStatus = "Pending" | "CheckFailed" | "Approved";
+export type MidStageDraftPurpose = "InitialFullList" | "FuturePendingPatch";
 
 export interface MidStageDraft {
   draft_id: string;
@@ -544,6 +566,11 @@ export interface MidStageDraft {
   last_check_failure_fingerprint?: string;
   last_candidate_fingerprint?: string;
   no_progress_count?: number;
+  purpose: MidStageDraftPurpose;
+  base_mid_stage_revision: number;
+  retained_mid_stage_ids: string[];
+  source_step: WorkflowStep;
+  allow_full_replacement: boolean;
 }
 
 // ========== 方案草稿 ==========
@@ -653,7 +680,7 @@ export interface TestResult {
   test_output_summary?: string;
   automated_test_status?: "Unknown" | "Passed" | "Failed" | "NotConfigured" | "Unavailable";
   review_passed?: boolean;
-  verification_kind?: "Legacy" | "AutomatedTestAndReview" | "CodeReviewOnly" | "HumanOverride";
+  verification_kind?: "Legacy" | "DeterministicLocal" | "AutomatedTestOnly" | "AutomatedTestAndReview" | "CodeReviewOnly" | "HumanOverride";
   review_evidence_status?: ReviewEvidenceStatus;
   review_evidence_summary?: string;
   acceptance_results?: AcceptanceLedgerItem[];
@@ -711,6 +738,8 @@ export interface Subtask {
   plan_patch_revision: number;
   depends_on: string[];
   dependency_notes: string;
+  contract_snapshot?: TaskContract;
+  child_tasks: Subtask[];
 }
 
 export type MidStageStatus = "Pending" | "Ready" | "InProgress" | "Completed" | "Rejected" | "Approved" | "RolledBack";
@@ -811,6 +840,13 @@ export interface DiscussionThread {
   title: string;
   node_id: string;
   messages: ChatMessage[];
+  scope: DiscussionScope;
+  milestone_id: string;
+  review_cycle_id: string;
+  revision: number;
+  opened_at: string;
+  closed_at?: string;
+  status: "Open" | "Closed";
 }
 
 export interface Project {
@@ -843,6 +879,284 @@ export interface Project {
   execution_history: ExecutionHistoryEntry[];
   recovery_learning: RecoveryLearningRecord[];
   project_path: string;
+  task_control?: TaskControlState;
+  cost_ledger?: CostLedger;
+}
+
+export type TaskControlMode = "Legacy" | "Shadow" | "SerialTakeover";
+
+export interface TaskControlState {
+  mode: TaskControlMode;
+  algorithm_version: string;
+  snapshot_version: string;
+  last_shadow_decision_at?: string;
+  last_shadow_decision_summary: string;
+  shadow_comparison: ShadowComparisonMetrics;
+  last_decision_id: string;
+  last_decision_fingerprint: string;
+  last_decision?: TaskControlDecision;
+  control_source: string;
+  tree_revision?: number;
+  active_action_id?: string;
+  active_action_kind?: string;
+  active_action_task_id?: string;
+  last_completed_action_id?: string;
+  last_completed_action_kind?: string;
+  last_completed_action_task_id?: string;
+  last_action_result?: string;
+  last_action_made_progress?: boolean;
+}
+
+export type TaskActionFamily = "Execute" | "Confirm" | "Repair" | "Wait" | "Human";
+export type ShadowComparisonOutcome = "Match" | "Difference" | "Uncomparable";
+
+export interface ShadowDecisionComparison {
+  compared_at: string;
+  shadow_decision_id: string;
+  shadow_action: string;
+  legacy_command: string;
+  shadow_family?: TaskActionFamily;
+  legacy_family?: TaskActionFamily;
+  outcome: ShadowComparisonOutcome;
+  reason: string;
+}
+
+export interface ShadowComparisonMetrics {
+  evaluated: number;
+  comparable_matches: number;
+  comparable_differences: number;
+  uncomparable: number;
+  latest?: ShadowDecisionComparison;
+}
+
+export type TaskNodeType = "Milestone" | "MidStage" | "Subtask";
+export type TaskComplexity = "Small" | "Medium" | "Large";
+export type TaskRiskLevel = "Low" | "Medium" | "High" | "Critical";
+export type VerificationMode = "Deterministic" | "AutomatedTest" | "SemanticReview" | "HumanReview";
+
+export interface TaskContract {
+  version: string;
+  task_id: string;
+  parent_task_id?: string;
+  depth: number;
+  node_type: TaskNodeType;
+  title: string;
+  goal: string;
+  allowed_file_paths: string[];
+  new_file_paths: string[];
+  evidence_files: string[];
+  acceptance_criteria: string[];
+  verification_modes: VerificationMode[];
+  stop_rules: string[];
+  dependencies: string[];
+  complexity: TaskComplexity;
+  risk: TaskRiskLevel;
+  artifacts: {
+    expected_files: string[];
+    expected_identifiers: string[];
+    completion_facts: string[];
+  };
+  budget: {
+    level: string;
+    estimated_model_calls: number;
+    estimated_input_tokens: number;
+    estimated_output_tokens: number;
+  };
+  recommended_executor: string;
+  plan_source: string;
+  compiled_at: string;
+  fingerprint: string;
+}
+
+export interface TaskTreeNodeView {
+  id: string;
+  title: string;
+  node_type: TaskNodeType;
+  status: string;
+  depth: number;
+  complexity: string;
+  risk: string;
+  contract_fingerprint: string;
+  contract?: TaskContract;
+  dependencies: string[];
+  acceptance: AcceptanceLedgerItem[];
+  children: TaskTreeNodeView[];
+}
+
+export type ControlActionKind = "Split" | "Execute" | "LocalValidate" | "AutomatedValidate" | "TargetedValidate" | "Repair" | "Recompile" | "AcceptDeviation" | "GitConfirm" | "Wait" | "Human";
+
+export interface TaskControlDecision {
+  decision_id: string;
+  task_id: string;
+  contract_fingerprint: string;
+  facts_fingerprint: string;
+  acceptance: {
+    satisfied: number;
+    unsatisfied: number;
+    unknown: number;
+    contradictory: number;
+    accepted_deviation: number;
+  };
+  action: {
+    kind: ControlActionKind;
+    priority: number;
+    risk: string;
+    reason: string;
+    retryable: boolean;
+  };
+  expected_cost: string;
+  expected_risk: string;
+  cache_hit: boolean;
+  shadow: boolean;
+  reason: string;
+}
+
+export interface TokenCostSummary {
+  calls: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  known_input_tokens: number;
+  known_output_tokens: number;
+  known_total_tokens: number;
+  usage_known_calls: number;
+  usage_unknown_calls: number;
+  effective_calls: number;
+  no_progress_calls: number;
+}
+
+export interface CostGroupSummary {
+  key: string;
+  summary: TokenCostSummary;
+}
+
+export interface CostLedger {
+  calls: ModelCallRecord[];
+  archived_calls?: ArchivedModelCallRecord[];
+  project_summary: TokenCostSummary;
+  soft_budget_level: string;
+}
+
+export type ModelCallPurpose =
+  | "Decision"
+  | "Review"
+  | "Execution"
+  | "Recovery"
+  | "Replan"
+  | "Constitution"
+  | "HumanTriggered"
+  | "MilestoneGeneration"
+  | "MilestoneCheck"
+  | "MidStageGeneration"
+  | "MidStageCheck"
+  | "ExecutionPlanGeneration"
+  | "ExecutionPlanCheck"
+  | "TaskCalibration"
+  | "EvidenceSupplement"
+  | "SchemaRepair"
+  | "ConstitutionSummary"
+  | "ConstitutionCompression"
+  | "PreflightCheck"
+  | "VersionPlanGeneration"
+  | "ExistingProjectAnalysis"
+  | "Discussion";
+
+export interface ModelCallRecord {
+  call_id: string;
+  task_id: string;
+  stage_id: string;
+  purpose?: ModelCallPurpose;
+  model: string;
+  provider?: string;
+  started_at: string;
+  ended_at: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  elapsed_ms?: number;
+  cache_hit: boolean;
+  produced_change: boolean;
+  produced_evidence: boolean;
+  produced_plan: boolean;
+  no_progress: boolean;
+  failure_kind: string;
+  decision_id?: string;
+  action_id?: string;
+  provider_response_id?: string;
+  produced_contract?: boolean;
+  produced_fact?: boolean;
+  duplicate_reason?: string;
+}
+
+export interface ArchivedModelCallRecord {
+  call_id: string;
+  task_id: string;
+  stage_id: string;
+  milestone_id?: string;
+  purpose?: ModelCallPurpose;
+  provider: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  no_progress: boolean;
+}
+
+export interface ControlActionStateView {
+  action_id: string;
+  kind: string;
+  task_id: string;
+  result: string;
+  made_progress: boolean;
+  at?: string;
+}
+
+export interface TaskControlSnapshot {
+  snapshot_version: string;
+  project_name: string;
+  project_revision: number;
+  control_algorithm_version: string;
+  control_mode: TaskControlMode;
+  control_mode_label: string;
+  current_milestone_id: string;
+  current_mid_stage_id: string;
+  current_task_id: string;
+  task_tree_revision: number;
+  nodes: TaskTreeNodeView[];
+  selected_contract?: TaskContract;
+  selected_acceptance: AcceptanceLedgerItem[];
+  decision?: TaskControlDecision;
+  shadow_comparison: ShadowComparisonMetrics;
+  current_action?: ControlActionStateView;
+  recent_action?: ControlActionStateView;
+  control_capabilities: string[];
+  cost: TokenCostSummary;
+  stage_cost: TokenCostSummary;
+  task_cost: TokenCostSummary;
+  provider_costs: CostGroupSummary[];
+  purpose_costs: CostGroupSummary[];
+  cost_calls: ModelCallRecord[];
+  events: Array<{
+    timestamp: string;
+    level: string;
+    source: string;
+    text: string;
+    task_id?: string;
+    criterion_index?: number;
+    decision_id?: string;
+    action_id?: string;
+    validator_id?: string;
+    model_call_id?: string;
+  }>;
+  heartbeat_at: string;
+}
+
+export interface TaskControlActionResult {
+  snapshot: TaskControlSnapshot;
+  job_started: boolean;
+  queued: boolean;
+  action_id: string;
+  project_revision: number;
+  snapshot_version: string;
 }
 
 export type ExecutionSessionStatus =
@@ -987,6 +1301,11 @@ export interface ExecutionHistoryEntry {
   milestone_id?: string;
   mid_stage_id?: string;
   subtask_id?: string;
+  criterion_index?: number;
+  decision_id?: string;
+  action_id?: string;
+  validator_id?: string;
+  model_call_id?: string;
 }
 
 export interface ChangeHistoryEntry {

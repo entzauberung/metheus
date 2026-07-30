@@ -5,4 +5,5 @@ pub mod plan;
 pub mod project_analysis;
 pub mod project_ops;
 pub mod settings;
+pub mod task_control;
 pub mod workflow;

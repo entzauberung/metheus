@@ -454,12 +454,32 @@ pub(crate) fn decide_next_step(
 
     use project::WorkflowStep::*;
     match step {
-        MilestoneSelection => transition(
-            project_name,
-            "MidStageGeneration",
-            "autopilot: 进入中阶段生成",
-            "进入中阶段规划流程",
-        ),
+        MilestoneSelection => match crate::workflow_resolution::resolve_mid_stage_route(target) {
+            crate::workflow_resolution::MidStageRoute::NeedsInitialGeneration => transition(
+                project_name,
+                "MidStageGeneration",
+                "autopilot: 首次生成中阶段",
+                "当前大阶段没有中阶段，进入首次生成",
+            ),
+            crate::workflow_resolution::MidStageRoute::SelectExisting { mid_stage_id }
+            | crate::workflow_resolution::MidStageRoute::ResumeExisting { mid_stage_id, .. } => {
+                next_step(
+                    "select_mid_stage",
+                    serde_json::json!({ "projectName": project_name, "midStageId": mid_stage_id }),
+                    "按项目事实选择或恢复现有中阶段",
+                    project::AutopilotCommandResultKind::ProjectState,
+                )
+            }
+            crate::workflow_resolution::MidStageRoute::ReviewMilestone => transition(
+                project_name,
+                "MilestoneReview",
+                "autopilot: 当前大阶段的中阶段均已完成",
+                "进入大阶段审阅",
+            ),
+            crate::workflow_resolution::MidStageRoute::WaitHuman { reason } => {
+                permanent_block(reason, project::AutopilotRecoveryAction::WaitHumanDecision)
+            }
+        },
         MidStageGeneration => next_step(
             "generate_mid_stage_draft",
             serde_json::json!({ "projectName": project_name }),
@@ -593,8 +613,14 @@ pub(crate) fn decide_next_step(
             project::AutopilotCommandResultKind::ProjectState,
         ),
         Execution => decide_execution(proj, project_name, target, facts),
-        Discussion | BranchDiscussion | PauseDecision | RollbackPreview | FuturePlanApproval
-        | ThreeChecks | PlanApproval => permanent_block(
+        Discussion
+        | BranchDiscussion
+        | PauseDecision
+        | RollbackPreview
+        | FuturePlanApproval
+        | ThreeChecks
+        | ProjectPlanGeneration
+        | PlanApproval => permanent_block(
             format!("当前步骤 {:?} 需要人工介入，无法自动推进", step),
             project::AutopilotRecoveryAction::WaitHumanDecision,
         ),

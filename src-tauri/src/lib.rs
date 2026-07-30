@@ -8,6 +8,7 @@
 use std::fs;
 mod acceptance;
 mod api;
+mod automated_validation;
 mod autopilot_failure;
 mod autopilot_policy;
 mod autopilot_runtime;
@@ -16,10 +17,16 @@ mod commands;
 mod constants;
 mod constitution;
 mod constitution_context;
+mod control_action;
+mod control_action_executor;
+mod control_scheduler;
+mod control_snapshot;
+mod cost_ledger;
 mod diff;
 mod engine;
 mod git_ops;
 mod json_utils;
+mod managed_runtime;
 mod pipeline;
 mod plan_calibration;
 mod plan_compiler;
@@ -31,10 +38,21 @@ mod quality_gate;
 mod recovery;
 mod recovery_checkpoint;
 mod recovery_learning;
+mod review_evidence;
 mod review_protocol;
 mod settings;
 mod snapshot;
+mod task_aggregation;
+mod task_compiler;
+mod task_complexity;
+mod task_contract;
+mod task_control;
+mod task_tree;
 mod test_runner;
+mod validator_contract;
+mod validator_registry;
+mod validators;
+mod workflow_resolution;
 use crate::pipeline::PipelineState;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -90,8 +108,15 @@ pub(crate) fn save_project_to_path(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{}", e))?;
     }
+    // Preserve model calls recorded after this in-memory project snapshot was loaded.
+    let mut value = project.clone();
+    if let Ok(data) = fs::read_to_string(path) {
+        if let Ok(on_disk) = serde_json::from_str::<project::Project>(&data) {
+            value.cost_ledger.merge_from(&on_disk.cost_ledger);
+        }
+    }
     //2.序列化为JSON
-    let json = serde_json::to_string_pretty(project).map_err(|e| format!("序列化失败: {}", e))?;
+    let json = serde_json::to_string_pretty(&value).map_err(|e| format!("序列化失败: {}", e))?;
     //3. 写入同目录临时文件
     let tmp_path = path.with_extension("json.tmp");
     fs::write(&tmp_path, &json).map_err(|e| format!("写入临时文件失败: {}", e))?;
@@ -118,7 +143,9 @@ pub(crate) fn load_project_from_path(path: &std::path::Path) -> Result<project::
 
     // 3. 把 JSON 字符串解析成 Project 结构体
     //    如果格式不对（比如缺少必要字段），就返回错误
-    let project = serde_json::from_str(&data).map_err(|e| format!("解析 JSON 失败：{}", e))?;
+    let mut project: project::Project =
+        serde_json::from_str(&data).map_err(|e| format!("解析 JSON 失败：{}", e))?;
+    crate::task_control::hydrate_project(&mut project)?;
 
     // 4. 成功时，把 Project 对象装进 Ok 信封返回
     Ok(project)
@@ -141,6 +168,7 @@ fn load_env() {
 pub struct AppState {
     pub(crate) pipeline_state: Arc<Mutex<Option<PipelineState>>>,
     pub(crate) autopilot_runtime: Arc<crate::autopilot_runtime::AutopilotRuntime>,
+    pub(crate) managed_runtime: Arc<crate::managed_runtime::ManagedRuntime>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -156,6 +184,7 @@ pub fn run() {
         .manage(AppState {
             pipeline_state: Arc::new(Mutex::new(None)),
             autopilot_runtime: Arc::new(crate::autopilot_runtime::AutopilotRuntime::default()),
+            managed_runtime: Arc::new(crate::managed_runtime::ManagedRuntime::default()),
         })
         .manage(crate::chat_runtime::ChatRuntimeState::default())
         .invoke_handler(tauri::generate_handler![
@@ -189,6 +218,7 @@ pub fn run() {
             crate::commands::milestone::check_mid_stage_draft,
             crate::commands::milestone::approve_mid_stage_draft,
             crate::commands::milestone::select_mid_stage,
+            crate::commands::milestone::continue_current_milestone,
             crate::commands::milestone::generate_execution_plan,
             crate::commands::milestone::regenerate_execution_plan,
             crate::commands::milestone::check_stage_plan,
@@ -251,6 +281,9 @@ pub fn run() {
             crate::commands::workflow::resume_plan_approval,
             crate::commands::workflow::restart_discussion_from_approved,
             crate::commands::workflow::restart_checks,
+            crate::commands::task_control::get_task_control_snapshot,
+            crate::commands::task_control::set_task_control_mode,
+            crate::commands::task_control::apply_task_control_action,
             crate::commands::project_ops::initialize_project_entry,
             crate::commands::project_ops::validate_project_path,
             crate::commands::project_ops::get_project_files,

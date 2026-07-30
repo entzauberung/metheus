@@ -269,12 +269,25 @@ fn merge_targeted_review(
         .filter(|review| !targets.contains(&review.criterion_index))
         .map(|review| (review.criterion_index, review.clone()))
         .collect::<BTreeMap<_, _>>();
-    reviews.extend(
-        targeted
-            .criterion_reviews
-            .drain(..)
-            .map(|review| (review.criterion_index, review)),
-    );
+    for review in targeted.criterion_reviews.drain(..) {
+        let preserve_proven = previous.criterion_reviews.iter().any(|prior| {
+            prior.criterion_index == review.criterion_index
+                && prior.conclusion == project::CriterionReviewConclusion::Satisfied
+                && !prior.evidence_references.is_empty()
+                && review.conclusion == project::CriterionReviewConclusion::EvidenceInsufficient
+        });
+        if preserve_proven {
+            if let Some(prior) = previous
+                .criterion_reviews
+                .iter()
+                .find(|prior| prior.criterion_index == review.criterion_index)
+            {
+                reviews.insert(review.criterion_index, prior.clone());
+            }
+        } else {
+            reviews.insert(review.criterion_index, review);
+        }
+    }
     targeted.criterion_reviews = reviews.into_values().collect();
 
     let mut issues = previous
@@ -304,6 +317,82 @@ fn merge_targeted_review(
     );
     targeted.acceptance_results.clear();
     targeted
+}
+
+fn evidence_failure_detail(
+    test: &project::TestResult,
+    authorized_paths: &[String],
+    target_indices: &[u32],
+) -> String {
+    if authorized_paths.is_empty() {
+        return "授权文件范围不包含可用于目标验收项的文件".to_string();
+    }
+    if test.review_evidence_summary.contains("目标文件读取失败")
+        || test
+            .review_evidence_summary
+            .contains("没有可供审查的授权文件")
+    {
+        return format!("没有找到目标文件：{}", test.review_evidence_summary);
+    }
+    if test.review_evidence_summary.contains("没有命中目标锚点") {
+        return format!(
+            "找到授权文件但没有目标锚点：{}",
+            test.review_evidence_summary
+        );
+    }
+    if test
+        .review_evidence_summary
+        .contains("写入但没有初始化读取")
+    {
+        return format!(
+            "找到存储写入但没有初始化读取：{}",
+            test.review_evidence_summary
+        );
+    }
+    if test.review_evidence_summary.contains("定义")
+        && test.review_evidence_summary.contains("没有调用")
+    {
+        return format!("找到定义但没有调用：{}", test.review_evidence_summary);
+    }
+    let targets = target_indices.iter().copied().collect::<BTreeSet<_>>();
+    let references = test
+        .criterion_reviews
+        .iter()
+        .filter(|review| targets.contains(&review.criterion_index))
+        .flat_map(|review| review.evidence_references.iter())
+        .collect::<Vec<_>>();
+    let has_definition = references
+        .iter()
+        .any(|reference| reference.source_kind == project::EvidenceSourceKind::SymbolDefinition);
+    let has_reference = references.iter().any(|reference| {
+        matches!(
+            reference.source_kind,
+            project::EvidenceSourceKind::SymbolReference
+                | project::EvidenceSourceKind::LifecycleContext
+                | project::EvidenceSourceKind::GitDiffHunk
+        )
+    });
+    if has_definition && !has_reference {
+        return "找到符号定义但没有调用或生命周期证据".to_string();
+    }
+    if test.warnings.iter().any(|warning| {
+        warning.contains("证据块") || warning.contains("UNKNOWN") || warning.contains("未请求")
+    }) {
+        return "模型引用了不存在、未授权或未请求的证据块".to_string();
+    }
+    if references.is_empty() {
+        return format!(
+            "证据块存在但模型未提供有效引用：{}",
+            test.review_evidence_summary
+        );
+    }
+    if test.criterion_reviews.iter().any(|review| {
+        targets.contains(&review.criterion_index)
+            && review.conclusion == project::CriterionReviewConclusion::EvidenceInsufficient
+    }) {
+        return "证据存在但模型结论或置信度不足".to_string();
+    }
+    format!("定向补证仍不完整：{}", test.review_evidence_summary)
 }
 
 fn issue_list_for_prompt(issues: &[project::RecoveryIssue]) -> String {
@@ -562,22 +651,7 @@ pub(crate) fn ensure_quality_recovery(
         .as_ref()
         .ok_or_else(|| "质量门禁失败但没有执行会话。".to_string())?
         .clone();
-    let subtask = proj
-        .milestones
-        .iter()
-        .find(|milestone| milestone.id == session.milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter()
-                .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-        })
-        .and_then(|mid_stage| {
-            mid_stage
-                .subtasks
-                .iter()
-                .find(|item| item.id == session.subtask_id)
-        })
+    let subtask = crate::task_tree::find_task(proj, &session.subtask_id)?
         .ok_or_else(|| "质量门禁失败但无法定位当前小阶段。".to_string())?;
 
     if let Some(recovery) = proj.workflow_state.recovery_state.as_ref() {
@@ -837,22 +911,7 @@ fn current_recovery_context(
     if session.subtask_id != recovery.subtask_id {
         return Err("恢复任务与执行会话不一致。".to_string());
     }
-    let subtask = proj
-        .milestones
-        .iter()
-        .find(|milestone| milestone.id == session.milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter()
-                .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-        })
-        .and_then(|mid_stage| {
-            mid_stage
-                .subtasks
-                .iter()
-                .find(|item| item.id == session.subtask_id)
-        })
+    let subtask = crate::task_tree::find_task(proj, &session.subtask_id)?
         .ok_or_else(|| "无法定位恢复任务对应的小阶段。".to_string())?
         .clone();
     Ok((recovery, session, subtask))
@@ -1154,12 +1213,19 @@ async fn replan_current_subtask(
         MAX_DIAGNOSIS_CHARS,
     );
 
-    let reply =
-        crate::api::call_deepseek_api_json(crate::prompts::RECOVERY_REPLAN_PROMPT, &context)
-            .await
-            .map_err(|error| format!("当前任务重规划 AI 调用失败：{}", error))?;
+    let call_context = crate::cost_ledger::ModelCallContext::for_project(
+        proj,
+        crate::cost_ledger::ModelCallPurpose::Replan,
+    );
+    let response = crate::api::call_deepseek_api_json_with_context(
+        crate::prompts::RECOVERY_REPLAN_PROMPT,
+        &context,
+        call_context.clone(),
+    )
+    .await
+    .map_err(|error| format!("当前任务重规划 AI 调用失败：{}", error))?;
     let output: crate::plan_calibration::PlanPatchOutput =
-        crate::json_utils::parse_json_with_retry(&reply)
+        crate::json_utils::parse_json_with_retry_with_context(&response.content, call_context)
             .await
             .map_err(|error| format!("当前任务重规划结果解析失败：{}", error))?;
     let output = validate_replan_output(output)?;
@@ -1176,22 +1242,7 @@ async fn replan_current_subtask(
     crate::plan_contract::validate_subtask(&contract_candidate, "当前小阶段重规划")?;
     crate::plan_contract::validate_execution_prompt(&contract_candidate, "当前小阶段重规划")?;
 
-    let item = proj
-        .milestones
-        .iter_mut()
-        .find(|milestone| milestone.id == session.milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter_mut()
-                .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-        })
-        .and_then(|mid_stage| {
-            mid_stage
-                .subtasks
-                .iter_mut()
-                .find(|item| item.id == session.subtask_id)
-        })
+    let item = crate::task_tree::find_task_mut(proj, &session.subtask_id)?
         .ok_or_else(|| "重规划完成后无法定位当前小阶段。".to_string())?;
     item.execution_prompt = contract_candidate.execution_prompt;
     item.context_summary = contract_candidate.context_summary;
@@ -1204,6 +1255,17 @@ async fn replan_current_subtask(
     item.execution_result = None;
     item.test_result = None;
     item.human_verification = None;
+
+    crate::cost_ledger::mark_call_outcome_best_effort(
+        &proj.name,
+        &response.metadata.call_id,
+        crate::cost_ledger::ModelCallOutcome {
+            produced_plan: true,
+            produced_contract: true,
+            produced_fact: true,
+            ..Default::default()
+        },
+    );
 
     let now = chrono::Utc::now().to_rfc3339();
     let current = proj
@@ -1243,45 +1305,13 @@ async fn replan_current_subtask(
 }
 
 fn set_subtask_running(proj: &mut project::Project, session: &project::ExecutionSession) {
-    if let Some(subtask) = proj
-        .milestones
-        .iter_mut()
-        .find(|milestone| milestone.id == session.milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter_mut()
-                .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-        })
-        .and_then(|mid_stage| {
-            mid_stage
-                .subtasks
-                .iter_mut()
-                .find(|item| item.id == session.subtask_id)
-        })
-    {
+    if let Ok(Some(subtask)) = crate::task_tree::find_task_mut(proj, &session.subtask_id) {
         subtask.status = project::SubtaskStatus::Executing;
     }
 }
 
 fn reset_subtask_to_pending(proj: &mut project::Project, session: &project::ExecutionSession) {
-    if let Some(subtask) = proj
-        .milestones
-        .iter_mut()
-        .find(|milestone| milestone.id == session.milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter_mut()
-                .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-        })
-        .and_then(|mid_stage| {
-            mid_stage
-                .subtasks
-                .iter_mut()
-                .find(|item| item.id == session.subtask_id)
-        })
-    {
+    if let Ok(Some(subtask)) = crate::task_tree::find_task_mut(proj, &session.subtask_id) {
         subtask.status = project::SubtaskStatus::Pending;
         subtask.execution_result = None;
         subtask.test_result = None;
@@ -1472,7 +1502,7 @@ async fn run_recovery_retest(
     session: &project::ExecutionSession,
     authorized_paths: &[String],
     execution_id: &str,
-    evidence_request: Option<crate::test_runner::ReviewEvidenceRequest>,
+    evidence_request: Option<crate::review_evidence::ReviewEvidenceRequest>,
     retest_kind: RecoveryRetestKind,
 ) -> Result<project::Project, String> {
     {
@@ -1480,21 +1510,7 @@ async fn run_recovery_retest(
         set_pipeline_retesting(&mut pipeline_guard, execution_id);
     }
     let project = crate::load_project(project_name)?;
-    let subtask = project
-        .milestones
-        .iter()
-        .find(|milestone| milestone.id == session.milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter()
-                .find(|mid| mid.id == session.mid_stage_id)
-        })
-        .and_then(|mid| {
-            mid.subtasks
-                .iter()
-                .find(|item| item.id == session.subtask_id)
-        })
+    let subtask = crate::task_tree::find_task(&project, &session.subtask_id)?
         .ok_or_else(|| "复测时无法定位当前小阶段。".to_string())?
         .clone();
     let prompt = if subtask.execution_prompt.is_empty() {
@@ -1527,7 +1543,7 @@ async fn run_recovery_retest(
         });
     let mut test = match retest_kind {
         RecoveryRetestKind::Full => {
-            crate::test_runner::check_subtask_with_context_and_progress(
+            crate::test_runner::check_subtask_with_context_and_progress_and_model(
                 &project.project_path,
                 goal,
                 &session.subtask_id,
@@ -1538,6 +1554,10 @@ async fn run_recovery_retest(
                 Some(prompt),
                 evidence_request,
                 progress.clone(),
+                Some(crate::cost_ledger::ModelCallContext::for_project(
+                    &project,
+                    crate::cost_ledger::ModelCallPurpose::Review,
+                )),
             )
             .await
         }
@@ -1545,7 +1565,7 @@ async fn run_recovery_retest(
             let previous = previous_test
                 .as_ref()
                 .ok_or_else(|| "重新审查缺少可复用的自动化测试结果。".to_string())?;
-            crate::test_runner::retry_subtask_review_with_context(
+            crate::test_runner::retry_subtask_review_with_context_and_model(
                 &project.project_path,
                 goal,
                 &session.subtask_id,
@@ -1554,8 +1574,13 @@ async fn run_recovery_retest(
                 Some(subtask.acceptance_criteria.clone()),
                 Some(authorized_paths.to_vec()),
                 Some(prompt),
+                evidence_request,
                 previous,
                 progress,
+                Some(crate::cost_ledger::ModelCallContext::for_project(
+                    &project,
+                    crate::cost_ledger::ModelCallPurpose::EvidenceSupplement,
+                )),
             )
             .await
         }
@@ -1619,7 +1644,7 @@ async fn run_recovery_retest(
                 &mut proj,
                 "error",
                 project::ExecutionEventType::EvidenceStillInsufficient,
-                "定向补证后仍有验收项缺少有效证据".to_string(),
+                evidence_failure_detail(&test, authorized_paths, &target_indices),
                 Some(&session.milestone_id),
                 Some(&session.mid_stage_id),
                 Some(&session.subtask_id),
@@ -1751,11 +1776,10 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             &session,
             &authorized_paths,
             &recovery.execution_id,
-            Some(crate::test_runner::ReviewEvidenceRequest {
-                strategy,
-                target_criterion_indices: pending,
-            }),
-            RecoveryRetestKind::Full,
+            Some(crate::review_evidence::ReviewEvidenceRequest::for_task(
+                &subtask, strategy, pending,
+            )),
+            RecoveryRetestKind::ReviewOnly,
         )
         .await;
     }
@@ -2213,21 +2237,9 @@ pub(crate) async fn run_error_recovery_with_pipeline(
         .as_ref()
         .and_then(|state| state.pending_execution_result.clone())
         .or_else(|| {
-            proj.milestones
-                .iter()
-                .find(|milestone| milestone.id == session.milestone_id)
-                .and_then(|milestone| {
-                    milestone
-                        .mid_stages
-                        .iter()
-                        .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-                })
-                .and_then(|mid_stage| {
-                    mid_stage
-                        .subtasks
-                        .iter()
-                        .find(|item| item.id == session.subtask_id)
-                })
+            crate::task_tree::find_task(&proj, &session.subtask_id)
+                .ok()
+                .flatten()
                 .and_then(|item| item.execution_result.clone())
         });
     let merged_execution = merge_execution_result(previous_execution, repair_result);
@@ -2294,23 +2306,7 @@ fn handle_repair_engine_block(
     finish_repair_checkpoint(proj, restore_result.is_err())?;
     reset_subtask_to_pending(proj, session);
     if let Some(result) = execution_result {
-        if let Some(item) = proj
-            .milestones
-            .iter_mut()
-            .find(|milestone| milestone.id == session.milestone_id)
-            .and_then(|milestone| {
-                milestone
-                    .mid_stages
-                    .iter_mut()
-                    .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-            })
-            .and_then(|mid_stage| {
-                mid_stage
-                    .subtasks
-                    .iter_mut()
-                    .find(|item| item.id == session.subtask_id)
-            })
-        {
+        if let Ok(Some(item)) = crate::task_tree::find_task_mut(proj, &session.subtask_id) {
             item.execution_result = Some(result);
         }
     }
@@ -2433,58 +2429,10 @@ pub(crate) fn finish_retest(
         return Err("复测结果属于已失效的恢复会话，已忽略。".to_string());
     }
 
-    let subtask = proj
-        .milestones
-        .iter()
-        .find(|milestone| milestone.id == session.milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter()
-                .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-        })
-        .and_then(|mid_stage| {
-            mid_stage
-                .subtasks
-                .iter()
-                .find(|item| item.id == session.subtask_id)
-        })
+    let subtask = crate::task_tree::find_task(proj, &session.subtask_id)?
         .ok_or_else(|| "复测完成后无法定位小阶段。".to_string())?
         .clone();
     let authorized_paths = crate::plan_contract::validate_subtask(&subtask, "恢复复测任务")?;
-
-    test.acceptance_results =
-        crate::acceptance::build_ledger(&subtask.acceptance_criteria, &test, &authorized_paths);
-    let quality = crate::quality_gate::evaluate(
-        Some(&test),
-        &test.acceptance_results,
-        subtask.acceptance_criteria.len(),
-        false,
-    );
-    let quality_passed = quality.passed();
-    test.passed = quality_passed;
-    let item = proj
-        .milestones
-        .iter_mut()
-        .find(|milestone| milestone.id == session.milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter_mut()
-                .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-        })
-        .and_then(|mid_stage| {
-            mid_stage
-                .subtasks
-                .iter_mut()
-                .find(|item| item.id == session.subtask_id)
-        })
-        .ok_or_else(|| "复测完成后无法定位小阶段。".to_string())?;
-    item.status = project::SubtaskStatus::AwaitingConfirmation;
-    item.test_result = Some(test.clone());
-    item.acceptance_ledger = test.acceptance_results.clone();
-
-    let summary = test_failure_summary(Some(&test), "复测未通过");
     let evidence_recovery = proj
         .workflow_state
         .recovery_state
@@ -2493,6 +2441,28 @@ pub(crate) fn finish_retest(
             recovery.error_kind == project::RecoveryErrorKind::EvidenceInsufficient
                 || recovery.evidence_rebuild_attempts > 0
         });
+    let fresh_ledger =
+        crate::acceptance::build_ledger(&subtask.acceptance_criteria, &test, &authorized_paths);
+    test.acceptance_results = if evidence_recovery {
+        crate::acceptance::merge_evidence_refresh(&subtask.acceptance_ledger, fresh_ledger)
+    } else {
+        fresh_ledger
+    };
+    let quality = crate::quality_gate::evaluate(
+        Some(&test),
+        &test.acceptance_results,
+        subtask.acceptance_criteria.len(),
+        false,
+    );
+    let quality_passed = quality.passed();
+    test.passed = quality_passed;
+    let item = crate::task_tree::find_task_mut(proj, &session.subtask_id)?
+        .ok_or_else(|| "复测完成后无法定位小阶段。".to_string())?;
+    item.status = project::SubtaskStatus::AwaitingConfirmation;
+    item.test_result = Some(test.clone());
+    item.acceptance_ledger = test.acceptance_results.clone();
+
+    let summary = test_failure_summary(Some(&test), "复测未通过");
     let validation_recovery = proj
         .workflow_state
         .recovery_state
@@ -2549,22 +2519,7 @@ pub(crate) fn finish_retest(
             .recovery_state
             .as_mut()
             .and_then(|recovery| recovery.pending_execution_result.take());
-        if let Some(item) = proj
-            .milestones
-            .iter_mut()
-            .find(|milestone| milestone.id == session.milestone_id)
-            .and_then(|milestone| {
-                milestone
-                    .mid_stages
-                    .iter_mut()
-                    .find(|mid| mid.id == session.mid_stage_id)
-            })
-            .and_then(|mid| {
-                mid.subtasks
-                    .iter_mut()
-                    .find(|item| item.id == session.subtask_id)
-            })
-        {
+        if let Ok(Some(item)) = crate::task_tree::find_task_mut(proj, &session.subtask_id) {
             if pending_execution.is_some() {
                 item.execution_result = pending_execution;
             }
@@ -2880,22 +2835,10 @@ pub(crate) fn finish_retest(
         recovery.checkpoint_id.clear();
         if introduced_regression && !checkpoint_id.is_empty() {
             crate::recovery_checkpoint::restore(&checkpoint_id)?;
-            if let Some(item) = proj
-                .milestones
-                .iter_mut()
-                .find(|milestone| milestone.id == session.milestone_id)
-                .and_then(|milestone| {
-                    milestone
-                        .mid_stages
-                        .iter_mut()
-                        .find(|mid| mid.id == session.mid_stage_id)
-                })
-                .and_then(|mid| {
-                    mid.subtasks
-                        .iter_mut()
-                        .find(|item| item.id == session.subtask_id)
-                })
-            {
+            if let Some(item) = crate::task_tree::find_task_in_milestones_mut(
+                &mut proj.milestones,
+                &session.subtask_id,
+            ) {
                 item.test_report.clear();
                 item.test_result = None;
                 item.acceptance_ledger.clear();
@@ -2921,21 +2864,8 @@ pub(crate) fn finish_retest(
             crate::recovery_checkpoint::discard(&checkpoint_id)?;
         }
         let accepted_execution = recovery.pending_execution_result.take();
-        if let Some(item) = proj
-            .milestones
-            .iter_mut()
-            .find(|milestone| milestone.id == session.milestone_id)
-            .and_then(|milestone| {
-                milestone
-                    .mid_stages
-                    .iter_mut()
-                    .find(|mid| mid.id == session.mid_stage_id)
-            })
-            .and_then(|mid| {
-                mid.subtasks
-                    .iter_mut()
-                    .find(|item| item.id == session.subtask_id)
-            })
+        if let Some(item) =
+            crate::task_tree::find_task_in_milestones_mut(&mut proj.milestones, &session.subtask_id)
         {
             if accepted_execution.is_some() {
                 item.execution_result = accepted_execution;
@@ -2965,23 +2895,7 @@ pub(crate) fn finish_retest(
     }
 
     if !contradictory_criteria.is_empty() {
-        if let Some(item) = proj
-            .milestones
-            .iter_mut()
-            .find(|milestone| milestone.id == session.milestone_id)
-            .and_then(|milestone| {
-                milestone
-                    .mid_stages
-                    .iter_mut()
-                    .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-            })
-            .and_then(|mid_stage| {
-                mid_stage
-                    .subtasks
-                    .iter_mut()
-                    .find(|item| item.id == session.subtask_id)
-            })
-        {
+        if let Ok(Some(item)) = crate::task_tree::find_task_mut(proj, &session.subtask_id) {
             for ledger in &mut item.acceptance_ledger {
                 if contradictory_criteria.contains(&ledger.criterion_index) {
                     ledger.status = project::AcceptanceStatus::Contradictory;
@@ -3211,22 +3125,7 @@ pub(crate) async fn resolve_human_recovery(
                 validate_human_acceptance(&subtask, &resolution, &reason, &accepted)?;
             let original_failure =
                 test_failure_summary(subtask.test_result.as_ref(), "没有可用的自动化测试结果");
-            let item = proj
-                .milestones
-                .iter_mut()
-                .find(|milestone| milestone.id == session.milestone_id)
-                .and_then(|milestone| {
-                    milestone
-                        .mid_stages
-                        .iter_mut()
-                        .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-                })
-                .and_then(|mid_stage| {
-                    mid_stage
-                        .subtasks
-                        .iter_mut()
-                        .find(|item| item.id == session.subtask_id)
-                })
+            let item = crate::task_tree::find_task_mut(&mut proj, &session.subtask_id)?
                 .ok_or_else(|| "无法定位人工核验的小阶段。".to_string())?;
             item.status = project::SubtaskStatus::AwaitingConfirmation;
             for ledger in &mut item.acceptance_ledger {
@@ -3294,27 +3193,26 @@ pub(crate) async fn resolve_human_recovery(
             if reason.trim().is_empty() {
                 return Err("跳过任务必须填写原因。".to_string());
             }
-            let remaining = proj
-                .milestones
+            let leaves = crate::task_tree::leaf_addresses_in_scope(
+                &proj,
+                &session.milestone_id,
+                &session.mid_stage_id,
+            )?;
+            let current_index = leaves
                 .iter()
-                .find(|milestone| milestone.id == session.milestone_id)
-                .and_then(|milestone| {
-                    milestone
-                        .mid_stages
-                        .iter()
-                        .find(|mid| mid.id == session.mid_stage_id)
-                })
-                .map(|mid| {
-                    mid.subtasks
-                        .iter()
-                        .filter(|item| {
-                            item.order > subtask.order
-                                && item.status == project::SubtaskStatus::Pending
-                        })
+                .position(|address| address.task_id == session.subtask_id)
+                .ok_or_else(|| "无法定位要跳过的叶子任务。".to_string())?;
+            let remaining = leaves
+                .iter()
+                .skip(current_index + 1)
+                .filter_map(|address| {
+                    crate::task_tree::find_task(&proj, &address.task_id)
+                        .ok()
+                        .flatten()
+                        .filter(|task| task.status == project::SubtaskStatus::Pending)
                         .cloned()
-                        .collect::<Vec<_>>()
                 })
-                .unwrap_or_default();
+                .collect::<Vec<_>>();
             let dependency_check = validate_skip_dependencies(&subtask, &remaining)?;
             let baseline = proj
                 .workflow_state
@@ -3330,21 +3228,7 @@ pub(crate) async fn resolve_human_recovery(
                     &baseline
                 },
             )?;
-            let item = proj
-                .milestones
-                .iter_mut()
-                .find(|milestone| milestone.id == session.milestone_id)
-                .and_then(|milestone| {
-                    milestone
-                        .mid_stages
-                        .iter_mut()
-                        .find(|mid| mid.id == session.mid_stage_id)
-                })
-                .and_then(|mid| {
-                    mid.subtasks
-                        .iter_mut()
-                        .find(|item| item.id == session.subtask_id)
-                })
+            let item = crate::task_tree::find_task_mut(&mut proj, &session.subtask_id)?
                 .ok_or_else(|| "无法定位要跳过的小阶段。".to_string())?;
             item.status = project::SubtaskStatus::Skipped;
             item.execution_result = None;
@@ -3361,6 +3245,7 @@ pub(crate) async fn resolve_human_recovery(
                 accepted_criteria: vec![],
                 dependency_check,
             });
+            crate::task_aggregation::aggregate_ancestors(&mut proj, &session.subtask_id)?;
             proj.execution_session = None;
             proj.workflow_state.recovery_state = None;
             if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
@@ -3512,7 +3397,7 @@ pub(crate) async fn resolve_human_recovery(
             } else {
                 subtask.execution_prompt.clone()
             };
-            let mut test = crate::test_runner::check_subtask_with_context(
+            let mut test = crate::test_runner::check_subtask_with_context_and_model(
                 &proj.project_path,
                 if subtask.goal.is_empty() {
                     &subtask.title
@@ -3526,6 +3411,10 @@ pub(crate) async fn resolve_human_recovery(
                 Some(authorized_paths.clone()),
                 Some(prompt),
                 None,
+                Some(crate::cost_ledger::ModelCallContext::for_project(
+                    &proj,
+                    crate::cost_ledger::ModelCallPurpose::Review,
+                )),
             )
             .await
             .unwrap_or(project::TestResult {
@@ -3549,22 +3438,7 @@ pub(crate) async fn resolve_human_recovery(
             test.passed = quality.passed();
             let mut proj = crate::load_project(&project_name)?;
             if quality.passed() {
-                let item = proj
-                    .milestones
-                    .iter_mut()
-                    .find(|milestone| milestone.id == session.milestone_id)
-                    .and_then(|milestone| {
-                        milestone
-                            .mid_stages
-                            .iter_mut()
-                            .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-                    })
-                    .and_then(|mid_stage| {
-                        mid_stage
-                            .subtasks
-                            .iter_mut()
-                            .find(|item| item.id == session.subtask_id)
-                    })
+                let item = crate::task_tree::find_task_mut(&mut proj, &session.subtask_id)?
                     .ok_or_else(|| "复测完成后无法定位小阶段。".to_string())?;
                 item.status = project::SubtaskStatus::AwaitingConfirmation;
                 item.test_result = Some(test);
@@ -3597,22 +3471,8 @@ pub(crate) async fn resolve_human_recovery(
                     Some(&session.subtask_id),
                 );
             } else {
-                if let Some(item) = proj
-                    .milestones
-                    .iter_mut()
-                    .find(|milestone| milestone.id == session.milestone_id)
-                    .and_then(|milestone| {
-                        milestone
-                            .mid_stages
-                            .iter_mut()
-                            .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-                    })
-                    .and_then(|mid_stage| {
-                        mid_stage
-                            .subtasks
-                            .iter_mut()
-                            .find(|item| item.id == session.subtask_id)
-                    })
+                if let Ok(Some(item)) =
+                    crate::task_tree::find_task_mut(&mut proj, &session.subtask_id)
                 {
                     item.status = project::SubtaskStatus::AwaitingConfirmation;
                     item.test_result = Some(test.clone());
@@ -3716,6 +3576,54 @@ mod tests {
     }
 
     #[test]
+    fn recovery_context_resolves_nested_leaf_by_stable_id() {
+        let mut leaf = contract_subtask();
+        leaf.id = "nested-leaf".to_string();
+        let mut parent = project::Subtask {
+            id: "parent".to_string(),
+            title: "Parent".to_string(),
+            ..Default::default()
+        };
+        parent.child_tasks = vec![leaf];
+        let mut proj = project::Project::new("nested-recovery");
+        proj.milestones.push(project::Milestone {
+            id: "m".to_string(),
+            version: "v0.1".to_string(),
+            title: "M".to_string(),
+            description: String::new(),
+            tech_stack: String::new(),
+            status: project::MilestoneStatus::InProgress,
+            mode: project::StageMode::Quick,
+            mid_stages: Vec::new(),
+            subtasks: vec![parent],
+            qa_result: None,
+            git_commit_hash: String::new(),
+            decomposition_check: None,
+            review_status: None,
+            review_conclusion: None,
+            approved_at: None,
+            goal: String::new(),
+            scope: String::new(),
+            dependencies: Vec::new(),
+            expected_output: String::new(),
+            acceptance_criteria: Vec::new(),
+        });
+        proj.execution_session = Some(project::ExecutionSession {
+            milestone_id: "m".to_string(),
+            subtask_id: "nested-leaf".to_string(),
+            task_path: vec!["parent".to_string(), "nested-leaf".to_string()],
+            ..Default::default()
+        });
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            subtask_id: "nested-leaf".to_string(),
+            ..Default::default()
+        });
+
+        let (_, _, task) = current_recovery_context(&proj).unwrap();
+        assert_eq!(task.id, "nested-leaf");
+    }
+
+    #[test]
     fn targeted_review_replaces_only_requested_criteria() {
         let previous = project::TestResult {
             criterion_reviews: vec![
@@ -3760,6 +3668,38 @@ mod tests {
         );
         assert!(merged.review_evidence_summary.contains("standard"));
         assert!(merged.review_evidence_summary.contains("targeted"));
+    }
+
+    #[test]
+    fn targeted_unknown_does_not_erase_prior_satisfied_evidence() {
+        let previous = project::TestResult {
+            criterion_reviews: vec![project::CriterionReviewResult {
+                criterion_index: 1,
+                conclusion: project::CriterionReviewConclusion::Satisfied,
+                confidence: 0.9,
+                evidence_references: vec![evidence_reference("E001")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let targeted = project::TestResult {
+            criterion_reviews: vec![project::CriterionReviewResult {
+                criterion_index: 1,
+                conclusion: project::CriterionReviewConclusion::EvidenceInsufficient,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let merged = merge_targeted_review(Some(&previous), targeted, &[1]);
+        assert_eq!(
+            merged.criterion_reviews[0].conclusion,
+            project::CriterionReviewConclusion::Satisfied
+        );
+        assert_eq!(
+            merged.criterion_reviews[0].evidence_references[0].block_id,
+            "E001"
+        );
     }
 
     #[test]

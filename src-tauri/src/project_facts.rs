@@ -346,11 +346,127 @@ fn limited(items: &[String]) -> Vec<&str> {
         .collect()
 }
 
-/// Compressed, current repository facts shared by plan generation and review.
-/// Full source files are deliberately excluded from this context.
-pub(crate) fn planning_context(project: &project::Project) -> Result<String, String> {
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct PlanningConstraints {
+    pub accepted_deviations: Vec<String>,
+    pub unresolved_issues: Vec<String>,
+}
+
+fn accepted_deviation_fact(task: &project::Subtask) -> Option<String> {
+    if let Some(verification) = task
+        .human_verification
+        .as_ref()
+        .filter(|verification| verification.resolution == project::HumanResolution::AcceptDeviation)
+    {
+        let reason = verification.verification_reason.trim();
+        let reason = if reason.is_empty() {
+            "未记录接受原因"
+        } else {
+            reason
+        };
+        return Some(format!(
+            "{}：{}（验收项 {:?}）",
+            task.title, reason, verification.accepted_criteria,
+        ));
+    }
+    if task.child_tasks.is_empty() && task.status == project::SubtaskStatus::AcceptedDeviation {
+        let criteria = task
+            .acceptance_ledger
+            .iter()
+            .filter(|item| item.status == project::AcceptanceStatus::AcceptedDeviation)
+            .map(|item| item.criterion.trim())
+            .filter(|criterion| !criterion.is_empty())
+            .collect::<Vec<_>>();
+        return Some(if criteria.is_empty() {
+            format!("{}：旧项目记录为已接受偏差", task.title)
+        } else {
+            format!("{}：已接受偏差（{}）", task.title, criteria.join("；"))
+        });
+    }
+    None
+}
+
+fn collect_task_constraints(
+    roots: &[project::Subtask],
+    accepted_deviations: &mut BTreeSet<String>,
+    unresolved_issues: &mut BTreeSet<String>,
+) {
+    let mut pending = roots.iter().collect::<Vec<_>>();
+    while let Some(task) = pending.pop() {
+        if let Some(deviation) = accepted_deviation_fact(task) {
+            accepted_deviations.insert(deviation);
+        }
+        if task.status == project::SubtaskStatus::Rejected {
+            unresolved_issues.insert(format!("任务「{}」已驳回", task.title));
+        }
+        for item in &task.acceptance_ledger {
+            let status = match item.status {
+                project::AcceptanceStatus::Unsatisfied => "未满足",
+                project::AcceptanceStatus::Contradictory => "证据矛盾",
+                _ => continue,
+            };
+            unresolved_issues.insert(format!(
+                "任务「{}」验收项「{}」{}",
+                task.title, item.criterion, status
+            ));
+        }
+        pending.extend(task.child_tasks.iter());
+    }
+}
+
+fn planning_constraints_with_scope(
+    project: &project::Project,
+    milestone_scope: Option<&BTreeSet<String>>,
+) -> PlanningConstraints {
+    let mut accepted_deviations = BTreeSet::new();
+    let mut unresolved_issues = BTreeSet::new();
+    for milestone in &project.milestones {
+        if milestone_scope.is_some_and(|scope| !scope.contains(&milestone.id)) {
+            continue;
+        }
+        collect_task_constraints(
+            &milestone.subtasks,
+            &mut accepted_deviations,
+            &mut unresolved_issues,
+        );
+        for mid_stage in &milestone.mid_stages {
+            collect_task_constraints(
+                &mid_stage.subtasks,
+                &mut accepted_deviations,
+                &mut unresolved_issues,
+            );
+        }
+    }
+    PlanningConstraints {
+        accepted_deviations: accepted_deviations
+            .into_iter()
+            .take(MAX_PLANNING_FACT_ITEMS)
+            .collect(),
+        unresolved_issues: unresolved_issues
+            .into_iter()
+            .take(MAX_PLANNING_FACT_ITEMS)
+            .collect(),
+    }
+}
+
+pub(crate) fn planning_constraints_for_milestones(
+    project: &project::Project,
+    milestone_ids: &BTreeSet<String>,
+) -> PlanningConstraints {
+    planning_constraints_with_scope(project, Some(milestone_ids))
+}
+
+fn planning_context_with_scope(
+    project: &project::Project,
+    milestone_scope: Option<&BTreeSet<String>>,
+) -> Result<String, String> {
     let paths = planning_paths(&project.project_path)?;
-    let facts = capture(&project.project_path, &paths, accepted_deviations(project))?;
+    let constraints = planning_constraints_with_scope(project, milestone_scope);
+    let facts = capture(
+        &project.project_path,
+        &paths,
+        constraints.accepted_deviations,
+    )?;
     serde_json::to_string_pretty(&serde_json::json!({
         "git_head": facts.git_head,
         "structural_fingerprint": facts.structural_fingerprint,
@@ -361,8 +477,22 @@ pub(crate) fn planning_context(project: &project::Project) -> Result<String, Str
         "event_bindings": limited(&facts.event_bindings),
         "relevant_snippets": facts.relevant_snippets,
         "accepted_deviations": facts.accepted_deviations,
+        "unresolved_issues": constraints.unresolved_issues,
     }))
     .map_err(|error| format!("序列化计划项目事实失败：{}", error))
+}
+
+/// Compressed, current repository facts shared by plan generation and review.
+/// Full source files are deliberately excluded from this context.
+pub(crate) fn planning_context(project: &project::Project) -> Result<String, String> {
+    planning_context_with_scope(project, None)
+}
+
+pub(crate) fn planning_context_for_milestones(
+    project: &project::Project,
+    milestone_ids: &BTreeSet<String>,
+) -> Result<String, String> {
+    planning_context_with_scope(project, Some(milestone_ids))
 }
 
 pub(crate) fn has_drift(
@@ -404,29 +534,7 @@ pub(crate) fn next_task_needs_scan_or_calibration(
 }
 
 pub(crate) fn accepted_deviations(project: &project::Project) -> Vec<String> {
-    project
-        .milestones
-        .iter()
-        .flat_map(|milestone| &milestone.mid_stages)
-        .flat_map(|mid_stage| &mid_stage.subtasks)
-        .filter_map(|subtask| {
-            subtask
-                .human_verification
-                .as_ref()
-                .and_then(|verification| {
-                    (verification.resolution == project::HumanResolution::AcceptDeviation).then(
-                        || {
-                            format!(
-                                "{}：{}（验收项 {:?}）",
-                                subtask.title,
-                                verification.verification_reason,
-                                verification.accepted_criteria,
-                            )
-                        },
-                    )
-                })
-        })
-        .collect()
+    planning_constraints_with_scope(project, None).accepted_deviations
 }
 
 pub(crate) fn snapshot_paths(subtask: &project::Subtask) -> Vec<String> {
@@ -444,6 +552,144 @@ pub(crate) fn snapshot_paths(subtask: &project::Subtask) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_task(id: &str, title: &str) -> project::Subtask {
+        project::Subtask {
+            id: id.to_string(),
+            title: title.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn test_mid_stage(tasks: Vec<project::Subtask>) -> project::MidStage {
+        project::MidStage {
+            id: "mid-1".to_string(),
+            title: "测试中阶段".to_string(),
+            version: "v0.1.1".to_string(),
+            order: Some(1),
+            status: project::MidStageStatus::Completed,
+            subtasks: tasks,
+            domain: None,
+            test_log: None,
+            created_at: String::new(),
+            description: String::new(),
+            tech_focus: String::new(),
+            test_report: String::new(),
+            completed_at: None,
+            approved_at: None,
+            git_tag: String::new(),
+            plan_check_result: None,
+            plan_approved_at: None,
+            plan_revision: 0,
+            plan_draft_revision: 0,
+            plan_generated_at: None,
+            plan_regeneration_count: 0,
+            last_plan_failure_fingerprint: String::new(),
+            last_plan_issue_count: 0,
+            plan_no_progress_count: 0,
+        }
+    }
+
+    fn test_milestone(id: &str, title: &str) -> project::Milestone {
+        project::Milestone {
+            id: id.to_string(),
+            version: "v0.1".to_string(),
+            title: title.to_string(),
+            description: String::new(),
+            tech_stack: String::new(),
+            status: project::MilestoneStatus::Completed,
+            mode: project::StageMode::Professional,
+            mid_stages: vec![],
+            subtasks: vec![],
+            qa_result: None,
+            git_commit_hash: String::new(),
+            decomposition_check: None,
+            review_status: None,
+            review_conclusion: None,
+            approved_at: None,
+            goal: String::new(),
+            scope: String::new(),
+            dependencies: vec![],
+            expected_output: String::new(),
+            acceptance_criteria: vec![],
+        }
+    }
+
+    #[test]
+    fn planning_constraints_recursively_scope_dynamic_task_facts() {
+        let mut quick_deviation = test_task("quick-deviation", "快速模式偏差");
+        quick_deviation.human_verification = Some(project::HumanVerification {
+            verification_kind: project::VerificationKind::HumanOverride,
+            verification_reason: "保留兼容行为".to_string(),
+            verified_at: String::new(),
+            original_test_failure: String::new(),
+            resolution: project::HumanResolution::AcceptDeviation,
+            accepted_criteria: vec![1],
+            dependency_check: String::new(),
+        });
+
+        let mut deep_deviation = test_task("deep-deviation", "动态叶子偏差");
+        deep_deviation.human_verification = Some(project::HumanVerification {
+            verification_kind: project::VerificationKind::HumanOverride,
+            verification_reason: "接受性能债务".to_string(),
+            verified_at: String::new(),
+            original_test_failure: String::new(),
+            resolution: project::HumanResolution::AcceptDeviation,
+            accepted_criteria: vec![2],
+            dependency_check: String::new(),
+        });
+        let mut rejected = test_task("rejected", "被驳回任务");
+        rejected.status = project::SubtaskStatus::Rejected;
+        let mut contradictory = test_task("contradictory", "矛盾任务");
+        contradictory.acceptance_ledger = vec![project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            criterion: "行为必须稳定".to_string(),
+            status: project::AcceptanceStatus::Contradictory,
+            ..Default::default()
+        }];
+        let mut parent = test_task("parent", "动态父任务");
+        parent.child_tasks = vec![deep_deviation, rejected, contradictory];
+
+        let mut retained = test_milestone("retained", "已完成阶段");
+        retained.subtasks = vec![quick_deviation];
+        retained.mid_stages = vec![test_mid_stage(vec![parent])];
+
+        let mut future_legacy = test_task("future-legacy", "未来旧偏差");
+        future_legacy.status = project::SubtaskStatus::AcceptedDeviation;
+        let mut future = test_milestone("future", "未来阶段");
+        future.status = project::MilestoneStatus::Pending;
+        future.subtasks = vec![future_legacy];
+
+        let mut project = project::Project::new("recursive-facts");
+        project.milestones = vec![retained, future];
+        let scope = BTreeSet::from(["retained".to_string()]);
+        let constraints = planning_constraints_for_milestones(&project, &scope);
+
+        assert_eq!(constraints.accepted_deviations.len(), 2);
+        assert!(constraints
+            .accepted_deviations
+            .iter()
+            .any(|item| item.contains("快速模式偏差")));
+        assert!(constraints
+            .accepted_deviations
+            .iter()
+            .any(|item| item.contains("动态叶子偏差")));
+        assert!(constraints
+            .accepted_deviations
+            .iter()
+            .all(|item| !item.contains("未来旧偏差")));
+        assert!(constraints
+            .unresolved_issues
+            .iter()
+            .any(|item| item.contains("被驳回任务")));
+        assert!(constraints
+            .unresolved_issues
+            .iter()
+            .any(|item| item.contains("证据矛盾")));
+        assert!(accepted_deviations(&project)
+            .iter()
+            .any(|item| item.contains("未来旧偏差")));
+    }
 
     #[test]
     fn detects_fact_drift() {

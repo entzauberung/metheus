@@ -1,6 +1,6 @@
 // src/components/DecisionStepHeader.tsx — 决策层步骤导航
 import { WorkflowStep } from "../types";
-import { MessageCircle, ClipboardCheck, FileCheck, Rocket } from "lucide-react";
+import { MessageCircle, ClipboardCheck, FileCheck, Rocket, WandSparkles } from "lucide-react";
 
 interface DecisionStepHeaderProps {
   currentStep: WorkflowStep;
@@ -9,6 +9,7 @@ interface DecisionStepHeaderProps {
 const steps: { step: WorkflowStep; label: string; icon: React.ReactNode; desc: string }[] = [
   { step: "Discussion", label: "需求讨论", icon: <MessageCircle size={16} />, desc: "与 AI 讨论项目目标" },
   { step: "ThreeChecks", label: "三项审查", icon: <ClipboardCheck size={16} />, desc: "通过三项质量检查" },
+  { step: "ProjectPlanGeneration", label: "方案生成", icon: <WandSparkles size={16} />, desc: "生成项目方案草稿" },
   { step: "PlanApproval", label: "方案审批", icon: <FileCheck size={16} />, desc: "审核并批准项目方案" },
   { step: "MilestoneGeneration", label: "进入控制台", icon: <Rocket size={16} />, desc: "开始规划执行" },
 ];

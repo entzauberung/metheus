@@ -1,0 +1,408 @@
+use crate::control_scheduler::TaskControlDecision;
+use crate::cost_ledger::{CostGroupSummary, ModelCallRecord, TokenCostSummary};
+use crate::project::{AcceptanceLedgerItem, MidStage, Milestone, Project, Subtask};
+use crate::task_compiler::compile;
+use crate::task_contract::TaskContract;
+use crate::task_control::{mode_label, ShadowComparisonMetrics, TaskControlMode};
+use serde::{Deserialize, Serialize};
+
+pub const MAX_SNAPSHOT_EVENTS: usize = 120;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskTreeNodeView {
+    pub id: String,
+    pub title: String,
+    pub node_type: String,
+    pub status: String,
+    pub depth: u32,
+    pub complexity: String,
+    pub risk: String,
+    pub contract_fingerprint: String,
+    pub contract: Option<TaskContract>,
+    pub dependencies: Vec<String>,
+    pub acceptance: Vec<AcceptanceLedgerItem>,
+    pub children: Vec<TaskTreeNodeView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ControlEventView {
+    pub timestamp: String,
+    pub level: String,
+    pub source: String,
+    pub text: String,
+    pub task_id: Option<String>,
+    pub criterion_index: Option<u32>,
+    pub decision_id: Option<String>,
+    pub action_id: Option<String>,
+    pub validator_id: Option<String>,
+    pub model_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlActionStateView {
+    pub action_id: String,
+    pub kind: String,
+    pub task_id: String,
+    pub result: String,
+    pub made_progress: bool,
+    pub at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskControlSnapshot {
+    pub snapshot_version: String,
+    pub project_name: String,
+    pub project_revision: u64,
+    pub control_algorithm_version: String,
+    pub control_mode: TaskControlMode,
+    pub control_mode_label: String,
+    pub current_milestone_id: String,
+    pub current_mid_stage_id: String,
+    pub current_task_id: String,
+    pub task_tree_revision: u64,
+    pub nodes: Vec<TaskTreeNodeView>,
+    pub selected_contract: Option<TaskContract>,
+    pub selected_acceptance: Vec<AcceptanceLedgerItem>,
+    pub decision: Option<TaskControlDecision>,
+    pub shadow_comparison: ShadowComparisonMetrics,
+    pub current_action: Option<ControlActionStateView>,
+    pub recent_action: Option<ControlActionStateView>,
+    pub control_capabilities: Vec<String>,
+    pub cost: TokenCostSummary,
+    pub stage_cost: TokenCostSummary,
+    pub task_cost: TokenCostSummary,
+    pub provider_costs: Vec<CostGroupSummary>,
+    pub purpose_costs: Vec<CostGroupSummary>,
+    pub cost_calls: Vec<ModelCallRecord>,
+    pub events: Vec<ControlEventView>,
+    pub heartbeat_at: String,
+}
+
+pub fn build(project: &Project) -> Result<TaskControlSnapshot, String> {
+    crate::task_tree::validate_project_tree(project)?;
+    let mut nodes = Vec::new();
+    for milestone in &project.milestones {
+        nodes.push(milestone_node(milestone));
+    }
+    let selected_address = crate::task_tree::select_current_leaf(project)?;
+    let selected_task_id = selected_address
+        .as_ref()
+        .map(|address| address.task_id.clone())
+        .unwrap_or_default();
+    let selected = crate::task_tree::find_task(project, &selected_task_id)?;
+    let (selected_contract, acceptance, selected_can_split) = if let Some(task) = selected {
+        let address = selected_address
+            .as_ref()
+            .ok_or_else(|| "控制快照缺少当前任务地址".to_string())?;
+        let result = compile(
+            task,
+            address.ancestor_task_ids.last().map(String::as_str),
+            address.depth,
+        );
+        (
+            Some(result.contract.clone()),
+            task.acceptance_ledger.clone(),
+            result.decision.kind == crate::task_compiler::TaskCompileDecisionKind::SplitFurther,
+        )
+    } else {
+        (None, Vec::new(), false)
+    };
+    let decision = project
+        .task_control
+        .last_decision
+        .as_ref()
+        .filter(|decision| decision.task_id == selected_task_id)
+        .cloned();
+    let events = project
+        .execution_history
+        .iter()
+        .rev()
+        .take(MAX_SNAPSHOT_EVENTS)
+        .map(|event| ControlEventView {
+            timestamp: event.timestamp.clone(),
+            level: event.level.clone(),
+            source: format!("{:?}", event.source),
+            text: event.text.clone(),
+            task_id: event.subtask_id.clone(),
+            criterion_index: event.criterion_index,
+            decision_id: event.decision_id.clone(),
+            action_id: event.action_id.clone(),
+            validator_id: event.validator_id.clone(),
+            model_call_id: event.model_call_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    Ok(TaskControlSnapshot {
+        snapshot_version: project.task_control.snapshot_version.clone(),
+        project_name: project.name.clone(),
+        project_revision: project.workflow_state.data_revision,
+        control_algorithm_version: project.task_control.algorithm_version.clone(),
+        control_mode: project.task_control.mode,
+        control_mode_label: mode_label(project.task_control.mode).to_string(),
+        current_milestone_id: project.current_milestone_id.clone(),
+        current_mid_stage_id: project.current_mid_stage_id.clone(),
+        current_task_id: selected_task_id.clone(),
+        task_tree_revision: project.task_control.tree_revision,
+        nodes,
+        selected_contract,
+        selected_acceptance: acceptance,
+        decision,
+        shadow_comparison: project.task_control.shadow_comparison.clone(),
+        current_action: current_action(project),
+        recent_action: recent_action(project),
+        control_capabilities: control_capabilities(project, selected, selected_can_split),
+        cost: project.cost_ledger.project_summary.clone(),
+        stage_cost: project
+            .cost_ledger
+            .summary_for_stage(&project.current_mid_stage_id),
+        task_cost: project.cost_ledger.summary_for_task(&selected_task_id),
+        provider_costs: project.cost_ledger.summaries_by_provider(),
+        purpose_costs: project.cost_ledger.summaries_by_purpose(),
+        cost_calls: project
+            .cost_ledger
+            .calls
+            .iter()
+            .rev()
+            .take(100)
+            .cloned()
+            .collect(),
+        events,
+        heartbeat_at: project
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .map(|state| state.heartbeat_at.clone())
+            .unwrap_or_default(),
+    })
+}
+
+fn current_action(project: &Project) -> Option<ControlActionStateView> {
+    (!project.task_control.active_action_id.is_empty()).then(|| ControlActionStateView {
+        action_id: project.task_control.active_action_id.clone(),
+        kind: project.task_control.active_action_kind.clone(),
+        task_id: project.task_control.active_action_task_id.clone(),
+        result: "running".to_string(),
+        made_progress: false,
+        at: project.task_control.last_action_at.clone(),
+    })
+}
+
+fn recent_action(project: &Project) -> Option<ControlActionStateView> {
+    (!project.task_control.last_completed_action_id.is_empty()).then(|| ControlActionStateView {
+        action_id: project.task_control.last_completed_action_id.clone(),
+        kind: project.task_control.last_completed_action_kind.clone(),
+        task_id: project.task_control.last_completed_action_task_id.clone(),
+        result: project.task_control.last_action_result.clone(),
+        made_progress: project.task_control.last_action_made_progress,
+        at: project.task_control.last_action_at.clone(),
+    })
+}
+
+fn control_capabilities(
+    project: &Project,
+    selected: Option<&Subtask>,
+    selected_can_split: bool,
+) -> Vec<String> {
+    let mut capabilities = Vec::new();
+    if let Some(state) = project.workflow_state.autopilot_state.as_ref() {
+        if state.run_status == crate::project::AutopilotRunStatus::Running {
+            capabilities.push("pause".to_string());
+        }
+        if state.run_status == crate::project::AutopilotRunStatus::Paused
+            || (state.run_status == crate::project::AutopilotRunStatus::ErrorStopped
+                && matches!(
+                    state.recovery_action,
+                    crate::project::AutopilotRecoveryAction::None
+                        | crate::project::AutopilotRecoveryAction::RetryAutopilotAdvance
+                ))
+        {
+            capabilities.push("resume".to_string());
+        }
+        if state.active || project.workflow_state.autopilot_active {
+            capabilities.push("stop".to_string());
+        }
+    }
+    let Some(task) = selected else {
+        return capabilities;
+    };
+    let session_blocks_edit = project.execution_session.as_ref().is_some_and(|session| {
+        session.active
+            && (session.subtask_id == task.id || session.task_path.iter().any(|id| id == &task.id))
+    });
+    if !crate::task_tree::is_terminal(&task.status) && task.child_tasks.is_empty() {
+        capabilities.push("revalidate".to_string());
+        if task.acceptance_ledger.iter().any(|item| {
+            !matches!(
+                item.status,
+                crate::project::AcceptanceStatus::Satisfied
+                    | crate::project::AcceptanceStatus::AcceptedDeviation
+            )
+        }) {
+            capabilities.push("accept_deviation".to_string());
+        }
+    }
+    if !crate::task_tree::is_terminal(&task.status) && !session_blocks_edit {
+        capabilities.push("recompile".to_string());
+        if task.child_tasks.is_empty() && selected_can_split {
+            capabilities.push("split".to_string());
+        }
+    }
+    capabilities
+}
+
+fn milestone_node(milestone: &Milestone) -> TaskTreeNodeView {
+    let mut children = milestone
+        .mid_stages
+        .iter()
+        .map(mid_stage_node)
+        .collect::<Vec<_>>();
+    if children.is_empty() {
+        children = milestone
+            .subtasks
+            .iter()
+            .map(|task| subtask_node(task, None, 1))
+            .collect();
+    }
+    TaskTreeNodeView {
+        id: milestone.id.clone(),
+        title: milestone.title.clone(),
+        node_type: "Milestone".to_string(),
+        status: format!("{:?}", milestone.status),
+        depth: 0,
+        complexity: "stage".to_string(),
+        risk: "stage".to_string(),
+        contract_fingerprint: String::new(),
+        contract: None,
+        dependencies: milestone.dependencies.clone(),
+        acceptance: Vec::new(),
+        children,
+    }
+}
+
+fn mid_stage_node(stage: &MidStage) -> TaskTreeNodeView {
+    TaskTreeNodeView {
+        id: stage.id.clone(),
+        title: stage.title.clone(),
+        node_type: "MidStage".to_string(),
+        status: format!("{:?}", stage.status),
+        depth: 1,
+        complexity: "stage".to_string(),
+        risk: "stage".to_string(),
+        contract_fingerprint: String::new(),
+        contract: None,
+        dependencies: Vec::new(),
+        acceptance: Vec::new(),
+        children: stage
+            .subtasks
+            .iter()
+            .map(|task| subtask_node(task, Some(&stage.id), 2))
+            .collect(),
+    }
+}
+
+fn subtask_node(task: &Subtask, parent: Option<&str>, depth: u32) -> TaskTreeNodeView {
+    let result = compile(task, parent, depth);
+    TaskTreeNodeView {
+        id: task.id.clone(),
+        title: task.title.clone(),
+        node_type: "Subtask".to_string(),
+        status: format!("{:?}", task.status),
+        depth,
+        complexity: format!("{:?}", result.contract.complexity),
+        risk: format!("{:?}", result.contract.risk),
+        contract_fingerprint: result.contract.fingerprint.clone(),
+        contract: Some(result.contract),
+        dependencies: task.depends_on.clone(),
+        acceptance: task.acceptance_ledger.clone(),
+        children: task
+            .child_tasks
+            .iter()
+            .map(|child| subtask_node(child, Some(&task.id), depth + 1))
+            .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_supports_quick_and_professional_trees() {
+        let mut project = Project::new("snapshot");
+        project.milestones.push(Milestone {
+            id: "m".into(),
+            version: "v0.1".into(),
+            title: "Milestone".into(),
+            description: String::new(),
+            tech_stack: String::new(),
+            status: crate::project::MilestoneStatus::Pending,
+            mode: crate::project::StageMode::Quick,
+            mid_stages: Vec::new(),
+            subtasks: vec![Subtask {
+                id: "task".into(),
+                ..Default::default()
+            }],
+            qa_result: None,
+            git_commit_hash: String::new(),
+            decomposition_check: None,
+            review_status: None,
+            review_conclusion: None,
+            approved_at: None,
+            goal: String::new(),
+            scope: String::new(),
+            dependencies: Vec::new(),
+            expected_output: String::new(),
+            acceptance_criteria: Vec::new(),
+        });
+        project.current_milestone_id = "m".into();
+        let snapshot = build(&project).unwrap();
+        assert_eq!(snapshot.nodes[0].children.len(), 1);
+        assert_eq!(snapshot.nodes[0].children[0].depth, 1);
+    }
+
+    #[test]
+    fn snapshot_uses_the_persisted_decision_without_regenerating_it() {
+        let mut project = Project::new("snapshot-decision");
+        project.milestones.push(Milestone {
+            id: "m".into(),
+            version: "v0.1".into(),
+            title: "Milestone".into(),
+            description: String::new(),
+            tech_stack: String::new(),
+            status: crate::project::MilestoneStatus::InProgress,
+            mode: crate::project::StageMode::Quick,
+            mid_stages: Vec::new(),
+            subtasks: vec![Subtask {
+                id: "task".into(),
+                status: crate::project::SubtaskStatus::Pending,
+                ..Default::default()
+            }],
+            qa_result: None,
+            git_commit_hash: String::new(),
+            decomposition_check: None,
+            review_status: None,
+            review_conclusion: None,
+            approved_at: None,
+            goal: String::new(),
+            scope: String::new(),
+            dependencies: Vec::new(),
+            expected_output: String::new(),
+            acceptance_criteria: Vec::new(),
+        });
+        project.current_milestone_id = "m".into();
+        let task = &project.milestones[0].subtasks[0];
+        let compiled = compile(task, None, 1);
+        let decision =
+            crate::control_scheduler::decide_next_action(task, &compiled, "facts", false);
+        let decision_id = decision.decision_id.clone();
+        project.task_control.last_decision = Some(decision);
+
+        assert_eq!(
+            build(&project).unwrap().decision.unwrap().decision_id,
+            decision_id
+        );
+        assert_eq!(
+            build(&project).unwrap().decision.unwrap().decision_id,
+            decision_id
+        );
+    }
+}

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Activity, Clock3, Pause, Play, Square, Target } from "lucide-react";
 import { ExecutionWorkspaceStatus, Project } from "./types";
 import { invokeWithTimeout, isInvokeTimeoutError } from "./utils/invokeWithTimeout";
 import { ConsoleFeedback } from "./components/ConsoleStepShell";
@@ -91,12 +92,6 @@ export function ConsoleWorkflowPanel({
       onActionEnd();
     }
   };
-
-  const handleTransition = (targetStep: string) => runProjectCommand(
-    "transition_workflow",
-    { projectName: project.name, targetStep, reason: "用户手动推进" },
-    "已进入下一规划步骤。",
-  );
 
   const handleGenerateMilestone = async () => {
     if (!beginAction("generate_milestone_draft")) return;
@@ -204,41 +199,49 @@ export function ConsoleWorkflowPanel({
 
   // Managed flow banner (shown during any Console step when managed flow is active)
   const managedBanner = managedActive ? (
-    <div className="feedback-banner" style={{ marginBottom: "12px", padding: "10px 14px", background: managedState?.run_status === "Running" ? "#f0e6ff" : "#fff8e1", border: `1px solid ${managedState?.run_status === "Running" ? "#6e40c9" : "#d4a72c"}`, borderRadius: "6px", fontSize: "13px" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <span>
-          <strong>{managedPresentation?.statusLabel}</strong>
-          {" - "}{managedState?.last_action || "自动推进中..."}
-        </span>
-        <div style={{ display: "flex", gap: "8px", flexShrink: 0 }}>
+    <div className={`managed-flow-banner managed-${managedState?.run_status.toLowerCase()}`}>
+      <div className="managed-flow-summary">
+        <div className="managed-flow-facts">
+          <strong><Activity size={15} />{managedPresentation?.statusLabel}</strong>
+          <span><Target size={14} />目标：{managedPresentation?.targetLabel}</span>
+          <span><Activity size={14} />动作：{managedPresentation?.actionLabel}</span>
+          <span><Clock3 size={14} />心跳：{managedPresentation?.heartbeatLabel}</span>
+          {managedPresentation?.detail && <span className="managed-flow-detail">{managedPresentation.detail}</span>}
+        </div>
+        <div className="managed-flow-actions">
           {managedPresentation?.canPause && (
-            <button className="action-btn secondary" style={{ fontSize: "12px", padding: "4px 10px" }}
+            <button className="ap-bar-btn"
               disabled={busy}
-              onClick={() => runProjectCommand("pause_managed_flow", { projectName: project.name }, "托管层已暂停。")}>暂停托管</button>
+              onClick={() => runProjectCommand("pause_managed_flow", { projectName: project.name }, "托管层已暂停。")}>
+              <Pause size={14} />暂停托管
+            </button>
           )}
           {managedPresentation?.canResume && (
-            <button className="action-btn primary" style={{ fontSize: "12px", padding: "4px 10px" }}
+            <button className="ap-bar-btn ap-bar-btn-primary"
               disabled={busy}
-              onClick={() => runProjectCommand("resume_managed_flow", { projectName: project.name }, "托管层已恢复。")}>{managedPresentation.resumeLabel}</button>
+              onClick={() => runProjectCommand("resume_managed_flow", { projectName: project.name }, "托管层已恢复。")}>
+              <Play size={14} />{managedPresentation.resumeLabel}
+            </button>
           )}
-          <button className="action-btn secondary" style={{ fontSize: "12px", padding: "4px 10px" }}
+          <button className="ap-bar-btn"
             disabled={busy}
-            onClick={() => runProjectCommand("stop_managed_flow", { projectName: project.name }, "托管层已停止，已转为手动处理。")}>停止托管</button>
+            onClick={() => runProjectCommand("stop_managed_flow", { projectName: project.name }, "托管层已停止，已转为手动处理。")}>
+            <Square size={14} />停止托管
+          </button>
         </div>
       </div>
     </div>
   ) : null;
 
-  if (["MilestoneGeneration", "MilestoneCheck", "MilestoneApproval", "MilestoneSelection", "FuturePlanApproval"].includes(step)) {
+  if (["MilestoneGeneration", "MilestoneCheck", "MilestoneApproval", "MilestoneSelection"].includes(step)) {
     return <>{managedBanner}<MilestonePlanningStep project={project} busy={planningBusy} feedback={feedback}
       regenerationFeedback={regenerationFeedback} setRegenerationFeedback={setRegenerationFeedback}
       regenerationModalOpen={milestoneModalOpen} setRegenerationModalOpen={setMilestoneModalOpen}
       onGenerate={handleGenerateMilestone}
       onCheck={() => runProjectCommand("check_milestone_draft", { projectName: project.name }, "大阶段检查已完成。")}
       onApprove={() => runProjectCommand("approve_milestone_draft", { projectName: project.name }, "大阶段已批准。")}
-      onApproveFuture={() => runProjectCommand("approve_future_milestones", { projectName: project.name }, "后续大阶段已批准。")}
       onSelect={(milestoneId) => runProjectCommand("select_milestone", { projectName: project.name, milestoneId }, "已选择大阶段。")}
-      onContinue={() => handleTransition("MidStageGeneration")}
+      onContinue={() => runProjectCommand("continue_current_milestone", { projectName: project.name }, "已按项目事实继续当前大阶段。")}
       onRegenerate={handleRegenerateMilestone} onSync={handleSync}
     /></>;
   }
@@ -251,7 +254,8 @@ export function ConsoleWorkflowPanel({
       onCheck={() => runProjectCommand("check_mid_stage_draft", { projectName: project.name }, "中阶段检查已完成。")}
       onApprove={() => runProjectCommand("approve_mid_stage_draft", { projectName: project.name }, "中阶段已批准。")}
       onSelect={(midStageId) => runProjectCommand("select_mid_stage", { projectName: project.name, midStageId }, "已选择中阶段。")}
-      onContinue={() => handleTransition("PlanGeneration")} onRegenerate={handleRegenerateMidStage}
+      onContinue={() => runProjectCommand("select_mid_stage", { projectName: project.name, midStageId: project.current_mid_stage_id }, "已按中阶段事实继续。")}
+      onRegenerate={handleRegenerateMidStage}
     /></>;
   }
 

@@ -1,5 +1,54 @@
 use crate::project;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub(crate) fn revalidation_target_indexes(
+    task: &project::Subtask,
+    requested: &[u32],
+) -> Result<Vec<u32>, String> {
+    let criterion_count = task.acceptance_criteria.len() as u32;
+    if !requested.is_empty() {
+        let mut seen = BTreeSet::new();
+        let mut targets = Vec::new();
+        for &index in requested {
+            if index == 0 || index > criterion_count {
+                return Err(format!("验收项不存在：{}", index));
+            }
+            let rows = task
+                .acceptance_ledger
+                .iter()
+                .filter(|item| item.criterion_index == index)
+                .collect::<Vec<_>>();
+            let needs_revalidation = rows.is_empty()
+                || rows.iter().any(|item| {
+                    matches!(
+                        item.status,
+                        project::AcceptanceStatus::Unknown | project::AcceptanceStatus::Unsatisfied
+                    )
+                });
+            if needs_revalidation && seen.insert(index) {
+                targets.push(index);
+            }
+        }
+        return Ok(targets);
+    }
+
+    Ok((1..=criterion_count)
+        .filter(|index| {
+            let rows = task
+                .acceptance_ledger
+                .iter()
+                .filter(|item| item.criterion_index == *index)
+                .collect::<Vec<_>>();
+            rows.is_empty()
+                || rows.iter().any(|item| {
+                    matches!(
+                        item.status,
+                        project::AcceptanceStatus::Unknown | project::AcceptanceStatus::Unsatisfied
+                    )
+                })
+        })
+        .collect())
+}
 
 fn valid_evidence_references(
     references: &[project::ReviewEvidenceReference],
@@ -218,6 +267,35 @@ pub(crate) fn needs_evidence(ledger: &[project::AcceptanceLedgerItem]) -> bool {
             .any(|item| item.status == project::AcceptanceStatus::Unknown)
 }
 
+/// Evidence-only retries must not erase an already proven criterion merely
+/// because the targeted response omitted it. Explicit new conclusions win.
+pub(crate) fn merge_evidence_refresh(
+    previous: &[project::AcceptanceLedgerItem],
+    fresh: Vec<project::AcceptanceLedgerItem>,
+) -> Vec<project::AcceptanceLedgerItem> {
+    fresh
+        .into_iter()
+        .map(|item| {
+            if item.status != project::AcceptanceStatus::Unknown {
+                return item;
+            }
+            previous
+                .iter()
+                .find(|old| {
+                    old.criterion_index == item.criterion_index
+                        && old.criterion == item.criterion
+                        && matches!(
+                            old.status,
+                            project::AcceptanceStatus::Satisfied
+                                | project::AcceptanceStatus::AcceptedDeviation
+                        )
+                })
+                .cloned()
+                .unwrap_or(item)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +308,75 @@ mod tests {
             start_line: Some(1),
             end_line: Some(3),
         }
+    }
+
+    #[test]
+    fn evidence_refresh_preserves_only_previously_proven_rows() {
+        let previous = vec![project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            criterion: "criterion".to_string(),
+            status: project::AcceptanceStatus::Satisfied,
+            evidence: "stable evidence".to_string(),
+            ..Default::default()
+        }];
+        let fresh = vec![project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            criterion: "criterion".to_string(),
+            status: project::AcceptanceStatus::Unknown,
+            ..Default::default()
+        }];
+        let merged = merge_evidence_refresh(&previous, fresh);
+        assert_eq!(merged[0].status, project::AcceptanceStatus::Satisfied);
+        assert_eq!(merged[0].evidence, "stable evidence");
+    }
+
+    #[test]
+    fn explicit_revalidation_skips_proven_and_human_decided_rows() {
+        let task = project::Subtask {
+            acceptance_criteria: vec![
+                "satisfied".into(),
+                "accepted".into(),
+                "contradictory".into(),
+                "unknown".into(),
+                "unsatisfied".into(),
+            ],
+            acceptance_ledger: vec![
+                project::AcceptanceLedgerItem {
+                    criterion_index: 1,
+                    status: project::AcceptanceStatus::Satisfied,
+                    ..Default::default()
+                },
+                project::AcceptanceLedgerItem {
+                    criterion_index: 2,
+                    status: project::AcceptanceStatus::AcceptedDeviation,
+                    ..Default::default()
+                },
+                project::AcceptanceLedgerItem {
+                    criterion_index: 3,
+                    status: project::AcceptanceStatus::Contradictory,
+                    ..Default::default()
+                },
+                project::AcceptanceLedgerItem {
+                    criterion_index: 4,
+                    status: project::AcceptanceStatus::Unknown,
+                    ..Default::default()
+                },
+                project::AcceptanceLedgerItem {
+                    criterion_index: 5,
+                    status: project::AcceptanceStatus::Unsatisfied,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            revalidation_target_indexes(&task, &[1, 2, 3, 4, 5]).unwrap(),
+            vec![4, 5]
+        );
+        assert!(revalidation_target_indexes(&task, &[1, 2, 3])
+            .unwrap()
+            .is_empty());
     }
 
     fn criterion_review(
@@ -420,5 +567,74 @@ mod tests {
 
         assert_eq!(ledger[0].status, project::AcceptanceStatus::Unknown);
         assert!(needs_evidence(&ledger));
+    }
+
+    fn task_with_criteria(count: usize) -> project::Subtask {
+        project::Subtask {
+            acceptance_criteria: (1..=count)
+                .map(|index| format!("criterion {index}"))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn empty_or_partial_ledger_revalidates_unproven_criteria() {
+        let mut task = task_with_criteria(3);
+        assert_eq!(
+            revalidation_target_indexes(&task, &[]).unwrap(),
+            vec![1, 2, 3]
+        );
+
+        task.acceptance_ledger = vec![project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            status: project::AcceptanceStatus::Satisfied,
+            ..Default::default()
+        }];
+        assert_eq!(revalidation_target_indexes(&task, &[]).unwrap(), vec![2, 3]);
+    }
+
+    #[test]
+    fn default_revalidation_includes_unknown_and_unsatisfied_only() {
+        let mut task = task_with_criteria(5);
+        task.acceptance_ledger = vec![
+            project::AcceptanceLedgerItem {
+                criterion_index: 1,
+                status: project::AcceptanceStatus::Unknown,
+                ..Default::default()
+            },
+            project::AcceptanceLedgerItem {
+                criterion_index: 2,
+                status: project::AcceptanceStatus::Unsatisfied,
+                ..Default::default()
+            },
+            project::AcceptanceLedgerItem {
+                criterion_index: 3,
+                status: project::AcceptanceStatus::Satisfied,
+                ..Default::default()
+            },
+            project::AcceptanceLedgerItem {
+                criterion_index: 4,
+                status: project::AcceptanceStatus::AcceptedDeviation,
+                ..Default::default()
+            },
+            project::AcceptanceLedgerItem {
+                criterion_index: 5,
+                status: project::AcceptanceStatus::Contradictory,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(revalidation_target_indexes(&task, &[]).unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn explicit_revalidation_indexes_are_validated_and_deduplicated() {
+        let task = task_with_criteria(3);
+        assert_eq!(
+            revalidation_target_indexes(&task, &[3, 1, 3]).unwrap(),
+            vec![3, 1]
+        );
+        assert!(revalidation_target_indexes(&task, &[0]).is_err());
+        assert!(revalidation_target_indexes(&task, &[4]).is_err());
     }
 }

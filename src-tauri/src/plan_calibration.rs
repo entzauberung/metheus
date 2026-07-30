@@ -110,15 +110,21 @@ pub(crate) async fn calibrate_next_subtask(project: &mut project::Project) -> Re
     }
 
     let contract_before = immutable_contract(&task)?;
-    let reply = crate::api::call_deepseek_api_json(
+    let call_context = crate::cost_ledger::ModelCallContext::for_project(
+        project,
+        crate::cost_ledger::ModelCallPurpose::TaskCalibration,
+    );
+    let response = crate::api::call_deepseek_api_json_with_context(
         crate::prompts::PLAN_PATCH_PROMPT,
         &patch_context(&task, &current)?,
+        call_context.clone(),
     )
     .await
     .map_err(|error| format!("下一任务滚动校准失败：{}", error))?;
-    let patch: PlanPatchOutput = crate::json_utils::parse_json_with_retry(&reply)
-        .await
-        .map_err(|error| format!("计划补丁解析失败：{}", error))?;
+    let patch: PlanPatchOutput =
+        crate::json_utils::parse_json_with_retry_with_context(&response.content, call_context)
+            .await
+            .map_err(|error| format!("计划补丁解析失败：{}", error))?;
     if patch.implementation_guidance.trim().is_empty()
         || patch.context_summary.trim().is_empty()
         || patch.evidence_files.is_empty()
@@ -169,6 +175,16 @@ pub(crate) async fn calibrate_next_subtask(project: &mut project::Project) -> Re
     );
     project.workflow_state.data_revision = project.workflow_state.data_revision.saturating_add(1);
     project.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+    crate::cost_ledger::mark_call_outcome_best_effort(
+        &project.name,
+        &response.metadata.call_id,
+        crate::cost_ledger::ModelCallOutcome {
+            produced_plan: true,
+            produced_contract: true,
+            produced_fact: true,
+            ..Default::default()
+        },
+    );
     Ok(true)
 }
 

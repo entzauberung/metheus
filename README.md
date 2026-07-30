@@ -87,14 +87,24 @@ metheus/auto/v0.1.1/task-0        ← 子任务 tag
 
 回退时自动 `stash` 未提交变更。你可以回到**任何一个子任务执行前的状态**。
 
-### 🖥 3.4 任务控制台
+### 🖥 3.4 任务控制工作区
 
-| 标签页 | 功能 |
-|--------|------|
-| **执行日志** | 流水线实时日志 |
-| **代码变更** | 执行前后 Diff 对比 |
-| **文件树** | 项目结构一览 |
-| **宪法** | 随时查看 AI 维护的项目知识 |
+执行阶段使用三栏工作区：左侧是一棵支持任意深度子任务的递归任务树，中间保留当前任务、执行日志与代码变更，右侧任务检查器展示所选任务的完整控制事实。左、中、右区域分别滚动；右侧宽度可拖动，在中小窗口中切换为抽屉或全屏详情。
+
+任务检查器分为四页：
+
+| 页面 | 内容 |
+|------|------|
+| **概览与合同** | 目标、文件范围、依赖、复杂度、风险和合同指纹 |
+| **验收与证据** | 逐项状态、证据文件与行号、自动测试状态和接受偏差入口 |
+| **决策与恢复** | 当前控制决策、Shadow 对照、恢复分类、次数和人工边界 |
+| **成本与事件** | 项目/阶段/任务成本、模型调用和关联控制事件 |
+
+日志中的任务链接、左侧选中状态和右侧详情使用同一个任务 ID。父任务可展开和查看，但不能作为执行叶子。
+
+验证结果严格区分三种通道：`LocalValidate` 是本地确定性证明，`AutomatedValidate` 是真实测试命令，`TargetedValidate` 是 AI 语义审查。测试未配置、测试环境不可用和证据不足都保持未知状态，不会被当作通过，也不会被误判为代码失败。
+
+控制模式边界保持不变：`Legacy` 用于旧项目和显式回退，`Shadow` 只对照记录且不派发新控制动作，`SerialTakeover` 只在显式选择后接管任务执行阶段，且不是默认模式。
 
 ### 🔓 3.5 模型边界
 
@@ -137,6 +147,7 @@ npm install && npm run tauri dev
 ```bash
 npm run verify:core-light   # Core 格式与库目标类型检查
 npm run verify:quality      # 定向 Rust 测试、TypeScript 和前端策略测试
+npm run verify:phase1       # 第一阶段任务控制专项门禁 + 前端生产构建
 npm run verify:grok-check   # 单任务检查内置 Grok 特性，不做最终链接
 ```
 
@@ -164,13 +175,15 @@ npm run verify:grok-check   # 单任务检查内置 Grok 特性，不做最终�
 metheus/
 ├── src/                          # React 前端
 │   ├── App.tsx                   # 状态机中心枢纽
+│   ├── ExecutionTree.tsx         # 唯一递归任务树
+│   ├── TaskConsole.tsx           # 日志、Diff、宪法与标签
+│   ├── TaskInspector.tsx         # 右侧任务检查器
+│   ├── V1ExecutionPanel.tsx      # 当前任务执行与确认面板
 │   ├── types.ts                  # 数据结构定义
 │   └── components/
-│       ├── TaskConsole.tsx       # 任务控制台
-│       ├── ExecutionTree.tsx     # 执行树 + Git Tag 回退
-│       ├── ChatArea.tsx          # 与 AI 角色的对话区
-│       ├── PlanView.tsx          # 版本方案审批视图
-│       └── ProjectSelector.tsx   # 项目选择器
+│       ├── AutopilotControlBar.tsx
+│       ├── ApplicationSettings.tsx
+│       └── ExecutionEngineSettings.tsx
 ├── src-tauri/                    # Rust 后端
 │   ├── src/
 │   │   ├── lib.rs                # 核心逻辑，30+ Tauri 命令
@@ -220,10 +233,10 @@ metheus/
 ### 当前主要技术问题
 
 ```
-⚠️ 自动化回归测试资产尚未建立 → 目前主要依赖构建和手工端到端验收
+⚠️ 真实桌面窗口的多尺寸端到端回归仍需发布环境复验
 ⚠️ 真实模型与 CLI 烟雾测试依赖用户自己的认证、网络和额度
-⚠️ Tauri CSP 尚未收紧 → Alpha 阶段保留，正式分发前需要配置白名单
-⚠️ 前端入口职责偏重 → App.tsx 仍同时承载状态机、轮询和多视图协调
+⚠️ 全量 Rust 库测试仍有少量既有工作流/引擎健康场景待单独收口
+⚠️ 前端入口仍承担宏观状态机与多视图协调，后续重构需独立进行
 ```
 
 > 持久化恢复、暂停/回退、自动驾驶状态和执行输出管道已完成本轮稳定性修复；当前不把历史遗留问题继续当作未完成项。

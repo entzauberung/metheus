@@ -81,10 +81,45 @@ pub(crate) async fn repair_json_once_with_contract(
     expected: &str,
     actual: &str,
 ) -> Result<String, crate::api::ApiRequestError> {
+    repair_json_once_with_contract_and_context(
+        response_text,
+        schema_contract,
+        error_path,
+        expected,
+        actual,
+        crate::cost_ledger::ModelCallContext::default(),
+    )
+    .await
+}
+
+pub(crate) async fn repair_json_once_with_contract_and_context(
+    response_text: &str,
+    schema_contract: &str,
+    error_path: &str,
+    expected: &str,
+    actual: &str,
+    mut context: crate::cost_ledger::ModelCallContext,
+) -> Result<String, crate::api::ApiRequestError> {
     let user_message =
         schema_repair_user_message(response_text, schema_contract, error_path, expected, actual);
-    crate::api::call_deepseek_api_inner_typed(SCHEMA_REPAIR_SYSTEM_PROMPT, &user_message, true, 0.0)
-        .await
+    context.purpose = Some(crate::cost_ledger::ModelCallPurpose::SchemaRepair);
+    let response = crate::api::call_deepseek_api_inner_typed_with_context(
+        SCHEMA_REPAIR_SYSTEM_PROMPT,
+        &user_message,
+        true,
+        0.0,
+        context.clone(),
+    )
+    .await?;
+    crate::cost_ledger::mark_call_outcome_best_effort(
+        &context.project_name,
+        &response.metadata.call_id,
+        crate::cost_ledger::ModelCallOutcome {
+            produced_change: true,
+            ..Default::default()
+        },
+    );
+    Ok(response.content)
 }
 
 /// 带重试的 JSON 解析
@@ -94,6 +129,21 @@ pub(crate) async fn repair_json_once_with_contract(
 /// 三次全失败则返回错误
 pub(crate) async fn parse_json_with_retry<T: serde::de::DeserializeOwned>(
     response_text: &str,
+) -> Result<T, String> {
+    parse_json_with_retry_and_context(response_text, None).await
+}
+
+pub(crate) async fn parse_json_with_retry_with_context<T: serde::de::DeserializeOwned>(
+    response_text: &str,
+    mut context: crate::cost_ledger::ModelCallContext,
+) -> Result<T, String> {
+    context.purpose = Some(crate::cost_ledger::ModelCallPurpose::SchemaRepair);
+    parse_json_with_retry_and_context(response_text, Some(context)).await
+}
+
+async fn parse_json_with_retry_and_context<T: serde::de::DeserializeOwned>(
+    response_text: &str,
+    context: Option<crate::cost_ledger::ModelCallContext>,
 ) -> Result<T, String> {
     // 第一次尝试：直接 sanitize + 解析
     let cleaned = sanitize_json_response(response_text);
@@ -109,11 +159,37 @@ pub(crate) async fn parse_json_with_retry<T: serde::de::DeserializeOwned>(
         "以下 JSON 解析失败。\n\n错误信息：\n解析失败，请检查 JSON 格式是否正确。\n\n原始内容：\n{}\n\n请修正后重新输出，只输出 JSON，不要任何其他内容。",
         cleaned
     );
-    match call_deepseek_api_inner(system_prompt, &user_message, false, 0.5).await {
-        Ok(reply) => {
+    let second = match context.clone() {
+        Some(context) => crate::api::call_deepseek_api_inner_with_context(
+            system_prompt,
+            &user_message,
+            false,
+            0.5,
+            context,
+        )
+        .await
+        .map(|response| (response.content, Some(response.metadata.call_id))),
+        None => call_deepseek_api_inner(system_prompt, &user_message, false, 0.5)
+            .await
+            .map(|reply| (reply, None)),
+    };
+    match second {
+        Ok((reply, call_id)) => {
             let cleaned2 = sanitize_json_response(&reply);
             match serde_json::from_str::<T>(&cleaned2) {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    if let (Some(context), Some(call_id)) = (context.as_ref(), call_id.as_deref()) {
+                        crate::cost_ledger::mark_call_outcome_best_effort(
+                            &context.project_name,
+                            call_id,
+                            crate::cost_ledger::ModelCallOutcome {
+                                produced_change: true,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    return Ok(value);
+                }
                 Err(second_err) => {
                     eprintln!("[parse_json_with_retry] 第2次解析失败：{}", second_err);
                 }
@@ -128,11 +204,37 @@ pub(crate) async fn parse_json_with_retry<T: serde::de::DeserializeOwned>(
         "以下 JSON 解析仍然失败，这是最后一次修正机会。\n\n原始内容：\n{}\n\n请修正后只输出 JSON，不要任何其他内容。如果仍无法修正，请输出一个空 JSON 对象 {{}}。",
         cleaned
     );
-    match call_deepseek_api_inner(system_prompt, &user_message_last, false, 0.5).await {
-        Ok(reply) => {
+    let third = match context.clone() {
+        Some(context) => crate::api::call_deepseek_api_inner_with_context(
+            system_prompt,
+            &user_message_last,
+            false,
+            0.5,
+            context,
+        )
+        .await
+        .map(|response| (response.content, Some(response.metadata.call_id))),
+        None => call_deepseek_api_inner(system_prompt, &user_message_last, false, 0.5)
+            .await
+            .map(|reply| (reply, None)),
+    };
+    match third {
+        Ok((reply, call_id)) => {
             let cleaned3 = sanitize_json_response(&reply);
             match serde_json::from_str::<T>(&cleaned3) {
-                Ok(value) => Ok(value),
+                Ok(value) => {
+                    if let (Some(context), Some(call_id)) = (context.as_ref(), call_id.as_deref()) {
+                        crate::cost_ledger::mark_call_outcome_best_effort(
+                            &context.project_name,
+                            call_id,
+                            crate::cost_ledger::ModelCallOutcome {
+                                produced_change: true,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                    Ok(value)
+                }
                 Err(final_err) => {
                     let preview: String = cleaned3.chars().take(200).collect();
                     let original_preview: String = response_text.chars().take(200).collect();

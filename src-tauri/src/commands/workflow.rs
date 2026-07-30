@@ -16,7 +16,9 @@ fn is_valid_transition(from: &project::WorkflowStep, to: &project::WorkflowStep)
         // Discussion -> checks -> plan
         | (Discussion, ThreeChecks)
         | (ThreeChecks, Discussion)          // check failed
-        | (ThreeChecks, PlanApproval)        // when generating plan draft, stays at PlanApproval
+        | (ThreeChecks, ProjectPlanGeneration) // all checks passed
+        | (ProjectPlanGeneration, Discussion)  // requirements changed before generation
+        | (ProjectPlanGeneration, PlanApproval) // draft generated successfully
         // Plan flow
         | (PlanApproval, Discussion)         // rejected
         | (PlanApproval, MilestoneGeneration) // entering console
@@ -27,6 +29,7 @@ fn is_valid_transition(from: &project::WorkflowStep, to: &project::WorkflowStep)
         | (MilestoneApproval, MilestoneGeneration)   // 仅描述语义；正式重生成由原子业务命令完成
         | (MilestoneApproval, MilestoneSelection)    // approved
         | (MilestoneSelection, MidStageGeneration)
+        | (MilestoneSelection, MilestoneReview) // existing mid stages are already complete
         | (MidStageGeneration, MidStageCheck)
         | (MidStageCheck, MidStageGeneration) // 仅描述语义；正式重生成由原子业务命令完成
         | (MidStageCheck, Discussion)        // check failed -> branch discussion for fix
@@ -69,6 +72,7 @@ fn can_enter_discussion(from: &project::WorkflowStep) -> bool {
         from,
         Discussion
             | ThreeChecks
+            | ProjectPlanGeneration
             | MilestoneSelection
             | MidStageCheck
             | PlanCheck
@@ -85,6 +89,23 @@ fn can_complete(from: &project::WorkflowStep) -> bool {
     // 只有 MilestoneReview（最后一个大阶段选 A 分支）可以进入 Completed
     // Discussion 和 PlanApproval 不能直接跳到 Completed
     matches!(from, MilestoneReview)
+}
+
+fn has_valid_preflight_checks(proj: &project::Project) -> bool {
+    [
+        "goal_completeness",
+        "reality_consistency",
+        "task_executability",
+    ]
+    .iter()
+    .all(|check_type| {
+        proj.preflight_results.iter().any(|result| {
+            result.check_type == *check_type
+                && result.passed
+                && !result.stale
+                && result.discussion_revision == proj.discussion_revision
+        })
+    })
 }
 
 /// 转换工作流状态（前端调用）
@@ -112,6 +133,9 @@ pub(crate) async fn transition_workflow(
             current, to_step, reason
         ));
     }
+    if to_step == project::WorkflowStep::PlanApproval && proj.plan_draft.is_none() {
+        return Err("没有可审批的项目方案草稿，无法进入 PlanApproval。".to_string());
+    }
 
     // Update workflow state
     proj.workflow_state.current_step = to_step.clone();
@@ -128,6 +152,7 @@ pub(crate) async fn transition_workflow(
         }
         s if *s == project::WorkflowStep::Discussion
             || *s == project::WorkflowStep::ThreeChecks
+            || *s == project::WorkflowStep::ProjectPlanGeneration
             || *s == project::WorkflowStep::PlanApproval =>
         {
             project::TopLevelPhase::FirstDiscussion
@@ -155,6 +180,9 @@ pub(crate) async fn migrate_project_workflow(
     // === 0.75. 旧执行计划契约迁移 ===
     // 无执行事实的旧计划退回检查；已有执行事实只停止自动驾驶，不改写历史。
     reconcile_plan_contract_in_migration(&mut proj);
+
+    // === 0.8. workflow closure migration ===
+    reconcile_workflow_closure_state(&mut proj);
 
     // Repair rule: PlanApproving + approved plan → Execution
     // Fixes projects stuck in the old "stay at PlanApproving" state after approval.
@@ -382,6 +410,7 @@ fn parse_step(s: &str) -> Option<project::WorkflowStep> {
         "BaselineApproval" => Some(BaselineApproval),
         "Discussion" => Some(Discussion),
         "ThreeChecks" => Some(ThreeChecks),
+        "ProjectPlanGeneration" => Some(ProjectPlanGeneration),
         "PlanApproval" => Some(PlanApproval),
         "MilestoneGeneration" => Some(MilestoneGeneration),
         "MilestoneCheck" => Some(MilestoneCheck),
@@ -440,7 +469,7 @@ pub(crate) async fn start_preflight_check(
     crate::save_and_reload_project(&proj)
 }
 
-/// 返回继续讨论（从 ThreeChecks 或 PlanApproval 返回 Discussion）
+/// 返回继续讨论（从检查、项目方案生成或方案审批返回 Discussion）
 ///
 /// - 从 ThreeChecks 返回：保留未过期检查结果
 /// - 从 PlanApproval（待审批草稿）返回：保留草稿和有效检查结果
@@ -464,9 +493,9 @@ pub(crate) async fn return_to_discussion(
         ));
     }
 
-    // 允许的来源步骤：ThreeChecks 或 PlanApproval
+    // 允许的来源步骤：ThreeChecks、ProjectPlanGeneration 或 PlanApproval
     match parsed {
-        project::WorkflowStep::ThreeChecks => {
+        project::WorkflowStep::ThreeChecks | project::WorkflowStep::ProjectPlanGeneration => {
             // 保留未过期检查结果，直接转换到 Discussion
         }
         project::WorkflowStep::PlanApproval => {
@@ -484,7 +513,7 @@ pub(crate) async fn return_to_discussion(
         }
         _ => {
             return Err(format!(
-                "return_to_discussion 只能从 ThreeChecks 或 PlanApproval 调用，当前来源为 {:?}",
+                "return_to_discussion 只能从 ThreeChecks、ProjectPlanGeneration 或 PlanApproval 调用，当前来源为 {:?}",
                 parsed
             ));
         }
@@ -641,19 +670,92 @@ pub(crate) async fn restart_checks(project_name: String) -> Result<project::Proj
 // V2 托管层（Managed Flow）：ThreeChecks 后自动推进到大阶段批准完成
 // ===================================================================
 
+fn pending_plan_draft_is_valid(proj: &project::Project) -> bool {
+    proj.plan_draft.as_ref().is_some_and(|draft| {
+        draft.draft_status == project::DraftStatus::Pending
+            && !draft.plan_content.trim().is_empty()
+            && !draft.constitution_part1_draft.trim().is_empty()
+            && draft.generation_revision == proj.discussion_revision
+    }) && has_valid_preflight_checks(proj)
+}
+
+fn reconcile_managed_plan_state(proj: &mut project::Project) -> bool {
+    let original_step = proj.workflow_state.current_step.clone();
+
+    if original_step == project::WorkflowStep::ThreeChecks && has_valid_preflight_checks(proj) {
+        proj.workflow_state.current_step = project::WorkflowStep::ProjectPlanGeneration;
+    }
+
+    if original_step == project::WorkflowStep::PlanApproval && proj.plan_draft.is_none() {
+        proj.workflow_state.current_step = project::WorkflowStep::ProjectPlanGeneration;
+    }
+
+    if matches!(
+        original_step,
+        project::WorkflowStep::ProjectPlanGeneration | project::WorkflowStep::PlanApproval
+    ) {
+        let has_approved = proj.plan_draft.as_ref().is_some_and(|draft| {
+            draft.draft_status == project::DraftStatus::Approved
+                && !draft.plan_content.trim().is_empty()
+        });
+        if pending_plan_draft_is_valid(proj) || has_approved {
+            proj.workflow_state.current_step = project::WorkflowStep::PlanApproval;
+        } else if proj.plan_draft.is_some() {
+            if let Some(mut invalid) = proj.plan_draft.take() {
+                if invalid.draft_status == project::DraftStatus::Pending {
+                    invalid.draft_status = project::DraftStatus::Expired;
+                    invalid.expired_at = Some(chrono::Utc::now().to_rfc3339());
+                }
+                proj.draft_history.push(invalid);
+            }
+            proj.workflow_state.current_step = if has_valid_preflight_checks(proj) {
+                project::WorkflowStep::ProjectPlanGeneration
+            } else {
+                project::WorkflowStep::ThreeChecks
+            };
+        }
+    }
+
+    if proj.workflow_state.current_step == original_step {
+        return false;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(managed) = proj.workflow_state.managed_flow_state.as_mut() {
+        managed.managed_state = format!("{:?}", proj.workflow_state.current_step);
+        managed.last_action = "托管层已按方案草稿事实修复工作流状态".to_string();
+        managed.last_action_at = now.clone();
+    }
+    proj.workflow_state.data_revision = proj.workflow_state.data_revision.saturating_add(1);
+    proj.workflow_state.last_transition_at = now;
+    true
+}
+
 /// 激活托管层：从当前步骤开始自动推进到大阶段批准完成
 #[tauri::command]
-pub(crate) async fn start_managed_flow(project_name: String) -> Result<project::Project, String> {
-    let mut proj = crate::load_project(&project_name)?;
+pub(crate) async fn start_managed_flow(
+    state: tauri::State<'_, crate::AppState>,
+    project_name: String,
+) -> Result<project::Project, String> {
+    let updated = start_managed_flow_state(project_name.clone()).await?;
+    state.managed_runtime.start(project_name).await?;
+    Ok(updated)
+}
 
-    // 仅允许在 ThreeChecks 或 PlanApproval 步骤启动托管
+pub(crate) async fn start_managed_flow_state(
+    project_name: String,
+) -> Result<project::Project, String> {
+    let mut proj = crate::load_project(&project_name)?;
+    reconcile_managed_plan_state(&mut proj);
+
+    // 仅允许在检查完成后的生成/审批步骤或大阶段生成步骤启动托管
     match proj.workflow_state.current_step {
         project::WorkflowStep::ThreeChecks
+        | project::WorkflowStep::ProjectPlanGeneration
         | project::WorkflowStep::PlanApproval
         | project::WorkflowStep::MilestoneGeneration => {}
         _ => {
             return Err(format!(
-                "当前步骤为 {:?}，托管层只能在 ThreeChecks、PlanApproval 或 MilestoneGeneration 启动",
+                "当前步骤为 {:?}，托管层只能在 ThreeChecks、ProjectPlanGeneration、PlanApproval 或 MilestoneGeneration 启动",
                 proj.workflow_state.current_step
             ));
         }
@@ -667,7 +769,7 @@ pub(crate) async fn start_managed_flow(project_name: String) -> Result<project::
     let now = chrono::Utc::now().to_rfc3339();
     let current_step_str = format!("{:?}", proj.workflow_state.current_step);
 
-    proj.workflow_state.managed_flow_state = Some(project::ManagedFlowState {
+    let mut managed_state = project::ManagedFlowState {
         active: true,
         managed_state: current_step_str,
         managed_target: "MilestoneSelection".to_string(),
@@ -675,7 +777,13 @@ pub(crate) async fn start_managed_flow(project_name: String) -> Result<project::
         last_action_at: now.clone(),
         run_status: project::ManagedRunStatus::Running,
         error_message: String::new(),
-    });
+        ..Default::default()
+    };
+    crate::managed_runtime::assign_new_job_identity(
+        &mut managed_state,
+        "托管层已激活，后端开始自动推进",
+    );
+    proj.workflow_state.managed_flow_state = Some(managed_state);
 
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = now;
@@ -697,7 +805,10 @@ pub struct ManagedNextStep {
 
 #[tauri::command]
 pub(crate) async fn managed_next_step(project_name: String) -> Result<ManagedNextStep, String> {
-    let proj = crate::load_project(&project_name)?;
+    let mut proj = crate::load_project(&project_name)?;
+    if reconcile_managed_plan_state(&mut proj) {
+        crate::save_project(&proj)?;
+    }
 
     let managed = match proj.workflow_state.managed_flow_state.as_ref() {
         Some(m) => m,
@@ -838,34 +949,20 @@ pub(crate) async fn managed_next_step(project_name: String) -> Result<ManagedNex
             error_message: String::new(),
         },
 
-        // ThreeChecks → generate plan draft
+        // ThreeChecks remains a real human boundary until every check passes.
         ThreeChecks => {
             // Check if all three checks passed
-            let all_passed = [
-                "goal_completeness",
-                "reality_consistency",
-                "task_executability",
-            ]
-            .iter()
-            .all(|ct| {
-                proj.preflight_results
-                    .iter()
-                    .any(|r| r.check_type == *ct && r.passed && !r.stale)
-            });
+            let all_passed = has_valid_preflight_checks(&proj);
 
             if all_passed {
                 ManagedNextStep {
-                    command: "generate_version_plan".to_string(),
-                    args: serde_json::json!({
-                        "projectName": project_name,
-                        "expectedDiscussionRevision": proj.discussion_revision,
-                        "expectedDataRevision": proj.workflow_state.data_revision,
-                    }),
-                    description: "三项检查全部通过，生成方案草稿".to_string(),
+                    command: String::new(),
+                    args: serde_json::json!({}),
+                    description: "检查已通过，请同步项目状态进入方案生成".to_string(),
                     reached_target: false,
-                    needs_human: false,
-                    is_error: false,
-                    error_message: String::new(),
+                    needs_human: true,
+                    is_error: true,
+                    error_message: "检查状态尚未对账到 ProjectPlanGeneration".to_string(),
                 }
             } else {
                 ManagedNextStep {
@@ -879,6 +976,20 @@ pub(crate) async fn managed_next_step(project_name: String) -> Result<ManagedNex
                 }
             }
         }
+
+        ProjectPlanGeneration => ManagedNextStep {
+            command: "generate_version_plan".to_string(),
+            args: serde_json::json!({
+                "projectName": project_name,
+                "expectedDiscussionRevision": proj.discussion_revision,
+                "expectedDataRevision": proj.workflow_state.data_revision,
+            }),
+            description: "生成项目方案草稿".to_string(),
+            reached_target: false,
+            needs_human: false,
+            is_error: false,
+            error_message: String::new(),
+        },
 
         // PlanApproval: auto-approve if possible, then enter Console
         PlanApproval => {
@@ -900,16 +1011,7 @@ pub(crate) async fn managed_next_step(project_name: String) -> Result<ManagedNex
                 }
             } else {
                 // Check if we can auto-approve: draft exists, is pending, and can_approve
-                let can_auto_approve = proj
-                    .plan_draft
-                    .as_ref()
-                    .map(|d| {
-                        d.draft_status == project::DraftStatus::Pending
-                            && !d.plan_content.trim().is_empty()
-                            && !d.constitution_part1_draft.trim().is_empty()
-                            && d.generation_revision == proj.discussion_revision
-                    })
-                    .unwrap_or(false);
+                let can_auto_approve = pending_plan_draft_is_valid(&proj);
 
                 if can_auto_approve {
                     ManagedNextStep {
@@ -929,11 +1031,11 @@ pub(crate) async fn managed_next_step(project_name: String) -> Result<ManagedNex
                     ManagedNextStep {
                         command: String::new(),
                         args: serde_json::json!({}),
-                        description: "等待方案草稿生成（需先生成方案草稿方可自动批准）".to_string(),
+                        description: "方案审批状态缺少有效草稿，请同步项目状态".to_string(),
                         reached_target: false,
                         needs_human: true,
-                        is_error: false,
-                        error_message: String::new(),
+                        is_error: true,
+                        error_message: "PlanApproval 缺少有效草稿".to_string(),
                     }
                 }
             }
@@ -950,16 +1052,93 @@ pub(crate) async fn managed_next_step(project_name: String) -> Result<ManagedNex
             error_message: String::new(),
         },
 
-        // MilestoneCheck → check draft
-        MilestoneCheck => ManagedNextStep {
-            command: "check_milestone_draft".to_string(),
-            args: serde_json::json!({ "projectName": project_name }),
-            description: "检查大阶段草稿".to_string(),
-            reached_target: false,
-            needs_human: false,
-            is_error: false,
-            error_message: String::new(),
-        },
+        MilestoneCheck => {
+            let waiting = |description: String| ManagedNextStep {
+                command: String::new(),
+                args: serde_json::json!({}),
+                description,
+                reached_target: false,
+                needs_human: true,
+                is_error: false,
+                error_message: String::new(),
+            };
+            let Some(draft) = proj.milestone_draft.as_ref() else {
+                return Ok(waiting("大阶段检查步骤缺少草稿，等待人工同步".to_string()));
+            };
+            if draft.draft_kind != project::MilestoneDraftKind::Normal {
+                return Ok(waiting(
+                    "大阶段检查步骤包含未来规划草稿，等待人工同步".to_string(),
+                ));
+            }
+            if draft.candidate_milestones.is_empty() {
+                return Ok(waiting("候选大阶段为空，等待人工处理".to_string()));
+            }
+
+            match draft.status {
+                project::MilestoneDraftStatus::Pending => ManagedNextStep {
+                    command: "check_milestone_draft".to_string(),
+                    args: serde_json::json!({ "projectName": project_name }),
+                    description: "检查大阶段草稿".to_string(),
+                    reached_target: false,
+                    needs_human: false,
+                    is_error: false,
+                    error_message: String::new(),
+                },
+                project::MilestoneDraftStatus::CheckFailed => {
+                    let feedback = draft
+                        .check_result
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let Some(feedback) = feedback else {
+                        return Ok(waiting(
+                            "大阶段检查未通过但缺少反馈，等待人工处理".to_string(),
+                        ));
+                    };
+                    if draft.regeneration_count
+                        >= crate::autopilot_policy::MAX_PLANNING_REGENERATIONS
+                    {
+                        return Ok(waiting(
+                            "大阶段草稿自动重生成已达到两次上限，等待人工处理".to_string(),
+                        ));
+                    }
+                    let repeated_issue = draft.regeneration_count > 0
+                        && draft
+                            .last_regeneration_reason
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .is_some_and(|previous| {
+                                crate::autopilot_policy::text_fingerprint(previous)
+                                    == crate::autopilot_policy::text_fingerprint(feedback)
+                            });
+                    if repeated_issue {
+                        return Ok(waiting(
+                            "大阶段草稿连续出现相同检查问题，等待人工处理".to_string(),
+                        ));
+                    }
+                    ManagedNextStep {
+                        command: "regenerate_milestone_draft".to_string(),
+                        args: serde_json::json!({
+                            "projectName": project_name,
+                            "currentDraftId": draft.draft_id,
+                            "expectedDataRevision": proj.workflow_state.data_revision,
+                            "feedback": feedback,
+                            "source": "check_failed",
+                        }),
+                        description: "按检查结果重新生成大阶段草稿".to_string(),
+                        reached_target: false,
+                        needs_human: false,
+                        is_error: false,
+                        error_message: String::new(),
+                    }
+                }
+                project::MilestoneDraftStatus::CheckPassed
+                | project::MilestoneDraftStatus::Approved => {
+                    waiting("大阶段草稿状态与检查步骤不一致，等待人工同步".to_string())
+                }
+            }
+        }
 
         // Steps where managed flow cannot help
         Discussion | BranchDiscussion | PauseDecision | Execution | MidStageGeneration
@@ -1051,7 +1230,18 @@ pub(crate) async fn wait_managed_flow_for_human(
 
 /// 恢复托管层
 #[tauri::command]
-pub(crate) async fn resume_managed_flow(project_name: String) -> Result<project::Project, String> {
+pub(crate) async fn resume_managed_flow(
+    state: tauri::State<'_, crate::AppState>,
+    project_name: String,
+) -> Result<project::Project, String> {
+    let updated = resume_managed_flow_state(project_name.clone()).await?;
+    state.managed_runtime.start(project_name).await?;
+    Ok(updated)
+}
+
+pub(crate) async fn resume_managed_flow_state(
+    project_name: String,
+) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
 
     let managed = proj
@@ -1082,8 +1272,7 @@ pub(crate) async fn resume_managed_flow(project_name: String) -> Result<project:
     let now = chrono::Utc::now().to_rfc3339();
     if let Some(ref mut m) = proj.workflow_state.managed_flow_state {
         m.run_status = project::ManagedRunStatus::Running;
-        m.last_action = "托管层已恢复".to_string();
-        m.last_action_at = now.clone();
+        crate::managed_runtime::assign_new_job_identity(m, "托管层已恢复，后端继续推进");
     }
 
     proj.workflow_state.data_revision += 1;
@@ -1096,7 +1285,17 @@ pub(crate) async fn resume_managed_flow(project_name: String) -> Result<project:
 ///
 /// 清除 managed_flow_state 并保持当前人工步骤；仅修复已经批准却仍停在批准页的旧状态。
 #[tauri::command]
-pub(crate) async fn stop_managed_flow(project_name: String) -> Result<project::Project, String> {
+pub(crate) async fn stop_managed_flow(
+    state: tauri::State<'_, crate::AppState>,
+    project_name: String,
+) -> Result<project::Project, String> {
+    state.managed_runtime.stop(&project_name).await;
+    stop_managed_flow_state(project_name).await
+}
+
+pub(crate) async fn stop_managed_flow_state(
+    project_name: String,
+) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
 
     if proj.workflow_state.managed_flow_state.is_none() {
@@ -1414,6 +1613,43 @@ fn current_mid_stage<'a>(proj: &'a project::Project) -> Option<&'a project::MidS
         })
 }
 
+fn current_control_task<'a>(
+    proj: &'a project::Project,
+) -> Result<Option<(crate::task_tree::TaskNodeAddress, &'a project::Subtask)>, String> {
+    let Some(address) = crate::task_tree::select_current_leaf(proj)? else {
+        return Ok(None);
+    };
+    let task = crate::task_tree::find_task(proj, &address.task_id)?
+        .ok_or_else(|| format!("当前叶子任务不存在：{}", address.task_id))?;
+    Ok(Some((address, task)))
+}
+
+fn evaluate_control_decision(
+    proj: &project::Project,
+    shadow: bool,
+) -> Result<Option<crate::control_scheduler::TaskControlDecision>, String> {
+    let Some((address, task)) = current_control_task(proj)? else {
+        return Ok(None);
+    };
+    let compiled = crate::task_compiler::compile(
+        task,
+        address.ancestor_task_ids.last().map(String::as_str),
+        address.depth,
+    );
+    let facts_fingerprint = task
+        .fact_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.structural_fingerprint.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    Ok(Some(crate::control_scheduler::decide_next_action(
+        task,
+        &compiled,
+        facts_fingerprint,
+        shadow,
+    )))
+}
+
 fn classify_autopilot_precondition(
     proj: &project::Project,
 ) -> Result<Option<(String, project::AutopilotRecoveryAction)>, String> {
@@ -1533,7 +1769,9 @@ pub(crate) async fn autopilot_mark_error(
     crate::save_and_reload_project(&proj)
 }
 
-async fn autopilot_resume_state(project_name: String) -> Result<project::Project, String> {
+pub(crate) async fn autopilot_resume_state(
+    project_name: String,
+) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
 
     if !proj.workflow_state.autopilot_active {
@@ -1685,6 +1923,105 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
         quality_gate,
         needs_calibration,
     };
+    // Shadow mode computes a task decision but still returns and executes the legacy command.
+    let shadow_decision = if proj.workflow_state.autopilot_active
+        && proj.workflow_state.current_step == project::WorkflowStep::Execution
+        && proj.task_control.mode == crate::task_control::TaskControlMode::Shadow
+    {
+        evaluate_control_decision(&proj, true)?
+    } else {
+        None
+    };
+
+    if proj.workflow_state.current_step == project::WorkflowStep::Execution
+        && proj.task_control.mode == crate::task_control::TaskControlMode::SerialTakeover
+    {
+        if let Some(block) = facts.precondition_block.as_ref() {
+            autopilot_persist_step_state(
+                &mut proj,
+                &block.description,
+                project::AutopilotRunStatus::ErrorStopped,
+                &block.description,
+                block.recovery_action.clone(),
+            )?;
+            crate::save_project(&proj)?;
+            return Ok(AutopilotNextStep {
+                command: String::new(),
+                args: serde_json::json!({}),
+                description: block.description.clone(),
+                at_milestone_boundary: false,
+                is_error: true,
+                error_message: block.description.clone(),
+                result_kind: project::AutopilotCommandResultKind::NoResult,
+                waiting_for_execution: false,
+            });
+        }
+        if let Some(mut control) = evaluate_control_decision(&proj, false)? {
+            let no_progress = proj
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .is_some_and(|state| {
+                    crate::control_scheduler::should_stop_no_progress(state.consecutive_no_progress)
+                });
+            if no_progress {
+                control.action.kind = crate::control_action::ControlActionKind::Human;
+                control.action.reason =
+                    "控制动作连续未产生新的合同、事实或证据，已进入人工边界".to_string();
+                control.reason = control.action.reason.clone();
+            }
+            let fingerprint = crate::control_scheduler::decision_fingerprint(&control);
+            if fingerprint == proj.task_control.last_decision_fingerprint
+                && !proj.task_control.last_decision_id.is_empty()
+            {
+                control.decision_id = proj.task_control.last_decision_id.clone();
+            }
+            proj.task_control.last_decision_fingerprint = fingerprint;
+            proj.task_control.last_decision_id = control.decision_id.clone();
+            proj.task_control.last_decision = Some(control.clone());
+            proj.task_control.last_shadow_decision_summary = control.reason.clone();
+            proj.task_control.control_source = "task_controller".to_string();
+            crate::save_project(&proj)?;
+            if control.action.kind == crate::control_action::ControlActionKind::Wait {
+                return Ok(AutopilotNextStep {
+                    command: String::new(),
+                    args: serde_json::json!({}),
+                    description: control.reason,
+                    at_milestone_boundary: false,
+                    is_error: false,
+                    error_message: String::new(),
+                    result_kind: project::AutopilotCommandResultKind::NoResult,
+                    waiting_for_execution: true,
+                });
+            }
+            let request = crate::control_action_executor::ControlActionRequest {
+                action_id: format!(
+                    "control-{}-{}",
+                    control.decision_id,
+                    control.action.kind.as_str()
+                ),
+                action: control.action.kind,
+                task_id: control.task_id,
+                decision_id: control.decision_id,
+                expected_project_revision: Some(proj.workflow_state.data_revision),
+                expected_tree_revision: Some(proj.task_control.tree_revision),
+                contract_fingerprint: control.contract_fingerprint,
+                criterion_indexes: Vec::new(),
+                reason: control.reason.clone(),
+                source: project::OperationSource::Autopilot,
+            };
+            return Ok(AutopilotNextStep {
+                command: "execute_control_action".to_string(),
+                args: serde_json::json!({ "request": request }),
+                description: control.reason,
+                at_milestone_boundary: false,
+                is_error: false,
+                error_message: String::new(),
+                result_kind: project::AutopilotCommandResultKind::ProjectState,
+                waiting_for_execution: false,
+            });
+        }
+    }
     let mut decision = crate::autopilot_policy::decide_next_step(&proj, &project_name, &facts);
 
     if decision.kind == crate::autopilot_policy::AutopilotDecisionKind::InitializeQualityRecovery {
@@ -1697,6 +2034,25 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
         crate::save_project(&proj)?;
         decision =
             crate::autopilot_policy::resolve_quality_recovery(&project_name, &reason, automatic);
+    }
+
+    if let Some(mut shadow) = shadow_decision {
+        let fingerprint = crate::control_scheduler::decision_fingerprint(&shadow);
+        if fingerprint == proj.task_control.last_decision_fingerprint
+            && !proj.task_control.last_decision_id.is_empty()
+        {
+            shadow.decision_id = proj.task_control.last_decision_id.clone();
+        }
+        proj.task_control.last_decision_fingerprint = fingerprint;
+        proj.task_control.last_decision_id = shadow.decision_id.clone();
+        proj.task_control.last_decision = Some(shadow.clone());
+        proj.task_control.last_shadow_decision_at = Some(chrono::Utc::now().to_rfc3339());
+        proj.task_control.last_shadow_decision_summary =
+            format!("{:?}：{}", shadow.action.kind, shadow.reason);
+        proj.task_control.control_source = "shadow_controller".to_string();
+        proj.task_control
+            .record_shadow_comparison(&shadow, &decision.next);
+        crate::save_project(&proj)?;
     }
 
     if proj.workflow_state.autopilot_active {
@@ -1746,6 +2102,215 @@ fn reconcile_execution_in_migration(proj: &mut crate::project::Project) {
     ) {
         crate::pipeline::apply_execution_reconciliation(proj, &reconciliation);
     }
+}
+
+fn reconcile_discussion_threads_in_migration(proj: &mut project::Project) -> bool {
+    let mut changed = false;
+    let now = chrono::Utc::now().to_rfc3339();
+    for thread in &mut proj.discussion_threads {
+        let revision = thread.revision.max(thread.messages.len() as u64);
+        if thread.revision != revision {
+            thread.revision = revision;
+            changed = true;
+        }
+        if thread.opened_at.is_empty() {
+            thread.opened_at = now.clone();
+            changed = true;
+        }
+    }
+
+    let future_context = proj.workflow_state.current_step
+        == project::WorkflowStep::FuturePlanApproval
+        || (proj.workflow_state.current_step == project::WorkflowStep::BranchDiscussion
+            && (proj.workflow_state.discussion_scope == project::DiscussionScope::AdjustFuture
+                || proj.milestone_draft.as_ref().is_some_and(|draft| {
+                    draft.draft_kind == project::MilestoneDraftKind::FutureOnly
+                })));
+    if future_context
+        && proj.workflow_state.discussion_scope != project::DiscussionScope::AdjustFuture
+    {
+        proj.workflow_state.discussion_scope = project::DiscussionScope::AdjustFuture;
+        changed = true;
+    }
+
+    let mut confirmed_future_source: Option<(String, u64)> = None;
+    if future_context {
+        let explicit_source = proj
+            .milestone_draft
+            .as_ref()
+            .filter(|draft| draft.draft_kind == project::MilestoneDraftKind::FutureOnly)
+            .map(|draft| (draft.source_thread_id.clone(), draft.source_thread_revision));
+        if let Some((source_id, source_revision)) = explicit_source {
+            if !source_id.is_empty() {
+                confirmed_future_source = proj
+                    .discussion_threads
+                    .iter()
+                    .find(|thread| {
+                        thread.id == source_id
+                            && thread.scope == project::DiscussionScope::AdjustFuture
+                            && thread.milestone_id == proj.current_milestone_id
+                            && thread.status == project::DiscussionThreadStatus::Open
+                            && (source_revision == 0 || source_revision == thread.revision)
+                    })
+                    .map(|thread| (thread.id.clone(), thread.revision));
+            } else {
+                let candidates = proj
+                    .discussion_threads
+                    .iter()
+                    .filter(|thread| {
+                        thread.scope == project::DiscussionScope::AdjustFuture
+                            && thread.milestone_id == proj.current_milestone_id
+                            && thread.status == project::DiscussionThreadStatus::Open
+                    })
+                    .map(|thread| (thread.id.clone(), thread.revision))
+                    .collect::<Vec<_>>();
+                if candidates.len() == 1 {
+                    confirmed_future_source = candidates.into_iter().next();
+                }
+            }
+        }
+        if let Some((source_id, _)) = confirmed_future_source.as_ref() {
+            if proj.workflow_state.active_discussion_thread_id != *source_id {
+                proj.workflow_state.active_discussion_thread_id = source_id.clone();
+                changed = true;
+            }
+        }
+    }
+
+    let active_is_valid = proj.active_discussion_thread().is_some_and(|thread| {
+        thread.status == project::DiscussionThreadStatus::Open
+            && thread.scope == proj.workflow_state.discussion_scope
+            && (thread.scope == project::DiscussionScope::FirstDiscussion
+                || thread.milestone_id == proj.current_milestone_id)
+    });
+    if !active_is_valid {
+        let scope = proj.workflow_state.discussion_scope.clone();
+        let milestone_id = if scope == project::DiscussionScope::FirstDiscussion {
+            String::new()
+        } else {
+            proj.current_milestone_id.clone()
+        };
+        let review_cycle_id = if scope == project::DiscussionScope::FirstDiscussion {
+            String::new()
+        } else {
+            format!(
+                "{}:{}",
+                milestone_id,
+                if proj.workflow_state.last_transition_at.is_empty() {
+                    now.as_str()
+                } else {
+                    proj.workflow_state.last_transition_at.as_str()
+                }
+            )
+        };
+        let previous_active = proj.workflow_state.active_discussion_thread_id.clone();
+        let previous_len = proj.discussion_threads.len();
+        proj.activate_discussion_thread(scope, &milestone_id, &review_cycle_id);
+        changed |= previous_active != proj.workflow_state.active_discussion_thread_id
+            || previous_len != proj.discussion_threads.len();
+    }
+
+    if future_context {
+        let current_revision = proj.workflow_state.data_revision;
+        if let Some(draft) = proj
+            .milestone_draft
+            .as_mut()
+            .filter(|draft| draft.draft_kind == project::MilestoneDraftKind::FutureOnly)
+        {
+            if let Some((source_id, source_revision)) = confirmed_future_source {
+                if draft.source_thread_id != source_id {
+                    draft.source_thread_id = source_id;
+                    changed = true;
+                }
+                if draft.source_thread_revision != source_revision {
+                    draft.source_thread_revision = source_revision;
+                    changed = true;
+                }
+                if draft.generation_revision == 0 && source_revision > 0 {
+                    draft.generation_revision = source_revision;
+                    changed = true;
+                }
+                if draft.source_data_revision.saturating_add(1) != current_revision {
+                    if !draft.expired {
+                        draft.expired = true;
+                        changed = true;
+                    }
+                    let reason = "旧未来草稿的项目事实修订无法确认，请重新生成。".to_string();
+                    if draft.expiration_reason.as_ref() != Some(&reason) {
+                        draft.expiration_reason = Some(reason);
+                        changed = true;
+                    }
+                }
+            } else {
+                if !draft.expired {
+                    draft.expired = true;
+                    changed = true;
+                }
+                let reason = "旧未来草稿无法确认来源讨论线程，已保留但禁止批准。".to_string();
+                if draft.expiration_reason.as_ref() != Some(&reason) {
+                    draft.expiration_reason = Some(reason);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+fn reconcile_legacy_mid_stage_approval(proj: &mut project::Project) -> bool {
+    if proj.workflow_state.current_step != project::WorkflowStep::MidStageApproval {
+        return false;
+    }
+    let Some(milestone) = proj
+        .milestones
+        .iter()
+        .find(|milestone| milestone.id == proj.current_milestone_id)
+    else {
+        return false;
+    };
+    if milestone.mid_stages.is_empty() {
+        return false;
+    }
+
+    if let Some(draft) = proj.mid_stage_draft.as_mut() {
+        draft.status = project::MidStageDraftStatus::CheckFailed;
+        draft.check_result =
+            Some("迁移归档：当前大阶段已有正式中阶段，遗留首次整表草稿禁止批准。".to_string());
+        draft.allow_full_replacement = false;
+        draft.last_regeneration_reason =
+            Some("旧项目中阶段事实优先，遗留整表草稿已归档。".to_string());
+    }
+    proj.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
+    proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+    true
+}
+
+pub(crate) fn reconcile_workflow_closure_state(proj: &mut project::Project) -> bool {
+    let initial_revision = proj.workflow_state.data_revision;
+    let mut changed = reconcile_discussion_threads_in_migration(proj);
+
+    if proj.workflow_state.current_step == project::WorkflowStep::PlanApproval
+        && proj.plan_draft.is_none()
+    {
+        proj.workflow_state.current_step = project::WorkflowStep::ProjectPlanGeneration;
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::FirstDiscussion;
+        changed = true;
+    }
+    if proj.workflow_state.current_step == project::WorkflowStep::ThreeChecks
+        && has_valid_preflight_checks(proj)
+    {
+        proj.workflow_state.current_step = project::WorkflowStep::ProjectPlanGeneration;
+        changed = true;
+    }
+
+    changed |= reconcile_legacy_mid_stage_approval(proj);
+    changed |= crate::workflow_resolution::reconcile_mid_stage_route(proj);
+    if changed && proj.workflow_state.data_revision == initial_revision {
+        proj.workflow_state.data_revision = initial_revision.saturating_add(1);
+        proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+    }
+    changed
 }
 
 fn subtask_has_execution_facts(subtask: &project::Subtask) -> bool {
@@ -2017,6 +2582,41 @@ mod tests {
         format!("test-{}-{}", label, uuid::Uuid::new_v4())
     }
 
+    #[tokio::test]
+    async fn plan_approval_requires_a_concrete_draft() -> Result<(), String> {
+        let project_name = unique_project_name("plan-approval-contract");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::FirstDiscussion;
+        proj.workflow_state.current_step = project::WorkflowStep::ProjectPlanGeneration;
+        crate::save_project(&proj)?;
+
+        let error =
+            transition_workflow(project_name, "PlanApproval".to_string(), "test".to_string())
+                .await
+                .expect_err("无草稿时不得进入审批步骤");
+        assert!(error.contains("没有可审批"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_reconciles_legacy_empty_plan_approval() -> Result<(), String> {
+        let project_name = unique_project_name("empty-plan-approval");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::FirstDiscussion;
+        proj.workflow_state.current_step = project::WorkflowStep::PlanApproval;
+        crate::save_project(&proj)?;
+
+        let migrated = migrate_project_workflow(project_name).await?;
+        assert_eq!(
+            migrated.workflow_state.current_step,
+            project::WorkflowStep::ProjectPlanGeneration
+        );
+        assert!(migrated.plan_draft.is_none());
+        Ok(())
+    }
+
     fn test_subtask(status: project::SubtaskStatus) -> project::Subtask {
         project::Subtask {
             id: "subtask-1".to_string(),
@@ -2103,6 +2703,143 @@ mod tests {
         }
     }
 
+    #[test]
+    fn workflow_closure_migration_expires_unattributed_future_draft() {
+        let mut proj = project::Project::new("legacy-future-unattributed");
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.current_step = project::WorkflowStep::FuturePlanApproval;
+        proj.workflow_state.discussion_scope = project::DiscussionScope::FirstDiscussion;
+        proj.workflow_state.data_revision = 5;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.milestones.push(test_milestone(
+            "milestone-1",
+            "当前大阶段",
+            project::MilestoneStatus::Completed,
+        ));
+        proj.milestone_draft = Some(project::MilestoneDraft {
+            draft_kind: project::MilestoneDraftKind::FutureOnly,
+            candidate_milestones: vec![test_milestone(
+                "milestone-2",
+                "未来大阶段",
+                project::MilestoneStatus::Pending,
+            )],
+            ..Default::default()
+        });
+
+        assert!(reconcile_workflow_closure_state(&mut proj));
+        assert_eq!(
+            proj.workflow_state.discussion_scope,
+            project::DiscussionScope::AdjustFuture
+        );
+        let active = proj.active_discussion_thread().expect("专属未来讨论线程");
+        assert_eq!(active.scope, project::DiscussionScope::AdjustFuture);
+        assert_eq!(active.milestone_id, "milestone-1");
+        let draft = proj.milestone_draft.as_ref().expect("保留旧未来草稿");
+        assert!(draft.expired);
+        assert!(draft
+            .expiration_reason
+            .as_deref()
+            .is_some_and(|reason| { reason.contains("无法确认来源讨论线程") }));
+    }
+
+    #[test]
+    fn workflow_closure_migration_binds_unique_future_thread() {
+        let mut proj = project::Project::new("legacy-future-thread");
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.current_step = project::WorkflowStep::FuturePlanApproval;
+        proj.workflow_state.discussion_scope = project::DiscussionScope::AdjustFuture;
+        proj.workflow_state.data_revision = 5;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.milestones.push(test_milestone(
+            "milestone-1",
+            "当前大阶段",
+            project::MilestoneStatus::Completed,
+        ));
+        let thread_id = proj.activate_discussion_thread(
+            project::DiscussionScope::AdjustFuture,
+            "milestone-1",
+            "review-1",
+        );
+        proj.milestone_draft = Some(project::MilestoneDraft {
+            draft_kind: project::MilestoneDraftKind::FutureOnly,
+            source_data_revision: 4,
+            candidate_milestones: vec![test_milestone(
+                "milestone-2",
+                "未来大阶段",
+                project::MilestoneStatus::Pending,
+            )],
+            ..Default::default()
+        });
+
+        assert!(reconcile_workflow_closure_state(&mut proj));
+        let draft = proj.milestone_draft.as_ref().expect("未来草稿");
+        assert_eq!(draft.source_thread_id, thread_id);
+        assert_eq!(draft.source_data_revision, 4);
+        assert!(!draft.expired);
+    }
+
+    #[test]
+    fn workflow_closure_migration_archives_legacy_mid_stage_replacement() {
+        let mut proj = project::Project::new("legacy-mid-stage-approval");
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.current_step = project::WorkflowStep::MidStageApproval;
+        proj.current_milestone_id = "milestone-1".to_string();
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "当前大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone
+            .mid_stages
+            .push(test_mid_stage(project::MidStageStatus::Pending));
+        proj.milestones.push(milestone);
+        proj.mid_stage_draft = Some(project::MidStageDraft {
+            milestone_id: "milestone-1".to_string(),
+            candidate_mid_stages: vec![test_mid_stage(project::MidStageStatus::Pending)],
+            ..Default::default()
+        });
+
+        assert!(reconcile_workflow_closure_state(&mut proj));
+        assert_eq!(proj.current_mid_stage_id, "mid-1");
+        assert_eq!(
+            proj.workflow_state.current_step,
+            project::WorkflowStep::PlanGeneration
+        );
+        let draft = proj.mid_stage_draft.as_ref().expect("归档草稿仍保留审计");
+        assert_eq!(draft.status, project::MidStageDraftStatus::CheckFailed);
+        assert!(!draft.allow_full_replacement);
+        assert_eq!(proj.milestones[0].mid_stages.len(), 1);
+    }
+
+    #[test]
+    fn workflow_closure_migration_selects_existing_next_mid_stage() {
+        let mut proj = project::Project::new("existing-next-mid-stage");
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
+        proj.current_milestone_id = "milestone-1".to_string();
+        let mut completed = test_mid_stage(project::MidStageStatus::Completed);
+        completed.id = "mid-completed".to_string();
+        completed.order = Some(1);
+        let mut pending = test_mid_stage(project::MidStageStatus::Pending);
+        pending.id = "mid-next".to_string();
+        pending.order = Some(2);
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "当前大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone.mid_stages = vec![completed, pending];
+        proj.milestones.push(milestone);
+
+        assert!(reconcile_workflow_closure_state(&mut proj));
+        assert_eq!(proj.current_mid_stage_id, "mid-next");
+        assert_eq!(
+            proj.workflow_state.current_step,
+            project::WorkflowStep::PlanGeneration
+        );
+        assert!(proj.mid_stage_draft.is_none());
+    }
+
     fn activate_autopilot(proj: &mut project::Project, target: &str) {
         proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
         proj.workflow_state.autopilot_active = true;
@@ -2135,6 +2872,7 @@ mod tests {
             last_action_at: "2026-07-22T00:00:00Z".to_string(),
             run_status,
             error_message: String::new(),
+            ..Default::default()
         });
         proj.milestone_draft = Some(project::MilestoneDraft {
             status: draft_status,
@@ -2147,6 +2885,299 @@ mod tests {
             ..Default::default()
         });
         proj
+    }
+
+    fn managed_milestone_check_project(
+        project_name: &str,
+        draft_status: project::MilestoneDraftStatus,
+    ) -> project::Project {
+        let mut proj = managed_milestone_project(
+            project_name,
+            draft_status,
+            project::ManagedRunStatus::Running,
+        );
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneCheck;
+        if let Some(managed) = proj.workflow_state.managed_flow_state.as_mut() {
+            managed.managed_state = "MilestoneCheck".to_string();
+            managed.managed_target = "MilestoneSelection".to_string();
+        }
+        proj
+    }
+
+    fn active_managed_plan_project(
+        project_name: &str,
+        step: project::WorkflowStep,
+    ) -> project::Project {
+        let mut proj = project::Project::new(project_name);
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::FirstDiscussion;
+        proj.workflow_state.current_step = step;
+        proj.workflow_state.managed_flow_state = Some(project::ManagedFlowState {
+            active: true,
+            managed_state: "plan".to_string(),
+            managed_target: "MilestoneSelection".to_string(),
+            last_action: String::new(),
+            last_action_at: String::new(),
+            run_status: project::ManagedRunStatus::Running,
+            error_message: String::new(),
+            ..Default::default()
+        });
+        proj
+    }
+
+    #[tokio::test]
+    async fn managed_legacy_empty_plan_approval_generates_instead_of_waiting() -> Result<(), String>
+    {
+        let project_name = unique_project_name("managed-empty-plan");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = active_managed_plan_project(&project_name, project::WorkflowStep::PlanApproval);
+        crate::save_project(&proj)?;
+
+        let next = managed_next_step(project_name.clone()).await?;
+        assert_eq!(next.command, "generate_version_plan");
+        assert!(!next.needs_human);
+        assert_eq!(
+            crate::load_project(&project_name)?
+                .workflow_state
+                .current_step,
+            project::WorkflowStep::ProjectPlanGeneration
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_generation_reuses_existing_valid_plan_draft() -> Result<(), String> {
+        let project_name = unique_project_name("managed-existing-plan");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = active_managed_plan_project(
+            &project_name,
+            project::WorkflowStep::ProjectPlanGeneration,
+        );
+        proj.plan_draft = Some(project::PlanDraft {
+            plan_content: "project plan".to_string(),
+            constitution_part1_draft: "constitution".to_string(),
+            generation_revision: proj.discussion_revision,
+            ..Default::default()
+        });
+        for check_type in [
+            "goal_completeness",
+            "reality_consistency",
+            "task_executability",
+        ] {
+            proj.preflight_results.push(project::PreflightCheckResult {
+                check_type: check_type.to_string(),
+                passed: true,
+                summary: String::new(),
+                issues: vec![],
+                suggestions: vec![],
+                discussion_revision: proj.discussion_revision,
+                checked_at: String::new(),
+                stale: false,
+                expired_at: None,
+            });
+        }
+        crate::save_project(&proj)?;
+
+        let next = managed_next_step(project_name.clone()).await?;
+        assert_eq!(next.command, "approve_version_plan");
+        assert!(!next.needs_human);
+        assert_eq!(
+            crate::load_project(&project_name)?
+                .workflow_state
+                .current_step,
+            project::WorkflowStep::PlanApproval
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_closure_e2e_managed_reaches_milestone_selection_from_seeded_results(
+    ) -> Result<(), String> {
+        let project_name = unique_project_name("managed-closure-e2e");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj =
+            active_managed_plan_project(&project_name, project::WorkflowStep::ThreeChecks);
+        for check_type in [
+            "goal_completeness",
+            "reality_consistency",
+            "task_executability",
+        ] {
+            proj.preflight_results.push(project::PreflightCheckResult {
+                check_type: check_type.to_string(),
+                passed: true,
+                summary: String::new(),
+                issues: vec![],
+                suggestions: vec![],
+                discussion_revision: proj.discussion_revision,
+                checked_at: String::new(),
+                stale: false,
+                expired_at: None,
+            });
+        }
+        crate::save_project(&proj)?;
+
+        let generate_plan = managed_next_step(project_name.clone()).await?;
+        assert_eq!(generate_plan.command, "generate_version_plan");
+
+        let mut with_plan = crate::load_project(&project_name)?;
+        with_plan.plan_draft = Some(project::PlanDraft {
+            plan_content: "可执行项目方案".to_string(),
+            constitution_part1_draft: "项目约束".to_string(),
+            generation_revision: with_plan.discussion_revision,
+            ..Default::default()
+        });
+        crate::save_project(&with_plan)?;
+        let approve_plan = managed_next_step(project_name.clone()).await?;
+        assert_eq!(approve_plan.command, "approve_version_plan");
+
+        let mut approved_plan = crate::load_project(&project_name)?;
+        let draft = approved_plan
+            .plan_draft
+            .as_mut()
+            .ok_or_else(|| "方案草稿缺失".to_string())?;
+        draft.draft_status = project::DraftStatus::Approved;
+        draft.approved = true;
+        draft.approved_at = Some(chrono::Utc::now().to_rfc3339());
+        approved_plan.version_plan = draft.plan_content.clone();
+        crate::save_project(&approved_plan)?;
+        let enter_console = managed_next_step(project_name.clone()).await?;
+        assert_eq!(enter_console.command, "enter_console");
+
+        let mut milestone_generation = crate::load_project(&project_name)?;
+        milestone_generation.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        milestone_generation.workflow_state.current_step =
+            project::WorkflowStep::MilestoneGeneration;
+        crate::save_project(&milestone_generation)?;
+        let generate_milestone = managed_next_step(project_name.clone()).await?;
+        assert_eq!(generate_milestone.command, "generate_milestone_draft");
+
+        let mut milestone_approval = crate::load_project(&project_name)?;
+        milestone_approval.workflow_state.current_step = project::WorkflowStep::MilestoneApproval;
+        milestone_approval.milestone_draft = Some(project::MilestoneDraft {
+            status: project::MilestoneDraftStatus::CheckPassed,
+            check_result: Some("检查通过".to_string()),
+            candidate_milestones: vec![test_milestone(
+                "milestone-1",
+                "首个大阶段",
+                project::MilestoneStatus::Pending,
+            )],
+            ..Default::default()
+        });
+        crate::save_project(&milestone_approval)?;
+        let approve_milestone = managed_next_step(project_name.clone()).await?;
+        assert_eq!(approve_milestone.command, "approve_milestone_draft");
+
+        let completed = crate::commands::milestone::approve_milestone_draft(project_name).await?;
+        assert_eq!(
+            completed.workflow_state.current_step,
+            project::WorkflowStep::MilestoneSelection
+        );
+        assert!(completed.workflow_state.managed_flow_state.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_milestone_check_routes_pending_and_failed_drafts() -> Result<(), String> {
+        let project_name = unique_project_name("managed-milestone-check-route");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj =
+            managed_milestone_check_project(&project_name, project::MilestoneDraftStatus::Pending);
+        let draft = proj
+            .milestone_draft
+            .as_mut()
+            .ok_or_else(|| "缺少大阶段草稿".to_string())?;
+        draft.check_result = None;
+        let draft_id = draft.draft_id.clone();
+        crate::save_project(&proj)?;
+
+        let check = managed_next_step(project_name.clone()).await?;
+        assert_eq!(check.command, "check_milestone_draft");
+        assert!(!check.needs_human);
+
+        let mut failed = crate::load_project(&project_name)?;
+        let draft = failed
+            .milestone_draft
+            .as_mut()
+            .ok_or_else(|| "缺少大阶段草稿".to_string())?;
+        draft.status = project::MilestoneDraftStatus::CheckFailed;
+        draft.check_result = Some("缺少验收边界".to_string());
+        crate::save_project(&failed)?;
+
+        let regenerate = managed_next_step(project_name).await?;
+        assert_eq!(regenerate.command, "regenerate_milestone_draft");
+        assert!(!regenerate.needs_human);
+        assert_eq!(regenerate.args["currentDraftId"], draft_id);
+        assert_eq!(regenerate.args["feedback"], "缺少验收边界");
+        assert_eq!(regenerate.args["source"], "check_failed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_milestone_check_stops_on_repeated_feedback() -> Result<(), String> {
+        let project_name = unique_project_name("managed-milestone-check-repeat");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = managed_milestone_check_project(
+            &project_name,
+            project::MilestoneDraftStatus::CheckFailed,
+        );
+        let draft = proj
+            .milestone_draft
+            .as_mut()
+            .ok_or_else(|| "缺少大阶段草稿".to_string())?;
+        draft.check_result = Some("缺少 验收边界".to_string());
+        draft.regeneration_count = 1;
+        draft.last_regeneration_reason = Some("  缺少   验收边界  ".to_string());
+        crate::save_project(&proj)?;
+
+        let next = managed_next_step(project_name).await?;
+        assert!(next.command.is_empty());
+        assert!(next.needs_human);
+        assert!(next.description.contains("相同检查问题"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_milestone_check_stops_at_regeneration_limit() -> Result<(), String> {
+        let project_name = unique_project_name("managed-milestone-check-limit");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = managed_milestone_check_project(
+            &project_name,
+            project::MilestoneDraftStatus::CheckFailed,
+        );
+        let draft = proj
+            .milestone_draft
+            .as_mut()
+            .ok_or_else(|| "缺少大阶段草稿".to_string())?;
+        draft.check_result = Some("仍有范围遗漏".to_string());
+        draft.regeneration_count = crate::autopilot_policy::MAX_PLANNING_REGENERATIONS;
+        draft.last_regeneration_reason = Some("上一次是其他问题".to_string());
+        crate::save_project(&proj)?;
+
+        let next = managed_next_step(project_name).await?;
+        assert!(next.command.is_empty());
+        assert!(next.needs_human);
+        assert!(next.description.contains("两次上限"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_milestone_check_missing_feedback_waits_for_human() -> Result<(), String> {
+        let project_name = unique_project_name("managed-milestone-check-no-feedback");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = managed_milestone_check_project(
+            &project_name,
+            project::MilestoneDraftStatus::CheckFailed,
+        );
+        proj.milestone_draft
+            .as_mut()
+            .ok_or_else(|| "缺少大阶段草稿".to_string())?
+            .check_result = None;
+        crate::save_project(&proj)?;
+
+        let next = managed_next_step(project_name).await?;
+        assert!(next.command.is_empty());
+        assert!(next.needs_human);
+        assert!(next.description.contains("缺少反馈"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -2209,7 +3240,7 @@ mod tests {
         assert_eq!(managed.run_status, project::ManagedRunStatus::WaitingHuman);
         assert_eq!(managed.last_action, "候选大阶段缺失，等待人工处理");
 
-        let resumed = resume_managed_flow(project_name).await?;
+        let resumed = resume_managed_flow_state(project_name).await?;
         assert_eq!(
             resumed
                 .workflow_state
@@ -2232,7 +3263,7 @@ mod tests {
         );
         crate::save_project(&proj)?;
 
-        let stopped = stop_managed_flow(project_name).await?;
+        let stopped = stop_managed_flow_state(project_name).await?;
         assert_eq!(
             stopped.workflow_state.current_step,
             project::WorkflowStep::MilestoneApproval
@@ -2300,7 +3331,7 @@ mod tests {
         );
         crate::save_project(&proj)?;
 
-        let stopped = stop_managed_flow(project_name).await?;
+        let stopped = stop_managed_flow_state(project_name).await?;
         assert_eq!(
             stopped.workflow_state.current_step,
             project::WorkflowStep::MilestoneSelection
@@ -2391,6 +3422,106 @@ mod tests {
             step.result_kind,
             project::AutopilotCommandResultKind::ProjectState
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_returns_legacy_action_and_records_comparison_only() -> Result<(), String> {
+        let project_name = unique_project_name("shadow-comparison");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        activate_autopilot(&mut proj, "milestone-1");
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id = "mid-1".to_string();
+        let task = test_subtask(project::SubtaskStatus::Pending);
+        let mut mid = test_mid_stage(project::MidStageStatus::InProgress);
+        mid.subtasks = vec![task];
+        mid.plan_approved_at = Some("2026-07-28T00:00:00Z".to_string());
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone.mid_stages = vec![mid];
+        proj.milestones = vec![milestone];
+        crate::save_project(&proj)?;
+
+        let next = autopilot_next_step(project_name.clone()).await?;
+        assert_ne!(next.command, "execute_control_action");
+        let saved = crate::load_project(&project_name)?;
+        assert_eq!(
+            saved.task_control.mode,
+            crate::task_control::TaskControlMode::Shadow
+        );
+        assert_eq!(saved.task_control.shadow_comparison.evaluated, 1);
+        assert_eq!(
+            saved.task_control.shadow_comparison.comparable_matches
+                + saved.task_control.shadow_comparison.comparable_differences
+                + saved.task_control.shadow_comparison.uncomparable,
+            1
+        );
+        let comparison = saved
+            .task_control
+            .shadow_comparison
+            .latest
+            .as_ref()
+            .unwrap();
+        assert_eq!(comparison.legacy_command, next.command);
+        assert!(saved.task_control.active_action_id.is_empty());
+        assert_eq!(
+            crate::task_tree::find_task(&saved, "subtask-1")?
+                .unwrap()
+                .status,
+            project::SubtaskStatus::Pending
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serial_takeover_returns_new_controller_action_in_execution() -> Result<(), String> {
+        let project_name = unique_project_name("serial-takeover-action");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        activate_autopilot(&mut proj, "milestone-1");
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id = "mid-1".to_string();
+        proj.task_control.mode = crate::task_control::TaskControlMode::SerialTakeover;
+        let mut task = test_subtask(project::SubtaskStatus::AwaitingConfirmation);
+        task.acceptance_criteria = vec!["复杂业务行为需要语义审查".to_string()];
+        task.acceptance_ledger = vec![project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            criterion: task.acceptance_criteria[0].clone(),
+            ..Default::default()
+        }];
+        let mut mid = test_mid_stage(project::MidStageStatus::InProgress);
+        mid.subtasks = vec![task];
+        mid.plan_approved_at = Some("2026-07-28T00:00:00Z".to_string());
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone.mid_stages = vec![mid];
+        proj.milestones = vec![milestone];
+        crate::save_project(&proj)?;
+
+        let next = autopilot_next_step(project_name.clone()).await?;
+        assert_eq!(next.command, "execute_control_action");
+        let request =
+            serde_json::from_value::<crate::control_action_executor::ControlActionRequest>(
+                next.args["request"].clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(request.task_id, "subtask-1");
+        assert_eq!(
+            request.action,
+            crate::control_action::ControlActionKind::TargetedValidate
+        );
+        let saved = crate::load_project(&project_name)?;
+        assert_eq!(saved.task_control.control_source, "task_controller");
+        assert_eq!(request.decision_id, saved.task_control.last_decision_id);
         Ok(())
     }
 
@@ -2597,7 +3728,11 @@ mod tests {
         crate::save_project(&rejected)?;
         let rejected_step = autopilot_next_step(rejected_name.clone()).await?;
         assert!(rejected_step.is_error);
-        assert!(rejected_step.error_message.contains("Rejected"));
+        assert!(rejected_step.command.is_empty());
+        assert_eq!(
+            rejected_step.result_kind,
+            project::AutopilotCommandResultKind::NoResult
+        );
         let persisted_rejected = crate::load_project(&rejected_name)?;
         let rejected_ap = persisted_rejected
             .workflow_state
@@ -2781,6 +3916,11 @@ mod tests {
             status: project::MidStageDraftStatus::CheckFailed,
             check_result: Some("缺少验收边界".to_string()),
             regeneration_count: 0,
+            purpose: project::MidStageDraftPurpose::InitialFullList,
+            base_mid_stage_revision: 0,
+            retained_mid_stage_ids: vec![],
+            source_step: project::WorkflowStep::MidStageGeneration,
+            allow_full_replacement: true,
             ..Default::default()
         });
         activate_autopilot(&mut proj, "milestone-1");
@@ -3035,6 +4175,11 @@ mod tests {
             status: project::MidStageDraftStatus::CheckFailed,
             check_result: Some("缺少验收边界".to_string()),
             candidate_mid_stages: vec![test_mid_stage(project::MidStageStatus::Pending)],
+            purpose: project::MidStageDraftPurpose::InitialFullList,
+            base_mid_stage_revision: 0,
+            retained_mid_stage_ids: vec![],
+            source_step: project::WorkflowStep::MidStageGeneration,
+            allow_full_replacement: true,
             ..Default::default()
         });
 

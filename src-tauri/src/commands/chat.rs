@@ -78,6 +78,20 @@ fn send_stream_event(
         .map_err(|error| format!("发送聊天流事件失败：{error}"))
 }
 
+fn mark_discussion_call(project_name: &str, call_id: &str, produced_change: bool) {
+    if !produced_change {
+        return;
+    }
+    crate::cost_ledger::mark_call_outcome_best_effort(
+        project_name,
+        call_id,
+        crate::cost_ledger::ModelCallOutcome {
+            produced_change: true,
+            ..Default::default()
+        },
+    );
+}
+
 #[tauri::command]
 pub(crate) fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -111,20 +125,43 @@ pub(crate) async fn chat_with_role(
         &role,
         ChatInput::NewMessage(message),
     )?;
-    match crate::api::call_deepseek_api(prepared.system_prompt, &prepared.context).await {
-        Ok(reply) => persist_reply(
-            runtime.inner(),
-            &project_name,
-            &thread_id,
-            new_reply_message(
-                &role,
-                reply,
-                None,
-                &prepared.user_message.id,
-                uuid::Uuid::new_v4().to_string(),
-                now_millis(),
-            ),
-        ),
+    let model_context = crate::cost_ledger::ModelCallContext::for_project(
+        &crate::load_project(&project_name)?,
+        crate::cost_ledger::ModelCallPurpose::Discussion,
+    );
+    match crate::api::call_deepseek_api_inner_with_context(
+        prepared.system_prompt,
+        &prepared.context,
+        false,
+        0.5,
+        model_context,
+    )
+    .await
+    {
+        Ok(response) => {
+            let project = persist_reply(
+                runtime.inner(),
+                &project_name,
+                &thread_id,
+                new_reply_message(
+                    &role,
+                    response.content,
+                    None,
+                    &prepared.user_message.id,
+                    uuid::Uuid::new_v4().to_string(),
+                    now_millis(),
+                ),
+            )?;
+            crate::cost_ledger::mark_call_outcome_best_effort(
+                &project_name,
+                &response.metadata.call_id,
+                crate::cost_ledger::ModelCallOutcome {
+                    produced_change: true,
+                    ..Default::default()
+                },
+            );
+            Ok(project)
+        }
         Err(error) => persist_reply(
             runtime.inner(),
             &project_name,
@@ -281,7 +318,11 @@ async fn run_chat_stream(
 
     let cancellation = active.cancellation_flag();
     let mut partial_reply = String::new();
-    let stream_result = crate::api::call_deepseek_api_stream(
+    let model_context = crate::cost_ledger::ModelCallContext::for_project(
+        &crate::load_project(&project_name)?,
+        crate::cost_ledger::ModelCallPurpose::Discussion,
+    );
+    let stream_result = crate::api::call_deepseek_api_stream_with_context(
         prepared.system_prompt,
         &prepared.context,
         cancellation,
@@ -298,12 +339,14 @@ async fn run_chat_stream(
                 )
             })
         },
+        model_context,
     )
     .await;
 
     match stream_result {
-        Ok(reply) => {
+        Ok(response) => {
             if active.is_cancelled() {
+                let produced_change = !partial_reply.trim().is_empty();
                 let project = persist_terminal_reply(
                     runtime,
                     &project_name,
@@ -315,6 +358,7 @@ async fn run_chat_stream(
                     &reply_id,
                     reply_timestamp,
                 )?;
+                mark_discussion_call(&project_name, &response.metadata.call_id, produced_change);
                 let _ = send_stream_event(
                     &on_event,
                     ChatStreamEvent::Cancelled {
@@ -333,7 +377,7 @@ async fn run_chat_stream(
                 &thread_id,
                 new_reply_message(
                     &role,
-                    reply,
+                    response.content,
                     None,
                     &prepared.user_message.id,
                     reply_id.clone(),
@@ -354,6 +398,7 @@ async fn run_chat_stream(
                 );
                 format!("最终回复保存失败：{error}")
             })?;
+            mark_discussion_call(&project_name, &response.metadata.call_id, true);
             let _ = send_stream_event(
                 &on_event,
                 ChatStreamEvent::Completed {
@@ -366,7 +411,8 @@ async fn run_chat_stream(
             lease.finish();
             Ok(project)
         }
-        Err(crate::api::StreamResponseError::Cancelled) => {
+        Err(error) if error.is_cancelled() => {
+            let produced_change = !partial_reply.trim().is_empty();
             let project = persist_terminal_reply(
                 runtime,
                 &project_name,
@@ -378,6 +424,7 @@ async fn run_chat_stream(
                 &reply_id,
                 reply_timestamp,
             )?;
+            mark_discussion_call(&project_name, &error.metadata().call_id, produced_change);
             let _ = send_stream_event(
                 &on_event,
                 ChatStreamEvent::Cancelled {
@@ -390,7 +437,8 @@ async fn run_chat_stream(
             lease.finish();
             Ok(project)
         }
-        Err(crate::api::StreamResponseError::Failed(_)) if active.is_cancelled() => {
+        Err(error) if active.is_cancelled() => {
+            let produced_change = !partial_reply.trim().is_empty();
             let project = persist_terminal_reply(
                 runtime,
                 &project_name,
@@ -402,6 +450,7 @@ async fn run_chat_stream(
                 &reply_id,
                 reply_timestamp,
             )?;
+            mark_discussion_call(&project_name, &error.metadata().call_id, produced_change);
             let _ = send_stream_event(
                 &on_event,
                 ChatStreamEvent::Cancelled {
@@ -414,7 +463,10 @@ async fn run_chat_stream(
             lease.finish();
             Ok(project)
         }
-        Err(crate::api::StreamResponseError::Failed(error)) => {
+        Err(error) => {
+            let produced_change = !partial_reply.trim().is_empty();
+            let call_id = error.metadata().call_id.clone();
+            let error = error.to_string();
             let project = persist_terminal_reply(
                 runtime,
                 &project_name,
@@ -429,6 +481,7 @@ async fn run_chat_stream(
             .map_err(|save_error| {
                 format!("AI 回复失败（{error}），且中断状态保存失败：{save_error}")
             })?;
+            mark_discussion_call(&project_name, &call_id, produced_change);
             let _ = send_stream_event(
                 &on_event,
                 ChatStreamEvent::Failed {
@@ -466,6 +519,7 @@ fn prepare_chat(
     runtime.with_project_mutation(project_name, || {
         let mut project = crate::load_project(project_name)?;
         ensure_chat_is_unlocked(&project)?;
+        ensure_discussion_thread_is_active(&project, thread_id)?;
         let thread_idx = find_thread_index(&project, thread_id)?;
 
         let (user_message, context_end_message_id) = match input {
@@ -493,10 +547,22 @@ fn prepare_chat(
                 project.discussion_threads[thread_idx]
                     .messages
                     .push(user_message.clone());
-                project.discussion_revision = project.discussion_revision.saturating_add(1);
+                project.discussion_threads[thread_idx].revision = project.discussion_threads
+                    [thread_idx]
+                    .revision
+                    .saturating_add(1);
+                if project.discussion_threads[thread_idx].scope
+                    == project::DiscussionScope::FirstDiscussion
+                {
+                    project.discussion_revision = project.discussion_revision.saturating_add(1);
+                    invalidate_discussion_derivatives(&mut project);
+                } else if project.discussion_threads[thread_idx].scope
+                    == project::DiscussionScope::AdjustFuture
+                {
+                    invalidate_future_milestone_draft(&mut project);
+                }
                 project.workflow_state.data_revision =
                     project.workflow_state.data_revision.saturating_add(1);
-                invalidate_discussion_derivatives(&mut project);
                 (user_message, None)
             }
             ChatInput::RetryUserMessage(user_message_id) => {
@@ -557,6 +623,39 @@ fn find_thread_index(project: &project::Project, thread_id: &str) -> Result<usiz
         .ok_or_else(|| format!("讨论线程不存在: {thread_id}"))
 }
 
+fn ensure_discussion_thread_is_active(
+    project: &project::Project,
+    thread_id: &str,
+) -> Result<(), String> {
+    let active_id = project.workflow_state.active_discussion_thread_id.as_str();
+    if active_id.is_empty() {
+        return Err("活动讨论线程尚未完成对账，请同步项目状态。".to_string());
+    }
+    if active_id != thread_id {
+        return Err(format!(
+            "讨论线程已切换（当前活动线程为 {}），请同步项目状态。",
+            active_id
+        ));
+    }
+    let thread = project
+        .discussion_threads
+        .iter()
+        .find(|candidate| candidate.id == thread_id)
+        .ok_or_else(|| format!("活动讨论线程不存在: {thread_id}"))?;
+    if thread.status != project::DiscussionThreadStatus::Open {
+        return Err("当前讨论线程已关闭，请同步项目状态。".to_string());
+    }
+    if thread.scope != project.workflow_state.discussion_scope {
+        return Err("活动讨论线程与当前讨论范围不一致，请同步项目状态。".to_string());
+    }
+    if thread.scope != project::DiscussionScope::FirstDiscussion
+        && thread.milestone_id != project.current_milestone_id
+    {
+        return Err("活动讨论线程与当前大阶段不一致，请同步项目状态。".to_string());
+    }
+    Ok(())
+}
+
 fn invalidate_discussion_derivatives(project: &mut project::Project) {
     let now = chrono::Utc::now().to_rfc3339();
     for result in &mut project.preflight_results {
@@ -575,6 +674,17 @@ fn invalidate_discussion_derivatives(project: &mut project::Project) {
             expired_draft.expired_at = Some(now);
             project.draft_history.push(expired_draft);
         }
+    }
+}
+
+pub(crate) fn invalidate_future_milestone_draft(project: &mut project::Project) {
+    if let Some(draft) = project.milestone_draft.as_mut().filter(|draft| {
+        draft.draft_kind == project::MilestoneDraftKind::FutureOnly
+            && draft.status != project::MilestoneDraftStatus::Approved
+            && !draft.expired
+    }) {
+        draft.expired = true;
+        draft.expiration_reason = Some("来源讨论线程新增了消息".to_string());
     }
 }
 
@@ -748,6 +858,7 @@ fn append_reply_to_project(
     thread_id: &str,
     reply: project::Message,
 ) -> Result<(), String> {
+    ensure_discussion_thread_is_active(latest, thread_id)?;
     let thread_idx = find_thread_index(latest, thread_id)?;
     let user_message_id = reply
         .reply_to_message_id
@@ -768,6 +879,12 @@ fn append_reply_to_project(
         return Err(format!("AI 回复消息标识已存在: {}", reply.id));
     }
     latest.discussion_threads[thread_idx].messages.push(reply);
+    latest.discussion_threads[thread_idx].revision = latest.discussion_threads[thread_idx]
+        .revision
+        .saturating_add(1);
+    if latest.discussion_threads[thread_idx].scope == project::DiscussionScope::AdjustFuture {
+        invalidate_future_milestone_draft(latest);
+    }
     latest.workflow_state.data_revision = latest.workflow_state.data_revision.saturating_add(1);
     Ok(())
 }
@@ -845,11 +962,50 @@ mod tests {
             title: "second".to_string(),
             node_id: "node".to_string(),
             messages: vec![message("u2", "user", "selected thread content", None)],
+            ..Default::default()
         });
 
         let context = build_chat_context(&project, 1, None);
         assert!(context.contains("selected thread content"));
         assert!(!context.contains("other thread content"));
+    }
+
+    #[test]
+    fn inactive_or_wrong_scope_threads_are_rejected() {
+        let mut project = project::Project::new("active-thread-test");
+        project.discussion_threads.push(project::DiscussionThread {
+            id: "thread-other".to_string(),
+            title: "other".to_string(),
+            node_id: "root".to_string(),
+            ..Default::default()
+        });
+        let inactive = ensure_discussion_thread_is_active(&project, "thread-other")
+            .expect_err("非活动线程必须被拒绝");
+        assert!(inactive.contains("已切换"));
+
+        project.workflow_state.active_discussion_thread_id = "thread-other".to_string();
+        project.workflow_state.discussion_scope = project::DiscussionScope::AdjustFuture;
+        let wrong_scope = ensure_discussion_thread_is_active(&project, "thread-other")
+            .expect_err("作用域错误必须被拒绝");
+        assert!(wrong_scope.contains("讨论范围不一致"));
+    }
+
+    #[test]
+    fn future_discussion_keeps_but_expires_the_existing_draft() {
+        let mut project = project::Project::new("future-draft-expiration");
+        project.milestone_draft = Some(project::MilestoneDraft {
+            draft_kind: project::MilestoneDraftKind::FutureOnly,
+            ..Default::default()
+        });
+
+        invalidate_future_milestone_draft(&mut project);
+
+        let draft = project
+            .milestone_draft
+            .as_ref()
+            .expect("expired draft remains visible");
+        assert!(draft.expired);
+        assert!(draft.expiration_reason.is_some());
     }
 
     #[test]
@@ -885,6 +1041,7 @@ mod tests {
             2,
         );
         append_reply_to_project(&mut value, &thread_id, reply)?;
+        assert_eq!(value.discussion_threads[0].revision, 1);
 
         crate::save_project_to_path(&value, &path)?;
         let stored = crate::load_project_from_path(&path)?;

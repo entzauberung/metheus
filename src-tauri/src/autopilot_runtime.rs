@@ -538,7 +538,9 @@ async fn drive_project(
                         if let Some(state) = latest.workflow_state.autopilot_state.as_mut() {
                             // 执行命令只负责派发后台任务。基础设施重试状态必须保留到
                             // 执行真正完成并进入确认，否则第二次失败会被误判为首次失败。
-                            if next.command == "execute_current_subtask" {
+                            if next.command == "execute_current_subtask"
+                                || next.command == "execute_control_action"
+                            {
                                 clear_action_claim(state);
                             } else {
                                 clear_action_state(state);
@@ -602,6 +604,23 @@ async fn dispatch_action(
     next: &workflow::AutopilotNextStep,
 ) -> Result<(), String> {
     match next.command.as_str() {
+        "execute_control_action" => {
+            let request = next
+                .args
+                .get("request")
+                .cloned()
+                .ok_or_else(|| "控制动作缺少 request 参数".to_string())?;
+            let request = serde_json::from_value::<
+                crate::control_action_executor::ControlActionRequest,
+            >(request)
+            .map_err(|error| format!("控制动作参数无效：{}", error))?;
+            crate::control_action_executor::execute(
+                pipeline_state.clone(),
+                project_name.to_string(),
+                request,
+            )
+            .await?;
+        }
         "select_milestone" => {
             milestone::select_milestone(project_name.to_string(), string_arg(next, "milestoneId")?)
                 .await?;
@@ -875,5 +894,38 @@ mod tests {
         assert_eq!(installed.generation, 2);
         assert!(!installed.handle.is_finished());
         installed.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn installing_same_job_identity_keeps_one_runtime_job() {
+        let mut jobs = HashMap::new();
+        let installed = tokio::spawn(std::future::pending::<()>());
+        let installed_abort = installed.abort_handle();
+        jobs.insert(
+            "project-1".to_string(),
+            AutopilotJob {
+                job_id: "job-current".to_string(),
+                generation: 3,
+                handle: installed,
+            },
+        );
+        let duplicate = tokio::spawn(std::future::pending::<()>());
+        let duplicate_abort = duplicate.abort_handle();
+
+        assert!(!install_job(
+            &mut jobs,
+            "project-1".to_string(),
+            AutopilotJob {
+                job_id: "job-current".to_string(),
+                generation: 3,
+                handle: duplicate,
+            },
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(!installed_abort.is_finished());
+        assert!(duplicate_abort.is_finished());
+        assert_eq!(jobs.len(), 1);
+        jobs.get("project-1").unwrap().handle.abort();
     }
 }

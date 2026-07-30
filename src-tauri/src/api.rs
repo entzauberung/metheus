@@ -1,3 +1,4 @@
+use crate::cost_ledger::{ModelCallContext, ModelCallMetadata, ModelCallResponse, ProviderUsage};
 use crate::settings::{
     ConnectionTestResult, DecisionModelSettings, ModelConnectionErrorKind, ModelConnectionTarget,
     StructuredOutputPolicy,
@@ -51,6 +52,59 @@ pub(crate) async fn call_deepseek_api_inner_typed(
     force_json: bool,
     temperature: f64,
 ) -> Result<String, ApiRequestError> {
+    call_deepseek_api_inner_typed_with_context(
+        system_prompt,
+        user_message,
+        force_json,
+        temperature,
+        ModelCallContext::default(),
+    )
+    .await
+    .map(|response| response.content)
+}
+
+pub(crate) async fn call_deepseek_api_inner_with_context(
+    system_prompt: &str,
+    user_message: &str,
+    force_json: bool,
+    temperature: f64,
+    context: ModelCallContext,
+) -> Result<ModelCallResponse, String> {
+    call_deepseek_api_inner_typed_with_context(
+        system_prompt,
+        user_message,
+        force_json,
+        temperature,
+        context,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn call_deepseek_api_json_with_context(
+    system_prompt: &str,
+    user_message: &str,
+    context: ModelCallContext,
+) -> Result<ModelCallResponse, String> {
+    call_deepseek_api_inner_with_context(system_prompt, user_message, true, 0.5, context).await
+}
+
+pub(crate) async fn call_deepseek_api_json_typed_with_context(
+    system_prompt: &str,
+    user_message: &str,
+    context: ModelCallContext,
+) -> Result<ModelCallResponse, ApiRequestError> {
+    call_deepseek_api_inner_typed_with_context(system_prompt, user_message, true, 0.5, context)
+        .await
+}
+
+pub(crate) async fn call_deepseek_api_inner_typed_with_context(
+    system_prompt: &str,
+    user_message: &str,
+    force_json: bool,
+    temperature: f64,
+    context: ModelCallContext,
+) -> Result<ModelCallResponse, ApiRequestError> {
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if !system_prompt.is_empty() {
         messages.push(serde_json::json!({
@@ -67,14 +121,59 @@ pub(crate) async fn call_deepseek_api_inner_typed(
         ApiRequestError::new(ModelConnectionErrorKind::MissingSecret, message)
     })?;
     let _settings_revision = snapshot.settings_revision;
-    send_openai_compatible(
+    let call_id = uuid::Uuid::new_v4().to_string();
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let started = std::time::Instant::now();
+    let result = send_openai_compatible_with_usage(
         &snapshot.settings,
         &snapshot.api_key,
         messages,
         force_json,
         temperature,
     )
-    .await
+    .await;
+    let ended_at = chrono::Utc::now().to_rfc3339();
+    let elapsed_ms = elapsed_millis(started);
+    match result {
+        Ok(response) => {
+            let metadata = ModelCallMetadata {
+                call_id,
+                context,
+                model: if response.model.is_empty() {
+                    snapshot.settings.model.clone()
+                } else {
+                    response.model
+                },
+                provider_response_id: response.provider_response_id,
+                started_at,
+                ended_at,
+                elapsed_ms,
+                usage: response.usage,
+                failure_kind: String::new(),
+            };
+            crate::cost_ledger::record_metadata_best_effort(&metadata);
+            Ok(ModelCallResponse {
+                content: response.content,
+                metadata,
+            })
+        }
+        Err(mut error) => {
+            let metadata = ModelCallMetadata {
+                call_id,
+                context,
+                model: snapshot.settings.model.clone(),
+                provider_response_id: String::new(),
+                started_at,
+                ended_at,
+                elapsed_ms,
+                usage: None,
+                failure_kind: format!("{:?}", error.kind),
+            };
+            crate::cost_ledger::record_metadata_best_effort(&metadata);
+            error.metadata = Some(metadata);
+            Err(error)
+        }
+    }
 }
 
 pub(crate) async fn call_deepseek_api_messages(
@@ -82,23 +181,118 @@ pub(crate) async fn call_deepseek_api_messages(
     force_json: bool,
     temperature: f64,
 ) -> Result<String, String> {
-    let snapshot = crate::settings::begin_decision_request()?;
+    call_deepseek_api_messages_with_context(
+        messages,
+        force_json,
+        temperature,
+        ModelCallContext::default(),
+    )
+    .await
+    .map(|response| response.content)
+}
+
+pub(crate) async fn call_deepseek_api_messages_with_context(
+    messages: Vec<serde_json::Value>,
+    force_json: bool,
+    temperature: f64,
+    context: ModelCallContext,
+) -> Result<ModelCallResponse, String> {
+    call_deepseek_api_messages_typed_with_context(messages, force_json, temperature, context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) async fn call_deepseek_api_messages_typed_with_context(
+    messages: Vec<serde_json::Value>,
+    force_json: bool,
+    temperature: f64,
+    context: ModelCallContext,
+) -> Result<ModelCallResponse, ApiRequestError> {
+    let snapshot = crate::settings::begin_decision_request().map_err(|message| {
+        ApiRequestError::new(ModelConnectionErrorKind::MissingSecret, message)
+    })?;
     let _settings_revision = snapshot.settings_revision;
-    send_openai_compatible(
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let started = std::time::Instant::now();
+    let call_id = uuid::Uuid::new_v4().to_string();
+    let result = send_openai_compatible_with_usage(
         &snapshot.settings,
         &snapshot.api_key,
         messages,
         force_json,
         temperature,
     )
-    .await
-    .map_err(|error| error.to_string())
+    .await;
+    let ended_at = chrono::Utc::now().to_rfc3339();
+    let elapsed_ms = elapsed_millis(started);
+    match result {
+        Ok(response) => {
+            let metadata = ModelCallMetadata {
+                call_id,
+                context,
+                model: if response.model.is_empty() {
+                    snapshot.settings.model.clone()
+                } else {
+                    response.model
+                },
+                provider_response_id: response.provider_response_id,
+                started_at,
+                ended_at,
+                elapsed_ms,
+                usage: response.usage,
+                failure_kind: String::new(),
+            };
+            crate::cost_ledger::record_metadata_best_effort(&metadata);
+            Ok(ModelCallResponse {
+                content: response.content,
+                metadata,
+            })
+        }
+        Err(mut error) => {
+            let metadata = ModelCallMetadata {
+                call_id,
+                context,
+                model: snapshot.settings.model.clone(),
+                provider_response_id: String::new(),
+                started_at,
+                ended_at,
+                elapsed_ms,
+                usage: None,
+                failure_kind: format!("{:?}", error.kind),
+            };
+            crate::cost_ledger::record_metadata_best_effort(&metadata);
+            error.metadata = Some(metadata);
+            Err(error)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StreamResponseError {
     Cancelled,
     Failed(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StreamModelCallError {
+    error: StreamResponseError,
+    metadata: ModelCallMetadata,
+}
+
+impl StreamModelCallError {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.error == StreamResponseError::Cancelled
+    }
+
+    pub(crate) fn metadata(&self) -> &ModelCallMetadata {
+        &self.metadata
+    }
+}
+
+impl fmt::Display for StreamModelCallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.error, formatter)
+    }
 }
 
 impl fmt::Display for StreamResponseError {
@@ -119,6 +313,28 @@ pub(crate) async fn call_deepseek_api_stream<F>(
 where
     F: FnMut(&str) -> Result<(), String>,
 {
+    call_deepseek_api_stream_with_context(
+        system_prompt,
+        user_message,
+        cancellation,
+        on_delta,
+        ModelCallContext::default(),
+    )
+    .await
+    .map(|response| response.content)
+    .map_err(|error| error.error)
+}
+
+pub(crate) async fn call_deepseek_api_stream_with_context<F>(
+    system_prompt: &str,
+    user_message: &str,
+    cancellation: Arc<AtomicBool>,
+    on_delta: F,
+    context: ModelCallContext,
+) -> Result<ModelCallResponse, StreamModelCallError>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
     let mut messages = Vec::new();
     if !system_prompt.is_empty() {
         messages.push(serde_json::json!({
@@ -131,10 +347,30 @@ where
         "content": user_message
     }));
 
-    let snapshot =
-        crate::settings::begin_decision_request().map_err(StreamResponseError::Failed)?;
+    let call_id = uuid::Uuid::new_v4().to_string();
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let started = std::time::Instant::now();
+    let snapshot = match crate::settings::begin_decision_request() {
+        Ok(snapshot) => snapshot,
+        Err(message) => {
+            let metadata = ModelCallMetadata {
+                call_id,
+                context,
+                started_at,
+                ended_at: chrono::Utc::now().to_rfc3339(),
+                elapsed_ms: elapsed_millis(started),
+                failure_kind: "MissingSecret".to_string(),
+                ..Default::default()
+            };
+            crate::cost_ledger::record_metadata_best_effort(&metadata);
+            return Err(StreamModelCallError {
+                error: StreamResponseError::Failed(message),
+                metadata,
+            });
+        }
+    };
     let _settings_revision = snapshot.settings_revision;
-    send_openai_compatible_stream(
+    let result = send_openai_compatible_stream_with_usage(
         &snapshot.settings,
         &snapshot.api_key,
         messages,
@@ -142,13 +378,59 @@ where
         cancellation,
         on_delta,
     )
-    .await
+    .await;
+    let ended_at = chrono::Utc::now().to_rfc3339();
+    let elapsed_ms = elapsed_millis(started);
+    match result {
+        Ok(response) => {
+            let metadata = ModelCallMetadata {
+                call_id,
+                context,
+                model: if response.model.is_empty() {
+                    snapshot.settings.model.clone()
+                } else {
+                    response.model
+                },
+                provider_response_id: response.provider_response_id,
+                started_at,
+                ended_at,
+                elapsed_ms,
+                usage: response.usage,
+                failure_kind: String::new(),
+            };
+            crate::cost_ledger::record_metadata_best_effort(&metadata);
+            Ok(ModelCallResponse {
+                content: response.content,
+                metadata,
+            })
+        }
+        Err(error) => {
+            let failure_kind = if error == StreamResponseError::Cancelled {
+                "Cancelled"
+            } else {
+                "StreamFailed"
+            };
+            let metadata = ModelCallMetadata {
+                call_id,
+                context,
+                model: snapshot.settings.model.clone(),
+                started_at,
+                ended_at,
+                elapsed_ms,
+                failure_kind: failure_kind.to_string(),
+                ..Default::default()
+            };
+            crate::cost_ledger::record_metadata_best_effort(&metadata);
+            Err(StreamModelCallError { error, metadata })
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ApiRequestError {
     kind: ModelConnectionErrorKind,
     message: String,
+    metadata: Option<ModelCallMetadata>,
 }
 
 impl ApiRequestError {
@@ -156,6 +438,7 @@ impl ApiRequestError {
         Self {
             kind,
             message: message.into(),
+            metadata: None,
         }
     }
 
@@ -183,6 +466,10 @@ impl ApiRequestError {
     pub(crate) fn diagnostic_summary(&self) -> &str {
         &self.message
     }
+
+    pub(crate) fn call_metadata(&self) -> Option<&ModelCallMetadata> {
+        self.metadata.as_ref()
+    }
 }
 
 impl fmt::Display for ApiRequestError {
@@ -194,10 +481,30 @@ impl fmt::Display for ApiRequestError {
 async fn send_openai_compatible(
     settings: &DecisionModelSettings,
     api_key: &str,
-    mut messages: Vec<serde_json::Value>,
+    messages: Vec<serde_json::Value>,
     force_json: bool,
     temperature: f64,
 ) -> Result<String, ApiRequestError> {
+    send_openai_compatible_with_usage(settings, api_key, messages, force_json, temperature)
+        .await
+        .map(|response| response.content)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ProviderResponse {
+    content: String,
+    usage: Option<ProviderUsage>,
+    provider_response_id: String,
+    model: String,
+}
+
+async fn send_openai_compatible_with_usage(
+    settings: &DecisionModelSettings,
+    api_key: &str,
+    mut messages: Vec<serde_json::Value>,
+    force_json: bool,
+    temperature: f64,
+) -> Result<ProviderResponse, ApiRequestError> {
     if force_json && settings.structured_output == StructuredOutputPolicy::PromptOnly {
         messages.insert(
             0,
@@ -235,7 +542,7 @@ async fn send_openai_compatible(
         .await
         .map_err(|error| classify_transport_error(error, settings.timeout_secs))?;
 
-    parse_response(response, api_key).await
+    parse_response_with_usage(response, api_key).await
 }
 
 async fn send_openai_compatible_stream<F>(
@@ -246,6 +553,29 @@ async fn send_openai_compatible_stream<F>(
     cancellation: Arc<AtomicBool>,
     on_delta: F,
 ) -> Result<String, StreamResponseError>
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
+    send_openai_compatible_stream_with_usage(
+        settings,
+        api_key,
+        messages,
+        temperature,
+        cancellation,
+        on_delta,
+    )
+    .await
+    .map(|response| response.content)
+}
+
+async fn send_openai_compatible_stream_with_usage<F>(
+    settings: &DecisionModelSettings,
+    api_key: &str,
+    messages: Vec<serde_json::Value>,
+    temperature: f64,
+    cancellation: Arc<AtomicBool>,
+    on_delta: F,
+) -> Result<ProviderResponse, StreamResponseError>
 where
     F: FnMut(&str) -> Result<(), String>,
 {
@@ -283,7 +613,7 @@ where
         _ = wait_for_cancellation(&cancellation) => return Err(StreamResponseError::Cancelled),
     };
 
-    parse_stream_response(
+    parse_stream_response_with_usage(
         response,
         api_key,
         settings.timeout_secs,
@@ -293,13 +623,13 @@ where
     .await
 }
 
-async fn parse_stream_response<F>(
+async fn parse_stream_response_with_usage<F>(
     mut response: reqwest::Response,
     api_key: &str,
     timeout_secs: u64,
     cancellation: Arc<AtomicBool>,
     mut on_delta: F,
-) -> Result<String, StreamResponseError>
+) -> Result<ProviderResponse, StreamResponseError>
 where
     F: FnMut(&str) -> Result<(), String>,
 {
@@ -358,18 +688,15 @@ where
                         append_stream_delta(&mut reply, &mut reply_chars, &text, &mut on_delta)?;
                         if finished {
                             saw_done = true;
-                            stream_done = true;
-                            break;
                         }
                     }
                     ParsedStreamEvent::Reasoning { finished } => {
                         saw_reasoning = true;
                         if finished {
                             saw_done = true;
-                            stream_done = true;
-                            break;
                         }
                     }
+                    ParsedStreamEvent::Finished => saw_done = true,
                     ParsedStreamEvent::Done => {
                         saw_done = true;
                         stream_done = true;
@@ -401,7 +728,7 @@ where
                         saw_done = true;
                     }
                 }
-                ParsedStreamEvent::Done => saw_done = true,
+                ParsedStreamEvent::Finished | ParsedStreamEvent::Done => saw_done = true,
                 ParsedStreamEvent::Ignored => {}
             }
         }
@@ -416,7 +743,9 @@ where
             };
             return Err(protocol_stream_error(message));
         }
-        return Ok(reply);
+        let mut response = parser.provider_response;
+        response.content = reply;
+        return Ok(response);
     }
 
     let response_data: serde_json::Value =
@@ -430,7 +759,20 @@ where
         return Err(StreamResponseError::Cancelled);
     }
     append_stream_delta(&mut reply, &mut reply_chars, &content, &mut on_delta)?;
-    Ok(reply)
+    Ok(ProviderResponse {
+        content: reply,
+        usage: extract_provider_usage(&response_data),
+        provider_response_id: response_data
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        model: response_data
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
 }
 
 async fn wait_for_cancellation(cancellation: &AtomicBool) {
@@ -470,6 +812,7 @@ fn protocol_stream_error(message: impl Into<String>) -> StreamResponseError {
 enum ParsedStreamEvent {
     Delta { text: String, finished: bool },
     Reasoning { finished: bool },
+    Finished,
     Done,
     Ignored,
 }
@@ -477,6 +820,7 @@ enum ParsedStreamEvent {
 #[derive(Default)]
 struct SseParser {
     buffer: Vec<u8>,
+    provider_response: ProviderResponse,
 }
 
 impl SseParser {
@@ -493,7 +837,9 @@ impl SseParser {
         let mut events = self.drain_complete_events()?;
         if !self.buffer.iter().all(u8::is_ascii_whitespace) {
             let remaining = std::mem::take(&mut self.buffer);
-            events.push(parse_sse_event(&remaining)?);
+            let (event, metadata) = parse_sse_event(&remaining)?;
+            self.merge_provider_metadata(metadata);
+            events.push(event);
         }
         Ok(events)
     }
@@ -506,9 +852,23 @@ impl SseParser {
             }
             let raw_event = self.buffer[..index].to_vec();
             self.buffer.drain(..index + delimiter_len);
-            events.push(parse_sse_event(&raw_event)?);
+            let (event, metadata) = parse_sse_event(&raw_event)?;
+            self.merge_provider_metadata(metadata);
+            events.push(event);
         }
         Ok(events)
+    }
+
+    fn merge_provider_metadata(&mut self, metadata: ProviderResponse) {
+        if metadata.usage.is_some() {
+            self.provider_response.usage = metadata.usage;
+        }
+        if !metadata.provider_response_id.is_empty() {
+            self.provider_response.provider_response_id = metadata.provider_response_id;
+        }
+        if !metadata.model.is_empty() {
+            self.provider_response.model = metadata.model;
+        }
     }
 }
 
@@ -524,7 +884,7 @@ fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
     }
 }
 
-fn parse_sse_event(raw_event: &[u8]) -> Result<ParsedStreamEvent, String> {
+fn parse_sse_event(raw_event: &[u8]) -> Result<(ParsedStreamEvent, ProviderResponse), String> {
     let event =
         std::str::from_utf8(raw_event).map_err(|_| "流式响应包含无效 UTF-8 数据".to_string())?;
     let data = event
@@ -533,20 +893,37 @@ fn parse_sse_event(raw_event: &[u8]) -> Result<ParsedStreamEvent, String> {
         .collect::<Vec<_>>()
         .join("\n");
     if data.is_empty() {
-        return Ok(ParsedStreamEvent::Ignored);
+        return Ok((ParsedStreamEvent::Ignored, ProviderResponse::default()));
     }
     if data.trim() == "[DONE]" {
-        return Ok(ParsedStreamEvent::Done);
+        return Ok((ParsedStreamEvent::Done, ProviderResponse::default()));
     }
 
     let value: serde_json::Value = serde_json::from_str(&data)
         .map_err(|error| format!("解析流式 OpenAI Compatible 事件失败：{error}"))?;
-    let choices = value
-        .get("choices")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| "流式 OpenAI Compatible 事件缺少 choices[0]".to_string())?;
+    let metadata = ProviderResponse {
+        usage: extract_provider_usage(&value),
+        provider_response_id: value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        model: value
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        ..Default::default()
+    };
+    let choices = match value.get("choices").and_then(serde_json::Value::as_array) {
+        Some(choices) => choices,
+        None if metadata.usage.is_some() => {
+            return Ok((ParsedStreamEvent::Ignored, metadata));
+        }
+        None => return Err("流式 OpenAI Compatible 事件缺少 choices[0]".to_string()),
+    };
     let Some(choice) = choices.first() else {
-        return Ok(ParsedStreamEvent::Ignored);
+        return Ok((ParsedStreamEvent::Ignored, metadata));
     };
     let finished = choice
         .get("finish_reason")
@@ -562,16 +939,19 @@ fn parse_sse_event(raw_event: &[u8]) -> Result<ParsedStreamEvent, String> {
         .and_then(extract_content_value)
         .unwrap_or_default();
     if !delta.is_empty() {
-        Ok(ParsedStreamEvent::Delta {
-            text: delta,
-            finished,
-        })
+        Ok((
+            ParsedStreamEvent::Delta {
+                text: delta,
+                finished,
+            },
+            metadata,
+        ))
     } else if !reasoning.is_empty() {
-        Ok(ParsedStreamEvent::Reasoning { finished })
+        Ok((ParsedStreamEvent::Reasoning { finished }, metadata))
     } else if finished {
-        Ok(ParsedStreamEvent::Done)
+        Ok((ParsedStreamEvent::Finished, metadata))
     } else {
-        Ok(ParsedStreamEvent::Ignored)
+        Ok((ParsedStreamEvent::Ignored, metadata))
     }
 }
 
@@ -593,10 +973,10 @@ fn extract_content_value(content: &serde_json::Value) -> Option<String> {
     )
 }
 
-async fn parse_response(
+async fn parse_response_with_usage(
     response: reqwest::Response,
     api_key: &str,
-) -> Result<String, ApiRequestError> {
+) -> Result<ProviderResponse, ApiRequestError> {
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.map_err(|error| {
@@ -615,11 +995,67 @@ async fn parse_response(
             format!("解析 OpenAI Compatible 响应失败：{error}"),
         )
     })?;
-    extract_message_content(&response_data).ok_or_else(|| {
+    let content = extract_message_content(&response_data).ok_or_else(|| {
         ApiRequestError::new(
             ModelConnectionErrorKind::Protocol,
             "OpenAI Compatible 响应缺少有效 choices[0].message.content",
         )
+    })?;
+    Ok(ProviderResponse {
+        content,
+        usage: extract_provider_usage(&response_data),
+        provider_response_id: response_data
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        model: response_data
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+fn extract_provider_usage(response: &serde_json::Value) -> Option<ProviderUsage> {
+    let usage = response.get("usage")?.as_object()?;
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    let output_tokens = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            input_tokens
+                .zip(output_tokens)
+                .map(|(input, output)| input + output)
+        });
+    let cached_input_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .or_else(|| {
+            usage
+                .get("input_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+        })
+        .and_then(serde_json::Value::as_u64);
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && total_tokens.is_none()
+        && cached_input_tokens.is_none()
+    {
+        return None;
+    }
+    Some(ProviderUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        cached_input_tokens,
     })
 }
 
@@ -878,6 +1314,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parses_provider_usage_without_exposing_request_content() -> Result<(), String> {
+        let body = r#"{"id":"req-1","model":"provider-model","choices":[{"message":{"content":"OK"}}],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17,"prompt_tokens_details":{"cached_tokens":4}}}"#;
+        let (url, request) = one_shot_server("200 OK", body).await?;
+        let response = send_openai_compatible_with_usage(
+            &test_settings(url),
+            "metheus-secret-sentinel",
+            vec![serde_json::json!({"role":"user","content":"sensitive prompt"})],
+            false,
+            0.0,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert_eq!(response.content, "OK");
+        assert_eq!(response.provider_response_id, "req-1");
+        assert_eq!(response.model, "provider-model");
+        assert_eq!(
+            response.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(12)
+        );
+        assert_eq!(
+            response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens),
+            Some(5)
+        );
+        assert_eq!(
+            response.usage.as_ref().and_then(|usage| usage.total_tokens),
+            Some(17)
+        );
+        assert_eq!(
+            response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.cached_input_tokens),
+            Some(4)
+        );
+        request.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[test]
+    fn missing_or_invalid_usage_remains_unknown() {
+        assert!(extract_provider_usage(&serde_json::json!({})).is_none());
+        assert!(extract_provider_usage(&serde_json::json!({
+            "usage": { "prompt_tokens": "unknown", "completion_tokens": null }
+        }))
+        .is_none());
+        let derived = extract_provider_usage(&serde_json::json!({
+            "usage": { "input_tokens": 8, "output_tokens": 3 }
+        }))
+        .unwrap();
+        assert_eq!(derived.total_tokens, Some(11));
+    }
+
+    #[tokio::test]
     async fn classifies_and_redacts_authentication_errors() -> Result<(), String> {
         let body = r#"{"error":"Bearer metheus-secret-sentinel is invalid"}"#;
         let (url, request) = one_shot_server("401 Unauthorized", body).await?;
@@ -948,6 +1440,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"},\"finish_reason\":null}]}\n\n",
             "data: {\"choices\":[],\"usage\":{\"completion_tokens\":1}}\n\n",
+            "data: {\"usage\":{\"completion_tokens\":2}}\n\n",
         );
 
         assert_eq!(
@@ -957,7 +1450,16 @@ mod tests {
                 ParsedStreamEvent::Ignored,
                 ParsedStreamEvent::Reasoning { finished: false },
                 ParsedStreamEvent::Ignored,
+                ParsedStreamEvent::Ignored,
             ]
+        );
+        assert_eq!(
+            parser
+                .provider_response
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.output_tokens),
+            Some(2)
         );
         Ok(())
     }
@@ -971,7 +1473,7 @@ mod tests {
         );
         assert_eq!(
             parser.push(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")?,
-            vec![ParsedStreamEvent::Done]
+            vec![ParsedStreamEvent::Finished]
         );
         Ok(())
     }
@@ -1019,6 +1521,65 @@ mod tests {
         assert_eq!(deltas, vec!["whole reply"]);
         let raw_request = request.await.map_err(|error| error.to_string())??;
         assert!(raw_request.contains("\"stream\":true"));
+        assert!(!raw_request.contains("stream_options"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_reader_collects_metadata_from_ordinary_json() -> Result<(), String> {
+        let body = r#"{"id":"ordinary-1","model":"ordinary-model","choices":[{"message":{"content":"whole reply"}}],"usage":{"prompt_tokens":7,"completion_tokens":2,"total_tokens":9}}"#;
+        let (url, request) = one_shot_server("200 OK", body).await?;
+        let response = send_openai_compatible_stream_with_usage(
+            &test_settings(url),
+            "secret",
+            vec![],
+            0.0,
+            Arc::new(AtomicBool::new(false)),
+            |_| Ok(()),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        assert_eq!(response.content, "whole reply");
+        assert_eq!(response.provider_response_id, "ordinary-1");
+        assert_eq!(response.model, "ordinary-model");
+        assert_eq!(
+            response.usage.as_ref().and_then(|usage| usage.total_tokens),
+            Some(9)
+        );
+        request.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_reader_collects_trailing_usage_event() -> Result<(), String> {
+        let body = concat!(
+            "data: {\"id\":\"stream-1\",\"model\":\"stream-model\",\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3,\"total_tokens\":14}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (url, request) =
+            one_shot_server_with_content_type("200 OK", "text/event-stream", body).await?;
+        let response = send_openai_compatible_stream_with_usage(
+            &test_settings(url),
+            "secret",
+            vec![],
+            0.0,
+            Arc::new(AtomicBool::new(false)),
+            |_| Ok(()),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        assert_eq!(response.content, "done");
+        assert_eq!(response.provider_response_id, "stream-1");
+        assert_eq!(response.model, "stream-model");
+        assert_eq!(
+            response.usage.as_ref().and_then(|usage| usage.total_tokens),
+            Some(14)
+        );
+        request.await.map_err(|error| error.to_string())??;
         Ok(())
     }
 

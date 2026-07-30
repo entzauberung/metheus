@@ -255,6 +255,19 @@ pub(crate) async fn update_constitution(
     constitution_content: String,
     diff_summary: project::DiffSummary,
 ) -> Result<String, String> {
+    update_constitution_with_context(
+        constitution_content,
+        diff_summary,
+        crate::cost_ledger::ModelCallContext::default(),
+    )
+    .await
+}
+
+pub(crate) async fn update_constitution_with_context(
+    constitution_content: String,
+    diff_summary: project::DiffSummary,
+    mut model_context: crate::cost_ledger::ModelCallContext,
+) -> Result<String, String> {
     // 第一步：所有字段为空 → 跳过 AI 调用
     if diff_summary.new_files.is_empty()
         && diff_summary.modified_files.is_empty()
@@ -318,27 +331,40 @@ pub(crate) async fn update_constitution(
     );
 
     // 第三步：调用 AI（Flash 模型，低 temperature，纯文本模式）
-    let ai_result = match crate::api::call_deepseek_api_inner(
+    model_context.purpose = Some(crate::cost_ledger::ModelCallPurpose::ConstitutionSummary);
+    let response = match crate::api::call_deepseek_api_inner_with_context(
         crate::prompts::CONSTITUTION_UPDATE_PROMPT,
         &user_message,
         false,
         0.1,
+        model_context.clone(),
     )
     .await
     {
-        Ok(reply) => reply,
+        Ok(response) => response,
         Err(e) => {
             // AI 调用失败 → 直接兜底
             eprintln!("[constitution] AI 调用失败，降级为机械更新：{}", e);
             return mechanical_update_constitution(&constitution_content, &diff_summary);
         }
     };
+    let call_id = response.metadata.call_id.clone();
+    let ai_result = response.content;
 
     // 第四步：校验
     let validation = validate_constitution_update(&constitution_content, &ai_result);
     match validation {
         ValidationResult::Passed => {
             eprintln!("[constitution] 宪法更新成功");
+            crate::cost_ledger::mark_call_outcome_best_effort(
+                &model_context.project_name,
+                &call_id,
+                crate::cost_ledger::ModelCallOutcome {
+                    produced_change: true,
+                    produced_fact: true,
+                    ..Default::default()
+                },
+            );
             return Ok(ai_result);
         }
         ref result @ _ => {
@@ -356,20 +382,31 @@ pub(crate) async fn update_constitution(
                 user_message, err_desc
             );
 
-            match crate::api::call_deepseek_api_inner(
+            match crate::api::call_deepseek_api_inner_with_context(
                 crate::prompts::CONSTITUTION_UPDATE_PROMPT,
                 &retry_message,
                 false,
                 0.1,
+                model_context.clone(),
             )
             .await
             {
-                Ok(retry_reply) => {
+                Ok(retry_response) => {
+                    let retry_reply = retry_response.content;
                     let validation2 =
                         validate_constitution_update(&constitution_content, &retry_reply);
                     match validation2 {
                         ValidationResult::Passed => {
                             eprintln!("[constitution] 宪法更新成功（重试后）");
+                            crate::cost_ledger::mark_call_outcome_best_effort(
+                                &model_context.project_name,
+                                &retry_response.metadata.call_id,
+                                crate::cost_ledger::ModelCallOutcome {
+                                    produced_change: true,
+                                    produced_fact: true,
+                                    ..Default::default()
+                                },
+                            );
                             return Ok(retry_reply);
                         }
                         ref result2 @ _ => {
@@ -428,6 +465,17 @@ pub(crate) fn estimate_tokens(text: &str) -> f64 {
 
 #[tauri::command]
 pub(crate) async fn compact_constitution(constitution_content: String) -> Result<String, String> {
+    compact_constitution_with_context(
+        constitution_content,
+        crate::cost_ledger::ModelCallContext::default(),
+    )
+    .await
+}
+
+pub(crate) async fn compact_constitution_with_context(
+    constitution_content: String,
+    mut model_context: crate::cost_ledger::ModelCallContext,
+) -> Result<String, String> {
     // 第一步：提取第 2 部分
     let part2_start = match constitution_content.find("## 第 2 部分") {
         Some(pos) => pos,
@@ -465,26 +513,39 @@ pub(crate) async fn compact_constitution(constitution_content: String) -> Result
     );
 
     // 第四步：调用 AI
-    let ai_result = match crate::api::call_deepseek_api_inner(
+    model_context.purpose = Some(crate::cost_ledger::ModelCallPurpose::ConstitutionCompression);
+    let response = match crate::api::call_deepseek_api_inner_with_context(
         crate::prompts::COMPACT_CONSTITUTION_PROMPT,
         &user_message,
         false,
         0.1,
+        model_context.clone(),
     )
     .await
     {
-        Ok(reply) => reply,
+        Ok(response) => response,
         Err(e) => {
             eprintln!("[constitution] 宪法剪枝 AI 调用失败：{}，保留膨胀版本", e);
             return Err(format!("AI 调用失败：{}", e));
         }
     };
+    let call_id = response.metadata.call_id.clone();
+    let ai_result = response.content;
 
     // 第五步：校验
     let validation = validate_constitution_update(&constitution_content, &ai_result);
     match validation {
         ValidationResult::Passed => {
             eprintln!("[constitution] 宪法剪枝成功");
+            crate::cost_ledger::mark_call_outcome_best_effort(
+                &model_context.project_name,
+                &call_id,
+                crate::cost_ledger::ModelCallOutcome {
+                    produced_change: true,
+                    produced_fact: true,
+                    ..Default::default()
+                },
+            );
             return Ok(ai_result);
         }
         ref result @ _ => {
@@ -505,20 +566,31 @@ pub(crate) async fn compact_constitution(constitution_content: String) -> Result
                 user_message, err_desc
             );
 
-            match crate::api::call_deepseek_api_inner(
+            match crate::api::call_deepseek_api_inner_with_context(
                 crate::prompts::COMPACT_CONSTITUTION_PROMPT,
                 &retry_message,
                 false,
                 0.1,
+                model_context.clone(),
             )
             .await
             {
-                Ok(retry_reply) => {
+                Ok(retry_response) => {
+                    let retry_reply = retry_response.content;
                     let validation2 =
                         validate_constitution_update(&constitution_content, &retry_reply);
                     match validation2 {
                         ValidationResult::Passed => {
                             eprintln!("[constitution] 宪法剪枝成功（重试后）");
+                            crate::cost_ledger::mark_call_outcome_best_effort(
+                                &model_context.project_name,
+                                &retry_response.metadata.call_id,
+                                crate::cost_ledger::ModelCallOutcome {
+                                    produced_change: true,
+                                    produced_fact: true,
+                                    ..Default::default()
+                                },
+                            );
                             return Ok(retry_reply);
                         }
                         ref result2 @ _ => {

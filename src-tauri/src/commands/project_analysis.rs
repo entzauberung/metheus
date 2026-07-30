@@ -323,12 +323,19 @@ pub(crate) async fn analyze_existing_project(
         baseline.scanned_files.join("\n")
     );
 
-    let result_str =
-        crate::api::call_deepseek_api_json(&crate::prompts::EXISTING_BASELINE_PROMPT, &prompt)
-            .await?;
+    let response = crate::api::call_deepseek_api_json_with_context(
+        &crate::prompts::EXISTING_BASELINE_PROMPT,
+        &prompt,
+        crate::cost_ledger::ModelCallContext::for_project(
+            &proj,
+            crate::cost_ledger::ModelCallPurpose::ExistingProjectAnalysis,
+        ),
+    )
+    .await?;
+    let result_str = response.content.as_str();
 
-    let result: serde_json::Value = serde_json::from_str(&result_str)
-        .map_err(|e| format!("解析 AI 返回的 JSON 失败：{}", e))?;
+    let result: serde_json::Value =
+        serde_json::from_str(result_str).map_err(|e| format!("解析 AI 返回的 JSON 失败：{}", e))?;
 
     if let Some(capabilities) = result["completed_capabilities"].as_array() {
         baseline.completed_capabilities = capabilities
@@ -363,15 +370,25 @@ pub(crate) async fn analyze_existing_project(
     proj.workflow_state.current_step = project::WorkflowStep::BaselineApproval;
     proj.workflow_state.data_revision += 1;
 
-    crate::save_and_reload_project(&proj)
+    let saved = crate::save_and_reload_project(&proj)?;
+    crate::cost_ledger::mark_call_outcome_best_effort(
+        &project_name,
+        &response.metadata.call_id,
+        crate::cost_ledger::ModelCallOutcome {
+            produced_fact: true,
+            ..Default::default()
+        },
+    );
+    Ok(saved)
 }
 
 /// 通过 AI 生成详细基线内容
 #[tauri::command]
 pub(crate) async fn generate_existing_baseline(
-    _project_name: String,
+    project_name: String,
     baseline_json: String,
 ) -> Result<project::ExistingProjectBaseline, String> {
+    let project = crate::load_project(&project_name)?;
     let mut baseline: project::ExistingProjectBaseline =
         serde_json::from_str(&baseline_json).map_err(|e| format!("解析基线数据失败：{}", e))?;
 
@@ -392,12 +409,19 @@ pub(crate) async fn generate_existing_baseline(
         baseline.scanned_files.join("\n")
     );
 
-    let result_str =
-        crate::api::call_deepseek_api_json(&crate::prompts::EXISTING_BASELINE_PROMPT, &prompt)
-            .await?;
+    let response = crate::api::call_deepseek_api_json_with_context(
+        &crate::prompts::EXISTING_BASELINE_PROMPT,
+        &prompt,
+        crate::cost_ledger::ModelCallContext::for_project(
+            &project,
+            crate::cost_ledger::ModelCallPurpose::ExistingProjectAnalysis,
+        ),
+    )
+    .await?;
+    let result_str = response.content.as_str();
 
-    let result: serde_json::Value = serde_json::from_str(&result_str)
-        .map_err(|e| format!("解析 AI 返回的 JSON 失败：{}", e))?;
+    let result: serde_json::Value =
+        serde_json::from_str(result_str).map_err(|e| format!("解析 AI 返回的 JSON 失败：{}", e))?;
 
     if let Some(capabilities) = result["completed_capabilities"].as_array() {
         baseline.completed_capabilities = capabilities
@@ -424,6 +448,14 @@ pub(crate) async fn generate_existing_baseline(
             .collect();
     }
 
+    crate::cost_ledger::mark_call_outcome_best_effort(
+        &project_name,
+        &response.metadata.call_id,
+        crate::cost_ledger::ModelCallOutcome {
+            produced_fact: true,
+            ..Default::default()
+        },
+    );
     Ok(baseline)
 }
 

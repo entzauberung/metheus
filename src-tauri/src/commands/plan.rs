@@ -27,7 +27,7 @@ fn validate_preflight_checks(proj: &project::Project) -> Result<(), String> {
     Ok(())
 }
 
-/// 生成版本方案（必须三项检查全部通过且未过期，当前步骤为 ThreeChecks）
+/// 生成版本方案（必须三项检查全部通过且未过期，当前步骤为 ProjectPlanGeneration）
 ///
 /// 方案生成期间讨论发生变化时，旧上下文生成的草稿不得保存。
 /// AI 返回不完整草稿时不得进入审批页面。
@@ -40,9 +40,9 @@ pub(crate) async fn generate_version_plan(
     let proj = crate::load_project(&project_name)?;
 
     // === 1. 校验当前步骤 ===
-    if proj.workflow_state.current_step != project::WorkflowStep::ThreeChecks {
+    if proj.workflow_state.current_step != project::WorkflowStep::ProjectPlanGeneration {
         return Err(format!(
-            "当前步骤为 {:?}，只有通过三项检查后才能生成方案",
+            "当前步骤为 {:?}，只有在 ProjectPlanGeneration 步骤才能生成方案",
             proj.workflow_state.current_step
         ));
     }
@@ -149,7 +149,17 @@ pub(crate) async fn generate_version_plan(
         }));
     }
 
-    let ai_content = crate::api::call_deepseek_api_messages(api_messages, false, 0.5).await?;
+    let response = crate::api::call_deepseek_api_messages_with_context(
+        api_messages,
+        false,
+        0.5,
+        crate::cost_ledger::ModelCallContext::for_project(
+            &proj,
+            crate::cost_ledger::ModelCallPurpose::VersionPlanGeneration,
+        ),
+    )
+    .await?;
+    let ai_content = response.content.as_str();
 
     // === AI 返回后重新加载 Project，校验事实未变化 ===
     let current_proj = crate::load_project(&project_name)?;
@@ -245,7 +255,16 @@ pub(crate) async fn generate_version_plan(
     proj.workflow_state.current_step = project::WorkflowStep::PlanApproval;
     proj.workflow_state.data_revision += 1;
 
-    crate::save_and_reload_project(&proj)
+    let saved = crate::save_and_reload_project(&proj)?;
+    crate::cost_ledger::mark_call_outcome_best_effort(
+        &project_name,
+        &response.metadata.call_id,
+        crate::cost_ledger::ModelCallOutcome {
+            produced_plan: true,
+            ..Default::default()
+        },
+    );
+    Ok(saved)
 }
 
 /// 批准版本方案（必须三项检查全部通过且未过期，draft_id 匹配）

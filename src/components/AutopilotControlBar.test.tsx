@@ -348,4 +348,65 @@ describe("AutopilotControlBar Git confirmation recovery", () => {
 
     expect(host.textContent).toContain("心跳异常");
   });
+
+  it("uses the same deep recovery leaf for quality and evidence status", () => {
+    const project = validationProject("EvidenceInsufficient", "WaitingHuman");
+    project.workflow_state.recovery_state!.subtask_id = "deep-leaf";
+    project.milestones = [{
+      id: "milestone-1",
+      subtasks: [],
+      mid_stages: [{
+        id: "mid-1",
+        subtasks: [{
+          id: "parent",
+          status: "Pending",
+          child_tasks: [{
+            id: "child-parent",
+            status: "Pending",
+            child_tasks: [{
+              id: "deep-leaf",
+              status: "AwaitingConfirmation",
+              child_tasks: [],
+              test_result: {
+                passed: false,
+                issues: [],
+                suggestion: "",
+                automated_test_status: "Passed",
+              },
+              acceptance_ledger: [{
+                criterion_index: 1,
+                criterion: "深层证据",
+                status: "Unknown",
+                evidence: "",
+                evidence_references: [],
+                confidence: 0,
+                updated_at: "",
+              }],
+            }],
+          }],
+        }],
+      }],
+    }] as unknown as Project["milestones"];
+    const noop = vi.fn(async () => undefined);
+
+    act(() => {
+      root.render(
+        <AutopilotControlBar
+          project={project}
+          executionStatus={null}
+          busy={false}
+          onToggle={noop}
+          onStopManagedFlow={noop}
+          onPauseNow={noop}
+          onPauseAfterCurrent={noop}
+          onResume={noop}
+          onSync={noop}
+          onResolveHumanRecovery={noop}
+        />,
+      );
+    });
+
+    expect(host.textContent).toContain("自动化测试：通过");
+    expect(host.textContent).toContain("验收证据：不足");
+  });
 });

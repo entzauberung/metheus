@@ -53,6 +53,8 @@ pub enum WorkflowStep {
     Discussion,
     /// 三项检查
     ThreeChecks,
+    /// 项目方案生成（检查已通过，尚无可审批草稿）
+    ProjectPlanGeneration,
     /// 方案审批（已批准但尚未进入 Console）
     PlanApproval,
     /// 大阶段生成阶段
@@ -139,6 +141,9 @@ pub struct WorkflowState {
     /// 当前讨论范围
     #[serde(default)]
     pub discussion_scope: DiscussionScope,
+    /// 当前活动讨论线程；旧项目由启动对账按讨论范围补齐
+    #[serde(default)]
+    pub active_discussion_thread_id: String,
     /// 当前待审阅节点标识（大阶段或中阶段 ID）
     #[serde(default)]
     pub review_node_id: String,
@@ -170,6 +175,7 @@ impl Default for WorkflowState {
             pause_reason: PauseReason::None,
             data_revision: 0,
             discussion_scope: DiscussionScope::FirstDiscussion,
+            active_discussion_thread_id: String::new(),
             review_node_id: String::new(),
             last_transition_at: String::new(),
             autopilot_active: false,
@@ -390,7 +396,11 @@ pub enum ReviewIssueSeverity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum EvidenceSourceKind {
     GitDiff,
+    GitDiffHunk,
     IdentifierContext,
+    SymbolDefinition,
+    SymbolReference,
+    LifecycleContext,
     #[default]
     CurrentFileSnippet,
 }
@@ -805,6 +815,20 @@ pub struct ManagedFlowState {
     pub run_status: ManagedRunStatus,
     /// 出错信息
     pub error_message: String,
+    #[serde(default)]
+    pub job_id: String,
+    #[serde(default)]
+    pub job_generation: u64,
+    #[serde(default)]
+    pub current_action: String,
+    #[serde(default)]
+    pub current_action_id: String,
+    #[serde(default)]
+    pub heartbeat_at: String,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub last_completed_action: String,
 }
 
 impl Default for ManagedFlowState {
@@ -817,6 +841,13 @@ impl Default for ManagedFlowState {
             last_action_at: String::new(),
             run_status: ManagedRunStatus::Running,
             error_message: String::new(),
+            job_id: String::new(),
+            job_generation: 0,
+            current_action: String::new(),
+            current_action_id: String::new(),
+            heartbeat_at: String::new(),
+            retry_count: 0,
+            last_completed_action: String::new(),
         }
     }
 }
@@ -1055,6 +1086,45 @@ pub struct Subtask {
     /// Human-readable dependency binding updated by plan calibration.
     #[serde(default)]
     pub dependency_notes: String,
+    /// v0.0.4 compiled contract view. Legacy task fields remain authoritative.
+    #[serde(default)]
+    pub contract_snapshot: Option<crate::task_contract::TaskContract>,
+    /// Controller-created descendants. The legacy serial pipeline ignores this
+    /// field until SerialTakeover explicitly selects a leaf.
+    #[serde(default)]
+    pub child_tasks: Vec<Subtask>,
+    /// Expected outputs used by the deterministic split compiler.
+    #[serde(default)]
+    pub expected_artifacts: Vec<String>,
+    /// Symbols this task is expected to read or change.
+    #[serde(default)]
+    pub related_symbols: Vec<String>,
+    /// Narrow read scope for compiled child tasks.
+    #[serde(default)]
+    pub read_file_paths: Vec<String>,
+    /// Narrow write scope for compiled child tasks.
+    #[serde(default)]
+    pub write_file_paths: Vec<String>,
+    /// Auditable reason for the current child boundary.
+    #[serde(default)]
+    pub split_basis: String,
+    /// Whether the node can be verified without relying on sibling completion.
+    #[serde(default)]
+    pub independently_verifiable: bool,
+    /// Planning hint only; v0.0.4 still executes every node serially.
+    #[serde(default)]
+    pub future_parallel_safe: bool,
+    /// Maps each local acceptance criterion to its immediate parent criterion.
+    #[serde(default)]
+    pub parent_criterion_indexes: Vec<u32>,
+    #[serde(default)]
+    pub aggregated_at: Option<String>,
+    #[serde(default)]
+    pub aggregation_source_task_ids: Vec<String>,
+    #[serde(default)]
+    pub affected_deviation_criteria: Vec<u32>,
+    #[serde(default)]
+    pub aggregation_reason: String,
 }
 ///中阶段（域负责人拆解的技术实现模块）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1227,6 +1297,8 @@ pub enum AutomatedTestStatus {
 pub enum VerificationKind {
     #[default]
     Legacy,
+    DeterministicLocal,
+    AutomatedTestOnly,
     AutomatedTestAndReview,
     CodeReviewOnly,
     HumanOverride,
@@ -1348,7 +1420,14 @@ pub struct Message {
     pub reply_to_message_id: Option<String>,
 }
 ///讨论线程
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum DiscussionThreadStatus {
+    #[default]
+    Open,
+    Closed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DiscussionThread {
     ///唯一标识
     pub id: String,
@@ -1358,6 +1437,24 @@ pub struct DiscussionThread {
     pub node_id: String,
     ///消息列表
     pub messages: Vec<Message>,
+    /// 线程对应的讨论范围；旧线程默认属于首次讨论
+    #[serde(default)]
+    pub scope: DiscussionScope,
+    /// 关联的大阶段；首次讨论为空
+    #[serde(default)]
+    pub milestone_id: String,
+    /// 同一大阶段的审阅周期标识
+    #[serde(default)]
+    pub review_cycle_id: String,
+    /// 每次新增消息递增
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub opened_at: String,
+    #[serde(default)]
+    pub closed_at: Option<String>,
+    #[serde(default)]
+    pub status: DiscussionThreadStatus,
 }
 /// 已有项目基线
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1616,6 +1713,20 @@ pub struct MilestoneDraft {
     /// 来源方案修订号（生成时的 data_revision）
     #[serde(default)]
     pub source_plan_revision: u64,
+    /// 未来规划草稿来源讨论线程
+    #[serde(default)]
+    pub source_thread_id: String,
+    /// 未来规划草稿来源线程修订
+    #[serde(default)]
+    pub source_thread_revision: u64,
+    /// 生成开始时的项目数据修订
+    #[serde(default)]
+    pub source_data_revision: u64,
+    /// 来源讨论或项目事实变化后禁止批准
+    #[serde(default)]
+    pub expired: bool,
+    #[serde(default)]
+    pub expiration_reason: Option<String>,
     /// 生成时间
     #[serde(default)]
     pub generated_at: String,
@@ -1681,6 +1792,11 @@ impl Default for MilestoneDraft {
             check_result: None,
             generation_revision: 0,
             source_plan_revision: 0,
+            source_thread_id: String::new(),
+            source_thread_revision: 0,
+            source_data_revision: 0,
+            expired: false,
+            expiration_reason: None,
             generated_at: String::new(),
             approved_at: None,
             regeneration_count: 0,
@@ -1717,6 +1833,27 @@ impl Default for MidStageDraftStatus {
     fn default() -> Self {
         MidStageDraftStatus::Pending
     }
+}
+
+/// 中阶段草稿的写入契约。增量调整不得复用首次整表替换命令。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum MidStageDraftPurpose {
+    InitialFullList,
+    FuturePendingPatch,
+}
+
+impl Default for MidStageDraftPurpose {
+    fn default() -> Self {
+        Self::InitialFullList
+    }
+}
+
+fn default_mid_stage_draft_source_step() -> WorkflowStep {
+    WorkflowStep::MidStageGeneration
+}
+
+fn default_allow_full_mid_stage_replacement() -> bool {
+    true
 }
 
 /// 中阶段草稿
@@ -1760,6 +1897,21 @@ pub struct MidStageDraft {
     pub last_candidate_fingerprint: String,
     #[serde(default)]
     pub no_progress_count: u32,
+    /// 首次整表或未来未执行部分补丁。
+    #[serde(default)]
+    pub purpose: MidStageDraftPurpose,
+    /// 正式中阶段基线修订；首次空列表固定为 0。
+    #[serde(default)]
+    pub base_mid_stage_revision: u64,
+    /// 增量补丁必须保留的正式中阶段标识；首次草稿为空。
+    #[serde(default)]
+    pub retained_mid_stage_ids: Vec<String>,
+    /// 创建当前草稿链的工作流步骤。
+    #[serde(default = "default_mid_stage_draft_source_step")]
+    pub source_step: WorkflowStep,
+    /// 只有空基线上的首次完整列表可以整表写入。
+    #[serde(default = "default_allow_full_mid_stage_replacement")]
+    pub allow_full_replacement: bool,
 }
 
 impl Default for MidStageDraft {
@@ -1780,6 +1932,11 @@ impl Default for MidStageDraft {
             last_check_failure_fingerprint: String::new(),
             last_candidate_fingerprint: String::new(),
             no_progress_count: 0,
+            purpose: MidStageDraftPurpose::InitialFullList,
+            base_mid_stage_revision: 0,
+            retained_mid_stage_ids: vec![],
+            source_step: WorkflowStep::MidStageGeneration,
+            allow_full_replacement: true,
         }
     }
 }
@@ -1876,6 +2033,12 @@ pub struct Project {
     /// recovery experience is retained here for future prompts.
     #[serde(default)]
     pub recovery_learning: Vec<RecoveryLearningRecord>,
+    /// v0.0.4 task-control state. Missing on legacy projects and defaults to Legacy.
+    #[serde(default)]
+    pub task_control: crate::task_control::TaskControlState,
+    /// v0.0.4 model-call accounting. Missing on legacy projects and starts empty.
+    #[serde(default)]
+    pub cost_ledger: crate::cost_ledger::CostLedger,
 }
 impl Project {
     /// 创建一个新的空项目。
@@ -1885,13 +2048,23 @@ impl Project {
             title: "初始讨论".to_string(),
             node_id: "root".to_string(),
             messages: vec![],
+            scope: DiscussionScope::FirstDiscussion,
+            milestone_id: String::new(),
+            review_cycle_id: String::new(),
+            revision: 0,
+            opened_at: chrono::Utc::now().to_rfc3339(),
+            closed_at: None,
+            status: DiscussionThreadStatus::Open,
         };
 
         Project {
             name: name.to_string(),
             status: ProjectStatus::Idle,
             entry_kind: ProjectEntryKind::NoProject,
-            workflow_state: WorkflowState::default(),
+            workflow_state: WorkflowState {
+                active_discussion_thread_id: initial_thread.id.clone(),
+                ..WorkflowState::default()
+            },
             mode: ProjectMode::Professional,
             execution_profile: ExecutionProfile::default(),
             current_milestone_id: "".to_string(),
@@ -1914,7 +2087,84 @@ impl Project {
             execution_session: None,
             execution_history: vec![],
             recovery_learning: vec![],
+            task_control: crate::task_control::TaskControlState::for_new_project(),
+            cost_ledger: crate::cost_ledger::CostLedger::default(),
         }
+    }
+
+    pub fn activate_discussion_thread(
+        &mut self,
+        scope: DiscussionScope,
+        milestone_id: &str,
+        review_cycle_id: &str,
+    ) -> String {
+        if let Some(existing) = self.discussion_threads.iter().find(|thread| {
+            thread.status == DiscussionThreadStatus::Open
+                && thread.scope == scope
+                && thread.milestone_id == milestone_id
+                && thread.review_cycle_id == review_cycle_id
+        }) {
+            self.workflow_state.active_discussion_thread_id = existing.id.clone();
+            return existing.id.clone();
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Some(active) = self.discussion_threads.iter_mut().find(|thread| {
+            thread.id == self.workflow_state.active_discussion_thread_id
+                && thread.scope != DiscussionScope::FirstDiscussion
+                && thread.status == DiscussionThreadStatus::Open
+        }) {
+            active.status = DiscussionThreadStatus::Closed;
+            active.closed_at = Some(now.clone());
+        }
+
+        let title = match scope {
+            DiscussionScope::FirstDiscussion => "初始讨论",
+            DiscussionScope::PauseAdjustment => "暂停调整",
+            DiscussionScope::FixPast => "修正过去",
+            DiscussionScope::AdjustFuture => "调整未来",
+        };
+        let id = format!("thread-{}", uuid::Uuid::new_v4());
+        self.discussion_threads.push(DiscussionThread {
+            id: id.clone(),
+            title: title.to_string(),
+            node_id: if milestone_id.is_empty() {
+                "root".to_string()
+            } else {
+                milestone_id.to_string()
+            },
+            messages: Vec::new(),
+            scope,
+            milestone_id: milestone_id.to_string(),
+            review_cycle_id: review_cycle_id.to_string(),
+            revision: 0,
+            opened_at: now,
+            closed_at: None,
+            status: DiscussionThreadStatus::Open,
+        });
+        self.workflow_state.active_discussion_thread_id = id.clone();
+        id
+    }
+
+    pub fn close_active_discussion_thread(&mut self) {
+        let active_id = self.workflow_state.active_discussion_thread_id.clone();
+        if let Some(active) = self
+            .discussion_threads
+            .iter_mut()
+            .find(|thread| thread.id == active_id && thread.status == DiscussionThreadStatus::Open)
+        {
+            if active.scope != DiscussionScope::FirstDiscussion {
+                active.status = DiscussionThreadStatus::Closed;
+                active.closed_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+        }
+        self.workflow_state.active_discussion_thread_id.clear();
+    }
+
+    pub fn active_discussion_thread(&self) -> Option<&DiscussionThread> {
+        self.discussion_threads
+            .iter()
+            .find(|thread| thread.id == self.workflow_state.active_discussion_thread_id)
     }
 
     /// 创建 Half Project 项目（含路径和来源标识）
@@ -2265,6 +2515,24 @@ pub struct ExecutionSession {
     pub subtask_index: usize,
     /// 总小阶段数
     pub total_subtasks: usize,
+    /// Stable recursive path from the top-level task to the active leaf.
+    #[serde(default)]
+    pub task_path: Vec<String>,
+    /// Immediate parent task id; empty for legacy top-level tasks.
+    #[serde(default)]
+    pub parent_task_id: String,
+    /// Top-level task containing the active leaf.
+    #[serde(default)]
+    pub top_level_task_id: String,
+    /// Task tree revision claimed when execution started.
+    #[serde(default)]
+    pub task_tree_revision: u64,
+    /// Contract fingerprint claimed when execution started.
+    #[serde(default)]
+    pub contract_fingerprint: String,
+    /// Recursive task depth; legacy top-level tasks default to zero.
+    #[serde(default)]
+    pub node_depth: u32,
     /// 本次执行实际采用的引擎配置；恢复流程必须沿用该快照。
     #[serde(default)]
     pub engine_snapshot: ExecutionProfile,
@@ -2348,6 +2616,12 @@ impl Default for ExecutionSession {
             plan_revision: 0,
             subtask_index: 0,
             total_subtasks: 0,
+            task_path: Vec::new(),
+            parent_task_id: String::new(),
+            top_level_task_id: String::new(),
+            task_tree_revision: 0,
+            contract_fingerprint: String::new(),
+            node_depth: 0,
             engine_snapshot: ExecutionProfile::default(),
             engine_settings_revision: 0,
             engine_source_revision: String::new(),
@@ -2481,6 +2755,17 @@ pub struct ExecutionHistoryEntry {
     /// 关联小阶段 ID（可选）
     #[serde(default)]
     pub subtask_id: Option<String>,
+    /// Optional task-control correlations. Old history remains readable.
+    #[serde(default)]
+    pub criterion_index: Option<u32>,
+    #[serde(default)]
+    pub decision_id: Option<String>,
+    #[serde(default)]
+    pub action_id: Option<String>,
+    #[serde(default)]
+    pub validator_id: Option<String>,
+    #[serde(default)]
+    pub model_call_id: Option<String>,
 }
 
 /// 执行历史上限
@@ -2660,6 +2945,44 @@ mod tests {
     }
 
     #[test]
+    fn branch_discussion_threads_are_scoped_and_resumable() {
+        let mut project = Project::new("branch-threads");
+        let fix_id =
+            project.activate_discussion_thread(DiscussionScope::FixPast, "milestone-1", "cycle-1");
+        project
+            .discussion_threads
+            .iter_mut()
+            .find(|thread| thread.id == fix_id)
+            .expect("FixPast thread")
+            .revision = 2;
+        let resumed =
+            project.activate_discussion_thread(DiscussionScope::FixPast, "milestone-1", "cycle-1");
+        assert_eq!(resumed, fix_id);
+
+        let future_id = project.activate_discussion_thread(
+            DiscussionScope::AdjustFuture,
+            "milestone-1",
+            "cycle-1",
+        );
+        assert_ne!(future_id, fix_id);
+        assert_eq!(
+            project
+                .discussion_threads
+                .iter()
+                .find(|thread| thread.id == fix_id)
+                .expect("closed FixPast thread")
+                .status,
+            DiscussionThreadStatus::Closed
+        );
+        assert_eq!(
+            project
+                .active_discussion_thread()
+                .map(|thread| &thread.scope),
+            Some(&DiscussionScope::AdjustFuture)
+        );
+    }
+
+    #[test]
     fn execution_session_parsed_status_execution_failed_not_quality_blocked() {
         let session = ExecutionSession {
             active: false,
@@ -2768,9 +3091,14 @@ mod tests {
             .as_object_mut()
             .ok_or("工作流状态未序列化为对象".to_string())?
             .remove("recovery_state");
+        workflow_value
+            .as_object_mut()
+            .ok_or("工作流状态未序列化为对象".to_string())?
+            .remove("active_discussion_thread_id");
         let restored_workflow: WorkflowState = serde_json::from_value(workflow_value)
             .map_err(|error| format!("反序列化旧工作流状态失败：{}", error))?;
         assert!(restored_workflow.recovery_state.is_none());
+        assert!(restored_workflow.active_discussion_thread_id.is_empty());
 
         let mut test_value = serde_json::to_value(TestResult {
             passed: false,

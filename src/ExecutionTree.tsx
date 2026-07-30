@@ -1,22 +1,28 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   BookOpen,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Circle,
   CircleDot,
   Clock3,
   PauseCircle,
 } from "lucide-react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import { Project } from "./types";
+import type { Project, Subtask } from "./types";
 import { IconButton } from "./components/IconButton";
 import { Modal } from "./components/Modal";
+import { findProjectSubtaskPath } from "./taskTreePolicy";
 
 interface Props {
   project: Project;
   projectPath: string;
   onSelectMilestone: (id: string) => Promise<void>;
   onSelectMidStage: (id: string) => Promise<void>;
+  selectedTaskId?: string;
+  currentTaskId?: string;
+  onOpenTask?: (taskId: string) => void;
 }
 
 function statusIcon(status: string) {
@@ -36,19 +42,129 @@ function statusIcon(status: string) {
   }
 }
 
+function SubtaskBranches({
+  tasks,
+  currentTaskId,
+  selectedTaskId,
+  collapsedTaskIds,
+  onToggle,
+  onOpenTask,
+}: {
+  tasks: Subtask[];
+  currentTaskId: string;
+  selectedTaskId: string;
+  collapsedTaskIds: Set<string>;
+  onToggle: (id: string) => void;
+  onOpenTask?: (id: string) => void;
+}) {
+  return (
+    <>
+      {tasks.map(task => {
+        const children = task.child_tasks ?? [];
+        const hasChildren = children.length > 0;
+        const expanded = !collapsedTaskIds.has(task.id);
+        const current = task.id === currentTaskId;
+        const selected = task.id === selectedTaskId;
+        return (
+          <li key={task.id} title={task.title}>
+            <div
+              className={`tree-node tree-subtask${current ? " task-current" : ""}${selected ? " task-selected" : ""}`}
+            >
+              {hasChildren ? (
+                <button
+                  type="button"
+                  aria-label={`${expanded ? "收起" : "展开"}任务 ${task.title}`}
+                  aria-expanded={expanded}
+                  onClick={() => onToggle(task.id)}
+                  style={{
+                    alignItems: "center",
+                    background: "transparent",
+                    border: 0,
+                    color: "inherit",
+                    cursor: "pointer",
+                    display: "inline-flex",
+                    padding: 0,
+                  }}
+                >
+                  {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+                </button>
+              ) : <span className="tree-subtask-toggle-spacer">{statusIcon(task.status)}</span>}
+              <button
+                type="button"
+                className="tree-subtask-select"
+                onClick={() => onOpenTask?.(task.id)}
+                aria-current={current ? "true" : undefined}
+              >
+                {hasChildren && statusIcon(task.status)}
+                <span className="tree-label">{task.title}</span>
+              </button>
+              {task.auto_tag && <code className="tree-tag">{task.auto_tag}</code>}
+            </div>
+            {hasChildren && expanded && (
+              <ul className="tree-children tree-subtasks">
+                <SubtaskBranches
+                  tasks={children}
+                  currentTaskId={currentTaskId}
+                  selectedTaskId={selectedTaskId}
+                  collapsedTaskIds={collapsedTaskIds}
+                  onToggle={onToggle}
+                  onOpenTask={onOpenTask}
+                />
+              </ul>
+            )}
+          </li>
+        );
+      })}
+    </>
+  );
+}
+
 export default function ExecutionTree({
   project,
   projectPath,
   onSelectMilestone,
   onSelectMidStage,
+  selectedTaskId = "",
+  currentTaskId: currentTaskIdProp,
+  onOpenTask,
 }: Props) {
   const [constitutionOpen, setConstitutionOpen] = useState(false);
   const [constitutionContent, setConstitutionContent] = useState("");
   const [constitutionLoading, setConstitutionLoading] = useState(false);
   const [selectionBusy, setSelectionBusy] = useState(false);
+  const [collapsedTaskIds, setCollapsedTaskIds] = useState<Set<string>>(() => new Set());
   const step = project.workflow_state.current_step;
   const canSelectMilestone = step === "MilestoneSelection";
   const canSelectMidStage = step === "MidStageSelection";
+  const currentTaskId = currentTaskIdProp
+    ?? project.workflow_state.recovery_state?.subtask_id
+    ?? project.execution_session?.subtask_id
+    ?? "";
+  const currentTaskPath = findProjectSubtaskPath(project, currentTaskId);
+  const selectedTaskPath = findProjectSubtaskPath(project, selectedTaskId);
+  const expandedPath = [...new Set([...currentTaskPath, ...selectedTaskPath])];
+  const expandedPathKey = expandedPath.join("\u0000");
+
+  useEffect(() => {
+    if (expandedPath.length === 0) return;
+    setCollapsedTaskIds(current => {
+      const next = new Set(current);
+      let changed = false;
+      for (const taskId of expandedPath) {
+        changed = next.delete(taskId) || changed;
+      }
+      return changed ? next : current;
+    });
+  }, [expandedPathKey]);
+
+  const toggleTask = (id: string) => {
+    setCollapsedTaskIds(current => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
   const viewConstitution = async () => {
     setConstitutionOpen(true);
@@ -119,6 +235,19 @@ export default function ExecutionTree({
                 <span className="tree-label">{milestone.title}</span>
               </button>
 
+              {(milestone.subtasks ?? []).length > 0 && (
+                <ul className="tree-children tree-subtasks">
+                  <SubtaskBranches
+                    tasks={milestone.subtasks}
+                    currentTaskId={currentTaskId}
+                    selectedTaskId={selectedTaskId}
+                    collapsedTaskIds={collapsedTaskIds}
+                    onToggle={toggleTask}
+                    onOpenTask={onOpenTask}
+                  />
+                </ul>
+              )}
+
               {milestone.mid_stages.length > 0 && (
                 <ul className="tree-children">
                   {milestone.mid_stages.map((midStage) => {
@@ -137,13 +266,14 @@ export default function ExecutionTree({
                         </button>
                         {midStage.subtasks.length > 0 && (
                           <ul className="tree-children tree-subtasks">
-                            {midStage.subtasks.map((subtask) => (
-                              <li key={subtask.id} className="tree-node tree-subtask" title={subtask.title}>
-                                {statusIcon(subtask.status)}
-                                <span className="tree-label">{subtask.title}</span>
-                                {subtask.auto_tag && <code className="tree-tag">{subtask.auto_tag}</code>}
-                              </li>
-                            ))}
+                            <SubtaskBranches
+                              tasks={midStage.subtasks}
+                              currentTaskId={currentTaskId}
+                              selectedTaskId={selectedTaskId}
+                              collapsedTaskIds={collapsedTaskIds}
+                              onToggle={toggleTask}
+                              onOpenTask={onOpenTask}
+                            />
                           </ul>
                         )}
                       </li>

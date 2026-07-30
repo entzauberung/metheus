@@ -11,6 +11,13 @@ function managed(run_status: ManagedFlowState["run_status"]): ManagedFlowState {
     last_action_at: "2026-07-22T00:00:00Z",
     run_status,
     error_message: "",
+    job_id: "managed-job",
+    job_generation: 1,
+    current_action: "",
+    current_action_id: "",
+    heartbeat_at: "",
+    retry_count: 0,
+    last_completed_action: "",
   };
 }
 
@@ -23,6 +30,10 @@ function draft(status: MilestoneDraft["status"], checkResult = "检查通过"): 
     check_result: checkResult,
     generation_revision: 1,
     source_plan_revision: 1,
+    source_thread_id: "",
+    source_thread_revision: 0,
+    source_data_revision: 0,
+    expired: false,
     generated_at: "2026-07-22T00:00:00Z",
     regeneration_count: 0,
     retained_milestone_ids: [],
@@ -50,6 +61,21 @@ describe("managed flow presentation", () => {
       "MilestoneApproval",
       draft("CheckPassed"),
     )).toMatchObject({ canResume: true, resumeLabel: "继续托管并批准" });
+  });
+
+  it("exposes backend action, target, heartbeat, and waiting reason", () => {
+    const state = managed("WaitingHuman");
+    state.current_action = "generate_version_plan";
+    state.heartbeat_at = "2026-07-30T08:00:00Z";
+    state.last_action = "三项检查需要人工修订";
+    const presentation = getManagedFlowPresentation(state, "ProjectPlanGeneration");
+    expect(presentation).toMatchObject({
+      actionLabel: "生成项目方案",
+      targetLabel: "完成首个大阶段批准",
+      detail: "三项检查需要人工修订",
+      canResume: true,
+    });
+    expect(presentation.heartbeatLabel).not.toBe("尚无心跳");
   });
 });
 

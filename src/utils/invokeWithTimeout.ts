@@ -77,6 +77,7 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   check_milestone_draft: 150,
   approve_milestone_draft: 15,
   select_milestone: 15,
+  continue_current_milestone: 15,
   generate_mid_stage_draft: 150,
   regenerate_mid_stage_draft: 150,
   check_mid_stage_draft: 150,

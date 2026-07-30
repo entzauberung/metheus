@@ -63,4 +63,16 @@ describe("execution log merge policy", () => {
     ]);
     expect(merged.map(entry => entry.operationSource)).toEqual(sources);
   });
+
+  it("preserves separately correlated control events with the same text", () => {
+    const base = history("2026-07-22T12:00:00Z", "验证完成");
+    const merged = mergeExecutionLogs([
+      { ...base, subtask_id: "task", criterion_index: 1, action_id: "action-1" },
+      { ...base, subtask_id: "task", criterion_index: 2, action_id: "action-2" },
+    ]);
+
+    expect(merged).toHaveLength(2);
+    expect(merged.map(entry => entry.criterionIndex)).toEqual([1, 2]);
+    expect(merged.map(entry => entry.actionId)).toEqual(["action-1", "action-2"]);
+  });
 });

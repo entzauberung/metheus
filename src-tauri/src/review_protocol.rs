@@ -550,13 +550,27 @@ pub(crate) async fn parse_review_response_with_repair_and_progress(
     raw: &str,
     progress: Option<&(dyn Fn(project::VerificationStage) + Send + Sync)>,
 ) -> Result<NormalizedReviewResponse, ReviewProtocolError> {
+    parse_review_response_with_repair_and_progress_with_context(
+        raw,
+        progress,
+        crate::cost_ledger::ModelCallContext::default(),
+    )
+    .await
+}
+
+pub(crate) async fn parse_review_response_with_repair_and_progress_with_context(
+    raw: &str,
+    progress: Option<&(dyn Fn(project::VerificationStage) + Send + Sync)>,
+    context: crate::cost_ledger::ModelCallContext,
+) -> Result<NormalizedReviewResponse, ReviewProtocolError> {
     parse_review_response_with_repair_using(raw, progress, |response_text, error| async move {
-        crate::json_utils::repair_json_once_with_contract(
+        crate::json_utils::repair_json_once_with_contract_and_context(
             &response_text,
             crate::prompts::REVIEW_SCHEMA_CONTRACT,
             &error.path,
             &error.expected,
             &error.actual,
+            context,
         )
         .await
         .map_err(|repair_error| ReviewProtocolError {

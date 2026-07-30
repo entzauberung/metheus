@@ -17,6 +17,8 @@
     "verify:autopilot-unattended": "./scripts/verify-autopilot-unattended.sh",
     "verify:quality": "./scripts/verify-quality.sh",
     "verify:validation-resilience": "./scripts/verify-validation-resilience.sh",
+    "verify:task-control-closeout": "./scripts/verify-task-control-closeout.sh",
+    "verify:phase1": "npm run verify:task-control-closeout && npm run build",
     "verify:grok-check": "./scripts/verify-grok-check.sh",
     "preview": "vite preview",
     "tauri": "tauri"

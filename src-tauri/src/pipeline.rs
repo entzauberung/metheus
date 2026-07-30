@@ -167,6 +167,11 @@ pub(crate) fn write_execution_history_with_source(
         milestone_id: milestone_id.map(|s| s.to_string()),
         mid_stage_id: mid_stage_id.map(|s| s.to_string()),
         subtask_id: subtask_id.map(|s| s.to_string()),
+        criterion_index: None,
+        decision_id: None,
+        action_id: None,
+        validator_id: None,
+        model_call_id: None,
     };
     proj.execution_history.push(entry);
     // 限制历史上限
@@ -365,6 +370,15 @@ pub(crate) async fn execute_current_subtask_with_source(
     project_name: String,
     operation_source: project::OperationSource,
 ) -> Result<PipelineState, String> {
+    execute_task_with_source(pipeline_state, project_name, None, operation_source).await
+}
+
+pub(crate) async fn execute_task_with_source(
+    pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    project_name: String,
+    requested_task_id: Option<String>,
+    operation_source: project::OperationSource,
+) -> Result<PipelineState, String> {
     // 以全局流水线锁串行化“校验 + Running 落盘 + 内存状态建立”，阻止重复启动。
     let mut pipeline_guard = acquire_pipeline_start(&pipeline_state).await?;
 
@@ -455,14 +469,40 @@ pub(crate) async fn execute_current_subtask_with_source(
     };
     let engine_executable_path = engine_health.executable_path.clone().unwrap_or_default();
 
-    // Find the next pending subtask
-    let next_idx = mid
-        .subtasks
+    let selected_address = match requested_task_id.as_deref() {
+        Some(task_id) => crate::task_tree::locate_task(&proj, task_id)?
+            .ok_or_else(|| format!("任务节点不存在：{}", task_id))?,
+        None => crate::task_tree::select_current_leaf(&proj)?.ok_or_else(|| {
+            "没有可执行的叶子任务。所有任务可能已完成或依赖尚未满足。".to_string()
+        })?,
+    };
+    if selected_address.milestone_id != milestone_id
+        || selected_address.mid_stage_id != mid_stage_id
+    {
+        return Err("目标叶子任务不属于当前大阶段和中阶段".to_string());
+    }
+    if !selected_address.dependencies_satisfied {
+        return Err(format!(
+            "任务 {} 的依赖尚未满足，不能执行",
+            selected_address.task_id
+        ));
+    }
+    let leaves = crate::task_tree::leaf_addresses_in_scope(&proj, &milestone_id, &mid_stage_id)?;
+    let next_idx = leaves
         .iter()
-        .position(|st| st.status == project::SubtaskStatus::Pending)
-        .ok_or("没有待执行的小阶段。所有小阶段已执行完成。".to_string())?;
-
-    let subtask = &mid.subtasks[next_idx];
+        .position(|address| address.task_id == selected_address.task_id)
+        .ok_or_else(|| "当前任务不是可执行叶子节点".to_string())?;
+    let subtask = crate::task_tree::find_task(&proj, &selected_address.task_id)?
+        .ok_or_else(|| format!("任务节点不存在：{}", selected_address.task_id))?;
+    if !subtask.child_tasks.is_empty() {
+        return Err("父任务不能直接执行，必须选择最深层叶子节点".to_string());
+    }
+    if subtask.status != project::SubtaskStatus::Pending {
+        return Err(format!(
+            "任务 {} 当前状态为 {:?}，不能开始执行",
+            subtask.id, subtask.status
+        ));
+    }
     let authorized_paths =
         crate::plan_contract::validate_subtask(subtask, &format!("第 {} 个小阶段", next_idx + 1))?;
     let subtask_id = subtask.id.clone();
@@ -477,21 +517,37 @@ pub(crate) async fn execute_current_subtask_with_source(
     let approved_prompt =
         crate::plan_compiler::compile_execution_prompt_with_learning(subtask, &learning);
 
-    let total = mid.subtasks.len();
+    let total = leaves.len();
     let plan_revision = mid.plan_revision;
+    let compiled_contract = crate::task_compiler::compile(
+        subtask,
+        selected_address
+            .ancestor_task_ids
+            .last()
+            .map(String::as_str),
+        selected_address.depth,
+    )
+    .contract;
     let execution_id = format!(
         "execution-{}-{}",
         std::process::id(),
         chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
-    let subtask_statuses = mid
-        .subtasks
+    let subtask_statuses = leaves
         .iter()
-        .map(|s| SubtaskStatusItem {
-            subtask_id: s.id.clone(),
-            title: s.title.clone(),
-            status: if s.id == subtask_id {
+        .filter_map(|address| {
+            crate::task_tree::find_task(&proj, &address.task_id)
+                .ok()
+                .flatten()
+                .map(|task| (address, task))
+        })
+        .map(|(address, task)| SubtaskStatusItem {
+            subtask_id: task.id.clone(),
+            title: task.title.clone(),
+            status: if address.task_id == subtask_id {
                 "executing".to_string()
+            } else if crate::task_tree::is_terminal(&task.status) {
+                "completed".to_string()
             } else {
                 "waiting".to_string()
             },
@@ -524,19 +580,12 @@ pub(crate) async fn execute_current_subtask_with_source(
     // 这样刷新后前端能从磁盘 Project 中知道当前正在执行，
     // 而不是错误地显示"点击执行"。
     {
-        let ms = proj
-            .milestones
-            .iter_mut()
-            .find(|m| m.id == milestone_id)
-            .ok_or("大阶段不存在。")?;
-        let mid = ms
-            .mid_stages
-            .iter_mut()
-            .find(|m| m.id == mid_stage_id)
-            .ok_or("中阶段不存在。")?;
-        if let Some(st) = mid.subtasks.get_mut(next_idx) {
-            st.status = project::SubtaskStatus::Executing;
+        let st = crate::task_tree::find_task_mut(&mut proj, &subtask_id)?
+            .ok_or_else(|| format!("任务节点不存在：{}", subtask_id))?;
+        if !st.child_tasks.is_empty() || st.status != project::SubtaskStatus::Pending {
+            return Err("叶子任务状态在执行认领前发生变化".to_string());
         }
+        st.status = project::SubtaskStatus::Executing;
         // 读取当前 Git HEAD 作为执行基线；失败时不得启动后台执行。
         let base_commit_output = std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -574,6 +623,16 @@ pub(crate) async fn execute_current_subtask_with_source(
             plan_revision,
             subtask_index: next_idx,
             total_subtasks: total,
+            task_path: selected_address.task_path(),
+            parent_task_id: selected_address
+                .ancestor_task_ids
+                .last()
+                .cloned()
+                .unwrap_or_default(),
+            top_level_task_id: selected_address.top_level_task_id.clone(),
+            task_tree_revision: proj.task_control.tree_revision,
+            contract_fingerprint: compiled_contract.fingerprint.clone(),
+            node_depth: selected_address.depth,
             engine_snapshot: execution_profile.clone(),
             engine_settings_revision,
             engine_source_revision,
@@ -702,6 +761,8 @@ async fn execute_current_subtask_background(
     pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
     operation_source: project::OperationSource,
 ) -> Result<(), BackgroundExecutionFailure> {
+    let execution_started_at = chrono::Utc::now().to_rfc3339();
+    let execution_timer = std::time::Instant::now();
     let exec_result = match crate::engine::execute(
         prepared_engine,
         crate::engine::ExecutionRequest {
@@ -736,6 +797,7 @@ async fn execute_current_subtask_background(
             ));
         }
     };
+    let execution_elapsed_ms = execution_timer.elapsed().as_millis() as u64;
 
     if !exec_result.success {
         let message = if exec_result.error_log.is_empty() {
@@ -799,17 +861,25 @@ async fn execute_current_subtask_background(
                 stage,
             );
         });
-    let mut test = crate::test_runner::check_subtask_with_context_and_progress(
+    let mut test = crate::test_runner::check_subtask_with_context_and_progress_and_model(
         &project_path,
         &subtask_goal,
         &subtask_id,
-        &subtask_title,
+        &milestone_id,
         &mid_stage_id,
         Some(acceptance_criteria.clone()),
         Some(authorized_paths.clone()),
         Some(approved_prompt),
         None,
         progress,
+        Some(crate::cost_ledger::ModelCallContext {
+            project_name: project_name.clone(),
+            milestone_id: milestone_id.clone(),
+            stage_id: mid_stage_id.clone(),
+            task_id: subtask_id.clone(),
+            purpose: Some(crate::cost_ledger::ModelCallPurpose::Review),
+            ..Default::default()
+        }),
     )
     .await
     .unwrap_or(project::TestResult {
@@ -858,22 +928,74 @@ async fn execute_current_subtask_background(
     if proj.workflow_state.current_step == project::WorkflowStep::PauseDecision {
         return Ok(());
     }
+    if proj.task_control.tree_revision != session.task_tree_revision {
+        return Err(BackgroundExecutionFailure::state_conflict(
+            "任务执行期间任务树修订发生变化，拒绝旧结果写回",
+        ));
+    }
+    let current_address = crate::task_tree::locate_task(&proj, &subtask_id)
+        .map_err(|error| {
+            BackgroundExecutionFailure::new(project::RecoveryErrorKind::StateConflict, error)
+        })?
+        .ok_or_else(|| BackgroundExecutionFailure::state_conflict("目标叶子任务不存在"))?;
+    if current_address.task_path() != session.task_path {
+        return Err(BackgroundExecutionFailure::state_conflict(
+            "执行会话祖先路径与磁盘任务树不一致",
+        ));
+    }
+    let current_task = crate::task_tree::find_task(&proj, &subtask_id)
+        .map_err(|error| {
+            BackgroundExecutionFailure::new(project::RecoveryErrorKind::StateConflict, error)
+        })?
+        .ok_or_else(|| BackgroundExecutionFailure::state_conflict("目标叶子任务不存在"))?;
+    if !current_task.child_tasks.is_empty() {
+        return Err(BackgroundExecutionFailure::state_conflict(
+            "执行目标已变成父任务，拒绝旧结果写回",
+        ));
+    }
+    let current_contract = crate::task_compiler::compile(
+        current_task,
+        current_address.ancestor_task_ids.last().map(String::as_str),
+        current_address.depth,
+    )
+    .contract;
+    if !session.contract_fingerprint.is_empty()
+        && current_contract.fingerprint != session.contract_fingerprint
+    {
+        return Err(BackgroundExecutionFailure::state_conflict(
+            "任务合同在执行期间发生变化，拒绝旧结果写回",
+        ));
+    }
+
+    proj.cost_ledger
+        .record(crate::cost_ledger::ModelCallRecord {
+            call_id: uuid::Uuid::new_v4().to_string(),
+            task_id: subtask_id.clone(),
+            stage_id: mid_stage_id.clone(),
+            purpose: Some(crate::cost_ledger::ModelCallPurpose::Execution),
+            model: execution_profile.provider.display_name().to_string(),
+            provider: execution_profile.provider.display_name().to_string(),
+            started_at: execution_started_at,
+            ended_at: chrono::Utc::now().to_rfc3339(),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            elapsed_ms: Some(execution_elapsed_ms),
+            cache_hit: false,
+            produced_change: !exec_result.file_changes.is_empty(),
+            produced_evidence: false,
+            produced_plan: false,
+            no_progress: exec_result.file_changes.is_empty(),
+            failure_kind: String::new(),
+            ..Default::default()
+        });
 
     {
-        let ms = proj
-            .milestones
-            .iter_mut()
-            .find(|milestone| milestone.id == milestone_id)
-            .ok_or_else(|| BackgroundExecutionFailure::state_conflict("大阶段不存在。"))?;
-        let mid = ms
-            .mid_stages
-            .iter_mut()
-            .find(|mid_stage| mid_stage.id == mid_stage_id)
-            .ok_or_else(|| BackgroundExecutionFailure::state_conflict("中阶段不存在。"))?;
-        let subtask = mid
-            .subtasks
-            .get_mut(subtask_idx)
-            .ok_or_else(|| BackgroundExecutionFailure::state_conflict("小阶段索引已失效。"))?;
+        let subtask = crate::task_tree::find_task_mut(&mut proj, &subtask_id)
+            .map_err(|error| {
+                BackgroundExecutionFailure::new(project::RecoveryErrorKind::StateConflict, error)
+            })?
+            .ok_or_else(|| BackgroundExecutionFailure::state_conflict("目标叶子任务不存在"))?;
         if subtask.id != subtask_id || subtask.status != project::SubtaskStatus::Executing {
             return Ok(());
         }
@@ -905,6 +1027,12 @@ async fn execute_current_subtask_background(
         plan_revision: session.plan_revision,
         subtask_index: subtask_idx,
         total_subtasks: total,
+        task_path: session.task_path,
+        parent_task_id: session.parent_task_id,
+        top_level_task_id: session.top_level_task_id,
+        task_tree_revision: session.task_tree_revision,
+        contract_fingerprint: session.contract_fingerprint,
+        node_depth: session.node_depth,
         engine_snapshot: session.engine_snapshot,
         engine_settings_revision: session.engine_settings_revision,
         engine_source_revision: session.engine_source_revision,
@@ -1084,9 +1212,10 @@ async fn finalize_background_execution_failure(
     finalize_execution_failure(
         &mut proj,
         &mut *pipeline_guard,
-        subtask_idx,
+        subtask_id,
         &failure.message,
         failure.execution_result.clone(),
+        failure.kind != project::RecoveryErrorKind::StateConflict,
     );
     let effective_message = if engine_blocked {
         let target = if baseline.is_empty() {
@@ -1225,20 +1354,30 @@ fn validate_subtask_quality_gate_with_session_statuses(
         ));
     }
 
-    let ms = proj
-        .milestones
-        .iter()
-        .find(|m| m.id == session.milestone_id)
-        .ok_or("执行会话中的大阶段不存在。".to_string())?;
-    let mid = ms
-        .mid_stages
-        .iter()
-        .find(|m| m.id == session.mid_stage_id)
-        .ok_or("执行会话中的中阶段不存在。".to_string())?;
-    let subtask = mid
-        .subtasks
-        .get(session.subtask_index)
-        .ok_or("执行会话中的小阶段索引越界。".to_string())?;
+    let address = crate::task_tree::locate_task(proj, &session.subtask_id)?
+        .ok_or_else(|| "执行会话中的任务不存在。".to_string())?;
+    if proj.task_control.tree_revision != session.task_tree_revision {
+        return Err("任务树修订已变化，旧执行会话不能确认。".to_string());
+    }
+    if !session.task_path.is_empty() && address.task_path() != session.task_path {
+        return Err("执行会话中的任务路径与磁盘任务树不一致。".to_string());
+    }
+    let subtask = crate::task_tree::find_task(proj, &session.subtask_id)?
+        .ok_or_else(|| "执行会话中的任务不存在。".to_string())?;
+    if !subtask.child_tasks.is_empty() {
+        return Err("执行会话指向父任务，不能进入质量确认。".to_string());
+    }
+    let contract = crate::task_compiler::compile(
+        subtask,
+        address.ancestor_task_ids.last().map(String::as_str),
+        address.depth,
+    )
+    .contract;
+    if !session.contract_fingerprint.is_empty()
+        && contract.fingerprint != session.contract_fingerprint
+    {
+        return Err("任务合同已变化，旧执行会话不能确认。".to_string());
+    }
 
     // 校验执行结果存在
     let exec_result = subtask
@@ -1402,9 +1541,10 @@ pub(crate) fn reconcile_terminal_stage(
 fn finalize_execution_failure(
     proj: &mut project::Project,
     pipeline_state: &mut Option<PipelineState>,
-    subtask_idx: usize,
+    subtask_id: &str,
     error_message: &str,
     execution_result: Option<project::ExecutionResult>,
+    reset_task: bool,
 ) {
     let now = chrono::Utc::now().to_rfc3339();
     let mut error_chars = error_message.chars();
@@ -1424,17 +1564,9 @@ fn finalize_execution_failure(
     }
 
     // 修正小阶段状态：回到 Pending，但可由会话状态定位为可恢复（不依赖 retry_count）
-    if let Some(ms) = proj
-        .milestones
-        .iter_mut()
-        .find(|m| m.id == proj.current_milestone_id)
-    {
-        if let Some(mid) = ms
-            .mid_stages
-            .iter_mut()
-            .find(|m| m.id == proj.current_mid_stage_id)
-        {
-            if let Some(st) = mid.subtasks.get_mut(subtask_idx) {
+    if reset_task {
+        if let Ok(Some(st)) = crate::task_tree::find_task_mut(proj, subtask_id) {
+            if st.child_tasks.is_empty() {
                 st.status = project::SubtaskStatus::Pending;
                 st.execution_result = execution_result;
                 st.test_result = None;
@@ -1470,13 +1602,15 @@ fn claim_awaiting_confirmation_under_lock(
     proj: &mut project::Project,
     claim_status: &str,
 ) -> Result<(), String> {
-    let has_awaiting = proj.milestones.iter().any(|ms| {
-        ms.mid_stages.iter().any(|mid| {
-            mid.subtasks
-                .iter()
-                .any(|st| st.status == project::SubtaskStatus::AwaitingConfirmation)
+    let has_awaiting = proj
+        .execution_session
+        .as_ref()
+        .and_then(|session| {
+            crate::task_tree::find_task(proj, &session.subtask_id)
+                .ok()
+                .flatten()
         })
-    });
+        .is_some_and(|task| task.status == project::SubtaskStatus::AwaitingConfirmation);
     if !has_awaiting {
         return Err("没有待确认的小阶段。".to_string());
     }
@@ -1661,8 +1795,11 @@ pub(crate) async fn confirm_subtask_result_with_source(
     let mut proj = crate::load_project(&project_name)?;
     let project_path = proj.project_path.clone();
 
-    let milestone_id = proj.current_milestone_id.clone();
-    let mid_stage_id = proj.current_mid_stage_id.clone();
+    let (milestone_id, mid_stage_id) = proj
+        .execution_session
+        .as_ref()
+        .map(|session| (session.milestone_id.clone(), session.mid_stage_id.clone()))
+        .ok_or_else(|| "没有活跃的执行会话。".to_string())?;
     if milestone_id.is_empty() || mid_stage_id.is_empty() {
         release_confirmation_claim(&mut proj, "awaiting_confirmation");
         let _ = crate::save_project(&proj);
@@ -1715,15 +1852,20 @@ pub(crate) async fn confirm_subtask_result_with_source(
             .ok_or_else(|| "中阶段不存在。".to_string())?;
         let milestone_title = ms.title.clone();
         let mid_version = mid.version.clone();
-        let subtask_idx = mid
-            .subtasks
-            .iter()
-            .position(|s| s.status == project::SubtaskStatus::AwaitingConfirmation)
-            .ok_or_else(|| "没有待确认的小阶段。".to_string())?;
-        let subtask_id = mid.subtasks[subtask_idx].id.clone();
-        let subtask_title = mid.subtasks[subtask_idx].title.clone();
+        let session = proj
+            .execution_session
+            .as_ref()
+            .ok_or_else(|| "没有活跃的执行会话。".to_string())?;
+        let subtask_idx = session.subtask_index;
+        let task = crate::task_tree::find_task(&proj, &session.subtask_id)?
+            .ok_or_else(|| "执行会话中的任务不存在。".to_string())?;
+        if task.status != project::SubtaskStatus::AwaitingConfirmation {
+            return Err("执行会话中的叶子任务未处于待确认状态。".to_string());
+        }
+        let subtask_id = task.id.clone();
+        let subtask_title = task.title.clone();
         let authorized_paths = crate::plan_contract::validate_subtask(
-            &mid.subtasks[subtask_idx],
+            task,
             &format!("第 {} 个小阶段", subtask_idx + 1),
         )?;
         Ok::<_, String>((
@@ -1816,9 +1958,19 @@ pub(crate) async fn confirm_subtask_result_with_source(
                     .map_err(|error| format!("读取 CONSTITUTION.md 失败：{}", error));
                 match old_constitution {
                     Ok(old_constitution) => {
-                        match crate::constitution::update_constitution(
+                        match crate::constitution::update_constitution_with_context(
                             old_constitution.clone(),
                             diff_summary.clone(),
+                            crate::cost_ledger::ModelCallContext {
+                                project_name: project_name.clone(),
+                                milestone_id: milestone_id.clone(),
+                                stage_id: mid_stage_id.clone(),
+                                task_id: subtask_id.clone(),
+                                purpose: Some(
+                                    crate::cost_ledger::ModelCallPurpose::ConstitutionSummary,
+                                ),
+                                ..Default::default()
+                            },
                         )
                         .await
                         {
@@ -2044,21 +2196,33 @@ pub(crate) async fn confirm_subtask_result_with_source(
         return Err(message);
     }
 
-    if let Some(ms) = proj.milestones.iter_mut().find(|m| m.id == milestone_id) {
-        if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == mid_stage_id) {
-            if let Some(st) = mid.subtasks.get_mut(subtask_idx) {
-                st.status = if st.human_verification.as_ref().is_some_and(|verification| {
-                    verification.resolution == project::HumanResolution::AcceptDeviation
-                }) {
-                    project::SubtaskStatus::AcceptedDeviation
-                } else {
-                    project::SubtaskStatus::Passed
-                };
-                st.confirmed_by_user = Some(true);
-                st.confirmed_at = Some(now.clone());
-                st.auto_tag = Some(tag_name);
-            }
-        }
+    let st = crate::task_tree::find_task_mut(&mut proj, &subtask_id)?
+        .ok_or_else(|| "确认目标叶子任务不存在。".to_string())?;
+    if !st.child_tasks.is_empty() {
+        return Err("确认目标已经变成父任务，拒绝写入确认结果。".to_string());
+    }
+    st.status = if st.human_verification.as_ref().is_some_and(|verification| {
+        verification.resolution == project::HumanResolution::AcceptDeviation
+    }) {
+        project::SubtaskStatus::AcceptedDeviation
+    } else {
+        project::SubtaskStatus::Passed
+    };
+    st.confirmed_by_user = Some(true);
+    st.confirmed_at = Some(now.clone());
+    st.auto_tag = Some(tag_name);
+    let aggregation = crate::task_aggregation::aggregate_ancestors(&mut proj, &subtask_id)?;
+    if aggregation.contract_conflict {
+        write_execution_history_with_source(
+            &mut proj,
+            "error",
+            project::ExecutionEventType::QualityGateBlocked,
+            operation_source,
+            "父任务验收证据发生契约冲突，等待人工处理".to_string(),
+            Some(&milestone_id),
+            Some(&mid_stage_id),
+            Some(&subtask_id),
+        );
     }
 
     // === 记录本次授权代码变更历史，不把系统生成的宪法 diff 混入任务范围 ===
@@ -2356,50 +2520,47 @@ pub(crate) async fn reject_subtask_result(
     let mut proj = crate::load_project(&project_name)?;
     claim_awaiting_confirmation_under_lock(&mut proj, "rejecting")?;
 
-    let milestone_id = proj.current_milestone_id.clone();
-    let mid_stage_id = proj.current_mid_stage_id.clone();
+    let (milestone_id, mid_stage_id, session_task_id) = proj
+        .execution_session
+        .as_ref()
+        .map(|session| {
+            (
+                session.milestone_id.clone(),
+                session.mid_stage_id.clone(),
+                session.subtask_id.clone(),
+            )
+        })
+        .ok_or_else(|| "没有活跃的执行会话。".to_string())?;
 
     let locate = (|| {
-        let ms = proj
-            .milestones
-            .iter()
-            .find(|m| m.id == milestone_id)
-            .ok_or("大阶段不存在。")?;
-        let mid = ms
-            .mid_stages
-            .iter()
-            .find(|m| m.id == mid_stage_id)
-            .ok_or("中阶段不存在。")?;
-        let subtask_idx = mid
-            .subtasks
-            .iter()
-            .position(|s| s.status == project::SubtaskStatus::AwaitingConfirmation)
-            .ok_or("没有待确认的小阶段。")?;
-        let subtask_id = mid.subtasks[subtask_idx].id.clone();
-        let subtask_title = mid.subtasks[subtask_idx].title.clone();
-        Ok::<_, &str>((subtask_idx, subtask_id, subtask_title))
+        let address = crate::task_tree::locate_task(&proj, &session_task_id)?
+            .ok_or_else(|| "执行会话中的任务不存在。".to_string())?;
+        let task = crate::task_tree::find_task(&proj, &session_task_id)?
+            .ok_or_else(|| "执行会话中的任务不存在。".to_string())?;
+        if !task.child_tasks.is_empty()
+            || task.status != project::SubtaskStatus::AwaitingConfirmation
+        {
+            return Err("执行会话中的叶子任务未处于待驳回状态。".to_string());
+        }
+        Ok::<_, String>((address, task.id.clone(), task.title.clone()))
     })();
 
-    let (subtask_idx, subtask_id, subtask_title) = match locate {
+    let (_address, subtask_id, subtask_title) = match locate {
         Ok(v) => v,
         Err(msg) => {
             release_confirmation_claim(&mut proj, "awaiting_confirmation");
             let _ = crate::save_project(&proj);
-            return Err(msg.to_string());
+            return Err(msg);
         }
     };
 
     let now = chrono::Utc::now().to_rfc3339();
-    if let Some(ms) = proj.milestones.iter_mut().find(|m| m.id == milestone_id) {
-        if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == mid_stage_id) {
-            if let Some(st) = mid.subtasks.get_mut(subtask_idx) {
-                st.status = project::SubtaskStatus::Rejected;
-                st.confirmed_by_user = Some(false);
-                st.confirmed_at = Some(now.clone());
-                st.confirmation_notes = Some(reason.clone());
-            }
-        }
-    }
+    let st = crate::task_tree::find_task_mut(&mut proj, &subtask_id)?
+        .ok_or_else(|| "执行会话中的任务不存在。".to_string())?;
+    st.status = project::SubtaskStatus::Rejected;
+    st.confirmed_by_user = Some(false);
+    st.confirmed_at = Some(now.clone());
+    st.confirmation_notes = Some(reason.clone());
 
     write_execution_history(
         &mut proj,
@@ -2436,8 +2597,18 @@ pub(crate) async fn retry_current_subtask(
     let mut proj = crate::load_project(&project_name)?;
     let project_path = proj.project_path.clone();
 
-    let milestone_id = proj.current_milestone_id.clone();
-    let mid_stage_id = proj.current_mid_stage_id.clone();
+    let milestone_id = proj
+        .execution_session
+        .as_ref()
+        .map(|session| session.milestone_id.clone())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| proj.current_milestone_id.clone());
+    let mid_stage_id = proj
+        .execution_session
+        .as_ref()
+        .map(|session| session.mid_stage_id.clone())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| proj.current_mid_stage_id.clone());
     if milestone_id.is_empty() || mid_stage_id.is_empty() {
         return Err("请先选择大阶段和中阶段。".to_string());
     }
@@ -2449,36 +2620,31 @@ pub(crate) async fn retry_current_subtask(
         .filter(|session| session.is_recoverable_failure())
         .map(|session| session.subtask_id.clone());
 
-    let ms = proj
-        .milestones
+    let leaves = crate::task_tree::leaf_addresses_in_scope(&proj, &milestone_id, &mid_stage_id)?;
+    let retry_address = leaves
         .iter()
-        .find(|m| m.id == milestone_id)
-        .ok_or("大阶段不存在。")?;
-    let mid = ms
-        .mid_stages
-        .iter()
-        .find(|m| m.id == mid_stage_id)
-        .ok_or("中阶段不存在。")?;
-
-    let subtask_idx = mid
-        .subtasks
-        .iter()
-        .position(|st| {
-            matches!(
-                st.status,
-                project::SubtaskStatus::Rejected | project::SubtaskStatus::AwaitingConfirmation
-            ) || (st.status == project::SubtaskStatus::Pending
-                && recoverable_subtask_id
-                    .as_ref()
-                    .is_some_and(|id| id == &st.id))
-                || (st.status == project::SubtaskStatus::Pending && st.retry_count > 0)
+        .find(|address| {
+            crate::task_tree::find_task(&proj, &address.task_id)
+                .ok()
+                .flatten()
+                .is_some_and(|task| {
+                    matches!(
+                        task.status,
+                        project::SubtaskStatus::Rejected
+                            | project::SubtaskStatus::AwaitingConfirmation
+                    ) || (task.status == project::SubtaskStatus::Pending
+                        && recoverable_subtask_id
+                            .as_ref()
+                            .is_some_and(|id| id == &task.id))
+                        || (task.status == project::SubtaskStatus::Pending && task.retry_count > 0)
+                })
         })
         .ok_or(
             "没有可重试的小阶段。只有测试失败、执行失败、人工驳回或恢复中断的任务可以重试。"
                 .to_string(),
         )?;
-
-    let subtask = &mid.subtasks[subtask_idx];
+    let subtask = crate::task_tree::find_task(&proj, &retry_address.task_id)?
+        .ok_or_else(|| "可重试叶子任务不存在。".to_string())?;
 
     // 禁止重试已通过的任务
     if subtask.status == project::SubtaskStatus::Passed {
@@ -2507,17 +2673,8 @@ pub(crate) async fn retry_current_subtask(
     let now = chrono::Utc::now().to_rfc3339();
 
     // 基线恢复成功后才清理旧结果并递增重试次数（每次人工确认只 +1）
-    let ms = proj
-        .milestones
-        .iter_mut()
-        .find(|m| m.id == milestone_id)
-        .ok_or("大阶段不存在。")?;
-    let mid = ms
-        .mid_stages
-        .iter_mut()
-        .find(|m| m.id == mid_stage_id)
-        .ok_or("中阶段不存在。")?;
-    let st = &mut mid.subtasks[subtask_idx];
+    let st = crate::task_tree::find_task_mut(&mut proj, &subtask_id)?
+        .ok_or_else(|| "可重试叶子任务不存在。".to_string())?;
     let new_retry_count = st.retry_count.saturating_add(1);
     st.status = project::SubtaskStatus::Pending;
     st.execution_result = None;
@@ -3031,22 +3188,9 @@ fn get_execution_workspace_status_for_project(
         if current_head != session.base_commit {
             return None;
         }
-        let subtask = proj
-            .milestones
-            .iter()
-            .find(|milestone| milestone.id == session.milestone_id)
-            .and_then(|milestone| {
-                milestone
-                    .mid_stages
-                    .iter()
-                    .find(|mid_stage| mid_stage.id == session.mid_stage_id)
-            })
-            .and_then(|mid_stage| {
-                mid_stage
-                    .subtasks
-                    .iter()
-                    .find(|subtask| subtask.id == session.subtask_id)
-            })?;
+        let subtask = crate::task_tree::find_task(proj, &session.subtask_id)
+            .ok()
+            .flatten()?;
         Some(
             subtask
                 .allowed_file_paths
@@ -3380,24 +3524,19 @@ pub(crate) async fn perform_in_stop_with_pipeline_state(
 
     // 4. 只有进程退出且 Git 基线验证通过后，才进入暂停决策。
     let now = chrono::Utc::now().to_rfc3339();
-    if let Some(ms) = proj
-        .milestones
-        .iter_mut()
-        .find(|m| m.id == proj.current_milestone_id)
-    {
-        if let Some(mid) = ms
-            .mid_stages
-            .iter_mut()
-            .find(|m| m.id == proj.current_mid_stage_id)
-        {
-            for st in &mut mid.subtasks {
-                if st.status == project::SubtaskStatus::Executing
-                    || st.status == project::SubtaskStatus::AwaitingConfirmation
-                {
-                    st.status = project::SubtaskStatus::Pending;
-                    st.execution_result = None;
-                    st.test_result = None;
-                }
+    let active_task_id = proj
+        .execution_session
+        .as_ref()
+        .map(|session| session.subtask_id.clone())
+        .filter(|id| !id.is_empty());
+    if let Some(task_id) = active_task_id {
+        if let Some(st) = crate::task_tree::find_task_mut(proj, &task_id)? {
+            if st.status == project::SubtaskStatus::Executing
+                || st.status == project::SubtaskStatus::AwaitingConfirmation
+            {
+                st.status = project::SubtaskStatus::Pending;
+                st.execution_result = None;
+                st.test_result = None;
             }
         }
     }
@@ -3665,6 +3804,14 @@ pub(crate) async fn resolve_pause_decision(
             // Enter Discussion with PauseAdjustment scope
             proj.workflow_state.current_step = project::WorkflowStep::Discussion;
             proj.workflow_state.discussion_scope = project::DiscussionScope::PauseAdjustment;
+            let milestone_id = proj.current_milestone_id.clone();
+            let review_cycle_id =
+                format!("pause:{}:{}", milestone_id, chrono::Utc::now().to_rfc3339());
+            proj.activate_discussion_thread(
+                project::DiscussionScope::PauseAdjustment,
+                &milestone_id,
+                &review_cycle_id,
+            );
             // Keep pause_context for reference
             write_execution_history(
                 &mut proj,
@@ -3812,6 +3959,8 @@ pub(crate) async fn confirm_rollback(
     }
 
     proj.workflow_state.current_step = project::WorkflowStep::PlanGeneration;
+    proj.close_active_discussion_thread();
+    proj.workflow_state.discussion_scope = project::DiscussionScope::FirstDiscussion;
     proj.workflow_state.pause_reason = project::PauseReason::None;
     proj.pause_context = None;
     proj.execution_session = None;
@@ -3885,10 +4034,28 @@ fn build_constitution_change_summary(diff: &crate::project::DiffSummary) -> Stri
 pub(crate) fn find_last_passed_subtask(proj: &project::Project) -> Option<project::Subtask> {
     let mut last: Option<project::Subtask> = None;
     for ms in &proj.milestones {
-        for mid in &ms.mid_stages {
-            for st in &mid.subtasks {
-                if st.status == project::SubtaskStatus::Passed {
+        if ms.mid_stages.is_empty() {
+            for address in crate::task_tree::leaf_addresses_in_scope(proj, &ms.id, "").ok()? {
+                if let Some(st) = crate::task_tree::find_task(proj, &address.task_id)
+                    .ok()
+                    .flatten()
+                    .filter(|task| task.status == project::SubtaskStatus::Passed)
+                {
                     last = Some(st.clone());
+                }
+            }
+        } else {
+            for mid in &ms.mid_stages {
+                for address in
+                    crate::task_tree::leaf_addresses_in_scope(proj, &ms.id, &mid.id).ok()?
+                {
+                    if let Some(st) = crate::task_tree::find_task(proj, &address.task_id)
+                        .ok()
+                        .flatten()
+                        .filter(|task| task.status == project::SubtaskStatus::Passed)
+                    {
+                        last = Some(st.clone());
+                    }
                 }
             }
         }
@@ -3961,14 +4128,14 @@ pub fn reconcile_execution_state(
     }
 
     // Check if referenced subtask still exists
-    let subtask_exists = proj
-        .milestones
-        .iter()
-        .filter(|ms| ms.id == session.milestone_id)
-        .flat_map(|ms| ms.mid_stages.iter())
-        .filter(|mid| mid.id == session.mid_stage_id)
-        .flat_map(|mid| mid.subtasks.iter())
-        .any(|st| st.id == session.subtask_id);
+    let subtask_exists = crate::task_tree::locate_task(proj, &session.subtask_id)
+        .ok()
+        .flatten()
+        .is_some_and(|address| {
+            address.milestone_id == session.milestone_id
+                && address.mid_stage_id == session.mid_stage_id
+                && (session.task_path.is_empty() || address.task_path() == session.task_path)
+        });
 
     if !subtask_exists {
         return ExecutionReconciliation::DataConflict;
@@ -4224,7 +4391,7 @@ fn migrate_legacy_v1_confirmation_conflict(proj: &mut project::Project) -> bool 
     let milestone_id = session.milestone_id.clone();
     let mid_stage_id = session.mid_stage_id.clone();
     let subtask_id = session.subtask_id.clone();
-    let Some((mid_version, subtask_index, authorized_paths)) = proj
+    let Some(mid_version) = proj
         .milestones
         .iter()
         .find(|milestone| milestone.id == milestone_id)
@@ -4234,24 +4401,33 @@ fn migrate_legacy_v1_confirmation_conflict(proj: &mut project::Project) -> bool 
                 .iter()
                 .find(|mid_stage| mid_stage.id == mid_stage_id)
         })
-        .and_then(|mid_stage| {
-            mid_stage
-                .subtasks
-                .iter()
-                .enumerate()
-                .find(|(_, subtask)| {
-                    subtask.id == subtask_id
-                        && subtask.status == project::SubtaskStatus::AwaitingConfirmation
-                })
-                .and_then(|(index, subtask)| {
-                    crate::plan_contract::validate_subtask(
-                        subtask,
-                        &format!("第 {} 个小阶段", index + 1),
-                    )
-                    .ok()
-                    .map(|paths| (mid_stage.version.clone(), (index + 1) as u32, paths))
-                })
-        })
+        .map(|mid_stage| mid_stage.version.clone())
+    else {
+        return false;
+    };
+    let Some((subtask_index, subtask)) =
+        crate::task_tree::leaf_addresses_in_scope(proj, &milestone_id, &mid_stage_id)
+            .ok()
+            .and_then(|leaves| {
+                leaves
+                    .iter()
+                    .position(|address| address.task_id == subtask_id)
+                    .and_then(|index| {
+                        crate::task_tree::find_task(proj, &subtask_id)
+                            .ok()
+                            .flatten()
+                            .map(|task| ((index + 1) as u32, task))
+                    })
+            })
+    else {
+        return false;
+    };
+    if subtask.status != project::SubtaskStatus::AwaitingConfirmation {
+        return false;
+    }
+    let Some(authorized_paths) =
+        crate::plan_contract::validate_subtask(subtask, &format!("第 {} 个小阶段", subtask_index))
+            .ok()
     else {
         return false;
     };
@@ -4343,8 +4519,11 @@ pub(crate) async fn reconcile_on_startup(
     let mut proj = crate::load_project(&project_name)?;
     let mut modified = reconcile_loaded_project_under_pipeline_lock(&mut proj, guard.as_ref());
     crate::commands::workflow::reconcile_autopilot_in_migration(&mut proj);
+    modified |= crate::commands::workflow::reconcile_workflow_closure_state(&mut proj);
     let should_start_autopilot = crate::autopilot_runtime::reconcile_startup_job(&mut proj);
+    let should_start_managed = crate::managed_runtime::reconcile_startup_job(&mut proj);
     modified |= proj.workflow_state.autopilot_state.is_some();
+    modified |= proj.workflow_state.managed_flow_state.is_some();
 
     let result = if modified {
         crate::save_project(&proj)?;
@@ -4357,8 +4536,11 @@ pub(crate) async fn reconcile_on_startup(
     if should_start_autopilot {
         state
             .autopilot_runtime
-            .start(state.pipeline_state.clone(), project_name)
+            .start(state.pipeline_state.clone(), project_name.clone())
             .await?;
+    }
+    if should_start_managed {
+        state.managed_runtime.start(project_name).await?;
     }
     Ok(result)
 }
@@ -4518,15 +4700,11 @@ pub(crate) async fn acknowledge_execution_recovery_inner(
     proj.workflow_state.recovery_state = None;
 
     // 确保受影响任务为 Pending，可再次执行
-    if let Some(ms) = proj.milestones.iter_mut().find(|m| m.id == milestone_id) {
-        if let Some(mid) = ms.mid_stages.iter_mut().find(|m| m.id == mid_stage_id) {
-            if let Some(st) = mid.subtasks.iter_mut().find(|st| st.id == subtask_id) {
-                if st.status != project::SubtaskStatus::Passed {
-                    st.status = project::SubtaskStatus::Pending;
-                    st.execution_result = None;
-                    st.test_result = None;
-                }
-            }
+    if let Some(st) = crate::task_tree::find_task_mut(&mut proj, &subtask_id)? {
+        if st.status != project::SubtaskStatus::Passed {
+            st.status = project::SubtaskStatus::Pending;
+            st.execution_result = None;
+            st.test_result = None;
         }
     }
 
@@ -4571,28 +4749,11 @@ pub(crate) async fn acknowledge_execution_recovery_inner(
 }
 
 fn find_current_subtask(proj: &project::Project) -> Option<project::Subtask> {
-    for ms in &proj.milestones {
-        for mid in &ms.mid_stages {
-            for st in &mid.subtasks {
-                if st.status == project::SubtaskStatus::Executing
-                    || st.status == project::SubtaskStatus::AwaitingConfirmation
-                {
-                    return Some(st.clone());
-                }
-            }
-        }
-    }
-    // Fallback: find first Pending
-    for ms in &proj.milestones {
-        for mid in &ms.mid_stages {
-            for st in &mid.subtasks {
-                if st.status == project::SubtaskStatus::Pending {
-                    return Some(st.clone());
-                }
-            }
-        }
-    }
-    None
+    let address = crate::task_tree::select_current_leaf(proj).ok().flatten()?;
+    crate::task_tree::find_task(proj, &address.task_id)
+        .ok()
+        .flatten()
+        .cloned()
 }
 
 // ===================================================================
@@ -4841,6 +5002,12 @@ mod tests {
             plan_revision: 1,
             subtask_index: 0,
             total_subtasks: 1,
+            task_path: vec!["subtask-1".to_string()],
+            parent_task_id: String::new(),
+            top_level_task_id: "subtask-1".to_string(),
+            task_tree_revision: 0,
+            contract_fingerprint: String::new(),
+            node_depth: 0,
             engine_snapshot: project::ExecutionProfile::default(),
             engine_settings_revision: 0,
             engine_source_revision: String::new(),
@@ -6640,7 +6807,7 @@ mod tests {
             ..Default::default()
         });
         let mut pipeline = Some(pipeline_state("execution-x", PipelineStatus::Running));
-        finalize_execution_failure(&mut proj, &mut pipeline, 0, "timeout", None);
+        finalize_execution_failure(&mut proj, &mut pipeline, "subtask-1", "timeout", None, true);
 
         let session = proj.execution_session.as_ref().expect("session kept");
         assert_eq!(session.status, "execution_failed");
@@ -6664,6 +6831,48 @@ mod tests {
         );
         // 首次失败 retry_count 仍为 0，但会话可定位恢复
         assert_eq!(proj.milestones[0].mid_stages[0].subtasks[0].retry_count, 0);
+    }
+
+    #[test]
+    fn execution_failure_updates_only_nested_leaf() {
+        let mut proj = execution_project(
+            "nested-failure",
+            Path::new("/tmp"),
+            project::SubtaskStatus::Pending,
+            Some(execution_session("executing", "nested-execution", "base")),
+        );
+        let mut leaf = test_subtask(project::SubtaskStatus::Executing);
+        leaf.id = "nested-leaf".to_string();
+        let parent = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+        parent.id = "parent".to_string();
+        parent.child_tasks = vec![leaf];
+        let session = proj.execution_session.as_mut().unwrap();
+        session.subtask_id = "nested-leaf".to_string();
+        session.task_path = vec!["parent".to_string(), "nested-leaf".to_string()];
+        session.parent_task_id = "parent".to_string();
+        session.top_level_task_id = "parent".to_string();
+        session.node_depth = 1;
+
+        let mut pipeline = None;
+        finalize_execution_failure(
+            &mut proj,
+            &mut pipeline,
+            "nested-leaf",
+            "timeout",
+            None,
+            true,
+        );
+
+        let parent = &proj.milestones[0].mid_stages[0].subtasks[0];
+        assert_eq!(parent.status, project::SubtaskStatus::Pending);
+        assert_eq!(
+            parent.child_tasks[0].status,
+            project::SubtaskStatus::Pending
+        );
+        assert_eq!(
+            proj.execution_session.as_ref().unwrap().subtask_id,
+            "nested-leaf"
+        );
     }
 
     #[tokio::test]
