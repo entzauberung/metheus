@@ -30,6 +30,7 @@ pub fn aggregate_ancestors(
     if !crate::task_tree::is_terminal(&completed.status) {
         return Err("只有进入终态的叶子任务才能触发父节点聚合".to_string());
     }
+    validate_terminal_source(project, completed)?;
 
     let mut outcome = TaskAggregationOutcome {
         completed_task_id: completed_task_id.to_string(),
@@ -54,6 +55,29 @@ pub fn aggregate_ancestors(
     outcome.next_leaf_id =
         crate::task_tree::select_current_leaf(project)?.map(|address| address.task_id);
     Ok(outcome)
+}
+
+fn validate_terminal_source(project: &Project, task: &Subtask) -> Result<(), String> {
+    match task.status {
+        SubtaskStatus::AcceptedDeviation => {
+            crate::human_action_policy::validate_recorded_human_acceptance(project, task)
+                .map_err(|reason| format!("接受偏差任务审计无效，禁止父节点聚合：{}", reason))?;
+        }
+        SubtaskStatus::Skipped => {
+            let verification = task
+                .human_verification
+                .as_ref()
+                .filter(|verification| {
+                    verification.resolution == crate::project::HumanResolution::SkipTask
+                })
+                .ok_or_else(|| "跳过任务缺少后端人工动作审计，禁止父节点聚合".to_string())?;
+            if verification.action_source.is_empty() || verification.dependency_check.is_empty() {
+                return Err("跳过任务的依赖审计不完整，禁止父节点聚合".to_string());
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn aggregate_parent(parent: &Subtask) -> ParentAggregation {
@@ -317,6 +341,26 @@ mod tests {
     }
 
     #[test]
+    fn phase1_human_action_safety_illegal_deviation_cannot_complete_parent() {
+        let child = proven_child("deviation", 1, AcceptanceStatus::AcceptedDeviation);
+        let parent = Subtask {
+            id: "parent".to_string(),
+            title: "Parent".to_string(),
+            acceptance_criteria: vec!["criterion 1".to_string()],
+            child_tasks: vec![child],
+            ..Default::default()
+        };
+        let mut project = project_with_parent(parent);
+        assert!(aggregate_ancestors(&mut project, "deviation")
+            .unwrap_err()
+            .contains("审计"));
+        assert_eq!(
+            project.milestones[0].subtasks[0].status,
+            SubtaskStatus::Pending
+        );
+    }
+
+    #[test]
     fn unknown_child_evidence_keeps_parent_incomplete() {
         let parent = Subtask {
             id: "parent".to_string(),
@@ -363,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn two_leaf_serial_closeout_aggregates_parent_and_advances_top_level_task() {
+    fn phase1_runtime_contract_two_leaf_closeout_aggregates_parent_and_advances() {
         let mut first = Subtask {
             id: "leaf-one".to_string(),
             title: "Leaf one".to_string(),

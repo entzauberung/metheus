@@ -1650,6 +1650,10 @@ fn evaluate_control_decision(
     )))
 }
 
+fn serial_takeover_allows_macro_fallback(command: &str) -> bool {
+    command.is_empty() || matches!(command, "select_mid_stage" | "transition_workflow")
+}
+
 fn classify_autopilot_precondition(
     proj: &project::Project,
 ) -> Result<Option<(String, project::AutopilotRecoveryAction)>, String> {
@@ -1933,9 +1937,32 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
         None
     };
 
-    if proj.workflow_state.current_step == project::WorkflowStep::Execution
-        && proj.task_control.mode == crate::task_control::TaskControlMode::SerialTakeover
-    {
+    let serial_takeover_execution = proj.workflow_state.current_step
+        == project::WorkflowStep::Execution
+        && proj.task_control.mode == crate::task_control::TaskControlMode::SerialTakeover;
+    let mut serial_takeover_without_leaf = false;
+    if serial_takeover_execution {
+        if let Err(reason) = crate::task_control::ensure_serial_takeover_capability(&proj) {
+            let description = format!("串行接管不可用：{}", reason);
+            autopilot_persist_step_state(
+                &mut proj,
+                &description,
+                project::AutopilotRunStatus::ErrorStopped,
+                &description,
+                project::AutopilotRecoveryAction::WaitHumanDecision,
+            )?;
+            crate::save_project(&proj)?;
+            return Ok(AutopilotNextStep {
+                command: String::new(),
+                args: serde_json::json!({}),
+                description: description.clone(),
+                at_milestone_boundary: false,
+                is_error: true,
+                error_message: description,
+                result_kind: project::AutopilotCommandResultKind::NoResult,
+                waiting_for_execution: false,
+            });
+        }
         if let Some(block) = facts.precondition_block.as_ref() {
             autopilot_persist_step_state(
                 &mut proj,
@@ -2021,8 +2048,37 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
                 waiting_for_execution: false,
             });
         }
+        serial_takeover_without_leaf = true;
     }
     let mut decision = crate::autopilot_policy::decide_next_step(&proj, &project_name, &facts);
+
+    if serial_takeover_without_leaf
+        && !serial_takeover_allows_macro_fallback(&decision.next.command)
+    {
+        let rejected_command = decision.next.command.clone();
+        let description = format!(
+            "串行接管没有可选择的叶子任务，已拒绝旧任务级命令 `{}`；请检查父任务聚合和任务树状态",
+            rejected_command
+        );
+        autopilot_persist_step_state(
+            &mut proj,
+            &description,
+            project::AutopilotRunStatus::ErrorStopped,
+            &description,
+            project::AutopilotRecoveryAction::WaitHumanDecision,
+        )?;
+        crate::save_project(&proj)?;
+        return Ok(AutopilotNextStep {
+            command: String::new(),
+            args: serde_json::json!({}),
+            description: description.clone(),
+            at_milestone_boundary: false,
+            is_error: true,
+            error_message: description,
+            result_kind: project::AutopilotCommandResultKind::NoResult,
+            waiting_for_execution: false,
+        });
+    }
 
     if decision.kind == crate::autopilot_policy::AutopilotDecisionKind::InitializeQualityRecovery {
         let reason = decision
@@ -3426,10 +3482,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shadow_mode_returns_legacy_action_and_records_comparison_only() -> Result<(), String> {
+    async fn phase1_runtime_contract_explicit_shadow_uses_legacy_and_only_audits(
+    ) -> Result<(), String> {
         let project_name = unique_project_name("shadow-comparison");
         let _guard = ProjectDataGuard::new(&project_name)?;
         let mut proj = project::Project::new(&project_name);
+        crate::save_project(&proj)?;
+        let revision = proj.workflow_state.data_revision;
+        proj = crate::commands::task_control::set_task_control_mode(
+            project_name.clone(),
+            "Shadow".to_string(),
+            revision,
+            Some(true),
+            Some("运行时契约显式回退验证".to_string()),
+            Some("phase1_runtime_contract".to_string()),
+        )
+        .await?;
         activate_autopilot(&mut proj, "milestone-1");
         proj.workflow_state.current_step = project::WorkflowStep::Execution;
         proj.current_milestone_id = "milestone-1".to_string();
@@ -3455,6 +3523,11 @@ mod tests {
             crate::task_control::TaskControlMode::Shadow
         );
         assert_eq!(saved.task_control.shadow_comparison.evaluated, 1);
+        assert_eq!(saved.task_control.mode_change_history.len(), 1);
+        assert_eq!(
+            saved.task_control.mode_change_history[0].reason,
+            "运行时契约显式回退验证"
+        );
         assert_eq!(
             saved.task_control.shadow_comparison.comparable_matches
                 + saved.task_control.shadow_comparison.comparable_differences
@@ -3479,7 +3552,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serial_takeover_returns_new_controller_action_in_execution() -> Result<(), String> {
+    async fn phase1_runtime_contract_serial_takeover_dispatches_control_action(
+    ) -> Result<(), String> {
         let project_name = unique_project_name("serial-takeover-action");
         let _guard = ProjectDataGuard::new(&project_name)?;
         let mut proj = project::Project::new(&project_name);
@@ -3522,6 +3596,144 @@ mod tests {
         let saved = crate::load_project(&project_name)?;
         assert_eq!(saved.task_control.control_source, "task_controller");
         assert_eq!(request.decision_id, saved.task_control.last_decision_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phase1_runtime_contract_serial_without_leaf_allows_only_macro_stage_progression(
+    ) -> Result<(), String> {
+        let project_name = unique_project_name("serial-macro-progression");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        activate_autopilot(&mut proj, "milestone-1");
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id = "mid-1".to_string();
+        proj.task_control.mode = crate::task_control::TaskControlMode::SerialTakeover;
+
+        let mut completed_child = test_subtask(project::SubtaskStatus::Passed);
+        completed_child.id = "leaf-completed".to_string();
+        let mut completed_parent = test_subtask(project::SubtaskStatus::Passed);
+        completed_parent.id = "parent-completed".to_string();
+        completed_parent.child_tasks = vec![completed_child];
+        let mut current = test_mid_stage(project::MidStageStatus::Completed);
+        current.subtasks = vec![completed_parent];
+        current.plan_approved_at = Some("2026-07-31T00:00:00Z".to_string());
+
+        let mut next_mid = test_mid_stage(project::MidStageStatus::Pending);
+        next_mid.id = "mid-2".to_string();
+        next_mid.title = "下一中阶段".to_string();
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone.mid_stages = vec![current, next_mid];
+        proj.milestones = vec![milestone];
+        crate::save_project(&proj)?;
+
+        let next = autopilot_next_step(project_name.clone()).await?;
+        assert_eq!(next.command, "select_mid_stage");
+        assert_eq!(next.args["midStageId"], "mid-2");
+        assert_ne!(next.command, "execute_current_subtask");
+
+        let saved = crate::load_project(&project_name)?;
+        assert_eq!(
+            crate::task_tree::find_task(&saved, "parent-completed")?
+                .ok_or("完成父任务丢失".to_string())?
+                .status,
+            project::SubtaskStatus::Passed
+        );
+        assert!(saved.execution_session.is_none());
+        assert!(saved.task_control.active_action_id.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn phase1_runtime_contract_serial_macro_fallback_rejects_legacy_task_commands() {
+        for command in [
+            "execute_current_subtask",
+            "calibrate_next_subtask_command",
+            "confirm_subtask_result",
+            "run_error_recovery",
+            "retry_current_subtask",
+        ] {
+            assert!(
+                !serial_takeover_allows_macro_fallback(command),
+                "旧任务级命令不得从串行接管回落：{}",
+                command
+            );
+        }
+        assert!(serial_takeover_allows_macro_fallback("select_mid_stage"));
+        assert!(serial_takeover_allows_macro_fallback("transition_workflow"));
+        assert!(serial_takeover_allows_macro_fallback(""));
+    }
+
+    #[tokio::test]
+    async fn phase1_runtime_contract_serial_without_leaf_rejects_legacy_parent_execution(
+    ) -> Result<(), String> {
+        let project_name = unique_project_name("serial-parent-reexecution");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        activate_autopilot(&mut proj, "milestone-1");
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id = "mid-1".to_string();
+        proj.task_control.mode = crate::task_control::TaskControlMode::SerialTakeover;
+        proj.project_path = std::env::temp_dir().to_string_lossy().to_string();
+
+        let mut completed_child = test_subtask(project::SubtaskStatus::Passed);
+        completed_child.id = "leaf-completed".to_string();
+        let mut pending_parent = test_subtask(project::SubtaskStatus::Pending);
+        pending_parent.id = "parent-awaiting-aggregation".to_string();
+        pending_parent.allowed_file_paths.clear();
+        pending_parent.fact_snapshot = Some(crate::project_facts::capture(
+            &proj.project_path,
+            &[],
+            Vec::new(),
+        )?);
+        pending_parent.child_tasks = vec![completed_child];
+        let mut mid = test_mid_stage(project::MidStageStatus::InProgress);
+        mid.subtasks = vec![pending_parent];
+        mid.plan_approved_at = Some("2026-07-31T00:00:00Z".to_string());
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone.mid_stages = vec![mid];
+        proj.milestones = vec![milestone];
+        crate::save_project(&proj)?;
+
+        let next = autopilot_next_step(project_name.clone()).await?;
+        assert!(next.command.is_empty());
+        assert!(next.is_error);
+        assert!(!next.error_message.is_empty());
+        assert_ne!(next.command, "execute_current_subtask");
+
+        let saved = crate::load_project(&project_name)?;
+        assert_eq!(
+            crate::task_tree::find_task(&saved, "parent-awaiting-aggregation")?
+                .ok_or("待聚合父任务丢失".to_string())?
+                .status,
+            project::SubtaskStatus::Pending
+        );
+        assert_eq!(
+            crate::task_tree::find_task(&saved, "leaf-completed")?
+                .ok_or("完成叶子丢失".to_string())?
+                .status,
+            project::SubtaskStatus::Passed
+        );
+        assert!(saved.execution_session.is_none());
+        assert_eq!(
+            saved
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .ok_or("缺少自动驾驶停止状态".to_string())?
+                .run_status,
+            project::AutopilotRunStatus::ErrorStopped
+        );
         Ok(())
     }
 

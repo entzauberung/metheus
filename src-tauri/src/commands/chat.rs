@@ -223,6 +223,79 @@ pub(crate) async fn regenerate_chat_reply_stream(
     .await
 }
 
+#[tauri::command]
+pub(crate) async fn chat_with_role_runtime(
+    runtime: State<'_, crate::chat_runtime::ChatRuntimeState>,
+    project_name: String,
+    message: String,
+    role: String,
+    thread_id: String,
+) -> Result<crate::runtime_snapshot::RuntimeMutationResult, String> {
+    chat_with_role(runtime, project_name.clone(), message, role, thread_id).await?;
+    crate::runtime_snapshot::mutation_result(
+        &project_name,
+        None,
+        crate::runtime_snapshot::RuntimeActionSummary::silent("chat_with_role"),
+        false,
+    )
+}
+
+#[tauri::command]
+pub(crate) async fn chat_with_role_stream_runtime(
+    runtime: State<'_, crate::chat_runtime::ChatRuntimeState>,
+    project_name: String,
+    message: String,
+    role: String,
+    thread_id: String,
+    request_id: String,
+    on_event: Channel<ChatStreamEvent>,
+) -> Result<crate::runtime_snapshot::RuntimeMutationResult, String> {
+    chat_with_role_stream(
+        runtime,
+        project_name.clone(),
+        message,
+        role,
+        thread_id,
+        request_id,
+        on_event,
+    )
+    .await?;
+    crate::runtime_snapshot::mutation_result(
+        &project_name,
+        None,
+        crate::runtime_snapshot::RuntimeActionSummary::silent("chat_with_role_stream"),
+        false,
+    )
+}
+
+#[tauri::command]
+pub(crate) async fn regenerate_chat_reply_stream_runtime(
+    runtime: State<'_, crate::chat_runtime::ChatRuntimeState>,
+    project_name: String,
+    user_message_id: String,
+    role: String,
+    thread_id: String,
+    request_id: String,
+    on_event: Channel<ChatStreamEvent>,
+) -> Result<crate::runtime_snapshot::RuntimeMutationResult, String> {
+    regenerate_chat_reply_stream(
+        runtime,
+        project_name.clone(),
+        user_message_id,
+        role,
+        thread_id,
+        request_id,
+        on_event,
+    )
+    .await?;
+    crate::runtime_snapshot::mutation_result(
+        &project_name,
+        None,
+        crate::runtime_snapshot::RuntimeActionSummary::silent("regenerate_chat_reply_stream"),
+        false,
+    )
+}
+
 async fn run_chat_stream(
     runtime: &crate::chat_runtime::ChatRuntimeState,
     project_name: String,

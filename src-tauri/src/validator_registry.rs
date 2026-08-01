@@ -4,6 +4,22 @@ use crate::validator_contract::{
 };
 use sha2::{Digest, Sha256};
 
+pub fn ensure_serial_takeover_validators_available() -> Result<(), String> {
+    use VerificationMode::*;
+    let probes = [
+        ("DOM 包含 `root` 节点", Deterministic),
+        ("cargo test 测试通过", AutomatedTest),
+        ("用户可以完成结账流程", SemanticReview),
+    ];
+    for (criterion, expected) in probes {
+        let validators = validators_for(criterion);
+        if validators.is_empty() || validators.iter().any(|item| item.mode != expected) {
+            return Err(format!("串行接管验证器不可用：{:?}", expected));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalValidationBatch {
     pub criterion_reviews: Vec<crate::project::CriterionReviewResult>,

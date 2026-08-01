@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
 import { ArrowDown, CheckCircle2, FileDiff, FileText, History, Layers, Milestone, Tags } from "lucide-react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import type { ChangeHistoryEntry, ConstitutionChangeHistory, ExecutionHistoryEntry, GitTagTree, PipelineState, TestLog, VerificationStage } from "./types";
+import type { ChangeHistoryEntry, ConstitutionChangeHistory, ExecutionHistoryEntry, GitTagTree, PipelineState, RecoveryPresentation, TestLog, VerificationStage } from "./types";
 import { mergeExecutionLogs } from "./logPolicy";
 import { getVerificationStageLabel } from "./autopilotPolicy";
 
@@ -63,6 +63,7 @@ interface TaskConsoleProps {
   validationRetryCount?: number;
   validationRetryLimit?: number;
   nextValidationRetryAt?: string;
+  recoveryPresentation?: RecoveryPresentation | null;
   selectedTaskId?: string;
   onOpenTask?: (taskId: string) => void;
 }
@@ -78,6 +79,7 @@ export default function TaskConsole({
   validationRetryCount,
   validationRetryLimit,
   nextValidationRetryAt,
+  recoveryPresentation,
   selectedTaskId,
   onOpenTask,
 }: TaskConsoleProps) {
@@ -141,6 +143,17 @@ export default function TaskConsole({
   const hasAnyLog =
     mergedLogs.length > 0
     || !!executionStatus?.current_log;
+  const recovery = recoveryPresentation?.kind !== "None" ? recoveryPresentation : null;
+  const displayedValidationStage = recovery
+    ? recovery.validation_phase_label
+    : verificationStage && verificationStage !== "NotStarted"
+      ? getVerificationStageLabel(verificationStage)
+      : "";
+  const displayedRetryCount = recovery ? recovery.validation_retry_count : validationRetryCount;
+  const displayedRetryLimit = recovery ? recovery.validation_retry_limit : validationRetryLimit;
+  const displayedNextRetryAt = recovery
+    ? recovery.next_validation_retry_at
+    : nextValidationRetryAt;
 
   return (
     <div className="task-console task-console-readonly">
@@ -154,14 +167,14 @@ export default function TaskConsole({
 
         <Tabs.Content className="task-tab-content" value="logs">
           <div className="execution-log-panel">
-            {verificationStage && verificationStage !== "NotStarted" && (
+            {displayedValidationStage && (
               <div className="task-console-validation-strip">
-                <span>验证阶段：{getVerificationStageLabel(verificationStage)}</span>
-                {validationRetryLimit !== undefined && (
-                  <span>审查重试：{validationRetryCount ?? 0}/{validationRetryLimit}</span>
+                <span>验证阶段：{displayedValidationStage}</span>
+                {displayedRetryLimit !== undefined && displayedRetryLimit > 0 && (
+                  <span>审查重试：{displayedRetryCount ?? 0}/{displayedRetryLimit}</span>
                 )}
-                {nextValidationRetryAt && (
-                  <span>下一次：{formatLogTime(nextValidationRetryAt)}</span>
+                {displayedNextRetryAt && (
+                  <span>下一次：{formatLogTime(displayedNextRetryAt)}</span>
                 )}
               </div>
             )}

@@ -626,6 +626,10 @@ mod tests {
             resolution: project::HumanResolution::AcceptDeviation,
             accepted_criteria: vec![1],
             dependency_check: String::new(),
+            action_source: String::new(),
+            execution_result_fingerprint: String::new(),
+            task_tree_revision: 0,
+            project_revision: 0,
         });
 
         let mut deep_deviation = test_task("deep-deviation", "动态叶子偏差");
@@ -637,6 +641,10 @@ mod tests {
             resolution: project::HumanResolution::AcceptDeviation,
             accepted_criteria: vec![2],
             dependency_check: String::new(),
+            action_source: String::new(),
+            execution_result_fingerprint: String::new(),
+            task_tree_revision: 0,
+            project_revision: 0,
         });
         let mut rejected = test_task("rejected", "被驳回任务");
         rejected.status = project::SubtaskStatus::Rejected;

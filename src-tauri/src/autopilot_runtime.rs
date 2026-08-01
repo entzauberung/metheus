@@ -290,7 +290,11 @@ async fn recover_stopped_action(
             {
                 return Ok(false);
             }
-            crate::pipeline::acknowledge_execution_recovery_inner(project.name.clone()).await?;
+            crate::pipeline::acknowledge_execution_recovery_with_pipeline(
+                pipeline_state,
+                project.name.clone(),
+            )
+            .await?;
         }
         project::AutopilotRecoveryAction::PrepareExecutionWorkspace => {
             let workspace =

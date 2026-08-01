@@ -3013,67 +3013,24 @@ fn changed_paths(project_path: &str) -> Result<Vec<String>, String> {
 }
 
 fn validate_human_acceptance(
-    subtask: &project::Subtask,
+    project: &project::Project,
+    task_id: &str,
     resolution: &str,
     reason: &str,
     accepted_criteria: &[u32],
 ) -> Result<project::HumanResolution, String> {
-    if reason.trim().is_empty() {
-        return Err("人工决策必须填写依据。".to_string());
-    }
-    if subtask
-        .execution_result
-        .as_ref()
-        .is_none_or(|result| !result.success)
-    {
-        return Err("执行引擎没有成功完成任务，不能通过人工核验或接受代码偏差。".to_string());
-    }
     let human_resolution = if resolution == "accept_deviation" {
         project::HumanResolution::AcceptDeviation
     } else {
         project::HumanResolution::ConfirmActualPass
     };
-    if human_resolution == project::HumanResolution::AcceptDeviation {
-        if accepted_criteria.is_empty() {
-            return Err("接受偏差必须选择至少一个验收项。".to_string());
-        }
-        if accepted_criteria
-            .iter()
-            .any(|index| *index == 0 || *index as usize > subtask.acceptance_criteria.len())
-        {
-            return Err("接受偏差包含无效验收项编号。".to_string());
-        }
-    }
-    Ok(human_resolution)
-}
-
-fn validate_skip_dependencies(
-    skipped: &project::Subtask,
-    remaining: &[project::Subtask],
-) -> Result<String, String> {
-    let hard_dependents = remaining
-        .iter()
-        .filter(|item| item.depends_on.contains(&skipped.id))
-        .map(|item| item.title.clone())
-        .collect::<Vec<_>>();
-    if !hard_dependents.is_empty() {
-        return Err(format!(
-            "后续任务存在硬依赖，不能跳过：{}",
-            hard_dependents.join("、")
-        ));
-    }
-    if !remaining.is_empty()
-        && remaining
-            .iter()
-            .any(|item| item.depends_on.is_empty() && item.dependency_notes.trim().is_empty())
-    {
-        return Err("旧计划没有显式依赖契约，无法证明跳过安全；请先重新校准后续任务。".to_string());
-    }
-    Ok(if remaining.is_empty() {
-        "没有后续任务".to_string()
+    let action = if human_resolution == project::HumanResolution::AcceptDeviation {
+        crate::human_action_policy::HumanTerminalAction::AcceptDeviation
     } else {
-        "后续任务显式声明不依赖当前任务".to_string()
-    })
+        crate::human_action_policy::HumanTerminalAction::ConfirmActualPass
+    };
+    crate::human_action_policy::authorize(project, task_id, action, accepted_criteria, reason)?;
+    Ok(human_resolution)
 }
 
 #[tauri::command]
@@ -3083,8 +3040,9 @@ pub(crate) async fn resolve_human_recovery(
     resolution: String,
     reason: String,
     accepted_criteria: Option<Vec<u32>>,
+    expected_state_fingerprint: Option<String>,
 ) -> Result<project::Project, String> {
-    let _pipeline_guard = state.pipeline_state.lock().await;
+    let mut pipeline_guard = state.pipeline_state.lock().await;
     let mut proj = crate::load_project(&project_name)?;
     let (recovery, mut session, subtask) = current_recovery_context(&proj)?;
     if recovery.phase == project::RecoveryPhase::WaitingEngine
@@ -3093,20 +3051,23 @@ pub(crate) async fn resolve_human_recovery(
         return Err("执行引擎仍处于阻断状态；请通过引擎恢复入口检查或切换引擎。".to_string());
     }
     let authorized_paths = crate::plan_contract::validate_subtask(&subtask, "人工恢复任务")?;
+    let destructive_resolution = matches!(resolution.as_str(), "restore_and_retry" | "skip_task");
+    let verified_impact = if destructive_resolution {
+        Some(pipeline::verify_execution_recovery_preview(
+            &proj,
+            &resolution,
+            expected_state_fingerprint.as_deref(),
+        )?)
+    } else {
+        None
+    };
 
     match resolution.as_str() {
         "restore_and_retry" => {
-            let baseline = proj
-                .workflow_state
-                .recovery_state
+            let target = &verified_impact
                 .as_ref()
-                .map(|current| current.baseline_commit.clone())
-                .unwrap_or_default();
-            let target = if baseline.is_empty() {
-                "HEAD"
-            } else {
-                &baseline
-            };
+                .ok_or_else(|| "恢复基线缺少已验证的影响预览。".to_string())?
+                .baseline_commit;
             pipeline::restore_git_execution_baseline(&proj.project_path, target)?;
             reset_subtask_to_pending(&mut proj, &session);
             proj.execution_session = None;
@@ -3121,10 +3082,19 @@ pub(crate) async fn resolve_human_recovery(
         }
         "human_override" | "confirm_actual_pass" | "accept_deviation" => {
             let accepted = accepted_criteria.unwrap_or_default();
-            let human_resolution =
-                validate_human_acceptance(&subtask, &resolution, &reason, &accepted)?;
+            let human_resolution = validate_human_acceptance(
+                &proj,
+                &session.subtask_id,
+                &resolution,
+                &reason,
+                &accepted,
+            )?;
             let original_failure =
                 test_failure_summary(subtask.test_result.as_ref(), "没有可用的自动化测试结果");
+            let execution_result_fingerprint =
+                crate::human_action_policy::execution_result_fingerprint(&subtask)?;
+            let task_tree_revision = proj.task_control.tree_revision;
+            let project_revision = proj.workflow_state.data_revision;
             let item = crate::task_tree::find_task_mut(&mut proj, &session.subtask_id)?
                 .ok_or_else(|| "无法定位人工核验的小阶段。".to_string())?;
             item.status = project::SubtaskStatus::AwaitingConfirmation;
@@ -3143,6 +3113,10 @@ pub(crate) async fn resolve_human_recovery(
                 resolution: human_resolution.clone(),
                 accepted_criteria: accepted,
                 dependency_check: String::new(),
+                action_source: "recovery".to_string(),
+                execution_result_fingerprint,
+                task_tree_revision,
+                project_revision,
             });
             if let Some(current_session) = proj.execution_session.as_mut() {
                 current_session.status = "awaiting_confirmation".to_string();
@@ -3190,44 +3164,28 @@ pub(crate) async fn resolve_human_recovery(
             }
         }
         "skip_task" => {
-            if reason.trim().is_empty() {
-                return Err("跳过任务必须填写原因。".to_string());
-            }
-            let leaves = crate::task_tree::leaf_addresses_in_scope(
+            let policy = crate::human_action_policy::authorize(
                 &proj,
-                &session.milestone_id,
-                &session.mid_stage_id,
+                &session.subtask_id,
+                crate::human_action_policy::HumanTerminalAction::SkipTask,
+                &[],
+                &reason,
             )?;
-            let current_index = leaves
-                .iter()
-                .position(|address| address.task_id == session.subtask_id)
-                .ok_or_else(|| "无法定位要跳过的叶子任务。".to_string())?;
-            let remaining = leaves
-                .iter()
-                .skip(current_index + 1)
-                .filter_map(|address| {
-                    crate::task_tree::find_task(&proj, &address.task_id)
-                        .ok()
-                        .flatten()
-                        .filter(|task| task.status == project::SubtaskStatus::Pending)
-                        .cloned()
-                })
-                .collect::<Vec<_>>();
-            let dependency_check = validate_skip_dependencies(&subtask, &remaining)?;
-            let baseline = proj
-                .workflow_state
-                .recovery_state
+            let dependency_check = policy.dependency_check;
+            let baseline = &verified_impact
                 .as_ref()
-                .map(|current| current.baseline_commit.clone())
+                .ok_or_else(|| "跳过任务缺少已验证的影响预览。".to_string())?
+                .baseline_commit;
+            pipeline::restore_git_execution_baseline(&proj.project_path, baseline)?;
+            let execution_result_fingerprint = subtask
+                .execution_result
+                .as_ref()
+                .and_then(|_| {
+                    crate::human_action_policy::execution_result_fingerprint(&subtask).ok()
+                })
                 .unwrap_or_default();
-            pipeline::restore_git_execution_baseline(
-                &proj.project_path,
-                if baseline.is_empty() {
-                    "HEAD"
-                } else {
-                    &baseline
-                },
-            )?;
+            let task_tree_revision = proj.task_control.tree_revision;
+            let project_revision = proj.workflow_state.data_revision;
             let item = crate::task_tree::find_task_mut(&mut proj, &session.subtask_id)?
                 .ok_or_else(|| "无法定位要跳过的小阶段。".to_string())?;
             item.status = project::SubtaskStatus::Skipped;
@@ -3244,6 +3202,10 @@ pub(crate) async fn resolve_human_recovery(
                 resolution: project::HumanResolution::SkipTask,
                 accepted_criteria: vec![],
                 dependency_check,
+                action_source: "recovery".to_string(),
+                execution_result_fingerprint,
+                task_tree_revision,
+                project_revision,
             });
             crate::task_aggregation::aggregate_ancestors(&mut proj, &session.subtask_id)?;
             proj.execution_session = None;
@@ -3361,7 +3323,7 @@ pub(crate) async fn resolve_human_recovery(
             );
             touch(&mut proj);
             crate::save_project(&proj)?;
-            drop(_pipeline_guard);
+            drop(pipeline_guard);
             return run_recovery_retest(
                 &state.pipeline_state,
                 &project_name,
@@ -3390,7 +3352,7 @@ pub(crate) async fn resolve_human_recovery(
             set_autopilot_waiting(&mut proj, "人工修复已提交，正在重新测试");
             touch(&mut proj);
             crate::save_project(&proj)?;
-            drop(_pipeline_guard);
+            drop(pipeline_guard);
 
             let prompt = if subtask.execution_prompt.is_empty() {
                 subtask.prompt.clone()
@@ -3501,9 +3463,16 @@ pub(crate) async fn resolve_human_recovery(
     }
 
     touch(&mut proj);
+    if destructive_resolution
+        && pipeline_guard.as_ref().is_some_and(|value| {
+            value.project_name.is_empty() || value.project_name == project_name
+        })
+    {
+        *pipeline_guard = None;
+    }
     crate::save_project(&proj)?;
     let updated = crate::load_project(&project_name)?;
-    drop(_pipeline_guard);
+    drop(pipeline_guard);
     state
         .autopilot_runtime
         .start_if_active(state.pipeline_state.clone(), project_name)
@@ -3840,72 +3809,6 @@ mod tests {
         let restored: project::RecoveryState = serde_json::from_value(value).unwrap();
         assert!(restored.rollback_retest_pending);
         assert!(restored.pending_execution_result.is_some());
-    }
-
-    #[test]
-    fn human_pass_requires_successful_execution() {
-        let mut subtask = contract_subtask();
-        subtask.execution_result = Some(project::ExecutionResult {
-            success: false,
-            ..Default::default()
-        });
-        assert!(
-            validate_human_acceptance(&subtask, "confirm_actual_pass", "manual evidence", &[],)
-                .is_err()
-        );
-        subtask.execution_result.as_mut().unwrap().success = true;
-        assert_eq!(
-            validate_human_acceptance(&subtask, "confirm_actual_pass", "manual evidence", &[],)
-                .unwrap(),
-            project::HumanResolution::ConfirmActualPass
-        );
-    }
-
-    #[test]
-    fn accepting_deviation_requires_valid_criteria() {
-        let mut subtask = contract_subtask();
-        subtask.execution_result = Some(project::ExecutionResult {
-            success: true,
-            ..Default::default()
-        });
-        assert!(
-            validate_human_acceptance(&subtask, "accept_deviation", "known deviation", &[],)
-                .is_err()
-        );
-        assert!(
-            validate_human_acceptance(&subtask, "accept_deviation", "known deviation", &[2],)
-                .is_err()
-        );
-        assert_eq!(
-            validate_human_acceptance(&subtask, "accept_deviation", "known deviation", &[1],)
-                .unwrap(),
-            project::HumanResolution::AcceptDeviation
-        );
-    }
-
-    #[test]
-    fn skipping_requires_explicit_non_dependency() {
-        let skipped = contract_subtask();
-        let legacy = project::Subtask {
-            id: "next".to_string(),
-            title: "legacy next".to_string(),
-            ..Default::default()
-        };
-        assert!(validate_skip_dependencies(&skipped, &[legacy]).is_err());
-        let dependent = project::Subtask {
-            id: "next".to_string(),
-            title: "dependent".to_string(),
-            depends_on: vec![skipped.id.clone()],
-            ..Default::default()
-        };
-        assert!(validate_skip_dependencies(&skipped, &[dependent]).is_err());
-        let independent = project::Subtask {
-            id: "next".to_string(),
-            title: "independent".to_string(),
-            dependency_notes: "明确不依赖被跳过任务".to_string(),
-            ..Default::default()
-        };
-        assert!(validate_skip_dependencies(&skipped, &[independent]).is_ok());
     }
 
     #[test]

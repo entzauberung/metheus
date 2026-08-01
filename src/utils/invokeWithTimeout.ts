@@ -24,6 +24,10 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
 
   // 状态查询类 — 高频轮询，短超时
   get_execution_status: 10,
+  get_runtime_snapshot: 10,
+  subscribe_project_state: 10,
+  unsubscribe_project_state: 10,
+  preview_execution_recovery_impact: 15,
 
   // 持久化类 — 文件 I/O
 

@@ -1319,6 +1319,18 @@ pub struct HumanVerification {
     /// 跳过任务时记录依赖检查结果。
     #[serde(default)]
     pub dependency_check: String,
+    /// Stable backend entry that authorized this human terminal action.
+    #[serde(default)]
+    pub action_source: String,
+    /// Fingerprint of the execution fact reviewed by the human action.
+    #[serde(default)]
+    pub execution_result_fingerprint: String,
+    /// Task tree revision reviewed by the human action.
+    #[serde(default)]
+    pub task_tree_revision: u64,
+    /// Project revision reviewed by the human action.
+    #[serde(default)]
+    pub project_revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -2057,7 +2069,7 @@ impl Project {
             status: DiscussionThreadStatus::Open,
         };
 
-        Project {
+        let mut project = Project {
             name: name.to_string(),
             status: ProjectStatus::Idle,
             entry_kind: ProjectEntryKind::NoProject,
@@ -2089,7 +2101,9 @@ impl Project {
             recovery_learning: vec![],
             task_control: crate::task_control::TaskControlState::for_new_project(),
             cost_ledger: crate::cost_ledger::CostLedger::default(),
-        }
+        };
+        crate::task_control::refresh_serial_takeover_capability(&mut project);
+        project
     }
 
     pub fn activate_discussion_thread(
@@ -2387,6 +2401,25 @@ pub struct ExecutionWorkspaceChange {
     pub tracked: bool,
     #[serde(default)]
     pub managed: bool,
+}
+
+/// 执行基线恢复的只读影响预览。文件名用于确认范围，不包含文件正文。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionRecoveryImpact {
+    pub action_label: String,
+    pub confirmation_title: String,
+    pub presentation_description: String,
+    pub safety_stash_summary: String,
+    pub baseline_commit: String,
+    pub current_head: String,
+    pub affected_files: Vec<String>,
+    pub untracked_files: Vec<String>,
+    pub managed_changes: Vec<String>,
+    pub external_changes: Vec<String>,
+    pub discarded_files: Vec<String>,
+    pub creates_safety_stash: bool,
+    pub has_destructive_changes: bool,
+    pub state_fingerprint: String,
 }
 
 /// 宪法变更历史条目 — 小阶段确认后宪法第二部分更新记录

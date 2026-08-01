@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import TaskConsole from "./TaskConsole";
-import type { ExecutionHistoryEntry } from "./types";
+import type { ExecutionHistoryEntry, RecoveryPresentation } from "./types";
 
 describe("TaskConsole task navigation", () => {
   let host: HTMLDivElement;
@@ -58,5 +58,32 @@ describe("TaskConsole task navigation", () => {
     expect(host.querySelector('[role="tab"][data-state="active"]')?.textContent).toContain("执行日志");
     expect(host.textContent).not.toContain("任务控制");
     expect(linkedEntry?.getAttribute("aria-current")).toBe("true");
+  });
+
+  it("uses the backend recovery presentation instead of local validation fields", () => {
+    const recovery = {
+      kind: "ValidationRetry",
+      validation_phase_label: "请求代码审查",
+      validation_retry_count: 2,
+      validation_retry_limit: 3,
+      next_validation_retry_at: "2026-08-01T00:00:05Z",
+    } as RecoveryPresentation;
+    act(() => {
+      root.render(
+        <TaskConsole
+          projectPath="/tmp/project"
+          executionStatus={null}
+          testLogs={[]}
+          verificationStage="Completed"
+          validationRetryCount={0}
+          validationRetryLimit={1}
+          recoveryPresentation={recovery}
+        />,
+      );
+    });
+
+    expect(host.textContent).toContain("验证阶段：请求代码审查");
+    expect(host.textContent).toContain("审查重试：2/3");
+    expect(host.textContent).not.toContain("验证阶段：验证完成");
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { acceptanceCounts, countTaskNodes, getTaskControlModeLabel, hasControlCapability, tokenUsageCoverage, visibleCostGroups } from "./taskControlPolicy";
+import { acceptanceCounts, countTaskNodes, getModeTransitionImpact, getTaskControlModeDescription, getTaskControlModeLabel, hasControlCapability, requiresModeFallbackConfirmation, tokenUsageCoverage, visibleCostGroups } from "./taskControlPolicy";
 import type { TokenCostSummary } from "./types";
 
 const cost = (overrides: Partial<TokenCostSummary> = {}): TokenCostSummary => ({
@@ -16,11 +16,48 @@ const cost = (overrides: Partial<TokenCostSummary> = {}): TokenCostSummary => ({
 
 describe("task control presentation policy", () => {
   it("keeps backend mode names as display-only labels", () => {
-    expect(getTaskControlModeLabel("Shadow")).toBe("影子控制器");
+    expect(getTaskControlModeLabel("SerialTakeover")).toContain("新项目默认");
+    expect(getTaskControlModeLabel("Shadow")).toContain("仅审计");
+    expect(getTaskControlModeLabel("Legacy")).toContain("兼容");
+    expect(getTaskControlModeDescription("Shadow")).toContain("实际执行仍由旧流水线负责");
+  });
+
+  it("requires an explicit reasoned confirmation only when leaving serial takeover", () => {
+    expect(requiresModeFallbackConfirmation("SerialTakeover", "Shadow")).toBe(true);
+    expect(requiresModeFallbackConfirmation("SerialTakeover", "Legacy")).toBe(true);
+    expect(requiresModeFallbackConfirmation("Shadow", "SerialTakeover")).toBe(false);
+    expect(getModeTransitionImpact("Shadow").join(" ")).toContain("任务树");
+    expect(getModeTransitionImpact("Shadow").join(" ")).toContain("不再派发");
   });
 
   it("counts arbitrary-depth nodes without changing their state", () => {
-    expect(countTaskNodes([{ id: "m", title: "m", node_type: "Milestone", status: "Pending", depth: 0, complexity: "stage", risk: "stage", contract_fingerprint: "", dependencies: [], acceptance: [], children: [{ id: "t", title: "t", node_type: "Subtask", status: "Pending", depth: 1, complexity: "Small", risk: "Low", contract_fingerprint: "", dependencies: [], acceptance: [], children: [] }] }])).toBe(2);
+    const leaf = {
+      id: "t",
+      title: "t",
+      node_type: "Subtask" as const,
+      status: "Pending",
+      depth: 1,
+      complexity: "Small",
+      risk: "Low",
+      contract_fingerprint: "",
+      dependencies: [],
+      acceptance: [],
+      capabilities: [],
+      disabled_reasons: {},
+      is_currently_actionable: false,
+      actionable_acceptance_criteria: [],
+      children: [],
+    };
+    expect(countTaskNodes([{
+      ...leaf,
+      id: "m",
+      title: "m",
+      node_type: "Milestone",
+      depth: 0,
+      complexity: "stage",
+      risk: "stage",
+      children: [leaf],
+    }])).toBe(2);
   });
 
   it("preserves the distinction between unknown and unsatisfied evidence", () => {

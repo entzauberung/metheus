@@ -469,6 +469,8 @@ pub(crate) async fn initialize_project_entry(
         p
     };
     project.execution_profile = selected_profile;
+    crate::task_control::ensure_serial_takeover_capability(&project)
+        .map_err(|reason| format!("新项目无法启用默认串行接管：{}", reason))?;
 
     // Set workflow state based on entry kind
     match kind {

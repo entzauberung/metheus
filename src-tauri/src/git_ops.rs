@@ -1,4 +1,5 @@
 use crate::project;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,78 @@ fn run_git_with_index(
 fn head(project_path: &str) -> Result<String, String> {
     run_git(project_path, &["rev-parse", "HEAD"], "读取 Git HEAD 失败")
         .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+pub(crate) struct GitRecoveryCommitImpact {
+    pub current_head: String,
+    pub target_commit: String,
+    pub changed_since_target: Vec<String>,
+}
+
+/// Read-only committed-file impact for a future hard reset.
+pub(crate) fn preview_reset_impact(
+    project_path: &str,
+    target: &str,
+) -> Result<GitRecoveryCommitImpact, String> {
+    let current_head = head(project_path)?;
+    let target_commit = run_git(
+        project_path,
+        &["rev-parse", "--verify", &format!("{}^{{commit}}", target)],
+        "校验执行恢复基线失败",
+    )?;
+    let target_commit = String::from_utf8_lossy(&target_commit).trim().to_string();
+    let output = run_git(
+        project_path,
+        &["diff", "--name-only", "-z", &target_commit, &current_head],
+        "读取执行基线影响失败",
+    )?;
+    let mut changed_since_target = output
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf8_lossy(entry).to_string())
+        .collect::<Vec<_>>();
+    changed_since_target.sort();
+    changed_since_target.dedup();
+    Ok(GitRecoveryCommitImpact {
+        current_head,
+        target_commit,
+        changed_since_target,
+    })
+}
+
+/// Hashes the exact tracked diff and untracked file bytes used by a recovery preview.
+/// Paths are sorted so repeated reads of the same workspace produce the same value.
+pub(crate) fn recovery_workspace_fingerprint(
+    project_path: &str,
+    untracked_files: &[String],
+) -> Result<String, String> {
+    let tracked_diff = run_git(
+        project_path,
+        &["diff", "HEAD", "--binary", "--no-ext-diff"],
+        "读取执行恢复工作区差异失败",
+    )?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"tracked\0");
+    hasher.update(&tracked_diff);
+    let mut untracked = untracked_files.to_vec();
+    untracked.sort();
+    untracked.dedup();
+    for relative in untracked {
+        hasher.update(b"untracked\0");
+        hasher.update(relative.as_bytes());
+        hasher.update(b"\0");
+        let path = Path::new(project_path).join(&relative);
+        let bytes = fs::read(&path).map_err(|error| {
+            format!(
+                "读取恢复预览中的未跟踪文件 {} 失败：{}",
+                path.display(),
+                error
+            )
+        })?;
+        hasher.update(&bytes);
+        hasher.update(b"\0");
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn status_paths(project_path: &str) -> Result<Vec<String>, String> {

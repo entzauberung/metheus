@@ -316,6 +316,154 @@ export interface WorkflowState {
   recovery_state?: RecoveryState;
 }
 
+/** 后端事实变化通知。通知只负责失效提示，完整事实必须通过运行时快照读取。 */
+export interface ProjectStateChangedEvent {
+  project_name: string;
+  process_start_id: string;
+  event_sequence: number;
+  data_revision: number;
+  current_step: WorkflowStep;
+  execution_session_status: string | null;
+  autopilot_status: AutopilotRunStatus | null;
+  recovery_action: AutopilotRecoveryAction;
+  task_tree_revision: number;
+  control_action_id: string | null;
+  control_mode: TaskControlMode;
+  task_control_dirty: boolean;
+  occurred_at: string;
+}
+
+export interface ProjectStateSubscription {
+  subscription_id: string;
+  process_start_id: string;
+  event_sequence: number;
+}
+
+export type RecoveryPresentationKind =
+  | "None"
+  | "BaselineRecovery"
+  | "GitReconfirmation"
+  | "EngineBlocked"
+  | "ValidationRetry"
+  | "EvidenceInsufficient"
+  | "HumanDecision"
+  | "AutomaticRecovery"
+  | "RetryAdvance"
+  | "RegeneratePlan"
+  | "PrepareWorkspace"
+  | "ResolveWorkspaceChanges"
+  | "SyncAndClose";
+
+export type RecoverySeverity = "Info" | "Warning" | "Error";
+
+export type RecoveryCapability =
+  | "SyncProject"
+  | "AcknowledgeExecutionRecovery"
+  | "RetryGitConfirmation"
+  | "RetryAutopilotAdvance"
+  | "RegenerateExecutionPlan"
+  | "PrepareExecutionWorkspace"
+  | "RefreshExecutionWorkspace"
+  | "RunAutomaticRecovery"
+  | "ResolveHumanRecovery"
+  | "ResumeAutopilot"
+  | "CloseAutopilot";
+
+export interface RecoveryActionPresentation {
+  capability: RecoveryCapability;
+  label: string;
+  enabled: boolean;
+  disabled_reason: string | null;
+}
+
+export type RecoveryDecisionResolution =
+  | "retest"
+  | "revalidate"
+  | "restore_and_retry"
+  | "regenerate_plan"
+  | "confirm_actual_pass"
+  | "accept_deviation"
+  | "skip_task";
+
+export interface RecoveryDecisionOption {
+  resolution: RecoveryDecisionResolution;
+  label: string;
+  enabled: boolean;
+  disabled_reason: string | null;
+  requires_reason: boolean;
+  requires_acceptance_selection: boolean;
+  requires_baseline_preview: boolean;
+  preview_message?: string;
+}
+
+export interface RecoveryPresentation {
+  presentation_version?: string;
+  kind: RecoveryPresentationKind;
+  title: string;
+  reason: string;
+  severity: RecoverySeverity;
+  primary_action: RecoveryActionPresentation | null;
+  secondary_actions: RecoveryActionPresentation[];
+  preserve_current_code: boolean;
+  requires_baseline_restore: boolean;
+  supports_preview: boolean;
+  automatic_retry: boolean;
+  capabilities: RecoveryCapability[];
+  decision_options: RecoveryDecisionOption[];
+  state_fingerprint: string;
+  phase_label?: string;
+  background_retry_active?: boolean;
+  background_retry_summary?: string;
+  post_action_expectation?: string;
+  stale_risk?: boolean;
+  sync_risk_summary?: string;
+  sync_needed?: boolean;
+  code_impact_summary?: string;
+  affected_task_label?: string;
+  baseline_reference?: string;
+  validation_phase_label?: string;
+  retry_count?: number;
+  retry_limit?: number;
+  next_retry_at?: string | null;
+  validation_retry_count?: number;
+  validation_retry_limit?: number;
+  next_validation_retry_at?: string | null;
+  heartbeat_status?: string;
+  automated_test_status?: string;
+  code_review_status?: string;
+  review_protocol_status?: string;
+  acceptance_evidence_status?: string;
+}
+
+export interface RecoveryResultSummary {
+  title: string;
+  message: string;
+  baseline: string | null;
+  baseline_summary: string;
+  discarded_files: string[];
+  discarded_files_summary: string;
+  background_job_started: boolean;
+  background_job_summary: string;
+  next_step: string;
+  next_step_summary: string;
+}
+
+export interface RuntimeActionSummary {
+  action: string;
+  message: string;
+  notify_user: boolean;
+  recovery_result: RecoveryResultSummary | null;
+}
+
+export interface TaskControlSnapshotSummary {
+  available: boolean;
+  snapshot_version: string;
+  tree_revision: number;
+  event_sequence: number;
+  control_action_id: string | null;
+  control_mode: TaskControlMode;
+}
+
 // ========== 项目来源 ==========
 
 export type ProjectEntryKind = "NoProject" | "HalfProject";
@@ -884,11 +1032,28 @@ export interface Project {
 }
 
 export type TaskControlMode = "Legacy" | "Shadow" | "SerialTakeover";
+export type TaskControlDetailStatus = "idle" | "syncing" | "ready" | "unavailable";
+export type TakeoverCapabilityStatus = "Unknown" | "Ready" | "Unavailable";
+
+export interface TaskControlModeChangeRecord {
+  from: TaskControlMode;
+  to: TaskControlMode;
+  source: string;
+  reason: string;
+  changed_at: string;
+  project_revision: number;
+}
 
 export interface TaskControlState {
   mode: TaskControlMode;
   algorithm_version: string;
   snapshot_version: string;
+  takeover_version: string;
+  takeover_capability_status: TakeoverCapabilityStatus;
+  last_takeover_check_result: string;
+  takeover_unavailable_reason: string;
+  takeover_checked_at?: string;
+  mode_change_history: TaskControlModeChangeRecord[];
   last_shadow_decision_at?: string;
   last_shadow_decision_summary: string;
   shadow_comparison: ShadowComparisonMetrics;
@@ -980,6 +1145,10 @@ export interface TaskTreeNodeView {
   contract?: TaskContract;
   dependencies: string[];
   acceptance: AcceptanceLedgerItem[];
+  capabilities: string[];
+  disabled_reasons: Record<string, string>;
+  is_currently_actionable: boolean;
+  actionable_acceptance_criteria: number[];
   children: TaskTreeNodeView[];
 }
 
@@ -1121,6 +1290,9 @@ export interface TaskControlSnapshot {
   current_mid_stage_id: string;
   current_task_id: string;
   task_tree_revision: number;
+  source_process_start_id: string;
+  source_event_sequence: number;
+  source_control_action_id: string | null;
   nodes: TaskTreeNodeView[];
   selected_contract?: TaskContract;
   selected_acceptance: AcceptanceLedgerItem[];
@@ -1354,6 +1526,28 @@ export interface PipelineState {
   log_history: LogEntry[];
 }
 
+export interface RuntimeSnapshot {
+  project: Project;
+  pipeline_state: PipelineState | null;
+  process_start_id: string;
+  event_sequence: number;
+  recovery_presentation: RecoveryPresentation;
+  task_control_snapshot_version: string;
+  task_control_tree_revision: number;
+  task_control_event_sequence: number;
+  task_control_action_id: string | null;
+  task_control_mode: TaskControlMode;
+  task_control_snapshot?: TaskControlSnapshot | null;
+}
+
+export interface RuntimeMutationResult {
+  result_version: string;
+  runtime_snapshot: RuntimeSnapshot;
+  task_control: TaskControlSnapshotSummary;
+  action: RuntimeActionSummary;
+  task_control_snapshot: TaskControlSnapshot | null;
+}
+
 // ========== DiffSummary ==========
 
 export interface DiffSummary {
@@ -1490,6 +1684,23 @@ export interface ExecutionWorkspaceChange {
   worktree_status: string;
   tracked: boolean;
   managed: boolean;
+}
+
+export interface ExecutionRecoveryImpact {
+  action_label: string;
+  confirmation_title: string;
+  presentation_description: string;
+  safety_stash_summary: string;
+  baseline_commit: string;
+  current_head: string;
+  affected_files: string[];
+  untracked_files: string[];
+  managed_changes: string[];
+  external_changes: string[];
+  discarded_files: string[];
+  creates_safety_stash: boolean;
+  has_destructive_changes: boolean;
+  state_fingerprint: string;
 }
 
 export interface RollbackCheckpoint {

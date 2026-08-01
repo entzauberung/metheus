@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Activity, Clock3, Pause, Play, Square, Target } from "lucide-react";
-import { ExecutionWorkspaceStatus, Project } from "./types";
+import { ExecutionWorkspaceStatus, Project, RuntimeMutationResult } from "./types";
 import { invokeWithTimeout, isInvokeTimeoutError } from "./utils/invokeWithTimeout";
 import { ConsoleFeedback } from "./components/ConsoleStepShell";
 import { MilestonePlanningStep } from "./console/MilestonePlanningStep";
@@ -10,7 +10,7 @@ import { getManagedFlowPresentation } from "./managedFlowPolicy";
 
 interface Props {
   project: Project;
-  onProjectUpdated: (project: Project) => void;
+  onRuntimeMutation: (result: RuntimeMutationResult) => void;
   externalBusy: boolean;
   onActionStart: (action: string) => boolean;
   onActionEnd: () => void;
@@ -23,7 +23,7 @@ interface Props {
 type RegenerationSource = "check_failed" | "approval_rejected";
 
 export function ConsoleWorkflowPanel({
-  project, onProjectUpdated, externalBusy, onActionStart, onActionEnd, onFeedback,
+  project, onRuntimeMutation, externalBusy, onActionStart, onActionEnd, onFeedback,
   workspaceStatus, onPrepareWorkspace, onRefreshWorkspace,
 }: Props) {
   const step = project.workflow_state.current_step;
@@ -42,11 +42,11 @@ export function ConsoleWorkflowPanel({
   const beginAction = (action: string) => !busy && onActionStart(action);
 
   const syncProject = async () => {
-    const latest = await invokeWithTimeout<Project>("reconcile_managed_milestone_state", {
+    const result = await invokeWithTimeout<RuntimeMutationResult>("reconcile_managed_milestone_state_runtime", {
       projectName: project.name,
     });
-    onProjectUpdated(latest);
-    return latest;
+    onRuntimeMutation(result);
+    return result.runtime_snapshot.project;
   };
 
   const coordinate = async (isComplete: (latest: Project) => boolean) => {
@@ -83,8 +83,8 @@ export function ConsoleWorkflowPanel({
     if (!beginAction(command)) return;
     setFeedback(null);
     try {
-      const updated = await invokeWithTimeout<Project>(command, args);
-      onProjectUpdated(updated);
+      const result = await invokeWithTimeout<RuntimeMutationResult>(`${command}_runtime`, args);
+      onRuntimeMutation(result);
       setFeedback({ type: "success", message: successMessage });
     } catch (error) {
       setFeedback({ type: "error", message: String(error) });
@@ -98,8 +98,8 @@ export function ConsoleWorkflowPanel({
     const startingRevision = project.workflow_state.data_revision;
     setFeedback(null);
     try {
-      const updated = await invokeWithTimeout<Project>("generate_milestone_draft", { projectName: project.name });
-      onProjectUpdated(updated);
+      const result = await invokeWithTimeout<RuntimeMutationResult>("generate_milestone_draft_runtime", { projectName: project.name });
+      onRuntimeMutation(result);
       setFeedback({ type: "success", message: "大阶段草稿已生成，请运行质量检查。" });
     } catch (error) {
       if (isInvokeTimeoutError(error)) {
@@ -120,11 +120,11 @@ export function ConsoleWorkflowPanel({
     const draftId = draft.draft_id;
     setFeedback(null);
     try {
-      const updated = await invokeWithTimeout<Project>("regenerate_milestone_draft", {
+      const result = await invokeWithTimeout<RuntimeMutationResult>("regenerate_milestone_draft_runtime", {
         projectName: project.name, currentDraftId: draftId,
         expectedDataRevision: revision, feedback: regenerationFeedback, source,
       });
-      onProjectUpdated(updated);
+      onRuntimeMutation(result);
       setRegenerationFeedback(""); setMilestoneModalOpen(false);
       setFeedback({ type: "success", message: "大阶段草稿已重新生成，请重新检查。" });
     } catch (error) {
@@ -143,11 +143,11 @@ export function ConsoleWorkflowPanel({
     const draftId = draft.draft_id;
     setFeedback(null);
     try {
-      const updated = await invokeWithTimeout<Project>("regenerate_mid_stage_draft", {
+      const result = await invokeWithTimeout<RuntimeMutationResult>("regenerate_mid_stage_draft_runtime", {
         projectName: project.name, currentDraftId: draftId,
         expectedDataRevision: revision, feedback: regenerationFeedback, source,
       });
-      onProjectUpdated(updated);
+      onRuntimeMutation(result);
       setRegenerationFeedback(""); setMidStageModalOpen(false);
       setFeedback({ type: "success", message: "中阶段草稿已重新生成，请重新检查。" });
     } catch (error) {
@@ -167,11 +167,11 @@ export function ConsoleWorkflowPanel({
     const planRevision = midStage.plan_draft_revision;
     setFeedback(null);
     try {
-      const updated = await invokeWithTimeout<Project>("regenerate_execution_plan", {
+      const result = await invokeWithTimeout<RuntimeMutationResult>("regenerate_execution_plan_runtime", {
         projectName: project.name, expectedDataRevision: revision,
         expectedPlanDraftRevision: planRevision, feedback: regenerationFeedback, source,
       });
-      onProjectUpdated(updated);
+      onRuntimeMutation(result);
       setRegenerationFeedback(""); setPlanModalOpen(false);
       setFeedback({ type: "success", message: "执行计划已重新生成，请重新检查。" });
     } catch (error) {

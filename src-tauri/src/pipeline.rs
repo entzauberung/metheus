@@ -1,6 +1,7 @@
 use crate::project;
 use crate::AppState;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PipelineStatus {
@@ -324,8 +325,9 @@ pub(crate) async fn get_execution_status(
 ///
 /// # 返回值说明
 ///
-/// 本命令是唯一修改 `Project` 但返回 `PipelineState` 而非 `Project` 的命令。
-/// 原因：
+/// 本命令保留为返回 `PipelineState` 的兼容入口；前端主路径使用
+/// `execute_current_subtask_runtime`，一次取得 Project、Pipeline 与恢复展示。
+/// 保留该入口的原因：
 ///
 /// 1. **两阶段保存模式**：执行过程分为两个持久化点：
 ///    - 阶段一（执行前）：保存 `SubtaskStatus::Executing` + `execution_session(status="executing")`
@@ -342,9 +344,8 @@ pub(crate) async fn get_execution_status(
 ///
 /// # 前端契约
 ///
-/// - 调用方应立即使用返回的 `PipelineState` 更新 `executionStatus`
-/// - 调用方应启动执行轮询（`isExecuting = true`）持续获取最新状态
-/// - 轮询检测到终态后应调用 `get_project` 刷新完整 Project
+/// - 兼容调用方应立即使用返回的 `PipelineState` 更新 `executionStatus`
+/// - 新调用方必须消费统一运行时变更结果，并在终态读取统一运行时快照
 #[tauri::command]
 pub(crate) async fn execute_current_subtask(
     state: tauri::State<'_, AppState>,
@@ -1401,17 +1402,16 @@ fn validate_subtask_quality_gate_with_session_statuses(
         .human_verification
         .as_ref()
         .is_some_and(|verification| {
-            verification.verification_kind == project::VerificationKind::HumanOverride
-                && !verification.verification_reason.trim().is_empty()
-                && matches!(
-                    verification.resolution,
-                    project::HumanResolution::ConfirmActualPass
-                        | project::HumanResolution::AcceptDeviation
-                )
+            matches!(
+                verification.resolution,
+                project::HumanResolution::ConfirmActualPass
+                    | project::HumanResolution::AcceptDeviation
+            )
         });
 
     // 人工核验是独立的通过通道；真实测试结果保持原值。
     if human_override {
+        crate::human_action_policy::validate_recorded_human_acceptance(proj, subtask)?;
         return Ok(());
     }
 
@@ -3301,6 +3301,249 @@ pub(crate) fn restore_git_execution_baseline(
     Ok(())
 }
 
+fn recoverable_execution_session(
+    proj: &project::Project,
+) -> Result<project::ExecutionSession, String> {
+    if proj.execution_session.as_ref().is_some_and(|session| {
+        session.parsed_status() == project::ExecutionSessionStatus::ConfirmationBlocked
+    }) {
+        return Err(
+            "当前是 Git 确认受阻，代码与质量结果已保留；请使用“重新确认提交”，不得恢复执行基线。"
+                .to_string(),
+        );
+    }
+    proj.execution_session
+        .as_ref()
+        .filter(|session| {
+            matches!(
+                session.parsed_status(),
+                project::ExecutionSessionStatus::SessionLost
+                    | project::ExecutionSessionStatus::StopFailed
+                    | project::ExecutionSessionStatus::ExecutionFailed
+            )
+        })
+        .cloned()
+        .ok_or("当前没有需要恢复的执行失败会话。".to_string())
+}
+
+fn execution_restore_target(
+    proj: &project::Project,
+    session: &project::ExecutionSession,
+) -> String {
+    if session.base_commit.is_empty() {
+        find_last_passed_subtask(proj)
+            .and_then(|subtask| subtask.auto_tag)
+            .unwrap_or_else(|| "HEAD".to_string())
+    } else {
+        session.base_commit.clone()
+    }
+}
+
+fn execution_recovery_context(
+    proj: &project::Project,
+    action: &str,
+) -> Result<(project::ExecutionSession, String), String> {
+    if action == "acknowledge_execution_recovery" {
+        let session = recoverable_execution_session(proj)?;
+        let target = execution_restore_target(proj, &session);
+        return Ok((session, target));
+    }
+    if !matches!(action, "restore_and_retry" | "skip_task") {
+        return Err(format!("不支持预览恢复动作：{action}"));
+    }
+    let recovery = proj
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .ok_or_else(|| "当前没有可预览的人工恢复状态。".to_string())?;
+    let session = proj
+        .execution_session
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| "当前没有可预览的执行会话。".to_string())?;
+    let target = if !recovery.baseline_commit.is_empty() {
+        recovery.baseline_commit.clone()
+    } else if !session.base_commit.is_empty() {
+        session.base_commit.clone()
+    } else {
+        "HEAD".to_string()
+    };
+    Ok((session, target))
+}
+
+fn preview_execution_recovery_impact_for_project(
+    proj: &project::Project,
+    action: &str,
+) -> Result<project::ExecutionRecoveryImpact, String> {
+    let (session, restore_target) = execution_recovery_context(proj, action)?;
+    let commit_impact = crate::git_ops::preview_reset_impact(&proj.project_path, &restore_target)?;
+    let mut workspace = get_execution_workspace_status_inner(&proj.project_path)?;
+    let managed_paths = crate::task_tree::find_task(&proj, &session.subtask_id)?
+        .map(|subtask| {
+            subtask
+                .allowed_file_paths
+                .iter()
+                .chain(subtask.new_file_paths.iter())
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    for change in &mut workspace.changes {
+        change.managed = managed_paths.contains(&change.path)
+            || change
+                .path
+                .split(" -> ")
+                .any(|path| managed_paths.contains(path));
+    }
+    workspace.changes.sort_by(|left, right| {
+        (
+            left.path.as_str(),
+            left.index_status.as_str(),
+            left.worktree_status.as_str(),
+            left.tracked,
+            left.managed,
+        )
+            .cmp(&(
+                right.path.as_str(),
+                right.index_status.as_str(),
+                right.worktree_status.as_str(),
+                right.tracked,
+                right.managed,
+            ))
+    });
+
+    let mut affected = commit_impact.changed_since_target.clone();
+    affected.extend(workspace.changes.iter().map(|change| change.path.clone()));
+    affected.sort();
+    affected.dedup();
+    let mut untracked_files = workspace
+        .changes
+        .iter()
+        .filter(|change| !change.tracked)
+        .map(|change| change.path.clone())
+        .collect::<Vec<_>>();
+    let mut managed_changes = workspace
+        .changes
+        .iter()
+        .filter(|change| change.managed)
+        .map(|change| change.path.clone())
+        .collect::<Vec<_>>();
+    let mut external_changes = workspace
+        .changes
+        .iter()
+        .filter(|change| !change.managed)
+        .map(|change| change.path.clone())
+        .collect::<Vec<_>>();
+    for values in [
+        &mut untracked_files,
+        &mut managed_changes,
+        &mut external_changes,
+    ] {
+        values.sort();
+        values.dedup();
+    }
+    let has_workspace_changes = !workspace.changes.is_empty();
+    let has_destructive_changes =
+        !affected.is_empty() || commit_impact.current_head != commit_impact.target_commit;
+    let workspace_fingerprint =
+        crate::git_ops::recovery_workspace_fingerprint(&proj.project_path, &untracked_files)?;
+    let recovery_fingerprint =
+        crate::recovery_presentation::present_recovery(proj).state_fingerprint;
+    let mut fingerprint_input = format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        recovery_fingerprint,
+        action,
+        commit_impact.target_commit,
+        commit_impact.current_head,
+        format!(
+            "{}\n{}",
+            commit_impact.changed_since_target.join("\0"),
+            workspace_fingerprint,
+        ),
+    );
+    for change in &workspace.changes {
+        fingerprint_input.push_str(&format!(
+            "{}\0{}\0{}\0{}\0{}\n",
+            change.path,
+            change.index_status,
+            change.worktree_status,
+            change.tracked,
+            change.managed,
+        ));
+    }
+    let state_fingerprint = format!("sha256:{:x}", Sha256::digest(fingerprint_input.as_bytes()));
+    let action_label = match action {
+        "skip_task" => "跳过当前任务",
+        "restore_and_retry" => "恢复基线并重试",
+        _ => "恢复执行基线",
+    }
+    .to_string();
+    let confirmation_title = format!("确认{}", action_label);
+    let presentation_description =
+        "恢复会从工作区移除下列内容；未提交内容会先写入安全暂存。".to_string();
+    let safety_stash_summary = if has_workspace_changes {
+        "未提交及未跟踪内容会先进入 Metheus 安全暂存，然后从当前工作区移除。".to_string()
+    } else {
+        "工作区没有未提交内容。".to_string()
+    };
+    Ok(project::ExecutionRecoveryImpact {
+        action_label,
+        confirmation_title,
+        presentation_description,
+        safety_stash_summary,
+        baseline_commit: commit_impact.target_commit,
+        current_head: commit_impact.current_head,
+        affected_files: affected.clone(),
+        untracked_files,
+        managed_changes,
+        external_changes,
+        discarded_files: affected,
+        creates_safety_stash: has_workspace_changes,
+        has_destructive_changes,
+        state_fingerprint,
+    })
+}
+
+pub(crate) fn preview_execution_recovery_impact_inner(
+    project_name: &str,
+) -> Result<project::ExecutionRecoveryImpact, String> {
+    let proj = crate::load_project(project_name)?;
+    preview_execution_recovery_impact_for_project(&proj, "acknowledge_execution_recovery")
+}
+
+pub(crate) fn verify_execution_recovery_preview(
+    proj: &project::Project,
+    action: &str,
+    expected_state_fingerprint: Option<&str>,
+) -> Result<project::ExecutionRecoveryImpact, String> {
+    let expected = expected_state_fingerprint
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "恢复前必须先取得最新影响预览。".to_string())?;
+    let current = preview_execution_recovery_impact_for_project(proj, action)?;
+    if current.state_fingerprint != expected {
+        return Err(
+            "恢复影响预览已过期：Git HEAD、工作区内容或恢复状态已经变化，请重新预览。".to_string(),
+        );
+    }
+    Ok(current)
+}
+
+#[tauri::command]
+pub(crate) async fn preview_execution_recovery_impact(
+    state: tauri::State<'_, AppState>,
+    project_name: String,
+    action: Option<String>,
+) -> Result<project::ExecutionRecoveryImpact, String> {
+    let _pipeline_guard = state.pipeline_state.lock().await;
+    let proj = crate::load_project(&project_name)?;
+    preview_execution_recovery_impact_for_project(
+        &proj,
+        action
+            .as_deref()
+            .unwrap_or("acknowledge_execution_recovery"),
+    )
+}
+
 #[cfg(unix)]
 fn unix_process_is_running(pid: u32) -> Result<bool, String> {
     let output = std::process::Command::new("kill")
@@ -4550,8 +4793,20 @@ pub(crate) async fn reconcile_on_startup(
 pub(crate) async fn acknowledge_execution_recovery(
     state: tauri::State<'_, AppState>,
     project_name: String,
+    expected_state_fingerprint: Option<String>,
 ) -> Result<project::Project, String> {
-    let updated = acknowledge_execution_recovery_inner(project_name.clone()).await?;
+    let mut pipeline = state.pipeline_state.lock().await;
+    let (updated, recovered) = acknowledge_execution_recovery_detailed(
+        project_name.clone(),
+        expected_state_fingerprint.as_deref(),
+        true,
+        &mut pipeline,
+    )
+    .await?;
+    drop(pipeline);
+    if !recovered {
+        return Ok(updated);
+    }
     state
         .autopilot_runtime
         .start_if_active(state.pipeline_state.clone(), project_name)
@@ -4562,14 +4817,41 @@ pub(crate) async fn acknowledge_execution_recovery(
 pub(crate) async fn acknowledge_execution_recovery_inner(
     project_name: String,
 ) -> Result<project::Project, String> {
+    let mut pipeline = None;
+    acknowledge_execution_recovery_detailed(project_name, None, false, &mut pipeline)
+        .await
+        .map(|(project, _)| project)
+}
+
+pub(crate) async fn acknowledge_execution_recovery_with_pipeline(
+    pipeline_state: &std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
+    project_name: String,
+) -> Result<project::Project, String> {
+    let mut pipeline = pipeline_state.lock().await;
+    acknowledge_execution_recovery_detailed(project_name, None, false, &mut pipeline)
+        .await
+        .map(|(project, _)| project)
+}
+
+async fn acknowledge_execution_recovery_detailed(
+    project_name: String,
+    expected_state_fingerprint: Option<&str>,
+    require_preview: bool,
+    pipeline: &mut Option<PipelineState>,
+) -> Result<(project::Project, bool), String> {
     let mut proj = crate::load_project(&project_name)?;
-    if proj.execution_session.as_ref().is_some_and(|session| {
-        session.parsed_status() == project::ExecutionSessionStatus::ConfirmationBlocked
-    }) {
-        return Err(
-            "当前是 Git 确认受阻，代码与质量结果已保留；请使用“重新确认提交”，不得恢复执行基线。"
-                .to_string(),
-        );
+    let already_closed = proj.execution_session.is_none()
+        && proj.workflow_state.recovery_state.is_none()
+        && !proj
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .is_some_and(|autopilot| {
+                autopilot.recovery_action
+                    == project::AutopilotRecoveryAction::RestoreExecutionBaseline
+            });
+    if already_closed {
+        return Ok((proj, false));
     }
     let project_path = proj.project_path.clone();
     let waiting_engine = proj
@@ -4581,33 +4863,22 @@ pub(crate) async fn acknowledge_execution_recovery_inner(
                 && recovery.error_kind == project::RecoveryErrorKind::EngineBlocked
         });
 
-    let session = proj
-        .execution_session
-        .as_ref()
-        .filter(|session| {
-            matches!(
-                session.parsed_status(),
-                project::ExecutionSessionStatus::SessionLost
-                    | project::ExecutionSessionStatus::StopFailed
-                    | project::ExecutionSessionStatus::ExecutionFailed
-            )
-        })
-        .cloned()
-        .ok_or("当前没有需要恢复的执行失败会话。".to_string())?;
+    let session = recoverable_execution_session(&proj)?;
 
-    let base_commit = session.base_commit.clone();
     let subtask_id = session.subtask_id.clone();
     let subtask_title = session.subtask_title.clone();
     let milestone_id = session.milestone_id.clone();
     let mid_stage_id = session.mid_stage_id.clone();
 
-    let restore_target = if base_commit.is_empty() {
-        find_last_passed_subtask(&proj)
-            .and_then(|st| st.auto_tag)
-            .unwrap_or_else(|| "HEAD".to_string())
-    } else {
-        base_commit
-    };
+    let restore_target = execution_restore_target(&proj, &session);
+
+    if require_preview {
+        verify_execution_recovery_preview(
+            &proj,
+            "acknowledge_execution_recovery",
+            expected_state_fingerprint,
+        )?;
+    }
 
     // Git 恢复失败：保留失败会话、基线和错误证据，自动驾驶保持 ErrorStopped
     restore_git_execution_baseline(&project_path, &restore_target).map_err(|error| {
@@ -4745,7 +5016,13 @@ pub(crate) async fn acknowledge_execution_recovery_inner(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = now;
 
-    crate::save_and_reload_project(&proj)
+    if pipeline
+        .as_ref()
+        .is_some_and(|value| value.project_name.is_empty() || value.project_name == project_name)
+    {
+        *pipeline = None;
+    }
+    crate::save_and_reload_project(&proj).map(|project| (project, true))
 }
 
 fn find_current_subtask(proj: &project::Project) -> Option<project::Subtask> {
@@ -5718,7 +5995,7 @@ mod tests {
         });
         crate::save_project(&proj)?;
 
-        let updated = acknowledge_execution_recovery_inner(project_name).await?;
+        let updated = acknowledge_execution_recovery_inner(project_name.clone()).await?;
         assert!(updated.execution_session.is_none());
         assert_eq!(repo.head()?, baseline);
         let workspace = get_execution_workspace_status_inner(&repo.path_string())?;
@@ -5731,6 +6008,156 @@ mod tests {
                 .map(|ap| &ap.run_status),
             Some(&project::AutopilotRunStatus::Running)
         );
+        let revision = updated.workflow_state.data_revision;
+        let repeated = acknowledge_execution_recovery_inner(project_name).await?;
+        assert_eq!(repeated.workflow_state.data_revision, revision);
+        assert_eq!(repo.head()?, baseline);
+        Ok(())
+    }
+
+    #[test]
+    fn phase1_runtime_contract_recovery_preview_uses_backend_presentation_without_mutation(
+    ) -> Result<(), String> {
+        let repo = TempGitRepo::new("recovery-preview")?;
+        let baseline = repo.head()?;
+        std::fs::write(repo.path.join("tracked.txt"), "managed change\n")
+            .map_err(|error| format!("写入受管预览变更失败：{error}"))?;
+        std::fs::write(repo.path.join("external.txt"), "external change\n")
+            .map_err(|error| format!("写入外部预览变更失败：{error}"))?;
+        let project_name = unique_project_name("recovery-preview");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut session = execution_session("execution_failed", "preview-execution", &baseline);
+        session.active = false;
+        let project = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::Pending,
+            Some(session),
+        );
+        crate::save_project(&project)?;
+
+        let impact = preview_execution_recovery_impact_inner(&project_name)?;
+        assert_eq!(impact.baseline_commit, baseline);
+        assert!(impact.managed_changes.contains(&"tracked.txt".to_string()));
+        assert!(impact
+            .external_changes
+            .contains(&"external.txt".to_string()));
+        assert!(impact.untracked_files.contains(&"external.txt".to_string()));
+        assert!(impact.creates_safety_stash);
+        assert!(impact.has_destructive_changes);
+        assert_eq!(impact.action_label, "恢复执行基线");
+        assert_eq!(impact.confirmation_title, "确认恢复执行基线");
+        assert!(impact.presentation_description.contains("安全暂存"));
+        assert!(impact.safety_stash_summary.contains("安全暂存"));
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("tracked.txt"))
+                .map_err(|error| format!("读取预览后受管文件失败：{error}"))?,
+            "managed change\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clean_recovery_preview_can_skip_confirmation() -> Result<(), String> {
+        let repo = TempGitRepo::new("clean-recovery-preview")?;
+        let baseline = repo.head()?;
+        let project_name = unique_project_name("clean-recovery-preview");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut session = execution_session("execution_failed", "clean-preview", &baseline);
+        session.active = false;
+        let project = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::Pending,
+            Some(session),
+        );
+        crate::save_project(&project)?;
+
+        let impact = preview_execution_recovery_impact_inner(&project_name)?;
+        assert!(!impact.has_destructive_changes);
+        assert!(impact.affected_files.is_empty());
+        assert!(!impact.creates_safety_stash);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rejects_preview_after_workspace_changes() -> Result<(), String> {
+        let repo = TempGitRepo::new("stale-recovery-preview")?;
+        let baseline = repo.head()?;
+        let project_name = unique_project_name("stale-recovery-preview");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut session = execution_session("execution_failed", "stale-preview", &baseline);
+        session.active = false;
+        let project = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::Pending,
+            Some(session),
+        );
+        crate::save_project(&project)?;
+
+        std::fs::write(repo.path.join("tracked.txt"), "changed before preview\n")
+            .map_err(|error| format!("写入预览前变更失败：{error}"))?;
+        let preview = preview_execution_recovery_impact_inner(&project_name)?;
+        std::fs::write(repo.path.join("tracked.txt"), "changed after preview\n")
+            .map_err(|error| format!("写入预览后变更失败：{error}"))?;
+        let latest = crate::load_project(&project_name)?;
+        let error = verify_execution_recovery_preview(
+            &latest,
+            "acknowledge_execution_recovery",
+            Some(&preview.state_fingerprint),
+        )
+        .expect_err("工作区变化后必须拒绝旧预览");
+
+        assert!(error.contains("预览已过期"));
+        assert_eq!(repo.head()?, baseline);
+        assert_eq!(
+            std::fs::read_to_string(repo.path.join("tracked.txt"))
+                .map_err(|error| format!("读取拒绝后的工作区失败：{error}"))?,
+            "changed after preview\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_automatic_recovery_is_idempotent_and_clears_pipeline() -> Result<(), String>
+    {
+        let repo = TempGitRepo::new("concurrent-recovery")?;
+        let baseline = repo.head()?;
+        std::fs::write(repo.path.join("tracked.txt"), "failed execution\n")
+            .map_err(|error| format!("写入并发恢复残留失败：{error}"))?;
+        let project_name = unique_project_name("concurrent-recovery");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut session = execution_session("execution_failed", "concurrent", &baseline);
+        session.active = false;
+        let project = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::Pending,
+            Some(session),
+        );
+        crate::save_project(&project)?;
+        let pipeline = Arc::new(Mutex::new(Some(pipeline_state(
+            "concurrent",
+            PipelineStatus::Failed,
+        ))));
+
+        let (first, second) = tokio::join!(
+            acknowledge_execution_recovery_with_pipeline(&pipeline, project_name.clone()),
+            acknowledge_execution_recovery_with_pipeline(&pipeline, project_name.clone()),
+        );
+        let first = first?;
+        let second = second?;
+
+        assert!(pipeline.lock().await.is_none());
+        assert!(first.execution_session.is_none());
+        assert!(second.execution_session.is_none());
+        assert_eq!(
+            first.workflow_state.data_revision,
+            second.workflow_state.data_revision
+        );
+        assert_eq!(repo.head()?, baseline);
+        assert!(get_execution_workspace_status_inner(&repo.path_string())?.working_tree_clean);
         Ok(())
     }
 
@@ -6058,7 +6485,8 @@ mod tests {
     }
 
     #[test]
-    fn successful_retest_clears_recovery_and_returns_to_autopilot() -> Result<(), String> {
+    fn phase1_runtime_contract_successful_retest_clears_recovery_immediately() -> Result<(), String>
+    {
         let session = execution_session("recovering", "recovery-success", "abc123");
         let mut proj = execution_project(
             "recovery-success",
@@ -6234,6 +6662,10 @@ mod tests {
             resolution: project::HumanResolution::ConfirmActualPass,
             accepted_criteria: vec![],
             dependency_check: String::new(),
+            action_source: String::new(),
+            execution_result_fingerprint: String::new(),
+            task_tree_revision: 0,
+            project_revision: 0,
         });
         proj.workflow_state.recovery_state = Some(project::RecoveryState {
             error_kind: project::RecoveryErrorKind::TestFailure,
@@ -6496,7 +6928,7 @@ mod tests {
     }
 
     #[test]
-    fn human_override_passes_gate_without_mutating_failed_test() {
+    fn phase1_human_action_safety_audited_override_preserves_failed_test() {
         let mut proj = execution_project(
             "human-override",
             Path::new(""),
@@ -6507,6 +6939,7 @@ mod tests {
                 "abc123",
             )),
         );
+        proj.workflow_state.data_revision = 1;
         let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
         subtask.execution_result = Some(project::ExecutionResult {
             success: true,
@@ -6520,6 +6953,8 @@ mod tests {
             automated_test_status: project::AutomatedTestStatus::Unavailable,
             ..Default::default()
         });
+        let execution_result_fingerprint =
+            crate::human_action_policy::execution_result_fingerprint(subtask).unwrap();
         subtask.human_verification = Some(project::HumanVerification {
             verification_kind: project::VerificationKind::HumanOverride,
             verification_reason: "manual smoke test".to_string(),
@@ -6528,6 +6963,10 @@ mod tests {
             resolution: project::HumanResolution::ConfirmActualPass,
             accepted_criteria: vec![],
             dependency_check: String::new(),
+            action_source: "recovery".to_string(),
+            execution_result_fingerprint,
+            task_tree_revision: 0,
+            project_revision: 1,
         });
 
         assert!(validate_subtask_quality_gate(&proj).is_ok());
@@ -6538,6 +6977,15 @@ mod tests {
                 .map(|test| test.passed),
             Some(false)
         );
+
+        proj.milestones[0].mid_stages[0].subtasks[0]
+            .human_verification
+            .as_mut()
+            .unwrap()
+            .execution_result_fingerprint = "sha256:forged".to_string();
+        assert!(validate_subtask_quality_gate(&proj)
+            .unwrap_err()
+            .contains("执行结果已变化"));
     }
 
     #[test]
@@ -7145,7 +7593,7 @@ mod tests {
     }
 
     #[test]
-    fn git_confirmation_incomplete_claim_reconciles_as_awaiting() {
+    fn phase1_runtime_contract_git_confirmation_claim_reconciles_without_reexecution() {
         let proj = execution_project(
             "claim-crash",
             Path::new(""),

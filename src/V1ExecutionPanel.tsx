@@ -14,7 +14,7 @@ import {
   TestTube2,
   X,
 } from "lucide-react";
-import { getGitConfirmationBlockPresentation, getQualityStatusPresentation } from "./autopilotPolicy";
+import { getQualityStatusPresentation } from "./autopilotPolicy";
 import { ActionButton } from "./components/ActionButton";
 import { FeedbackBanner } from "./components/FeedbackBanner";
 import { Modal } from "./components/Modal";
@@ -26,7 +26,7 @@ import {
   isSubtaskLeaf,
   isSubtaskRunnableLeaf,
 } from "./taskTreePolicy";
-import type { ExecutionWorkspaceStatus, PipelineState, Project } from "./types";
+import type { ExecutionWorkspaceStatus, PipelineState, Project, RecoveryPresentation } from "./types";
 import { getWorkspaceAction } from "./workspacePolicy";
 
 // ============================================================
@@ -34,21 +34,18 @@ import { getWorkspaceAction } from "./workspacePolicy";
 // ============================================================
 export default function V1ExecutionPanel({
   project, executionStatus, workspaceStatus, busy: externalBusy,
-  onPrepareWorkspace, onExecute, onConfirm, onReject, onRetry, onInStop, onEdStop, onSyncProject,
-  onAcknowledgeRecovery,
-  onRetryGitConfirmation,
+  recoveryPresentation,
+  onPrepareWorkspace, onExecute, onConfirm, onReject, onInStop, onEdStop, onSyncProject,
 }: {
   project: Project; executionStatus: PipelineState | null;
   workspaceStatus: ExecutionWorkspaceStatus | null;
+  recoveryPresentation: RecoveryPresentation | null;
   busy: boolean;
   onPrepareWorkspace: () => Promise<void>;
   onExecute: () => Promise<void>; onConfirm: () => Promise<void>;
   onReject: (reason: string) => Promise<void>;
-  onRetry: () => Promise<void>;
   onInStop: () => Promise<void>; onEdStop: () => Promise<void>;
   onSyncProject: () => Promise<void>;
-  onAcknowledgeRecovery?: () => Promise<void>;
-  onRetryGitConfirmation?: () => Promise<void>;
 }) {
   const [rejectReason, setRejectReason] = useState("");
   const [localBusy, setLocalBusy] = useState(false);
@@ -73,18 +70,7 @@ export default function V1ExecutionPanel({
   const isAwaiting = executionStatus?.awaiting_confirmation === true || awaitingSubtask != null;
   const isExecuting = executionStatus?.status === "Running";
 
-  // 精确失败会话：优先显示失败面板，暂时隐藏普通执行和准备环境
-  const failedSession = project.execution_session;
-  const failedStatus = (failedSession?.status ?? "").toLowerCase();
-  const hasExecutionFailure =
-    failedStatus === "execution_failed"
-    || failedStatus === "session_lost"
-    || failedStatus === "stop_failed";
-  const hasConfirmationBlock = failedStatus === "confirmation_blocked";
-  const confirmationPresentation = getGitConfirmationBlockPresentation(
-    failedSession?.confirmation_failure_kind,
-  );
-  const recoveryActive = project.workflow_state.recovery_state != null;
+  const recoveryBlocked = recoveryPresentation != null && recoveryPresentation.kind !== "None";
 
   const handlePrepareWorkspace = async () => {
     if (!project || busy) return;
@@ -108,12 +94,6 @@ export default function V1ExecutionPanel({
     await onReject(rejectReason.trim());
     setRejectReason("");
     setShowReject(false);
-    setLocalBusy(false);
-  };
-
-  const handleRetry = async () => {
-    setLocalBusy(true);
-    await onRetry();
     setLocalBusy(false);
   };
 
@@ -142,100 +122,42 @@ export default function V1ExecutionPanel({
     <div className="v1-execution-panel" style={{ padding: "24px" }}>
       <h2 className="execution-panel-title"><ListTodo size={20} />执行</h2>
 
-      {hasConfirmationBlock && failedSession && (
+      {recoveryBlocked && recoveryPresentation && (
         <div className="execution-failure-panel" style={{
           marginBottom: "20px", padding: "16px",
-          background: "#fff8c5", borderRadius: "8px", border: "1px solid #d4a72c",
-        }}>
-          <div style={{ fontWeight: 600, fontSize: "14px", marginBottom: "8px", color: "#7d4e00" }}>
-            Git 确认受阻
-          </div>
-          <div style={{ fontSize: "13px", color: "#24292f", marginBottom: "8px", overflowWrap: "anywhere" }}>
-            <div>任务：{failedSession.subtask_title || failedSession.subtask_id}</div>
-            <div style={{ marginTop: "6px" }}>代码与质量结果已保留，不需要恢复执行基线。</div>
-            {failedSession.failure_message && (
-              <div style={{ marginTop: "6px", whiteSpace: "pre-wrap" }}>
-                受阻原因：{failedSession.failure_message}
-              </div>
-            )}
-          </div>
-          <WorkflowActionBar>
-            {confirmationPresentation.canRetry && onRetryGitConfirmation && (
-              <ActionButton
-                icon={<GitBranch size={16} />}
-                loading={busy}
-                loadingLabel="确认中"
-                onClick={onRetryGitConfirmation}
-              >
-                重新确认提交
-              </ActionButton>
-            )}
-            <ActionButton icon={<RotateCcw size={16} />} disabled={busy} onClick={onSyncProject}>
-              同步状态
-            </ActionButton>
-          </WorkflowActionBar>
-          <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
-            {confirmationPresentation.hint}
-          </p>
-        </div>
-      )}
-
-      {/* 执行失败专用面板：优先显示，隐藏普通执行/准备环境 */}
-      {hasExecutionFailure && failedSession && (
-        <div className="execution-failure-panel" style={{
-          marginBottom: "20px", padding: "16px",
-          background: "#ffebe9", borderRadius: "8px", border: "1px solid #cf222e",
+          background: recoveryPresentation.severity === "Error" ? "#ffebe9" : "#fff8c5",
+          borderRadius: "8px",
+          border: `1px solid ${recoveryPresentation.severity === "Error" ? "#cf222e" : "#d4a72c"}`,
         }}>
           <div style={{ fontWeight: 600, fontSize: "14px", marginBottom: "8px", color: "#cf222e" }}>
-            {failedStatus === "session_lost" ? "执行中断（进程失联）"
-              : failedStatus === "stop_failed" ? "暂停失败"
-              : "执行失败"}
+            {recoveryPresentation.title}
           </div>
           <div style={{ fontSize: "13px", color: "#24292f", marginBottom: "8px", overflowWrap: "anywhere" }}>
-            <div>受影响任务：{failedSession.subtask_title || failedSession.subtask_id}</div>
-            {failedSession.failure_message && (
-              <div style={{ marginTop: "6px", whiteSpace: "pre-wrap" }}>
-                失败原因：{failedSession.failure_message}
-              </div>
-            )}
-            {failedSession.base_commit && (
+            {recoveryPresentation.affected_task_label && <div>受影响任务：{recoveryPresentation.affected_task_label}</div>}
+            {recoveryPresentation.phase_label && <div style={{ marginTop: "4px" }}>恢复阶段：{recoveryPresentation.phase_label}</div>}
+            {recoveryPresentation.validation_phase_label && <div style={{ marginTop: "4px" }}>验证阶段：{recoveryPresentation.validation_phase_label}</div>}
+            <div style={{ marginTop: "6px", whiteSpace: "pre-wrap" }}>
+              阻断原因：{recoveryPresentation.reason}
+            </div>
+            {recoveryPresentation.baseline_reference && recoveryPresentation.requires_baseline_restore && (
               <div style={{ marginTop: "4px", color: "#656d76", fontFamily: "monospace", fontSize: "12px" }}>
-                基线：{failedSession.base_commit.slice(0, 12)}
+                基线：{recoveryPresentation.baseline_reference}
               </div>
             )}
+            {recoveryPresentation.heartbeat_status && <div style={{ marginTop: "4px" }}>心跳：{recoveryPresentation.heartbeat_status}</div>}
+            {[recoveryPresentation.automated_test_status, recoveryPresentation.code_review_status,
+              recoveryPresentation.review_protocol_status, recoveryPresentation.acceptance_evidence_status]
+              .filter(Boolean)
+              .map(status => <div key={status} style={{ marginTop: "4px" }}>{status}</div>)}
           </div>
-          <WorkflowActionBar>
-            <ActionButton
-              icon={<RotateCcw size={16} />}
-              loading={busy}
-              loadingLabel="恢复中"
-              onClick={async () => {
-                setLocalBusy(true);
-                try {
-                  if (onAcknowledgeRecovery) {
-                    await onAcknowledgeRecovery();
-                  } else {
-                    await onRetry();
-                  }
-                } finally {
-                  setLocalBusy(false);
-                }
-              }}
-            >
-              恢复执行基线
-            </ActionButton>
-            <ActionButton icon={<RotateCcw size={16} />} disabled={busy} onClick={onSyncProject}>
-              同步状态
-            </ActionButton>
-          </WorkflowActionBar>
           <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
-            恢复成功前不会显示“已恢复到安全状态”。请先完成基线恢复，再重新执行。
+            请使用页面顶部的唯一恢复入口处理；这里仅展示任务与阻断事实。
           </p>
         </div>
       )}
 
       {/* Workspace status banner — 失败会话期间隐藏准备环境 */}
-      {!hasExecutionFailure && !hasConfirmationBlock && !recoveryActive && planApproved && workspaceStatus && !workspaceReady && (
+      {!recoveryBlocked && planApproved && workspaceStatus && !workspaceReady && (
         <FeedbackBanner
           type={managedTaskChanges ? "info" : "warning"}
           message={workspaceStatus.status_message}
@@ -246,7 +168,7 @@ export default function V1ExecutionPanel({
       )}
 
       {/* Workspace preparation is only valid before repository metadata exists. */}
-      {!hasExecutionFailure && !hasConfirmationBlock && !recoveryActive && planApproved && workspaceAction === "prepare" && (
+      {!recoveryBlocked && planApproved && workspaceAction === "prepare" && (
         <div style={{ marginBottom: "20px" }}>
           <ActionButton icon={<GitBranch size={16} />} loading={busy} loadingLabel="准备中"
             onClick={handlePrepareWorkspace}>准备执行环境</ActionButton>
@@ -256,7 +178,7 @@ export default function V1ExecutionPanel({
         </div>
       )}
 
-      {!hasExecutionFailure && !hasConfirmationBlock && !recoveryActive && planApproved && workspaceStatus &&
+      {!recoveryBlocked && planApproved && workspaceStatus &&
         workspaceAction !== "none" && workspaceAction !== "prepare"
         && workspaceAction !== "managed_task_changes" && (
         <div style={{ marginBottom: "20px" }}>
@@ -274,7 +196,7 @@ export default function V1ExecutionPanel({
       )}
 
       {/* Awaiting confirmation */}
-      {!hasExecutionFailure && !hasConfirmationBlock && !recoveryActive && isAwaiting && awaitingSubtask && (
+      {!recoveryBlocked && isAwaiting && awaitingSubtask && (
         <div style={{ marginBottom: "20px" }}>
           <div style={{ padding: "14px", background: "#ddf4ff", borderRadius: "8px", border: "1px solid #0969da", marginBottom: "16px" }}>
             <strong>待确认：{awaitingSubtask.title}</strong>
@@ -320,14 +242,12 @@ export default function V1ExecutionPanel({
           <WorkflowActionBar>
             {canConfirm ? (
               <ActionButton icon={<Check size={16} />} loading={busy} loadingLabel="确认中" onClick={handleConfirm}>确认通过</ActionButton>
-            ) : (
-              <ActionButton icon={<RotateCcw size={16} />} loading={busy} loadingLabel="恢复中" onClick={handleRetry}>恢复基线并重试</ActionButton>
-            )}
+            ) : null}
             <ActionButton icon={<X size={16} />} variant="danger" disabled={busy} onClick={() => setShowReject(true)}>发现问题</ActionButton>
           </WorkflowActionBar>
           {failureReason && (
             <div style={{ padding: "10px 14px", background: "#fff8c5", borderRadius: "6px", border: "1px solid #d4a72c", marginTop: "12px", fontSize: "13px", color: "#9a6700" }}>
-              ⚠️ 质量门禁阻断：{failureReason}。请先恢复基线并重试，或驳回后人工处理。
+              ⚠️ 质量门禁阻断：{failureReason}。请驳回并记录问题，或通过顶部恢复入口选择后端允许的处理方式。
             </div>
           )}
           <Modal isOpen={showReject} onClose={() => setShowReject(false)} title="驳回执行结果"
@@ -342,7 +262,7 @@ export default function V1ExecutionPanel({
       )}
 
       {/* Next pending subtask — only when workspace is ready and no failure session */}
-      {!hasExecutionFailure && !hasConfirmationBlock && !recoveryActive && !isAwaiting && planApproved && workspaceReady && nextSubtask && (
+      {!recoveryBlocked && !isAwaiting && planApproved && workspaceReady && nextSubtask && (
         <div style={{ marginBottom: "20px" }}>
           <div style={subtaskCardStyle}>
             <strong>下一个任务：{nextSubtask.title}</strong>
@@ -366,7 +286,7 @@ export default function V1ExecutionPanel({
       )}
 
       {/* Pause controls — only visible when execution is actively running */}
-      {!hasConfirmationBlock && isExecuting && !isAwaiting && (
+      {!recoveryBlocked && isExecuting && !isAwaiting && (
         <div style={{
           marginBottom: "20px", padding: "16px",
           background: "#fff8f0", borderRadius: "8px", border: "1px solid #e6a23c",
@@ -408,7 +328,7 @@ export default function V1ExecutionPanel({
       )}
 
       {/* All done — workflow should have auto-advanced; this is a safety net */}
-      {!hasConfirmationBlock && !isAwaiting && planApproved && workspaceReady && !nextSubtask && (
+      {!recoveryBlocked && !isAwaiting && planApproved && workspaceReady && !nextSubtask && (
         <div style={{ marginBottom: "20px" }}>
           <FeedbackBanner type="success" message="当前中阶段所有小阶段已执行完成。" />
           <p style={{ color: "#656d76", fontSize: "13px", marginTop: "12px" }}>

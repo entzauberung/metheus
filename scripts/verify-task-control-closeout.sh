@@ -39,11 +39,11 @@ done
 
 cargo test --locked --package metheus --lib --no-default-features \
   --profile core-dev \
-  commands::workflow::tests::shadow_mode_returns_legacy_action_and_records_comparison_only \
+  commands::workflow::tests::phase1_runtime_contract_explicit_shadow_uses_legacy_and_only_audits \
   -- --exact --nocapture
 cargo test --locked --package metheus --lib --no-default-features \
   --profile core-dev \
-  commands::workflow::tests::serial_takeover_returns_new_controller_action_in_execution \
+  commands::workflow::tests::phase1_runtime_contract_serial_takeover_dispatches_control_action \
   -- --exact --nocapture
 cargo test --locked --package metheus --lib --no-default-features \
   --profile core-dev \

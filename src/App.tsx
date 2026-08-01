@@ -7,7 +7,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
 import "./App.css";
-import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, TestResult } from "./types";
+import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, TestResult, RecoveryPresentation, RecoveryResultSummary, RuntimeSnapshot, RuntimeMutationResult, ExecutionRecoveryImpact, RecoveryDecisionResolution } from "./types";
 import { ProjectEntry } from "./ProjectEntry";
 import { ExistingBaselinePanel } from "./ExistingBaselinePanel";
 import { PreflightPanel } from "./PreflightPanel";
@@ -19,6 +19,9 @@ import { ConsoleStepShell } from "./components/ConsoleStepShell";
 import { WorkflowActionBar } from "./components/WorkflowActionBar";
 import { ArrowLeft, Bot, GitBranch, PanelRightOpen, RotateCcw, Search, WandSparkles } from "lucide-react";
 import { AutopilotControlBar } from "./components/AutopilotControlBar";
+import { RecoveryNotice } from "./components/RecoveryNotice";
+import { RecoveryResultBanner } from "./components/RecoveryResultBanner";
+import { SyncStatusIndicator } from "./components/SyncStatusIndicator";
 import ExecutionTree from "./ExecutionTree";
 import ChatRoom from "./ChatRoom";
 import TaskConsole from "./TaskConsole";
@@ -26,6 +29,7 @@ import { ConsoleWorkflowPanel } from "./ConsoleWorkflowPanel";
 import { FuturePlanningWorkspace } from "./FuturePlanningWorkspace";
 import { PauseDecisionPanel } from "./PauseDecisionPanel";
 import { RollbackImpactDialog } from "./RollbackImpactDialog";
+import { RecoveryImpactDialog } from "./RecoveryImpactDialog";
 import { MilestoneReviewPanel } from "./MilestoneReviewPanel";
 import { ExecutionEngineSettings } from "./components/ExecutionEngineSettings";
 import { ApplicationSettings } from "./components/ApplicationSettings";
@@ -34,6 +38,7 @@ import FloatingChatBalloon from "./FloatingChatBalloon";
 import TaskInspector from "./TaskInspector";
 import V1ExecutionPanel from "./V1ExecutionPanel";
 import { useTaskControlWorkspace } from "./hooks/useTaskControlWorkspace";
+import { useProjectStateSync } from "./hooks/useProjectStateSync";
 import {
   clampPanelWidth,
   DEFAULT_INSPECTOR_WIDTH,
@@ -47,9 +52,13 @@ import {
   SIDEBAR_WIDTH_STORAGE_KEY,
 } from "./panelLayoutPolicy";
 import {
-  findProjectSubtaskById,
-  isSubtaskLeaf,
-} from "./taskTreePolicy";
+  executionPollDecision,
+  isTerminalRuntimeSnapshot,
+  shouldReconcileAfterPollFailure,
+  terminalDelayedSyncDelay,
+  terminalSyncDelay,
+  type TerminalSyncPhase,
+} from "./executionSyncPolicy";
 
 const WORKFLOW_STEPS = new Set<WorkflowStep>([
   "WaitingEntry", "ExistingAnalysis", "BaselineApproval", "Discussion", "ThreeChecks",
@@ -62,10 +71,6 @@ const WORKFLOW_STEPS = new Set<WorkflowStep>([
 
 /** 执行状态轮询周期（ms） */
 const EXECUTION_POLL_INTERVAL_MS = 1500;
-
-/** 后端自动驾驶运行时与空闲时的项目事实同步周期。 */
-const PROJECT_SYNC_ACTIVE_INTERVAL_MS = 1000;
-const PROJECT_SYNC_IDLE_INTERVAL_MS = 5000;
 
 /** 连续轮询失败最大次数，防止界面无限静默等待 */
 const EXECUTION_POLL_MAX_FAILURES = 10;
@@ -331,6 +336,17 @@ function App() {
   const [isExecuting, setIsExecuting] = useState(false);
   const [feedbackMsg, setFeedbackMsg] = useState<{ type: "error" | "success" | "warning" | "info"; message: string } | null>(null);
   const [executionStatus, setExecutionStatus] = useState<PipelineState | null>(null);
+  const [recoveryPresentation, setRecoveryPresentation] = useState<RecoveryPresentation | null>(null);
+  const [recoveryResult, setRecoveryResult] = useState<RecoveryResultSummary | null>(null);
+  const [runtimeTaskControlSnapshot, setRuntimeTaskControlSnapshot] = useState<import("./types").TaskControlSnapshot | null>(null);
+  const dismissRecoveryResult = useCallback(() => setRecoveryResult(null), []);
+  const [terminalSyncPhase, setTerminalSyncPhase] = useState<TerminalSyncPhase>("idle");
+  const [recoveryImpact, setRecoveryImpact] = useState<ExecutionRecoveryImpact | null>(null);
+  const [pendingRecoveryDecision, setPendingRecoveryDecision] = useState<{
+    resolution: RecoveryDecisionResolution;
+    reason: string;
+    acceptedCriteria: number[];
+  } | null>(null);
   // === 启动恢复完成标记（防止 UI 在恢复完成前渲染） ===
   const [startupRecoveryDone, setStartupRecoveryDone] = useState(false);
   // === 决策层统一提交锁（同一时间只能执行一个关键动作） ===
@@ -353,10 +369,61 @@ function App() {
   const [testLogs, setTestLogs] = useState<TestLog[]>([]);
   // === 执行工作区状态（供 V1ExecutionPanel 和 TaskConsole 共用） ===
   const [workspaceStatus, setWorkspaceStatus] = useState<ExecutionWorkspaceStatus | null>(null);
+  const applyRuntimeSnapshot = useCallback((snapshot: RuntimeSnapshot) => {
+    if (!handleChatComplete(snapshot.project)) return;
+    setExecutionStatus(snapshot.pipeline_state);
+    setIsExecuting(snapshot.pipeline_state?.status === "Running");
+    setRecoveryPresentation(snapshot.recovery_presentation);
+    if (snapshot.task_control_snapshot !== undefined) {
+      setRuntimeTaskControlSnapshot(snapshot.task_control_snapshot ?? null);
+    }
+    setTerminalSyncPhase(current => (
+      current !== "idle" && isTerminalRuntimeSnapshot(snapshot, snapshot.project.name)
+        ? "idle"
+        : current
+    ));
+  }, [handleChatComplete]);
+  const applyRuntimeMutation = useCallback((result: RuntimeMutationResult) => {
+    applyRuntimeSnapshot(result.runtime_snapshot);
+    if (result.task_control_snapshot) setRuntimeTaskControlSnapshot(result.task_control_snapshot);
+    if (result.action.recovery_result) setRecoveryResult(result.action.recovery_result);
+  }, [applyRuntimeSnapshot]);
+  const invokeRuntimeMutation = useCallback(async (
+    command: string,
+    args: Record<string, unknown>,
+    timeoutMs?: number,
+  ) => {
+    const result = await invokeWithTimeout<RuntimeMutationResult>(command, args, timeoutMs);
+    applyRuntimeMutation(result);
+    return result;
+  }, [applyRuntimeMutation]);
+  const projectStateSync = useProjectStateSync({
+    projectName: project?.name ?? "",
+    enabled: startupRecoveryDone && Boolean(project?.name),
+    includeTaskControlSnapshot: inspectorOpen,
+    onSnapshot: applyRuntimeSnapshot,
+  });
+  const forceRuntimeSync = projectStateSync.forceSync;
   const taskControlWorkspace = useTaskControlWorkspace({
     project,
-    enabled: project?.workflow_state.top_level_phase === "Console",
-    onProjectUpdated: handleChatComplete,
+    enabled: project?.workflow_state.top_level_phase === "Console" && inspectorOpen,
+    invalidationSequence: projectStateSync.state.taskControlEventSequence,
+    runtimeCursor: {
+      processStartId: projectStateSync.state.taskControlProcessStartId,
+      eventSequence: projectStateSync.state.taskControlEventSequence,
+      projectRevision: projectStateSync.state.taskControlProjectRevision,
+      treeRevision: projectStateSync.state.taskControlTreeRevision,
+      controlActionId: projectStateSync.state.taskControlActionId,
+      controlActionKnown: Boolean(projectStateSync.state.taskControlProcessStartId),
+      snapshotVersion: projectStateSync.state.taskControlSnapshotVersion,
+    },
+    atomicSnapshot: runtimeTaskControlSnapshot,
+    atomicSnapshotStatus: projectStateSync.state.taskControlDetailStatus,
+    atomicSnapshotUpdatedAt: projectStateSync.state.taskControlDetailUpdatedAt,
+    subscriptionStatus: projectStateSync.state.subscriptionStatus,
+    runtimeSyncStatus: projectStateSync.state.status,
+    runtimeSyncFailures: projectStateSync.state.consecutiveFailures,
+    onRuntimeMutation: applyRuntimeMutation,
   });
 
   const openTaskInspector = useCallback((taskId: string) => {
@@ -376,10 +443,13 @@ function App() {
     }
   }, [beginConsoleAction, endConsoleAction, taskControlWorkspace.executeAction]);
 
-  const changeTaskControlMode = useCallback(async (mode: import("./types").TaskControlMode) => {
+  const changeTaskControlMode = useCallback(async (
+    mode: import("./types").TaskControlMode,
+    reason?: string,
+  ) => {
     if (!beginConsoleAction("task_control:change_mode")) return;
     try {
-      await taskControlWorkspace.changeMode(mode);
+      await taskControlWorkspace.changeMode(mode, reason);
     } finally {
       endConsoleAction();
     }
@@ -388,150 +458,144 @@ function App() {
   useEffect(() => {
     projectRef.current = project;
   }, [project]);
+  useEffect(() => {
+    setRecoveryImpact(null);
+    setPendingRecoveryDecision(null);
+    setRecoveryResult(null);
+    setRuntimeTaskControlSnapshot(null);
+    setTerminalSyncPhase("idle");
+  }, [project?.name]);
   // V1: 回退后手动触发生成（不再自动触发）
 
-  // === 阶段一关键修复：启动时从磁盘 Project 恢复执行状态 ===
-  // 解决刷新后执行状态丢失的问题。
+  // 启动恢复也通过统一运行时快照对账，避免 Project 与 PipelineState 分头读取。
   useEffect(() => {
     if (!project) return;
-    // Guard: don't recover execution until startup recovery is complete.
-    // reconcile_on_startup must finish first to clean stale sessions.
     if (!startupRecoveryDone) return;
 
     const session = project.execution_session;
     if (!session || !session.active) {
-      // No active session — clear any stale execution state
       setExecutionStatus(null);
       setIsExecuting(false);
       return;
     }
 
-    // Recover based on disk session status
-    if (session.status === "executing" || session.status === "recovering") {
-      // Was executing when page was closed/refreshed.
-      // Check if backend memory still has the pipeline running.
-      invokeWithTimeout<PipelineState | null>("get_execution_status")
-        .then((memStatus) => {
-          if (memStatus && memStatus.status === "Running") {
-            // Backend still running — restore and poll
-            setExecutionStatus(memStatus);
-            setIsExecuting(true);
-          } else if (memStatus && memStatus.awaiting_confirmation) {
-            // Already finished while we were away
-            setExecutionStatus(memStatus);
-            setIsExecuting(false);
-            // Reload project to get latest disk state
-            invokeWithTimeout<Project>("get_project", { projectName: project.name })
-              .then((p) => handleChatComplete(p))
-              .catch(() => {});
-          } else {
-            // Memory state lost. reconcile_on_startup already ran and
-            // should have marked the session as "session_lost".
-            // Reload from disk to get the reconciled state.
-            invokeWithTimeout<Project>("get_project", { projectName: project.name })
-              .then((p) => handleChatComplete(p))
-              .catch(() => {
-                // Last resort: show recovery message from session data
-                setFeedbackMsg({
-                  type: "warning",
-                  message: `执行状态已丢失 (${session.subtask_title})，请手动继续。`,
-                });
-              });
-          }
-        })
-        .catch(() => {
-          // Can't reach backend — reload project from disk
-          invokeWithTimeout<Project>("get_project", { projectName: project.name })
-            .then((p) => handleChatComplete(p))
-            .catch(() => {
-              setFeedbackMsg({
-                type: "warning",
-                message: "无法连接后端，请重启应用。",
-              });
-            });
-        });
-    } else if (session.status === "awaiting_confirmation") {
-      // Try backend memory first — may have richer subtask_statuses/log_history.
-      // Fall back to a minimal display state from session data if backend memory is gone.
-      invokeWithTimeout<PipelineState | null>("get_execution_status")
-        .then((memStatus) => {
-          if (memStatus && memStatus.awaiting_confirmation) {
-            // Backend memory has the full state — use it
-            setExecutionStatus(memStatus);
-          } else {
-            // Backend memory lost. Build minimal display state from disk session.
-            // subtask_statuses/log_history are lost (only in memory), but UI can still
-            // show the confirmation prompt from session data.
-            setExecutionStatus({
-              execution_id: session.execution_id,
-              mid_stage_id: session.mid_stage_id,
-              status: "Paused",
-              current_subtask_index: session.subtask_index,
-              total_subtasks: session.total_subtasks,
-              subtask_statuses: [],
-              current_log: `⏳ 待确认 (${session.subtask_index + 1}/${session.total_subtasks})：${session.subtask_title}`,
-              last_error: undefined,
-              child_pid: undefined,
-              project_name: project.name,
-              milestone_id: session.milestone_id,
-              plan_revision: session.plan_revision,
-              current_subtask_id: session.subtask_id,
-              awaiting_confirmation: true,
-              log_history: [],
-            });
-          }
-          setIsExecuting(false);
-        })
-        .catch(() => {
-          // Can't reach backend — minimal fallback
-          setExecutionStatus({
-            execution_id: session.execution_id,
-            mid_stage_id: session.mid_stage_id,
-            status: "Paused",
-            current_subtask_index: session.subtask_index,
-            total_subtasks: session.total_subtasks,
-            subtask_statuses: [],
-            current_log: `⏳ 待确认 (${session.subtask_index + 1}/${session.total_subtasks})：${session.subtask_title}`,
-            last_error: undefined,
-            child_pid: undefined,
-            project_name: project.name,
-            milestone_id: session.milestone_id,
-            plan_revision: session.plan_revision,
-            current_subtask_id: session.subtask_id,
-            awaiting_confirmation: true,
-            log_history: [],
-          });
-          setIsExecuting(false);
-        });
-    } else if (
-      session.status === "session_lost"
-      || session.status === "execution_failed"
-      || session.status === "stop_failed"
-    ) {
-      // 失败/失联会话：仅提示需要恢复基线，不得谎称已恢复到安全状态
+    const sessionStatus = session.status.toLowerCase();
+    if (["session_lost", "execution_failed", "stop_failed"].includes(sessionStatus)) {
       setExecutionStatus(null);
       setIsExecuting(false);
       setFeedbackMsg({
         type: "warning",
         message: `执行中断 (${session.subtask_title})：${session.failure_message || "请先恢复执行基线后再继续。"}`,
       });
+      return;
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project?.name, project?.execution_session?.active, project?.execution_session?.status, project?.execution_session?.subtask_id, startupRecoveryDone]);
 
-  // Fetch workspace status before plan approval and throughout execution.
+    let cancelled = false;
+    void forceRuntimeSync().then(snapshot => {
+      if (cancelled) return;
+      if (!snapshot) {
+        setFeedbackMsg({
+          type: "warning",
+          message: "启动执行状态同步失败，当前状态可能过期；系统将继续后台对账。",
+        });
+        return;
+      }
+      const latestSession = snapshot.project.execution_session ?? session;
+      const pipeline = snapshot.pipeline_state;
+      if (pipeline?.status === "Running") {
+        setExecutionStatus(pipeline);
+        setIsExecuting(true);
+        return;
+      }
+      if (pipeline?.awaiting_confirmation) {
+        setExecutionStatus(pipeline);
+        setIsExecuting(false);
+        return;
+      }
+      if (latestSession.status.toLowerCase() === "awaiting_confirmation") {
+        setExecutionStatus({
+          execution_id: latestSession.execution_id,
+          mid_stage_id: latestSession.mid_stage_id,
+          status: "Paused",
+          current_subtask_index: latestSession.subtask_index,
+          total_subtasks: latestSession.total_subtasks,
+          subtask_statuses: [],
+          current_log: `⏳ 待确认 (${latestSession.subtask_index + 1}/${latestSession.total_subtasks})：${latestSession.subtask_title}`,
+          last_error: undefined,
+          child_pid: undefined,
+          project_name: snapshot.project.name,
+          milestone_id: latestSession.milestone_id,
+          plan_revision: latestSession.plan_revision,
+          current_subtask_id: latestSession.subtask_id,
+          awaiting_confirmation: true,
+          log_history: [],
+        });
+        setIsExecuting(false);
+      }
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.name, project?.execution_session?.active, project?.execution_session?.status, project?.execution_session?.subtask_id, startupRecoveryDone, forceRuntimeSync]);
+
+  // 工作区只在进入审批/执行步骤时读取；命令和恢复完成会显式刷新。
   useEffect(() => {
     if (!project || !["PlanApproving", "Execution"].includes(project.workflow_state.current_step)) return;
     invokeWithTimeout<ExecutionWorkspaceStatus>("get_execution_workspace_status", { projectName: project.name })
       .then(setWorkspaceStatus)
       .catch(() => setWorkspaceStatus(null));
-  }, [project?.name, project?.workflow_state.current_step, project?.workflow_state.data_revision]);
+  }, [project?.name, project?.workflow_state.current_step]);
+
+  const previousRecoveryKindRef = useRef<RecoveryPresentation["kind"] | null>(null);
+  useEffect(() => {
+    const currentKind = recoveryPresentation?.kind ?? null;
+    const previousKind = previousRecoveryKindRef.current;
+    previousRecoveryKindRef.current = currentKind;
+    if (
+      !project
+      || project.workflow_state.current_step !== "Execution"
+      || !previousKind
+      || previousKind === "None"
+      || currentKind !== "None"
+    ) return;
+    invokeWithTimeout<ExecutionWorkspaceStatus>("get_execution_workspace_status", {
+      projectName: project.name,
+    }).then(setWorkspaceStatus).catch(() => {});
+  }, [project?.name, project?.workflow_state.current_step, recoveryPresentation?.kind]);
 
   // 执行状态轮询失败计数器
   const executionPollFailuresRef = useRef(0);
   // 执行状态轮询定时器
   const executionPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const executionPollingActiveRef = useRef(false);
+
+  const reconcileExecutionState = useCallback(async (projectName: string) => {
+    setTerminalSyncPhase("terminal_reconciling");
+    for (let attempt = 0; ; attempt += 1) {
+      const delay = terminalSyncDelay(attempt);
+      if (delay === null) break;
+      if (delay > 0) {
+        await new Promise<void>(resolve => setTimeout(resolve, delay));
+      }
+      if (projectRef.current?.name !== projectName) return null;
+      const snapshot = await forceRuntimeSync();
+      if (isTerminalRuntimeSnapshot(snapshot, projectName)) {
+        setTerminalSyncPhase("idle");
+        return snapshot;
+      }
+    }
+    setTerminalSyncPhase("terminal_delayed");
+    for (let attempt = 0; ; attempt += 1) {
+      const delay = terminalDelayedSyncDelay(attempt);
+      if (delay === null) return null;
+      await new Promise<void>(resolve => setTimeout(resolve, delay));
+      if (projectRef.current?.name !== projectName) return null;
+      const snapshot = await forceRuntimeSync();
+      if (isTerminalRuntimeSnapshot(snapshot, projectName)) {
+        setTerminalSyncPhase("idle");
+        return snapshot;
+      }
+    }
+  }, [forceRuntimeSync]);
 
   /** 执行状态轮询只负责展示，不拥有自动驾驶推进权。 */
   const startExecutionPolling = useCallback(async (projectName: string) => {
@@ -542,22 +606,10 @@ function App() {
     const poll = async () => {
       try {
         const status = await invokeWithTimeout<PipelineState | null>("get_execution_status", {});
-        if (!status) {
-          executionPollingActiveRef.current = false;
-          setIsExecuting(false);
-          setFeedbackMsg({
-            type: "error",
-            message: "执行状态已丢失。请同步项目状态后重试，避免重复启动任务。",
-          });
-          return;
-        }
-
-        executionPollFailuresRef.current = 0; // 重置失败计数
-        setExecutionStatus(status);
-        setIsExecuting(status.status === "Running");
+        executionPollFailuresRef.current = 0;
 
         const newLogs: TestLog[] = [];
-        for (const item of status.subtask_statuses ?? []) {
+        for (const item of status?.subtask_statuses ?? []) {
           if (processedSubtaskIdsRef.current.has(item.subtask_id)) continue;
           if (item.test_result && (item.status === "passed" || item.status === "retrying")) {
             processedSubtaskIdsRef.current.add(item.subtask_id);
@@ -575,14 +627,22 @@ function App() {
         }
         if (newLogs.length > 0) setTestLogs((previous) => [...previous, ...newLogs]);
 
-        if (status.status === "Running") {
+        if (executionPollDecision(status, projectName) === "continue" && status) {
+          setExecutionStatus(status);
+          setIsExecuting(true);
           executionPollTimerRef.current = setTimeout(poll, EXECUTION_POLL_INTERVAL_MS);
         } else {
           executionPollingActiveRef.current = false;
           executionPollTimerRef.current = null;
-          const latest = await invokeWithTimeout<Project>("get_project", { projectName });
-          handleChatComplete(latest);
-          if (status.status === "Failed") {
+          const snapshot = await reconcileExecutionState(projectName);
+          if (!snapshot) {
+            setFeedbackMsg({
+              type: "warning",
+              message: "执行已停止响应，但运行时对账失败；保留当前展示，状态可能过期。",
+            });
+            return;
+          }
+          if (status?.status === "Failed") {
             setFeedbackMsg({
               type: "error",
               message: status.last_error || "后台执行失败，请查看阶段日志后重试。",
@@ -591,21 +651,27 @@ function App() {
         }
       } catch (error) {
         executionPollFailuresRef.current += 1;
+        if (shouldReconcileAfterPollFailure(executionPollFailuresRef.current)) {
+          const snapshot = await forceRuntimeSync();
+          if (snapshot?.project.name === projectName) {
+            executionPollFailuresRef.current = 0;
+            if (snapshot.pipeline_state?.status === "Running") {
+              executionPollTimerRef.current = setTimeout(poll, EXECUTION_POLL_INTERVAL_MS);
+            } else {
+              executionPollingActiveRef.current = false;
+              executionPollTimerRef.current = null;
+            }
+            return;
+          }
+        }
         if (executionPollFailuresRef.current >= EXECUTION_POLL_MAX_FAILURES) {
           executionPollingActiveRef.current = false;
           executionPollTimerRef.current = null;
-          setIsExecuting(false);
           const pollError = error instanceof Error ? error.message : String(error);
           setFeedbackMsg({
-            type: "error",
-            message: `执行状态连续同步失败：${pollError}。请检查后端连接并手动同步项目。`,
+            type: "warning",
+            message: `执行状态连续同步失败：${pollError}。保留当前展示，状态可能过期。`,
           });
-          try {
-            const latest = await invokeWithTimeout<Project>("get_project", { projectName });
-            handleChatComplete(latest);
-          } catch (syncError) {
-            console.error("执行轮询失败后同步项目失败:", syncError);
-          }
           return;
         }
         executionPollTimerRef.current = setTimeout(poll, EXECUTION_POLL_INTERVAL_MS);
@@ -613,7 +679,7 @@ function App() {
     };
 
     poll();
-  }, []);
+  }, [forceRuntimeSync, reconcileExecutionState]);
 
   // 启动恢复只需恢复 isExecuting，此 effect 会接入同一轮询入口。
   useEffect(() => {
@@ -621,40 +687,14 @@ function App() {
     startExecutionPolling(project.name);
   }, [isExecuting, project?.name, startExecutionPolling]);
 
-  // React 只同步后端磁盘事实；自动驾驶的动作选择和派发均由 Rust 作业运行器负责。
-  useEffect(() => {
-    const projectName = project?.name;
-    if (!projectName) return;
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
+  useEffect(() => () => {
+    if (executionPollTimerRef.current) clearTimeout(executionPollTimerRef.current);
+    executionPollTimerRef.current = null;
+    executionPollingActiveRef.current = false;
+    executionPollFailuresRef.current = 0;
+  }, [project?.name]);
 
-    const syncProject = async () => {
-      try {
-        const latest = await invokeWithTimeout<Project>("get_project", { projectName });
-        if (!cancelled) handleChatComplete(latest);
-      } catch (error) {
-        if (!cancelled) console.warn("项目状态同步失败:", error);
-      }
-      if (cancelled) return;
-      const current = projectRef.current;
-      const running = current?.name === projectName && (
-        (current.workflow_state.autopilot_active === true
-          && current.workflow_state.autopilot_state?.run_status === "Running")
-        || (current.workflow_state.managed_flow_state?.active === true
-          && current.workflow_state.managed_flow_state.run_status === "Running")
-      );
-      timer = setTimeout(
-        syncProject,
-        running ? PROJECT_SYNC_ACTIVE_INTERVAL_MS : PROJECT_SYNC_IDLE_INTERVAL_MS,
-      );
-    };
-
-    timer = setTimeout(syncProject, PROJECT_SYNC_ACTIVE_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-    };
-  }, [project?.name, handleChatComplete]);
+  // Project 的实时同步由 useProjectStateSync 的 Channel 驱动；低频轮询仅作断线兜底。
 
   // === 快照：保存 UI 状态到后端，用于刷新恢复和孤儿进程保护 ===
   const takeSnapshot = () => {
@@ -729,15 +769,16 @@ function App() {
         completedMilestonesRef.current = new Set([...completedMilestonesRef.current, ms.id]);
 
         // 任务 2.5：调用后端 AI 命令生成自然语言总结（第二层消息）
-        invokeWithTimeout<string>('summarize_milestone', {
+        invokeWithTimeout<RuntimeMutationResult>('summarize_milestone_runtime', {
           projectName: project.name,
           milestone_id: ms.id,
         })
-          .then((aiSummary) => {
+          .then((result) => {
+            applyRuntimeMutation(result);
             const aiMsg: ChatMessage = {
               id: crypto.randomUUID(),
               role: 'assistant',
-              content: aiSummary,
+              content: result.action.message,
               timestamp: Date.now(),
               msg_type: 'milestone_summary',
               milestone_id: ms.id,
@@ -749,7 +790,7 @@ function App() {
           });
       }
     }
-  }, [project, handleAddMessage]);
+  }, [applyRuntimeMutation, project, handleAddMessage]);
 
   // 启动恢复逻辑：从存储的项目名称恢复，没有则进入 Before 页面
   useEffect(() => {
@@ -780,11 +821,11 @@ function App() {
           && project.workflow_state.top_level_phase === "Before";
         if (needsMigration) {
           chain = chain.then((p: Project) =>
-            invokeWithTimeout<Project>("migrate_project_workflow", {
+            invokeWithTimeout<RuntimeMutationResult>("migrate_project_workflow_runtime", {
               projectName: p.name,
-            }).then((migrated) => {
-              handleChatComplete(migrated);
-              return migrated;
+            }).then((result) => {
+              applyRuntimeMutation(result);
+              return result.runtime_snapshot.project;
             }).catch((err) => {
               console.error("迁移旧项目工作流失败:", err);
               return p;
@@ -794,11 +835,11 @@ function App() {
 
         // 独立修复旧版本留下的大阶段检查/托管矛盾状态。
         chain = chain.then((p: Project) =>
-          invokeWithTimeout<Project>("reconcile_managed_milestone_state", {
+          invokeWithTimeout<RuntimeMutationResult>("reconcile_managed_milestone_state_runtime", {
             projectName: p.name,
-          }).then((reconciled) => {
-            handleChatComplete(reconciled);
-            return reconciled;
+          }).then((result) => {
+            applyRuntimeMutation(result);
+            return result.runtime_snapshot.project;
           }).catch((err) => {
             console.error("大阶段托管状态对账失败:", err);
             return p;
@@ -807,11 +848,11 @@ function App() {
 
         // 启动时对账执行状态：清理 stale session、修复工作流状态
         chain = chain.then((p: Project) =>
-          invokeWithTimeout<Project>("reconcile_on_startup", {
+          invokeWithTimeout<RuntimeMutationResult>("reconcile_on_startup_runtime", {
             projectName: p.name,
-          }).then((reconciled) => {
-            handleChatComplete(reconciled);
-            return reconciled;
+          }).then((result) => {
+            applyRuntimeMutation(result);
+            return result.runtime_snapshot.project;
           }).catch((err) => {
             console.error("启动执行状态对账失败:", err);
             return p;
@@ -887,32 +928,29 @@ function App() {
 
   const handleSelectMilestone = async (id: string) => {
     if (!project || project.current_milestone_id === id) return;
-    const updated = await invokeWithTimeout<Project>("select_milestone", {
+    await invokeRuntimeMutation("select_milestone_runtime", {
       projectName: project.name,
       milestoneId: id,
     });
-    handleChatComplete(updated);
   };
 
   const handleSelectMidStage = async (id: string) => {
     if (!project || project.current_mid_stage_id === id) return;
-    const updated = await invokeWithTimeout<Project>("select_mid_stage", {
+    await invokeRuntimeMutation("select_mid_stage_runtime", {
       projectName: project.name,
       midStageId: id,
     });
-    handleChatComplete(updated);
   };
   // 生成版本方案（V1: 后端校验三项检查 → 返回完整 Project → PlanApproval 步骤）
   const handleGeneratePlan = async () => {
     if (!project || isDecisionSubmitting) return;
     setDecisionAction("generate_plan");
     try {
-      const updatedProject = await invokeWithTimeout<Project>("generate_version_plan", {
+      await invokeRuntimeMutation("generate_version_plan_runtime", {
         projectName: project.name,
         expectedDiscussionRevision: project.discussion_revision,
         expectedDataRevision: project.workflow_state.data_revision,
       });
-      handleChatComplete(updatedProject);
     } catch (err) {
       console.error("生成方案失败", err);
       setFeedbackMsg({ type: "error", message: "生成方案失败：" + String(err) });
@@ -925,10 +963,9 @@ function App() {
     if (!project || isDecisionSubmitting) return;
     setDecisionAction("start_managed");
     try {
-      const updated = await invokeWithTimeout<Project>("start_managed_flow", {
+      await invokeRuntimeMutation("start_managed_flow_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({ type: "info", message: "托管层已激活。将自动推进到 Console 并完成大阶段审批。" });
     } catch (err) {
       console.error("启动托管失败", err);
@@ -942,12 +979,11 @@ function App() {
     if (!project || isDecisionSubmitting) return;
     setDecisionAction("approve_plan");
     try {
-      const updated = await invokeWithTimeout<Project>("approve_version_plan", {
+      await invokeRuntimeMutation("approve_version_plan_runtime", {
         projectName: project.name,
         draftId: draftId,
         generationRevision: generationRevision,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({ type: "success", message: "项目方案已批准。宪法第一部分已写入项目目录。" });
     } catch (err) {
       console.error("批准失败:", err);
@@ -962,12 +998,11 @@ function App() {
     if (!project || isDecisionSubmitting) return;
     setDecisionAction("reject_plan");
     try {
-      const updated = await invokeWithTimeout<Project>("reject_version_plan", {
+      await invokeRuntimeMutation("reject_version_plan_runtime", {
         projectName: project.name,
         draftId: draftId,
         feedback: feedback,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({ type: "info", message: "方案已驳回，已返回讨论模式。" });
     } catch (err) {
       console.error("驳回失败:", err);
@@ -984,12 +1019,11 @@ function App() {
     if (currentStep !== "ThreeChecks" && currentStep !== "ProjectPlanGeneration" && currentStep !== "PlanApproval") return;
     setDecisionAction("return_to_discussion");
     try {
-      const updated = await invokeWithTimeout<Project>("return_to_discussion", {
+      await invokeRuntimeMutation("return_to_discussion_runtime", {
         projectName: project.name,
         sourceStep: currentStep,
         reason: "用户返回继续讨论",
       });
-      handleChatComplete(updated);
     } catch (err) {
       console.error("返回讨论失败:", err);
       setFeedbackMsg({ type: "error", message: "返回讨论失败：" + String(err) });
@@ -1003,10 +1037,9 @@ function App() {
     if (!project || isDecisionSubmitting) return;
     setDecisionAction("resume_plan_approval");
     try {
-      const updated = await invokeWithTimeout<Project>("resume_plan_approval", {
+      await invokeRuntimeMutation("resume_plan_approval_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
     } catch (err) {
       console.error("恢复方案审批失败:", err);
       setFeedbackMsg({ type: "error", message: "恢复方案审批失败：" + String(err) });
@@ -1020,10 +1053,9 @@ function App() {
     if (!project || isDecisionSubmitting) return;
     setDecisionAction("rediscuss_approved");
     try {
-      const updated = await invokeWithTimeout<Project>("restart_discussion_from_approved", {
+      await invokeRuntimeMutation("restart_discussion_from_approved_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({ type: "info", message: "已返回讨论模式，旧方案已保留在历史记录中。" });
     } catch (err) {
       console.error("重新讨论失败:", err);
@@ -1038,10 +1070,9 @@ function App() {
     if (!project || isDecisionSubmitting) return;
     setDecisionAction("start_checks");
     try {
-      const updated = await invokeWithTimeout<Project>("start_preflight_check", {
+      await invokeRuntimeMutation("start_preflight_check_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
     } catch (err) {
       console.error("进入检查模式失败:", err);
       setFeedbackMsg({ type: "error", message: "进入检查模式失败：" + String(err) });
@@ -1055,10 +1086,9 @@ function App() {
     if (!project || isDecisionSubmitting) return;
     setDecisionAction("restart_checks");
     try {
-      const updated = await invokeWithTimeout<Project>("restart_checks", {
+      await invokeRuntimeMutation("restart_checks_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({ type: "info", message: "检查结果已重置，请从第一项重新开始。" });
     } catch (err) {
       console.error("重新开始检查失败:", err);
@@ -1073,10 +1103,9 @@ function App() {
     if (!project || isDecisionSubmitting) return;
     setDecisionAction("enter_console");
     try {
-      const updatedProject = await invokeWithTimeout<Project>("enter_console", {
+      await invokeRuntimeMutation("enter_console_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updatedProject);
     } catch (err) {
       console.error("进入控制台失败:", err);
       setFeedbackMsg({ type: "error", message: "进入控制台失败：" + String(err) });
@@ -1095,8 +1124,7 @@ function App() {
   const handleInStop = async () => {
     if (!project || !beginConsoleAction("in_stop")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("request_in_stop", { projectName: project.name });
-      handleChatComplete(updated);
+      await invokeRuntimeMutation("request_in_stop_runtime", { projectName: project.name });
       setIsExecuting(false);
       setExecutionStatus(null);
       setFeedbackMsg({ type: "warning", message: "执行已暂停并恢复到安全基线。" });
@@ -1111,8 +1139,7 @@ function App() {
   const handleEdStop = async () => {
     if (!project || !beginConsoleAction("ed_stop")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("request_ed_stop", { projectName: project.name });
-      handleChatComplete(updated);
+      await invokeRuntimeMutation("request_ed_stop_runtime", { projectName: project.name });
       setFeedbackMsg({ type: "info", message: "将在当前任务完成并确认后暂停。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "ED Stop 请求失败：" + String(err) });
@@ -1125,11 +1152,10 @@ function App() {
   const handleResolvePause = async (action: string) => {
     if (!project || !beginConsoleAction(`pause_${action}`)) return;
     try {
-      const updated = await invokeWithTimeout<Project>("resolve_pause_decision", {
+      await invokeRuntimeMutation("resolve_pause_decision_runtime", {
         projectName: project.name,
         action,
       });
-      handleChatComplete(updated);
       if (action === "continue") {
         setFeedbackMsg({ type: "info", message: "已恢复执行模式，可继续执行下一个小阶段。" });
       }
@@ -1161,11 +1187,10 @@ function App() {
   const handleConfirmRollback = async (checkpointSubtaskId: string) => {
     if (!project || !beginConsoleAction("rollback_confirm")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("confirm_rollback", {
+      await invokeRuntimeMutation("confirm_rollback_runtime", {
         projectName: project.name,
         checkpointSubtaskId,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({ type: "success", message: "回退已完成。请重新生成执行计划。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "回退失败：" + String(err) });
@@ -1176,33 +1201,17 @@ function App() {
 
   // V1: 回退后不自动触发生成。pendingRollbackGenerate 已移除。
 
-  const refreshExecutionContext = async (projectName: string) => {
-    const [projectResult, workspaceResult, pipelineResult] = await Promise.allSettled([
-      invokeWithTimeout<Project>("get_project", { projectName }),
-      invokeWithTimeout<ExecutionWorkspaceStatus>("get_execution_workspace_status", { projectName }),
-      invokeWithTimeout<PipelineState | null>("get_execution_status", {}),
-    ]);
-    if (projectResult.status === "rejected") throw projectResult.reason;
-    handleChatComplete(projectResult.value);
-    if (workspaceResult.status === "fulfilled") setWorkspaceStatus(workspaceResult.value);
-    if (pipelineResult.status === "fulfilled") {
-      setExecutionStatus(pipelineResult.value);
-      setIsExecuting(pipelineResult.value?.status === "Running");
-    }
-    return {
-      project: projectResult.value,
-      workspace: workspaceResult.status === "fulfilled" ? workspaceResult.value : null,
-      pipeline: pipelineResult.status === "fulfilled" ? pipelineResult.value : null,
-    };
-  };
-
   const handlePrepareExecutionWorkspace = async () => {
     if (!project || !beginConsoleAction("prepare_workspace")) return;
     try {
-      const status = await invokeWithTimeout<ExecutionWorkspaceStatus>("prepare_execution_workspace", {
+      await invokeRuntimeMutation("prepare_execution_workspace_runtime", {
         projectName: project.name,
       });
-      await refreshExecutionContext(project.name);
+      const status = await invokeWithTimeout<ExecutionWorkspaceStatus>(
+        "get_execution_workspace_status",
+        { projectName: project.name },
+      );
+      setWorkspaceStatus(status);
       setFeedbackMsg({
         type: status.ready_for_new_execution ? "success" : "warning",
         message: status.status_message,
@@ -1217,10 +1226,14 @@ function App() {
   const handleRefreshExecutionWorkspace = async () => {
     if (!project || !beginConsoleAction("refresh_workspace")) return;
     try {
-      const status = await invokeWithTimeout<ExecutionWorkspaceStatus>("refresh_execution_workspace", {
+      await invokeRuntimeMutation("refresh_execution_workspace_runtime", {
         projectName: project.name,
       });
-      await refreshExecutionContext(project.name);
+      const status = await invokeWithTimeout<ExecutionWorkspaceStatus>(
+        "get_execution_workspace_status",
+        { projectName: project.name },
+      );
+      setWorkspaceStatus(status);
       setFeedbackMsg({
         type: status.ready_for_new_execution ? "success" : "warning",
         message: status.status_message,
@@ -1236,14 +1249,15 @@ function App() {
   const handleExecuteCurrentSubtask = async () => {
     if (!project || !beginConsoleAction("execute_subtask")) return;
     try {
-      const status = await invokeWithTimeout<PipelineState>("execute_current_subtask", {
+      const result = await invokeRuntimeMutation("execute_current_subtask_runtime", {
         projectName: project.name,
       });
-      setExecutionStatus(status);
-      setIsExecuting(status.status === "Running");
-      if (status.status === "Running") {
-        startExecutionPolling(project.name);
+      const status = result.runtime_snapshot.pipeline_state;
+      if (!status || status.status !== "Running") {
+        throw new Error("后端未返回已启动的执行状态，请同步后重试。");
       }
+      setTerminalSyncPhase("idle");
+      startExecutionPolling(project.name);
       setFeedbackMsg({ type: "info", message: "小阶段已启动，正在后台执行。" });
     } catch (err) {
       console.error("执行失败:", err);
@@ -1257,16 +1271,17 @@ function App() {
   const handleConfirmSubtask = async () => {
     if (!project || !beginConsoleAction("confirm_subtask")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("confirm_subtask_result", {
+      const result = await invokeRuntimeMutation("confirm_subtask_result_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
       setExecutionStatus(null);
-      setFeedbackMsg({ type: "success", message: "小阶段已确认通过，Git 标签已创建。" });
+      setFeedbackMsg({
+        type: "success",
+        message: result.action.message || "小阶段已确认通过，Git 标签已创建。",
+      });
     } catch (err) {
       try {
-        const latest = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
-        handleChatComplete(latest);
+        await forceRuntimeSync();
       } catch (syncError) {
         console.error("确认失败后的状态同步失败:", syncError);
       }
@@ -1279,16 +1294,17 @@ function App() {
   const handleRetryGitConfirmation = async () => {
     if (!project || !beginConsoleAction("retry_git_confirmation")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("retry_git_confirmation", {
+      const result = await invokeRuntimeMutation("retry_git_confirmation_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
       setExecutionStatus(null);
-      setFeedbackMsg({ type: "success", message: "Git 确认已完成，代码与质量结果保持不变。" });
+      setFeedbackMsg({
+        type: "success",
+        message: result.action.message || "Git 确认已完成，代码与质量结果保持不变。",
+      });
     } catch (err) {
       try {
-        const latest = await invokeWithTimeout<Project>("get_project", { projectName: project.name });
-        handleChatComplete(latest);
+        await forceRuntimeSync();
       } catch (syncError) {
         console.error("重新确认提交后的状态同步失败:", syncError);
       }
@@ -1302,11 +1318,10 @@ function App() {
   const handleRejectSubtask = async (reason: string) => {
     if (!project || !beginConsoleAction("reject_subtask")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("reject_subtask_result", {
+      await invokeRuntimeMutation("reject_subtask_result_runtime", {
         projectName: project.name,
         reason,
       });
-      handleChatComplete(updated);
       setExecutionStatus(null);
       setFeedbackMsg({ type: "warning", message: "小阶段已驳回：" + reason });
     } catch (err) {
@@ -1316,41 +1331,14 @@ function App() {
     }
   };
 
-  // === V1 人工执行：恢复基线并重试 ===
-  const handleRetryCurrentSubtask = async () => {
-    if (!project || !beginConsoleAction("retry_subtask")) return;
-    try {
-      const updated = await invokeWithTimeout<Project>("retry_current_subtask", {
-        projectName: project.name,
-      });
-      handleChatComplete(updated);
-      setExecutionStatus(null);
-      // 只有后端返回后才刷新工作区；失败时不在前端清空失败状态
-      try {
-        const ws = await invokeWithTimeout<ExecutionWorkspaceStatus>("get_execution_workspace_status", {
-          projectName: project.name,
-        });
-        setWorkspaceStatus(ws);
-      } catch {
-        /* 工作区探测失败不掩盖重试成功 */
-      }
-      setFeedbackMsg({ type: "info", message: "已恢复执行基线，可重新执行小阶段。" });
-    } catch (err) {
-      setFeedbackMsg({ type: "error", message: "重试失败：" + String(err) });
-    } finally {
-      endConsoleAction();
-    }
-  };
-
   // === 自动驾驶控制 ===
   const handleToggleAutopilot = async (active: boolean) => {
     if (!project || !beginConsoleAction(active ? "autopilot_start" : "autopilot_stop")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("toggle_autopilot", {
+      await invokeRuntimeMutation("toggle_autopilot_runtime", {
         projectName: project.name,
         active,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({
         type: active ? "info" : "info",
         message: active ? "自动驾驶已激活。" : "自动驾驶已关闭。",
@@ -1365,10 +1353,9 @@ function App() {
   const handleStopManagedFlow = async () => {
     if (!project || !beginConsoleAction("managed_stop")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("stop_managed_flow", {
+      await invokeRuntimeMutation("stop_managed_flow_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({ type: "info", message: "托管层已停止，当前步骤已交给手动处理。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "停止托管失败：" + String(err) });
@@ -1380,10 +1367,9 @@ function App() {
   const handleAutopilotPauseNow = async () => {
     if (!project || !beginConsoleAction("autopilot_pause")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("autopilot_pause", {
+      await invokeRuntimeMutation("autopilot_pause_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({ type: "info", message: "自动驾驶已暂停。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "暂停失败：" + String(err) });
@@ -1395,10 +1381,9 @@ function App() {
   const handleAutopilotPauseAfterCurrent = async () => {
     if (!project || !beginConsoleAction("autopilot_ed_stop")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("request_ed_stop", {
+      await invokeRuntimeMutation("request_ed_stop_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({ type: "info", message: "将在当前任务完成后暂停。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "ED Stop 失败：" + String(err) });
@@ -1410,13 +1395,32 @@ function App() {
   const handleAutopilotResume = async () => {
     if (!project || !beginConsoleAction("autopilot_resume")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("autopilot_resume", {
+      await invokeRuntimeMutation("autopilot_resume_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({ type: "info", message: "自动驾驶已恢复。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "恢复失败：" + String(err) });
+    } finally {
+      endConsoleAction();
+    }
+  };
+
+  const handleRunAutomaticRecovery = async () => {
+    if (!project || !beginConsoleAction("run_error_recovery")) return;
+    try {
+      const result = await invokeRuntimeMutation("run_error_recovery_runtime", {
+        projectName: project.name,
+      });
+      const recoveryPending = result.runtime_snapshot.recovery_presentation.kind !== "None";
+      setFeedbackMsg({
+        type: recoveryPending ? "warning" : "success",
+        message: result.action.message || (recoveryPending
+          ? "自动恢复已完成本轮处理，但仍需人工处理。"
+          : "自动恢复已完成。"),
+      });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "自动恢复失败：" + String(err) });
     } finally {
       endConsoleAction();
     }
@@ -1431,14 +1435,13 @@ function App() {
       const source = project.workflow_state.current_step === "PlanApproving"
         ? "approval_rejected"
         : "check_failed";
-      const updated = await invokeWithTimeout<Project>("regenerate_execution_plan", {
+      await invokeRuntimeMutation("regenerate_execution_plan_runtime", {
         projectName: project.name,
         expectedDataRevision: project.workflow_state.data_revision,
         expectedPlanDraftRevision: midStage.plan_draft_revision,
         feedback: "补全并校正每个小阶段的精确文件范围。",
         source,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({ type: "success", message: "执行计划已重新生成，请重新检查。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "重新生成计划失败：" + String(err) });
@@ -1447,112 +1450,148 @@ function App() {
     }
   };
 
-  // === 恢复执行基线：实际 Git 回退；失败时保留恢复面板与后端原始错误 ===
-  const handleAcknowledgeExecutionRecovery = async () => {
+  const executeAcknowledgedRecovery = async (expectedStateFingerprint: string) => {
     if (!project || !beginConsoleAction("acknowledge_recovery")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("acknowledge_execution_recovery", {
+      const result = await invokeRuntimeMutation("acknowledge_execution_recovery_runtime", {
         projectName: project.name,
+        expectedStateFingerprint,
       });
-      handleChatComplete(updated);
-      const refreshed = await refreshExecutionContext(project.name);
+      const workspace = await invokeWithTimeout<ExecutionWorkspaceStatus>(
+        "get_execution_workspace_status",
+        { projectName: project.name },
+      ).catch(() => null);
+      if (workspace) setWorkspaceStatus(workspace);
+      setRecoveryImpact(null);
+      setPendingRecoveryDecision(null);
       setFeedbackMsg({
-        type: refreshed.workspace?.working_tree_clean ? "success" : "warning",
-        message: refreshed.workspace?.working_tree_clean
-          ? "执行基线已恢复，自动驾驶将继续执行。"
-          : "基线已恢复，但工作区仍有残留，请检查后再继续。",
+        type: "success",
+        message: result.action.message,
       });
     } catch (err) {
       // 不得先在前端清空失败状态；保持恢复面板并显示后端原始错误
+      if (String(err).includes("预览已过期")) {
+        setRecoveryImpact(null);
+        setPendingRecoveryDecision(null);
+        await forceRuntimeSync();
+      }
       setFeedbackMsg({ type: "error", message: "恢复失败：" + String(err) });
     } finally {
       endConsoleAction();
     }
   };
 
-  const handleResolveHumanRecovery = async (
-    resolution: "retest" | "revalidate" | "restore_and_retry" | "regenerate_plan" | "confirm_actual_pass" | "accept_deviation" | "skip_task",
+  // 基线恢复先预览影响；无破坏性变化时直接收口。
+  const handleAcknowledgeExecutionRecovery = async () => {
+    if (!project) return;
+    if (!recoveryPresentation?.supports_preview) {
+      setFeedbackMsg({ type: "error", message: "后端未授权此恢复动作的影响预览，已拒绝执行。" });
+      return;
+    }
+    if (!beginConsoleAction("preview_execution_recovery")) return;
+    let impact: ExecutionRecoveryImpact | null = null;
+    try {
+      impact = await invokeWithTimeout<ExecutionRecoveryImpact>(
+        "preview_execution_recovery_impact",
+        { projectName: project.name, action: "acknowledge_execution_recovery" },
+      );
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "恢复影响预览失败：" + String(err) });
+    } finally {
+      endConsoleAction();
+    }
+    if (!impact) return;
+    if (impact.has_destructive_changes) {
+      setRecoveryImpact(impact);
+      return;
+    }
+    await executeAcknowledgedRecovery(impact.state_fingerprint);
+  };
+
+  const executeHumanRecovery = async (
+    resolution: RecoveryDecisionResolution,
+    reason: string,
+    acceptedCriteria: number[],
+    expectedStateFingerprint?: string,
   ) => {
     if (!project || !beginConsoleAction(`human_recovery:${resolution}`)) return;
     try {
-      let reason = "";
-      let acceptedCriteria: number[] | undefined;
-      if (["confirm_actual_pass", "accept_deviation", "skip_task"].includes(resolution)) {
-        const reasonLabel = resolution === "confirm_actual_pass"
-          ? "请填写确认实际通过的证据"
-          : resolution === "accept_deviation"
-            ? "请填写接受偏差的原因及影响"
-            : "请填写跳过任务的原因";
-        reason = window.prompt(reasonLabel)?.trim() ?? "";
-        if (!reason) return;
-      }
-      if (resolution === "accept_deviation") {
-        const current = project.workflow_state.recovery_state;
-        const targetTaskId = current?.subtask_id
-          ?? project.execution_session?.subtask_id
-          ?? taskControlWorkspace.selectedTaskId;
-        const targetTask = findProjectSubtaskById(project, targetTaskId);
-        const subtask = targetTask && isSubtaskLeaf(targetTask) ? targetTask : null;
-        const defaults = (subtask?.acceptance_ledger ?? [])
-          .filter(item => item.status !== "Satisfied")
-          .map(item => item.criterion_index);
-        const raw = window.prompt("填写要接受偏差的验收项编号，以逗号分隔", defaults.join(","))?.trim() ?? "";
-        acceptedCriteria = [...new Set(raw.split(/[,，\s]+/).filter(Boolean).map(Number))]
-          .filter(index => Number.isInteger(index) && index > 0);
-        if (acceptedCriteria.length === 0) {
-          setFeedbackMsg({ type: "warning", message: "接受偏差必须选择至少一个验收项。" });
-          return;
-        }
-      }
-      const updated = await invokeWithTimeout<Project>("resolve_human_recovery", {
+      const result = await invokeRuntimeMutation("resolve_human_recovery_runtime", {
         projectName: project.name,
         resolution,
-        reason,
-        acceptedCriteria,
+        reason: reason.trim(),
+        acceptedCriteria: acceptedCriteria.length > 0 ? acceptedCriteria : undefined,
+        expectedStateFingerprint,
       });
-      handleChatComplete(updated);
-      await refreshExecutionContext(project.name);
-      const messages = {
-        retest: updated.workflow_state.recovery_state
-          ? "重新测试仍未通过，继续等待人工处理。"
-          : "重新测试通过，自动驾驶将继续执行。",
-        revalidate: updated.workflow_state.recovery_state
-          ? "重新验证仍未通过，继续等待人工处理。"
-          : "重新验证通过，自动驾驶将继续执行。",
-        restore_and_retry: "已恢复执行基线，将重新执行当前小阶段。",
-        regenerate_plan: "已安排重新规划当前任务，自动驾驶将继续处理。",
-        confirm_actual_pass: "人工通过证据已单独记录，自动驾驶将继续执行。",
-        accept_deviation: "验收偏差已记录，后续任务会携带该约束。",
-        skip_task: "任务已跳过，系统将按依赖契约决定是否继续。",
-      };
+      const updated = result.runtime_snapshot.project;
+      const workspace = await invokeWithTimeout<ExecutionWorkspaceStatus>(
+        "get_execution_workspace_status",
+        { projectName: project.name },
+      ).catch(() => null);
+      if (workspace) setWorkspaceStatus(workspace);
+      setRecoveryImpact(null);
+      setPendingRecoveryDecision(null);
       setFeedbackMsg({
         type: updated.workflow_state.recovery_state ? "warning" : "success",
-        message: messages[resolution],
+        message: result.action.message,
       });
     } catch (err) {
+      if (String(err).includes("预览已过期")) {
+        setRecoveryImpact(null);
+        setPendingRecoveryDecision(null);
+        await forceRuntimeSync();
+      }
       setFeedbackMsg({ type: "error", message: "人工恢复失败：" + String(err) });
     } finally {
       endConsoleAction();
     }
   };
 
+  const handleResolveHumanRecovery = async (
+    resolution: RecoveryDecisionResolution,
+    reason: string,
+    acceptedCriteria: number[],
+  ) => {
+    if (!project) return;
+    if (!(["restore_and_retry", "skip_task"] as RecoveryDecisionResolution[]).includes(resolution)) {
+      await executeHumanRecovery(resolution, reason, acceptedCriteria);
+      return;
+    }
+    if (!beginConsoleAction(`preview_human_recovery:${resolution}`)) return;
+    let impact: ExecutionRecoveryImpact | null = null;
+    try {
+      impact = await invokeWithTimeout<ExecutionRecoveryImpact>(
+        "preview_execution_recovery_impact",
+        { projectName: project.name, action: resolution },
+      );
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "恢复影响预览失败：" + String(err) });
+    } finally {
+      endConsoleAction();
+    }
+    if (!impact) return;
+    if (impact.has_destructive_changes) {
+      setPendingRecoveryDecision({ resolution, reason, acceptedCriteria });
+      setRecoveryImpact(impact);
+      return;
+    }
+    await executeHumanRecovery(
+      resolution,
+      reason,
+      acceptedCriteria,
+      impact.state_fingerprint,
+    );
+  };
+
   // === V1 手动同步项目状态（不依赖浏览器 reload） ===
   const handleSyncProject = async () => {
     if (!project || !beginConsoleAction("sync_project")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("reconcile_managed_milestone_state", {
+      const result = await invokeRuntimeMutation("reconcile_managed_milestone_state_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
-      // Also refresh pipeline state if available
-      const pipelineStatus = await invokeWithTimeout<PipelineState | null>("get_execution_status");
-      if (pipelineStatus) {
-        setExecutionStatus(pipelineStatus);
-        if (pipelineStatus.awaiting_confirmation) {
-          setIsExecuting(false);
-        }
-      }
-      if (["PlanApproving", "Execution"].includes(updated.workflow_state.current_step)) {
+      const currentStep = result.runtime_snapshot.project.workflow_state.current_step;
+      if (["PlanApproving", "Execution"].includes(currentStep)) {
         const status = await invokeWithTimeout<ExecutionWorkspaceStatus>("get_execution_workspace_status", {
           projectName: project.name,
         });
@@ -1572,11 +1611,11 @@ function App() {
   const handleApproveMilestoneOutcome = async (branch: string) => {
     if (!project || !beginConsoleAction(`milestone_review_${branch}`)) return;
     try {
-      const updated = await invokeWithTimeout<Project>("approve_milestone_outcome", {
+      const result = await invokeRuntimeMutation("approve_milestone_outcome_runtime", {
         projectName: project.name,
         branch,
       });
-      handleChatComplete(updated);
+      const updated = result.runtime_snapshot.project;
       const messages: Record<string, string> = {
         A: updated.workflow_state.current_step === "Completed"
           ? "最后一个大阶段已批准，项目流程已完成。"
@@ -1607,8 +1646,7 @@ function App() {
   const handleGenerateFutureMilestones = async () => {
     if (!project || !beginConsoleAction("generate_future_milestones")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("generate_future_milestone_draft", { projectName: project.name });
-      handleChatComplete(updated);
+      await invokeRuntimeMutation("generate_future_milestone_draft_runtime", { projectName: project.name });
       setFeedbackMsg({ type: "success", message: "未来大阶段草稿已生成。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "生成失败：" + String(err) });
@@ -1620,10 +1658,9 @@ function App() {
   const handleApproveFutureMilestones = async () => {
     if (!project || !beginConsoleAction("approve_future_milestones")) return;
     try {
-      const updated = await invokeWithTimeout<Project>("approve_future_milestones", {
+      await invokeRuntimeMutation("approve_future_milestones_runtime", {
         projectName: project.name,
       });
-      handleChatComplete(updated);
       setFeedbackMsg({ type: "success", message: "未来规划已批准。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "批准失败：" + String(err) });
@@ -1674,9 +1711,9 @@ function App() {
     return <ExistingBaselinePanel
       projectName={project.name}
       projectPath={project.project_path}
-      onBaselineApproved={(updated) => {
-        handleChatComplete(updated);
-        setProjectPath(updated.project_path);
+      onBaselineApproved={(result) => {
+        applyRuntimeMutation(result);
+        setProjectPath(result.runtime_snapshot.project.project_path);
       }}
       onReject={() => {
         localStorage.removeItem("metheus_last_project");
@@ -1716,6 +1753,11 @@ function App() {
 
       <main className="main-content">
         <div className="project-utility-bar">
+          <SyncStatusIndicator
+            state={projectStateSync.state}
+            onRetry={forceRuntimeSync}
+            terminalPhase={terminalSyncPhase}
+          />
           {phase === "Console" && (
             <button
               type="button"
@@ -1733,7 +1775,7 @@ function App() {
           <ExecutionEngineSettings
             project={project}
             pipeline={executionStatus}
-            onProjectUpdated={handleChatComplete}
+            onRuntimeMutation={applyRuntimeMutation}
           />
         </div>
 
@@ -1762,7 +1804,7 @@ function App() {
                 preflightResults={project.preflight_results}
                 discussionRevision={project.discussion_revision}
                 dataRevision={project.workflow_state.data_revision}
-                onProjectUpdated={handleChatComplete}
+                onRuntimeMutation={applyRuntimeMutation}
                 onReturnToDiscussion={handleReturnToDiscussion}
                 onAllPassed={handleGeneratePlan}
                 onRestartChecks={handleRestartChecks}
@@ -1875,6 +1917,7 @@ function App() {
                 threadId={currentThread.id}
                 onViewDetailedReport={handleViewDetailedReport}
                 onProjectUpdated={handleChatComplete}
+                onRuntimeMutation={applyRuntimeMutation}
               />
             )}
           </div>
@@ -1884,9 +1927,18 @@ function App() {
           <div className="execution-layout">
             <FileTree projectPath={projectPath} />
             <div className="execution-main">
+              <RecoveryResultBanner
+                result={recoveryResult}
+                onDismiss={dismissRecoveryResult}
+              />
+              <RecoveryNotice
+                projectName={project.name}
+                recoveryPresentation={recoveryPresentation}
+              />
               {/* 全局自动驾驶控制条 */}
               <AutopilotControlBar
                 project={project}
+                recoveryPresentation={recoveryPresentation}
                 executionStatus={executionStatus}
                 busy={isConsoleBusy}
                 onToggle={handleToggleAutopilot}
@@ -1895,13 +1947,34 @@ function App() {
                 onPauseAfterCurrent={handleAutopilotPauseAfterCurrent}
                 onResume={handleAutopilotResume}
                 onSync={handleSyncProject}
-                onRetryCurrent={handleRetryCurrentSubtask}
                 onAcknowledgeRecovery={handleAcknowledgeExecutionRecovery}
                 onRegeneratePlan={handleRegenerateInvalidPlan}
                 onPrepareWorkspace={handlePrepareExecutionWorkspace}
                 onRefreshWorkspace={handleRefreshExecutionWorkspace}
                 onRetryGitConfirmation={handleRetryGitConfirmation}
+                onRunAutomaticRecovery={handleRunAutomaticRecovery}
                 onResolveHumanRecovery={handleResolveHumanRecovery}
+              />
+              <RecoveryImpactDialog
+                impact={recoveryImpact}
+                busy={isConsoleBusy}
+                onCancel={() => {
+                  setRecoveryImpact(null);
+                  setPendingRecoveryDecision(null);
+                }}
+                onConfirm={() => {
+                  if (!recoveryImpact) return;
+                  if (pendingRecoveryDecision) {
+                    void executeHumanRecovery(
+                      pendingRecoveryDecision.resolution,
+                      pendingRecoveryDecision.reason,
+                      pendingRecoveryDecision.acceptedCriteria,
+                      recoveryImpact.state_fingerprint,
+                    );
+                  } else {
+                    void executeAcknowledgedRecovery(recoveryImpact.state_fingerprint);
+                  }
+                }}
               />
               {feedbackMsg && (
                 <FeedbackBanner
@@ -1918,7 +1991,7 @@ function App() {
                 step === "PlanGeneration" || step === "PlanCheck" || step === "PlanApproving") && (
                 <ConsoleWorkflowPanel
                   project={project}
-                  onProjectUpdated={handleChatComplete}
+                  onRuntimeMutation={applyRuntimeMutation}
                   externalBusy={isConsoleBusy}
                   onActionStart={beginConsoleAction}
                   onActionEnd={endConsoleAction}
@@ -1933,6 +2006,7 @@ function App() {
                 <>
                   <V1ExecutionPanel
                     project={project}
+                    recoveryPresentation={recoveryPresentation}
                     executionStatus={executionStatus}
                     workspaceStatus={workspaceStatus}
                     busy={
@@ -1944,12 +2018,9 @@ function App() {
                     onExecute={handleExecuteCurrentSubtask}
                     onConfirm={handleConfirmSubtask}
                     onReject={handleRejectSubtask}
-                    onRetry={handleRetryCurrentSubtask}
                     onInStop={handleInStop}
                     onEdStop={handleEdStop}
                     onSyncProject={handleSyncProject}
-                    onAcknowledgeRecovery={handleAcknowledgeExecutionRecovery}
-                    onRetryGitConfirmation={handleRetryGitConfirmation}
                   />
                   <TaskConsole
                     projectPath={projectPath}
@@ -1962,6 +2033,7 @@ function App() {
                     validationRetryCount={project.workflow_state.recovery_state?.validation_retry_count}
                     validationRetryLimit={project.workflow_state.recovery_state?.max_validation_retries}
                     nextValidationRetryAt={project.workflow_state.recovery_state?.next_validation_retry_at}
+                    recoveryPresentation={recoveryPresentation}
                     selectedTaskId={taskControlWorkspace.selectedTaskId}
                     onOpenTask={openTaskInspector}
                   />
@@ -2028,7 +2100,7 @@ function App() {
                 <div className="unsupported-console-step">
                   <h2>不支持的 Console 步骤</h2>
                   <p>当前步骤：{step}。请同步项目状态后重试。</p>
-                  <button onClick={() => invokeWithTimeout<Project>("get_project", { projectName: project.name }).then(handleChatComplete)}>
+                  <button onClick={() => { void handleSyncProject(); }}>
                     同步项目状态
                   </button>
                 </div>
@@ -2079,10 +2151,13 @@ function App() {
               selectedTaskId={taskControlWorkspace.selectedTaskId}
               busy={isConsoleBusy || taskControlWorkspace.busy}
               error={taskControlWorkspace.error}
+              recoveryPresentation={recoveryPresentation}
+              expectedEventSequence={projectStateSync.state.taskControlEventSequence}
+              detailsSyncing={taskControlWorkspace.detailsSyncing}
               onClose={() => setInspectorOpen(false)}
               onRefresh={() => { void taskControlWorkspace.refresh(); }}
               onAction={(name, options) => { void runTaskControlAction(name, options); }}
-              onChangeMode={mode => { void changeTaskControlMode(mode); }}
+              onChangeMode={(mode, reason) => { void changeTaskControlMode(mode, reason); }}
             />
           </div>
         </>

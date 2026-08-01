@@ -1,6 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import type { ChatStreamEvent, Project } from "./types";
+import type { ChatStreamEvent, Project, RuntimeMutationResult } from "./types";
 import {
   applyChatStreamEvent,
   CHAT_STREAM_FLUSH_INTERVAL_MS,
@@ -13,6 +13,7 @@ import {
 interface ControllerCallbacks {
   onState: (state: ChatStreamSession | null) => void;
   onProject: (project: Project) => void;
+  onRuntimeMutation?: (result: RuntimeMutationResult) => void;
 }
 
 interface StartRequest {
@@ -29,7 +30,7 @@ interface ChatEventChannel {
 
 export interface ChatStreamTransport {
   createEventChannel: (onmessage: (event: ChatStreamEvent) => void) => ChatEventChannel;
-  invokeStream: (command: string, args: Record<string, unknown>) => Promise<Project>;
+  invokeStream: (command: string, args: Record<string, unknown>) => Promise<RuntimeMutationResult | Project>;
   invokeBounded: <T>(command: string, args: Record<string, unknown>) => Promise<T>;
 }
 
@@ -40,7 +41,7 @@ const defaultTransport: ChatStreamTransport = {
     return channel;
   },
   invokeStream(command, args) {
-    return invoke<Project>(command, args);
+    return invoke<RuntimeMutationResult>(command, args);
   },
   invokeBounded(command, args) {
     return invokeWithTimeout(command, args);
@@ -79,8 +80,8 @@ export class ChatStreamController {
 
     const channel = this.transport.createEventChannel((event) => this.receive(event));
     const command = request.originalUserMessageId
-      ? "regenerate_chat_reply_stream"
-      : "chat_with_role_stream";
+      ? "regenerate_chat_reply_stream_runtime"
+      : "chat_with_role_stream_runtime";
     const args: Record<string, unknown> = {
       projectName: request.projectName,
       role: request.role,
@@ -95,10 +96,15 @@ export class ChatStreamController {
     }
 
     try {
-      const project = await this.transport.invokeStream(command, args);
+      const result = await this.transport.invokeStream(command, args);
       if (this.session?.requestId !== requestId) return;
       this.flushDeltas();
-      this.callbacks.onProject(project);
+      if ("runtime_snapshot" in result) {
+        if (this.callbacks.onRuntimeMutation) this.callbacks.onRuntimeMutation(result);
+        else this.callbacks.onProject(result.runtime_snapshot.project);
+      } else {
+        this.callbacks.onProject(result);
+      }
       if (this.disposed) return;
       this.session = this.session.status === "failed"
         ? {

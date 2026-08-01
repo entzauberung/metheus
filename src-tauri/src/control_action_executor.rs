@@ -6,6 +6,43 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+pub fn ensure_serial_takeover_actions_available() -> Result<(), String> {
+    use ControlActionKind::*;
+    let required = [
+        Split,
+        Execute,
+        LocalValidate,
+        AutomatedValidate,
+        TargetedValidate,
+        Repair,
+        Recompile,
+        AcceptDeviation,
+        GitConfirm,
+        Wait,
+        Human,
+    ];
+    if required.iter().all(|action| {
+        matches!(
+            action,
+            Split
+                | Execute
+                | LocalValidate
+                | AutomatedValidate
+                | TargetedValidate
+                | Repair
+                | Recompile
+                | AcceptDeviation
+                | GitConfirm
+                | Wait
+                | Human
+        )
+    }) {
+        Ok(())
+    } else {
+        Err("串行接管动作执行器覆盖不完整".to_string())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ControlActionRequest {
     #[serde(default)]
@@ -90,7 +127,16 @@ pub async fn execute(
     project.workflow_state.data_revision = project.workflow_state.data_revision.saturating_add(1);
     crate::save_project(&project)?;
 
-    let dispatched = dispatch(pipeline_state, &project_name, &request).await;
+    let claimed_project_revision = project.workflow_state.data_revision;
+    let claimed_tree_revision = project.task_control.tree_revision;
+    let dispatched = dispatch(
+        pipeline_state,
+        &project_name,
+        &request,
+        claimed_project_revision,
+        claimed_tree_revision,
+    )
+    .await;
     match dispatched {
         Ok(message) => finish_action(&project_name, &request, before_fingerprint, message, true),
         Err(error) => {
@@ -126,10 +172,13 @@ fn validate_request(
             ));
         }
     }
-    if matches!(
-        request.action,
-        ControlActionKind::Wait | ControlActionKind::Human
-    ) {
+    if request.action == ControlActionKind::Wait {
+        return Ok(());
+    }
+    if request.action == ControlActionKind::Human
+        && request.task_id.is_empty()
+        && request.criterion_indexes.is_empty()
+    {
         return Ok(());
     }
     if request.task_id.is_empty() {
@@ -139,6 +188,23 @@ fn validate_request(
         .ok_or_else(|| format!("任务节点不存在：{}", request.task_id))?;
     let task = crate::task_tree::find_task(project, &request.task_id)?
         .ok_or_else(|| format!("任务节点不存在：{}", request.task_id))?;
+    if request.source == project::OperationSource::User {
+        let current = crate::task_tree::select_current_leaf(project)?
+            .is_some_and(|address| address.task_id == request.task_id);
+        let recovery_bound = project
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .zip(project.execution_session.as_ref())
+            .is_some_and(|(recovery, session)| {
+                recovery.phase == project::RecoveryPhase::WaitingHuman
+                    && recovery.subtask_id == request.task_id
+                    && session.subtask_id == request.task_id
+            });
+        if !current && !recovery_bound {
+            return Err("只能操作当前叶子或当前人工恢复会话绑定的任务".to_string());
+        }
+    }
     if !request.contract_fingerprint.is_empty() {
         let contract = crate::task_compiler::compile(
             task,
@@ -178,6 +244,16 @@ fn validate_request(
                 return Err("验证动作只能作用于未完成叶子任务".to_string());
             }
         }
+        ControlActionKind::Human if !request.criterion_indexes.is_empty() => {
+            if !task.child_tasks.is_empty() || crate::task_tree::is_terminal(&task.status) {
+                return Err("人工审查只能作用于未完成叶子任务".to_string());
+            }
+            validation_targets_for_mode(
+                task,
+                &request.criterion_indexes,
+                crate::validator_contract::VerificationMode::HumanReview,
+            )?;
+        }
         ControlActionKind::Repair => {
             if !task
                 .acceptance_ledger
@@ -188,12 +264,13 @@ fn validate_request(
             }
         }
         ControlActionKind::AcceptDeviation => {
-            if crate::task_tree::is_terminal(&task.status) {
-                return Err("已完成任务不能接受新的验收偏差".to_string());
-            }
-            if request.reason.trim().is_empty() || request.criterion_indexes.is_empty() {
-                return Err("接受偏差必须指定验收项并记录原因".to_string());
-            }
+            crate::human_action_policy::authorize(
+                project,
+                &request.task_id,
+                crate::human_action_policy::HumanTerminalAction::AcceptDeviation,
+                &request.criterion_indexes,
+                &request.reason,
+            )?;
         }
         ControlActionKind::GitConfirm => {
             if task.status != project::SubtaskStatus::AwaitingConfirmation {
@@ -209,10 +286,19 @@ async fn dispatch(
     pipeline_state: Arc<Mutex<Option<PipelineState>>>,
     project_name: &str,
     request: &ControlActionRequest,
+    claimed_project_revision: u64,
+    claimed_tree_revision: u64,
 ) -> Result<String, String> {
+    let claimed_project = crate::load_project(project_name)?;
+    validate_claimed_dispatch(
+        &claimed_project,
+        request,
+        claimed_project_revision,
+        claimed_tree_revision,
+    )?;
     match request.action {
         ControlActionKind::Split => {
-            let mut project = crate::load_project(project_name)?;
+            let mut project = claimed_project;
             crate::commands::task_control::split_task(&mut project, &request.task_id)?;
             project.workflow_state.data_revision =
                 project.workflow_state.data_revision.saturating_add(1);
@@ -254,7 +340,7 @@ async fn dispatch(
             Ok("定向验证已完成".to_string())
         }
         ControlActionKind::Repair => {
-            let mut project = crate::load_project(project_name)?;
+            let mut project = claimed_project;
             let automatic = crate::recovery::ensure_quality_recovery(
                 &mut project,
                 if request.reason.is_empty() {
@@ -275,7 +361,7 @@ async fn dispatch(
             Ok("受限修复已执行".to_string())
         }
         ControlActionKind::Recompile => {
-            let mut project = crate::load_project(project_name)?;
+            let mut project = claimed_project;
             crate::commands::task_control::recompile_task(&mut project, &request.task_id)?;
             project.workflow_state.data_revision =
                 project.workflow_state.data_revision.saturating_add(1);
@@ -283,7 +369,7 @@ async fn dispatch(
             Ok("当前任务合同已重编译".to_string())
         }
         ControlActionKind::AcceptDeviation => {
-            let mut project = crate::load_project(project_name)?;
+            let mut project = claimed_project;
             crate::commands::task_control::accept_deviation(
                 &mut project,
                 &request.task_id,
@@ -297,7 +383,11 @@ async fn dispatch(
             }
             project.workflow_state.data_revision =
                 project.workflow_state.data_revision.saturating_add(1);
-            crate::save_project(&project)?;
+            crate::save_project_if_revision(
+                &project,
+                claimed_project_revision,
+                claimed_tree_revision,
+            )?;
             Ok("验收偏差已按任务和验收项记录".to_string())
         }
         ControlActionKind::GitConfirm => {
@@ -311,16 +401,61 @@ async fn dispatch(
         }
         ControlActionKind::Wait => Ok("控制器等待新的项目事实".to_string()),
         ControlActionKind::Human => {
-            let mut project = crate::load_project(project_name)?;
-            if let Some(state) = project.workflow_state.autopilot_state.as_mut() {
-                state.run_status = project::AutopilotRunStatus::ErrorStopped;
-                state.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
-                state.error_message = request.reason.clone();
-            }
+            let mut project = claimed_project;
+            let message = enter_human_boundary(&mut project, request);
             crate::save_project(&project)?;
-            Ok("控制器已进入人工边界".to_string())
+            Ok(message)
         }
     }
+}
+
+fn enter_human_boundary(project: &mut project::Project, request: &ControlActionRequest) -> String {
+    let message = if request.criterion_indexes.is_empty() {
+        "控制器已进入人工边界".to_string()
+    } else {
+        format!(
+            "验收项 {} 已进入人工审查边界，等待显式人工结论",
+            request
+                .criterion_indexes
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    if let Some(state) = project.workflow_state.autopilot_state.as_mut() {
+        state.run_status = project::AutopilotRunStatus::ErrorStopped;
+        state.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+        state.error_message = if request.reason.trim().is_empty() {
+            message.clone()
+        } else {
+            request.reason.clone()
+        };
+    }
+    message
+}
+
+fn validate_claimed_dispatch(
+    project: &project::Project,
+    request: &ControlActionRequest,
+    claimed_project_revision: u64,
+    claimed_tree_revision: u64,
+) -> Result<(), String> {
+    if project.workflow_state.data_revision != claimed_project_revision
+        || project.task_control.tree_revision != claimed_tree_revision
+    {
+        return Err("控制动作认领后项目状态已变化，拒绝旧动作".to_string());
+    }
+    if project.task_control.active_action_id != request.action_id
+        || project.task_control.active_action_kind != request.action.as_str()
+        || project.task_control.active_action_task_id != request.task_id
+    {
+        return Err("控制动作认领已被新的项目状态取代".to_string());
+    }
+    let mut revalidated = request.clone();
+    revalidated.expected_project_revision = Some(claimed_project_revision);
+    revalidated.expected_tree_revision = Some(claimed_tree_revision);
+    validate_request(project, &revalidated)
 }
 
 fn run_local_validation(project_name: &str, request: &ControlActionRequest) -> Result<(), String> {
@@ -673,6 +808,9 @@ fn append_control_event(
         ControlActionKind::LocalValidate => Some("local_validator_registry".to_string()),
         ControlActionKind::AutomatedValidate => Some("automated_test_runner".to_string()),
         ControlActionKind::TargetedValidate => Some("semantic_review".to_string()),
+        ControlActionKind::Human if !request.criterion_indexes.is_empty() => {
+            Some("human_boundary_review".to_string())
+        }
         _ => None,
     };
     project
@@ -778,6 +916,7 @@ mod tests {
             expected_output: String::new(),
             acceptance_criteria: Vec::new(),
         });
+        project.current_milestone_id = "m".to_string();
         project
     }
 
@@ -812,8 +951,17 @@ mod tests {
     }
 
     #[test]
-    fn accepting_deviation_requires_criteria_and_reason() {
-        let project = project_with_task(project::SubtaskStatus::Pending);
+    fn phase1_human_action_safety_accepting_deviation_requires_success_and_scope() {
+        let mut project = project_with_task(project::SubtaskStatus::AwaitingConfirmation);
+        project.milestones[0].subtasks[0].execution_result = Some(project::ExecutionResult {
+            success: true,
+            ..Default::default()
+        });
+        project.milestones[0].subtasks[0].acceptance_ledger = vec![project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            criterion: "criterion".to_string(),
+            ..Default::default()
+        }];
         let missing_scope = ControlActionRequest {
             action: ControlActionKind::AcceptDeviation,
             task_id: "task".to_string(),
@@ -822,7 +970,7 @@ mod tests {
         };
         assert!(validate_request(&project, &missing_scope)
             .unwrap_err()
-            .contains("指定验收项"));
+            .contains("选择至少一个"));
 
         let missing_reason = ControlActionRequest {
             action: ControlActionKind::AcceptDeviation,
@@ -832,7 +980,49 @@ mod tests {
         };
         assert!(validate_request(&project, &missing_reason)
             .unwrap_err()
-            .contains("记录原因"));
+            .contains("填写依据"));
+
+        project.milestones[0].subtasks[0].execution_result = None;
+        let unexecuted = ControlActionRequest {
+            action: ControlActionKind::AcceptDeviation,
+            task_id: "task".to_string(),
+            criterion_indexes: vec![1],
+            reason: "已由用户确认".to_string(),
+            ..Default::default()
+        };
+        assert!(validate_request(&project, &unexecuted)
+            .unwrap_err()
+            .contains("没有成功完成"));
+    }
+
+    #[test]
+    fn phase1_human_action_safety_claimed_dispatch_rejects_newer_revision() {
+        let mut project = project_with_task(project::SubtaskStatus::AwaitingConfirmation);
+        project.milestones[0].subtasks[0].execution_result = Some(project::ExecutionResult {
+            success: true,
+            ..Default::default()
+        });
+        project.milestones[0].subtasks[0].acceptance_ledger = vec![project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            criterion: "criterion".to_string(),
+            ..Default::default()
+        }];
+        project.task_control.active_action_id = "action".to_string();
+        project.task_control.active_action_kind = "accept_deviation".to_string();
+        project.task_control.active_action_task_id = "task".to_string();
+        project.workflow_state.data_revision = 8;
+        project.task_control.tree_revision = 3;
+        let request = ControlActionRequest {
+            action_id: "action".to_string(),
+            action: ControlActionKind::AcceptDeviation,
+            task_id: "task".to_string(),
+            criterion_indexes: vec![1],
+            reason: "known deviation".to_string(),
+            ..Default::default()
+        };
+        validate_claimed_dispatch(&project, &request, 8, 3).unwrap();
+        project.workflow_state.data_revision = 9;
+        assert!(validate_claimed_dispatch(&project, &request, 8, 3).is_err());
     }
 
     #[test]
@@ -901,6 +1091,90 @@ mod tests {
             .unwrap(),
             vec![1, 3]
         );
+    }
+
+    #[test]
+    fn human_review_action_accepts_only_human_review_criteria() {
+        let mut project = project_with_task(project::SubtaskStatus::AwaitingConfirmation);
+        let task = &mut project.milestones[0].subtasks[0];
+        task.acceptance_criteria = vec![
+            "用户可以完成结账".to_string(),
+            "操作员确认真实桌面行为".to_string(),
+        ];
+        task.acceptance_ledger = task
+            .acceptance_criteria
+            .iter()
+            .enumerate()
+            .map(|(index, criterion)| project::AcceptanceLedgerItem {
+                criterion_index: index as u32 + 1,
+                criterion: criterion.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let mut contract = crate::task_contract::compile_subtask(task, None, 0);
+        contract.verification_modes = vec![
+            crate::validator_contract::VerificationMode::SemanticReview,
+            crate::validator_contract::VerificationMode::HumanReview,
+        ];
+        crate::task_contract::refresh_fingerprint(&mut contract);
+        task.contract_snapshot = Some(contract);
+
+        let mut request = ControlActionRequest {
+            action: ControlActionKind::Human,
+            task_id: "task".to_string(),
+            criterion_indexes: vec![2],
+            ..Default::default()
+        };
+        validate_request(&project, &request).unwrap();
+
+        request.criterion_indexes = vec![1];
+        assert!(validate_request(&project, &request)
+            .unwrap_err()
+            .contains("不属于 HumanReview 通道"));
+        let task = &project.milestones[0].subtasks[0];
+        assert!(validation_targets_for_mode(
+            task,
+            &[2],
+            crate::validator_contract::VerificationMode::SemanticReview,
+        )
+        .unwrap_err()
+        .contains("不属于 SemanticReview 通道"));
+    }
+
+    #[test]
+    fn human_review_boundary_preserves_ledger_and_uses_human_validator_audit() {
+        let mut project = project_with_task(project::SubtaskStatus::AwaitingConfirmation);
+        project.workflow_state.autopilot_state = Some(project::AutopilotState::default());
+        project.milestones[0].subtasks[0].acceptance_ledger = vec![project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            criterion: "操作员确认真实桌面行为".to_string(),
+            status: project::AcceptanceStatus::Unknown,
+            ..Default::default()
+        }];
+        let before = project.milestones[0].subtasks[0].acceptance_ledger.clone();
+        let request = ControlActionRequest {
+            action: ControlActionKind::Human,
+            action_id: "human-review-1".to_string(),
+            task_id: "task".to_string(),
+            criterion_indexes: vec![1],
+            ..Default::default()
+        };
+
+        let message = enter_human_boundary(&mut project, &request);
+        assert!(message.contains("等待显式人工结论"));
+        assert_eq!(project.milestones[0].subtasks[0].acceptance_ledger, before);
+        let state = project.workflow_state.autopilot_state.as_ref().unwrap();
+        assert_eq!(state.run_status, project::AutopilotRunStatus::ErrorStopped);
+        assert_eq!(
+            state.recovery_action,
+            project::AutopilotRecoveryAction::WaitHumanDecision
+        );
+
+        append_control_event(&mut project, &request, &message, true);
+        let event = project.execution_history.last().unwrap();
+        assert_eq!(event.validator_id.as_deref(), Some("human_boundary_review"));
+        assert!(event.model_call_id.is_none());
+        assert!(project.cost_ledger.calls.is_empty());
     }
 
     #[test]

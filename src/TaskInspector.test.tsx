@@ -6,7 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Project, TaskControlSnapshot, TaskTreeNodeView } from "./types";
 import TaskInspector from "./TaskInspector";
 
-function node(id: string): TaskTreeNodeView {
+const TASK_CAPABILITIES = ["revalidate", "accept_deviation"];
+
+function node(id: string, capabilities = TASK_CAPABILITIES): TaskTreeNodeView {
   return {
     id,
     title: `任务 ${id}`,
@@ -32,6 +34,13 @@ function node(id: string): TaskTreeNodeView {
       confidence: 0.6,
       updated_at: "2026-07-29T00:00:00Z",
     }],
+    capabilities,
+    disabled_reasons: capabilities.length > 0 ? {} : {
+      revalidate: "非当前任务节点只读",
+      accept_deviation: "非当前任务节点只读",
+    },
+    is_currently_actionable: capabilities.length > 0,
+    actionable_acceptance_criteria: capabilities.includes("accept_deviation") ? [1] : [],
     children: [],
   };
 }
@@ -71,9 +80,14 @@ function snapshot(currentTaskId: string): TaskControlSnapshot {
     project_revision: 1,
     current_task_id: currentTaskId,
     task_tree_revision: 1,
+    source_process_start_id: "process-1",
+    source_event_sequence: 4,
     control_mode: "Shadow",
     control_capabilities: ["pause", "stop", "revalidate", "accept_deviation"],
-    nodes: [node("selected"), node(currentTaskId)],
+    nodes: [
+      node("selected", currentTaskId === "selected" ? TASK_CAPABILITIES : []),
+      node(currentTaskId),
+    ],
     events: [{
       timestamp: "2026-07-29T00:00:00Z",
       level: "info",
@@ -104,7 +118,10 @@ describe("TaskInspector", () => {
     vi.restoreAllMocks();
   });
 
-  function render(currentTaskId = "selected") {
+  function render(
+    currentTaskId = "selected",
+    syncState: { error?: string; detailsSyncing?: boolean } = {},
+  ) {
     const onClose = vi.fn();
     const onAction = vi.fn();
     act(() => {
@@ -112,10 +129,16 @@ describe("TaskInspector", () => {
         <TaskInspector
           project={project()}
           snapshot={snapshot(currentTaskId)}
-          selectedNode={node("selected")}
+          selectedNode={node(
+            "selected",
+            currentTaskId === "selected" ? TASK_CAPABILITIES : [],
+          )}
           selectedTaskId="selected"
           busy={false}
-          error=""
+          error={syncState.error ?? ""}
+          recoveryPresentation={null}
+          expectedEventSequence={4}
+          detailsSyncing={syncState.detailsSyncing ?? false}
           onClose={onClose}
           onRefresh={vi.fn()}
           onAction={onAction}
@@ -126,11 +149,11 @@ describe("TaskInspector", () => {
     return { onClose, onAction };
   }
 
-  it("offers four focused pages and disables task actions for history", () => {
+  it("offers four focused pages and keeps a non-current task read-only", () => {
     render("other-task");
     expect([...host.querySelectorAll('[role="tab"]')].map(tab => tab.getAttribute("title")))
       .toEqual(["概览与合同", "验收与证据", "决策与恢复", "成本与事件"]);
-    expect(host.textContent).toContain("当前正在查看历史任务");
+    expect(host.textContent).toContain("非当前任务节点只读");
     const revalidate = [...host.querySelectorAll("button")]
       .find(button => button.textContent?.includes("重新验证"));
     expect(revalidate?.disabled).toBe(true);
@@ -148,6 +171,34 @@ describe("TaskInspector", () => {
     expect(host.textContent).toContain("CodeReviewOnly");
     expect(host.textContent).toContain("E004");
     expect(host.textContent).toContain("index.html:210-238");
+    expect(host.textContent).toContain("接受验收偏差");
+  });
+
+  it("does not render deviation controls for a future task", () => {
+    render("other-task");
+    const acceptanceTab = host.querySelector('[role="tab"][title="验收与证据"]');
+    act(() => acceptanceTab?.dispatchEvent(new MouseEvent("mousedown", {
+      bubbles: true,
+      button: 0,
+    })));
+    expect(host.textContent).not.toContain("接受验收偏差");
+    expect(host.querySelector('[data-testid="accept-deviation-disabled-reason"]')?.textContent)
+      .toContain("非当前任务节点只读");
+  });
+
+  it("removes a stale terminal action when backend node capabilities change", () => {
+    render("selected");
+    const acceptanceTab = host.querySelector('[role="tab"][title="验收与证据"]');
+    act(() => acceptanceTab?.dispatchEvent(new MouseEvent("mousedown", {
+      bubbles: true,
+      button: 0,
+    })));
+    expect(host.textContent).toContain("接受验收偏差");
+
+    render("other-task");
+    expect(host.textContent).not.toContain("接受验收偏差");
+    expect(host.querySelector('[data-testid="accept-deviation-disabled-reason"]')?.textContent)
+      .toContain("非当前任务节点只读");
   });
 
   it("closes from the header and Escape without changing the selected task", () => {
@@ -157,5 +208,14 @@ describe("TaskInspector", () => {
     act(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
     expect(onClose).toHaveBeenCalledTimes(2);
     expect(host.textContent).toContain("任务 selected");
+  });
+
+  it("keeps detailed snapshot failure non-blocking and visibly retrying", () => {
+    render("selected", {
+      error: "详细快照生成失败",
+      detailsSyncing: true,
+    });
+    expect(host.textContent).toContain("详细快照生成失败");
+    expect(host.textContent).toContain("主状态已更新，正在后台重试");
   });
 });

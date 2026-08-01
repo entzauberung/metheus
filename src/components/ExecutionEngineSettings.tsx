@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { Settings } from "lucide-react";
-import { EngineHealth, ExecutionProfile, PipelineState, Project } from "../types";
+import type { EngineHealth, ExecutionProfile, PipelineState, Project, RuntimeMutationResult } from "../types";
 import { invokeWithTimeout } from "../utils/invokeWithTimeout";
 import { engineChangeBlockedReason, engineHealthBlocksExecution } from "../enginePolicy";
 import { IconButton } from "./IconButton";
@@ -10,10 +10,10 @@ import { ExecutionEngineSelector, EngineHealthCheckState } from "./ExecutionEngi
 interface Props {
   project: Project;
   pipeline: PipelineState | null;
-  onProjectUpdated: (project: Project) => void;
+  onRuntimeMutation: (result: RuntimeMutationResult) => void;
 }
 
-export function ExecutionEngineSettings({ project, pipeline, onProjectUpdated }: Props) {
+export function ExecutionEngineSettings({ project, pipeline, onRuntimeMutation }: Props) {
   const [open, setOpen] = useState(false);
   const [profile, setProfile] = useState<ExecutionProfile>(project.execution_profile);
   const [saving, setSaving] = useState(false);
@@ -54,12 +54,12 @@ export function ExecutionEngineSettings({ project, pipeline, onProjectUpdated }:
     setSaving(true);
     setError("");
     try {
-      const updated = await invokeWithTimeout<Project>("update_execution_profile", {
+      const result = await invokeWithTimeout<RuntimeMutationResult>("update_execution_profile_runtime", {
         projectName: project.name,
         expectedDataRevision: project.workflow_state.data_revision,
         executionProfile: profile,
       });
-      onProjectUpdated(updated);
+      onRuntimeMutation(result);
       setOpen(false);
     } catch (saveError) {
       setError(String(saveError));

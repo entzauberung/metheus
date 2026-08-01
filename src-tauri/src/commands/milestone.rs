@@ -3874,6 +3874,10 @@ mod tests {
             resolution: project::HumanResolution::AcceptDeviation,
             accepted_criteria: vec![1],
             dependency_check: String::new(),
+            action_source: String::new(),
+            execution_result_fingerprint: String::new(),
+            task_tree_revision: 0,
+            project_revision: 0,
         });
         let mut parent = project::Subtask {
             id: "dynamic-parent".to_string(),

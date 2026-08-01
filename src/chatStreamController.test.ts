@@ -166,7 +166,7 @@ describe("ChatStreamController", () => {
       originalUserMessageId: "user-1",
     });
 
-    expect(harness.streamCalls[0].command).toBe("regenerate_chat_reply_stream");
+    expect(harness.streamCalls[0].command).toBe("regenerate_chat_reply_stream_runtime");
     expect(harness.streamCalls[0].args).toMatchObject({ userMessageId: "user-1" });
     expect(harness.streamCalls[0].args).not.toHaveProperty("message");
     expect(states[0]?.optimisticUser).toBeUndefined();

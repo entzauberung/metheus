@@ -156,6 +156,9 @@ export function ProjectEntry({ onProjectCreated }: ProjectEntryProps) {
       <div className="project-entry-subtitle">
         复杂任务编译系统 — 把模糊想法编译为可执行、可检查、可回退的代码变更
       </div>
+      <div className="project-entry-control-note" role="note">
+        新项目默认使用 v0.0.4 串行控制器；已有项目恢复时保留原控制模式。
+      </div>
 
       <div className="project-entry-cards">
         {ENTRY_CARDS.map((card) => {

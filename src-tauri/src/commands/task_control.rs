@@ -1,6 +1,8 @@
 use crate::control_snapshot::{build, TaskControlSnapshot};
 use crate::project;
-use crate::task_control::{TaskControlMode, TASK_CONTROL_ALGORITHM_VERSION};
+use crate::task_control::{
+    TaskControlMode, TASK_CONTROL_ALGORITHM_VERSION, TASK_CONTROL_SNAPSHOT_VERSION,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -46,7 +48,60 @@ fn parse_mode(mode: &str) -> Result<TaskControlMode, String> {
 pub(crate) async fn get_task_control_snapshot(
     project_name: String,
 ) -> Result<TaskControlSnapshot, String> {
-    build(&crate::load_project(&project_name)?)
+    let (project, cursor) = crate::runtime_snapshot::load_consistent_project(&project_name)?;
+    crate::control_snapshot::build_at_event(
+        &project,
+        &cursor.process_start_id,
+        cursor.event_sequence,
+    )
+}
+
+#[tauri::command]
+pub(crate) async fn set_task_control_mode_runtime(
+    state: tauri::State<'_, crate::AppState>,
+    project_name: String,
+    mode: String,
+    expected_revision: u64,
+    confirmed: Option<bool>,
+    reason: Option<String>,
+    source: Option<String>,
+) -> Result<crate::runtime_snapshot::RuntimeMutationResult, String> {
+    let pipeline_state = state.pipeline_state.clone();
+    let updated = set_task_control_mode(
+        project_name.clone(),
+        mode,
+        expected_revision,
+        confirmed,
+        reason,
+        source,
+    )
+    .await?;
+    let pipeline = pipeline_state.lock().await.clone();
+    let mut action = crate::runtime_snapshot::RuntimeActionSummary::silent("set_task_control_mode");
+    action.message = format!(
+        "控制模式已切换为 {}",
+        crate::task_control::mode_label(updated.task_control.mode)
+    );
+    crate::runtime_snapshot::mutation_result(&project_name, pipeline, action, true)
+}
+
+#[tauri::command]
+pub(crate) async fn apply_task_control_action_runtime(
+    state: tauri::State<'_, crate::AppState>,
+    project_name: String,
+    request: TaskControlActionRequest,
+) -> Result<crate::runtime_snapshot::RuntimeMutationResult, String> {
+    let pipeline_state = state.pipeline_state.clone();
+    let result = apply_task_control_action(state, project_name.clone(), request).await?;
+    let pipeline = pipeline_state.lock().await.clone();
+    let mut action = crate::runtime_snapshot::RuntimeActionSummary::silent("task_control_action");
+    action.message = result
+        .snapshot
+        .recent_action
+        .as_ref()
+        .map(|value| value.result.clone())
+        .unwrap_or_default();
+    crate::runtime_snapshot::mutation_result(&project_name, pipeline, action, true)
 }
 
 #[tauri::command]
@@ -54,29 +109,122 @@ pub(crate) async fn set_task_control_mode(
     project_name: String,
     mode: String,
     expected_revision: u64,
+    confirmed: Option<bool>,
+    reason: Option<String>,
+    source: Option<String>,
 ) -> Result<project::Project, String> {
     let mut project = crate::load_project(&project_name)?;
     ensure_revision(&project, expected_revision)?;
     let mode = parse_mode(&mode)?;
-    if mode == TaskControlMode::SerialTakeover
-        && project
-            .execution_session
-            .as_ref()
-            .is_some_and(|session| session.active)
-    {
-        return Err("当前任务正在执行，不能切换串行接管模式".to_string());
+    let previous_mode = project.task_control.mode;
+    if mode == previous_mode {
+        return Ok(project);
+    }
+    if let Some(blocker) = mode_switch_blocker(&project) {
+        return Err(blocker);
+    }
+    let is_fallback =
+        previous_mode == TaskControlMode::SerialTakeover && mode != TaskControlMode::SerialTakeover;
+    let reason = reason.unwrap_or_default().trim().to_string();
+    if is_fallback && confirmed != Some(true) {
+        return Err("从串行接管回退必须由用户明确确认".to_string());
+    }
+    if is_fallback && reason.is_empty() {
+        return Err("从串行接管回退必须记录原因".to_string());
+    }
+    if mode == TaskControlMode::SerialTakeover {
+        crate::task_control::refresh_serial_takeover_capability(&mut project);
+        crate::task_control::ensure_serial_takeover_capability(&project)
+            .map_err(|reason| format!("无法启用串行接管：{}", reason))?;
     }
     project.task_control.mode = mode;
     project.task_control.algorithm_version = TASK_CONTROL_ALGORITHM_VERSION.to_string();
+    project.task_control.snapshot_version = TASK_CONTROL_SNAPSHOT_VERSION.to_string();
     project.task_control.control_source = match mode {
         TaskControlMode::Legacy => "legacy_workflow",
         TaskControlMode::Shadow => "shadow_controller",
         TaskControlMode::SerialTakeover => "task_controller",
     }
     .to_string();
-    project.workflow_state.data_revision += 1;
+    project.workflow_state.data_revision = project.workflow_state.data_revision.saturating_add(1);
     project.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+    let source = source
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "user".to_string());
+    let audit_reason = if reason.is_empty() {
+        "用户显式选择控制模式".to_string()
+    } else {
+        reason
+    };
+    project.task_control.mode_change_history.push(
+        crate::task_control::TaskControlModeChangeRecord {
+            from: previous_mode,
+            to: mode,
+            source: source.clone(),
+            reason: audit_reason.clone(),
+            changed_at: project.workflow_state.last_transition_at.clone(),
+            project_revision: project.workflow_state.data_revision,
+        },
+    );
+    project
+        .execution_history
+        .push(project::ExecutionHistoryEntry {
+            timestamp: project.workflow_state.last_transition_at.clone(),
+            level: "info".to_string(),
+            event_type: project::ExecutionEventType::SystemAdvance,
+            source: project::OperationSource::User,
+            text: format!(
+                "控制模式从 {} 切换为 {}；来源：{}；原因：{}",
+                crate::task_control::mode_label(previous_mode),
+                crate::task_control::mode_label(mode),
+                source,
+                audit_reason
+            ),
+            milestone_id: None,
+            mid_stage_id: None,
+            subtask_id: None,
+            criterion_index: None,
+            decision_id: None,
+            action_id: None,
+            validator_id: None,
+            model_call_id: None,
+        });
     crate::save_and_reload_project(&project)
+}
+
+fn mode_switch_blocker(project: &project::Project) -> Option<String> {
+    if project
+        .execution_session
+        .as_ref()
+        .is_some_and(|session| session.active)
+    {
+        return Some("当前任务正在执行，停止执行后才能切换控制模式".to_string());
+    }
+    if !project.task_control.active_action_id.is_empty() {
+        return Some(format!(
+            "控制动作 {} 正在执行，完成后才能切换控制模式",
+            project.task_control.active_action_id
+        ));
+    }
+    if project
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .is_some_and(|state| state.phase != project::RecoveryPhase::Recovered)
+    {
+        return Some("恢复流程正在进行，完成恢复后才能切换控制模式".to_string());
+    }
+    if project
+        .workflow_state
+        .autopilot_state
+        .as_ref()
+        .is_some_and(|state| {
+            state.active && state.run_status == project::AutopilotRunStatus::Running
+        })
+    {
+        return Some("自动驾驶正在推进，暂停后才能切换控制模式".to_string());
+    }
+    None
 }
 
 #[tauri::command]
@@ -326,12 +474,13 @@ fn manual_executor_actions(
     let mut deterministic = Vec::new();
     let mut automated = Vec::new();
     let mut semantic = Vec::new();
+    let mut human = Vec::new();
     for index in targets {
         match crate::validator_registry::verification_mode_for(task, index) {
             crate::validator_contract::VerificationMode::Deterministic => deterministic.push(index),
             crate::validator_contract::VerificationMode::AutomatedTest => automated.push(index),
-            crate::validator_contract::VerificationMode::SemanticReview
-            | crate::validator_contract::VerificationMode::HumanReview => semantic.push(index),
+            crate::validator_contract::VerificationMode::SemanticReview => semantic.push(index),
+            crate::validator_contract::VerificationMode::HumanReview => human.push(index),
         }
     }
     let mut actions = Vec::new();
@@ -352,6 +501,9 @@ fn manual_executor_actions(
             crate::control_action::ControlActionKind::TargetedValidate,
             semantic,
         ));
+    }
+    if !human.is_empty() {
+        actions.push((crate::control_action::ControlActionKind::Human, human));
     }
     Ok(actions)
 }
@@ -405,6 +557,10 @@ fn action_result(
 }
 
 pub(crate) fn split_task(project: &mut project::Project, task_id: &str) -> Result<(), String> {
+    let address = crate::task_tree::locate_task(project, task_id)?
+        .ok_or_else(|| format!("任务节点不存在：{}", task_id))?;
+    let parent_task_id = address.ancestor_task_ids.last().cloned();
+    let depth = address.depth;
     let changed = {
         let task = crate::task_tree::find_task_mut(project, task_id)?
             .ok_or_else(|| format!("任务节点不存在：{}", task_id))?;
@@ -419,12 +575,7 @@ pub(crate) fn split_task(project: &mut project::Project, task_id: &str) -> Resul
         if !task.child_tasks.is_empty() {
             false
         } else {
-            let depth = task
-                .contract_snapshot
-                .as_ref()
-                .map(|contract| contract.depth)
-                .unwrap_or(0);
-            let compiled = crate::task_compiler::compile(task, None, depth);
+            let compiled = crate::task_compiler::compile(task, parent_task_id.as_deref(), depth);
             if compiled.decision.kind != crate::task_compiler::TaskCompileDecisionKind::SplitFurther
             {
                 return Err(compiled.decision.reason);
@@ -458,11 +609,14 @@ pub(crate) fn recompile_task(project: &mut project::Project, task_id: &str) -> R
     ) {
         return Err("已完成任务不能重新编译覆盖".to_string());
     }
-    task.contract_snapshot = Some(crate::task_contract::compile_subtask(
-        task,
-        address.ancestor_task_ids.last().map(String::as_str),
-        address.depth,
-    ));
+    task.contract_snapshot = Some(
+        crate::task_compiler::compile(
+            task,
+            address.ancestor_task_ids.last().map(String::as_str),
+            address.depth,
+        )
+        .contract,
+    );
     Ok(())
 }
 
@@ -472,6 +626,19 @@ pub(crate) fn accept_deviation(
     criterion_indexes: &[u32],
     reason: &str,
 ) -> Result<(), String> {
+    crate::human_action_policy::authorize(
+        project,
+        task_id,
+        crate::human_action_policy::HumanTerminalAction::AcceptDeviation,
+        criterion_indexes,
+        reason,
+    )?;
+    let execution_result_fingerprint = crate::human_action_policy::execution_result_fingerprint(
+        crate::task_tree::find_task(project, task_id)?
+            .ok_or_else(|| format!("任务节点不存在：{}", task_id))?,
+    )?;
+    let task_tree_revision = project.task_control.tree_revision;
+    let project_revision = project.workflow_state.data_revision;
     let task = crate::task_tree::find_task_mut(project, task_id)?
         .ok_or_else(|| format!("任务节点不存在：{}", task_id))?;
     if matches!(
@@ -503,6 +670,10 @@ pub(crate) fn accept_deviation(
         resolution: project::HumanResolution::AcceptDeviation,
         accepted_criteria: criterion_indexes.to_vec(),
         dependency_check: "偏差仅作用于当前任务合同".to_string(),
+        action_source: "task_control".to_string(),
+        execution_result_fingerprint,
+        task_tree_revision,
+        project_revision,
     });
     if task.acceptance_ledger.iter().all(|item| {
         matches!(
@@ -641,8 +812,50 @@ mod tests {
     }
 
     #[test]
-    fn deviation_updates_only_requested_criterion() {
+    fn split_and_recompile_preserve_parent_context_and_contract_fingerprint() {
         let mut project = project_with_task();
+        let mut nested = project.milestones[0].subtasks.remove(0);
+        nested.id = "nested".to_string();
+        let expected = crate::task_compiler::compile(&nested, Some("parent"), 1).contract;
+        project.milestones[0].subtasks.push(project::Subtask {
+            id: "parent".to_string(),
+            title: "Parent".to_string(),
+            child_tasks: vec![nested],
+            ..Default::default()
+        });
+
+        split_task(&mut project, "nested").unwrap();
+        let split_contract = crate::task_tree::find_task(&project, "nested")
+            .unwrap()
+            .unwrap()
+            .contract_snapshot
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(split_contract.parent_task_id.as_deref(), Some("parent"));
+        assert_eq!(split_contract.depth, 1);
+        assert_eq!(split_contract.fingerprint, expected.fingerprint);
+
+        recompile_task(&mut project, "nested").unwrap();
+        let recompiled = crate::task_tree::find_task(&project, "nested")
+            .unwrap()
+            .unwrap()
+            .contract_snapshot
+            .as_ref()
+            .unwrap();
+        assert_eq!(recompiled.parent_task_id.as_deref(), Some("parent"));
+        assert_eq!(recompiled.depth, 1);
+        assert_eq!(recompiled.fingerprint, split_contract.fingerprint);
+    }
+
+    #[test]
+    fn phase1_human_action_safety_partial_deviation_keeps_other_criteria_open() {
+        let mut project = project_with_task();
+        project.milestones[0].subtasks[0].status = project::SubtaskStatus::AwaitingConfirmation;
+        project.milestones[0].subtasks[0].execution_result = Some(project::ExecutionResult {
+            success: true,
+            ..Default::default()
+        });
         accept_deviation(&mut project, "task", &[2], "外部依赖已接受").unwrap();
         let task = &project.milestones[0].subtasks[0];
         assert_eq!(
@@ -657,15 +870,17 @@ mod tests {
             task.human_verification.as_ref().unwrap().accepted_criteria,
             vec![2]
         );
+        assert_eq!(task.status, project::SubtaskStatus::AwaitingConfirmation);
     }
 
     #[test]
-    fn revalidation_routes_deterministic_and_semantic_criteria() {
+    fn revalidation_routes_human_review_to_its_own_action() {
         let mut project = project_with_task();
         project.milestones[0].subtasks[0].acceptance_criteria = vec![
             "file exists: `index.html`".to_string(),
             "自动化测试通过".to_string(),
             "用户可以完整完成结账流程".to_string(),
+            "需要操作员在真实桌面确认".to_string(),
         ];
         project.milestones[0].subtasks[0].acceptance_ledger = vec![
             project::AcceptanceLedgerItem {
@@ -685,7 +900,18 @@ mod tests {
                 status: project::AcceptanceStatus::Unsatisfied,
                 ..Default::default()
             },
+            project::AcceptanceLedgerItem {
+                criterion_index: 4,
+                criterion: "需要操作员在真实桌面确认".to_string(),
+                status: project::AcceptanceStatus::Unknown,
+                ..Default::default()
+            },
         ];
+        let task = &mut project.milestones[0].subtasks[0];
+        let mut contract = crate::task_contract::compile_subtask(task, None, 0);
+        contract.verification_modes[3] = crate::validator_contract::VerificationMode::HumanReview;
+        crate::task_contract::refresh_fingerprint(&mut contract);
+        task.contract_snapshot = Some(contract);
         let request = TaskControlActionRequest {
             action: "revalidate".to_string(),
             task_id: Some("task".to_string()),
@@ -693,7 +919,7 @@ mod tests {
         };
 
         let actions = manual_executor_actions(&project, &request, "task").unwrap();
-        assert_eq!(actions.len(), 3);
+        assert_eq!(actions.len(), 4);
         assert_eq!(
             actions[0],
             (
@@ -714,6 +940,10 @@ mod tests {
                 crate::control_action::ControlActionKind::TargetedValidate,
                 vec![3]
             )
+        );
+        assert_eq!(
+            actions[3],
+            (crate::control_action::ControlActionKind::Human, vec![4])
         );
     }
 

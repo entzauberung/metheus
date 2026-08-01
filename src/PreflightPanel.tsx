@@ -1,7 +1,7 @@
 // src/PreflightPanel.tsx — 三项显式检查面板（后端事实驱动，无本地业务状态）
 import { useMemo } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import { PreflightCheckResult, Project } from "./types";
+import { PreflightCheckResult, RuntimeMutationResult } from "./types";
 import { CheckCircle, XCircle, Clock, ArrowRight, ArrowLeft } from "lucide-react";
 import { useState } from "react";
 
@@ -13,8 +13,8 @@ interface PreflightPanelProps {
   discussionRevision: number;
   /** 当前项目数据修订号，用于后端乐观并发校验 */
   dataRevision: number;
-  /** 检查完成后回传完整 Project */
-  onProjectUpdated: (project: Project) => void;
+  /** 检查完成后应用统一运行时变更结果 */
+  onRuntimeMutation: (result: RuntimeMutationResult) => void;
   /** 返回继续讨论 */
   onReturnToDiscussion: () => void;
   /** 全部通过后生成方案 */
@@ -51,7 +51,7 @@ export function PreflightPanel({
   preflightResults,
   discussionRevision,
   dataRevision,
-  onProjectUpdated,
+  onRuntimeMutation,
   onReturnToDiscussion,
   onAllPassed,
   onRestartChecks,
@@ -97,15 +97,13 @@ export function PreflightPanel({
     setLoadingType(checkType);
     setError(null);
     try {
-      const updatedProject = await invokeWithTimeout<Project>("run_preflight_check", {
+      const result = await invokeWithTimeout<RuntimeMutationResult>("run_preflight_check_runtime", {
         projectName,
         checkType,
         frontendDiscussionRevision: discussionRevision,
         frontendDataRevision: dataRevision,
       });
-      if (updatedProject) {
-        onProjectUpdated(updatedProject);
-      }
+      onRuntimeMutation(result);
     } catch (e: any) {
       const msg = String(e);
       if (msg.includes("超时") || msg.includes("网络")) {

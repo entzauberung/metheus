@@ -1,7 +1,36 @@
 import type { AcceptanceLedgerItem, CostGroupSummary, TaskControlMode, TaskTreeNodeView, TokenCostSummary } from "./types";
 
 export function getTaskControlModeLabel(mode: TaskControlMode): string {
-  return { Legacy: "旧流水线", Shadow: "影子控制器", SerialTakeover: "串行接管" }[mode];
+  return {
+    Legacy: "旧流水线（兼容）",
+    Shadow: "影子控制器（仅审计）",
+    SerialTakeover: "串行接管（新项目默认）",
+  }[mode];
+}
+
+export function getTaskControlModeDescription(mode: TaskControlMode): string {
+  return {
+    Legacy: "旧流水线拥有执行权，新控制器不参与决策。",
+    Shadow: "新控制器只做对照审计，实际执行仍由旧流水线负责。",
+    SerialTakeover: "v0.0.4 正式默认：新控制器拥有任务执行阶段的串行派发与恢复决策权。",
+  }[mode];
+}
+
+export function requiresModeFallbackConfirmation(
+  current: TaskControlMode,
+  next: TaskControlMode,
+): boolean {
+  return current === "SerialTakeover" && next !== "SerialTakeover";
+}
+
+export function getModeTransitionImpact(next: TaskControlMode): string[] {
+  return [
+    "现有任务合同、任务树、证据账本和成本账本都会保留。",
+    next === "Shadow"
+      ? "新控制器只继续记录对照决策，不再派发任务控制动作。"
+      : "新控制器停止参与任务级决策，任务执行交还旧流水线。",
+    "活动执行、控制动作、自动推进或恢复期间不能切换模式。",
+  ];
 }
 
 export function countTaskNodes(nodes: TaskTreeNodeView[]): number {

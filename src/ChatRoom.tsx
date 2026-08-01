@@ -21,7 +21,7 @@ import {
   clampComposerHeight,
   shouldSendFromComposer,
 } from "./chatComposerPolicy";
-import type { ChatMessage, Project } from "./types";
+import type { ChatMessage, Project, RuntimeMutationResult } from "./types";
 interface Props {
   messages: ChatMessage[];
   onAddMessage: (msg: ChatMessage) => void;
@@ -31,11 +31,12 @@ interface Props {
   onViewDetailedReport?: () => void;
   // === V1：项目状态更新回调（替代乐观插入） ===
   onProjectUpdated?: (project: Project) => void;
+  onRuntimeMutation?: (result: RuntimeMutationResult) => void;
   // === V1：方案已批准时隐藏聊天输入 ===
   hideInput?: boolean;
   hideInputReason?: string;
 }
-function ChatRoomSession({ messages, projectName, currentRole, threadId, onViewDetailedReport, onProjectUpdated, hideInput, hideInputReason }: Props) {
+function ChatRoomSession({ messages, projectName, currentRole, threadId, onViewDetailedReport, onProjectUpdated, onRuntimeMutation, hideInput, hideInputReason }: Props) {
   const [inputValue, setInputValue] = useState("");
   const [streamSession, setStreamSession] = useState<ChatStreamSession | null>(null);
   const controllerRef = useRef<ChatStreamController | null>(null);
@@ -46,11 +47,16 @@ function ChatRoomSession({ messages, projectName, currentRole, threadId, onViewD
   const [hasUnread, setHasUnread] = useState(false);
   const projectUpdatedRef = useRef(onProjectUpdated);
   projectUpdatedRef.current = onProjectUpdated;
+  const runtimeMutationRef = useRef(onRuntimeMutation);
+  runtimeMutationRef.current = onRuntimeMutation;
 
   useEffect(() => {
     const controller = new ChatStreamController({
       onState: setStreamSession,
       onProject: (project) => projectUpdatedRef.current?.(project),
+      onRuntimeMutation: runtimeMutationRef.current
+        ? (result) => runtimeMutationRef.current?.(result)
+        : undefined,
     });
     controllerRef.current = controller;
     return () => {

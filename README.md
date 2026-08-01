@@ -104,7 +104,9 @@ metheus/auto/v0.1.1/task-0        ← 子任务 tag
 
 验证结果严格区分三种通道：`LocalValidate` 是本地确定性证明，`AutomatedValidate` 是真实测试命令，`TargetedValidate` 是 AI 语义审查。测试未配置、测试环境不可用和证据不足都保持未知状态，不会被当作通过，也不会被误判为代码失败。
 
-控制模式边界保持不变：`Legacy` 用于旧项目和显式回退，`Shadow` 只对照记录且不派发新控制动作，`SerialTakeover` 只在显式选择后接管任务执行阶段，且不是默认模式。
+控制模式已经正式收口：`SerialTakeover` 是新项目的正式默认模式，由 v0.0.4 控制器接管任务执行阶段的串行派发与恢复决策；`Shadow` 只做对照审计，不派发新控制动作；`Legacy` 只用于兼容和显式人工回退。旧项目继续保留磁盘中已有的模式，不会自动迁移。
+
+要确认当前项目的实际模式，请查看任务控制工作区顶部或任务检查器标题中的“控制模式”。这里展示的是后端快照中的生效值，而不是新项目默认值；模式切换也会在该处立即更新。
 
 ### 🔓 3.5 模型边界
 
@@ -147,7 +149,7 @@ npm install && npm run tauri dev
 ```bash
 npm run verify:core-light   # Core 格式与库目标类型检查
 npm run verify:quality      # 定向 Rust 测试、TypeScript 和前端策略测试
-npm run verify:phase1       # 第一阶段任务控制专项门禁 + 前端生产构建
+npm run verify:phase1-runtime-contract # 第一阶段正式接管运行时契约，不做产品构建
 npm run verify:grok-check   # 单任务检查内置 Grok 特性，不做最终链接
 ```
 

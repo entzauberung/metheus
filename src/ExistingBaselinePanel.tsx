@@ -1,13 +1,13 @@
 // src/ExistingBaselinePanel.tsx — Half Project: Already 基线展示和批准
 import { useState, useEffect } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import { Project } from "./types";
+import type { Project, RuntimeMutationResult } from "./types";
 import { ArrowLeft, RefreshCw, CheckCircle, FileText } from "lucide-react";
 
 interface ExistingBaselinePanelProps {
   projectName: string;
   projectPath: string;
-  onBaselineApproved: (project: Project) => void;
+  onBaselineApproved: (result: RuntimeMutationResult) => void;
   onReject: () => void;
 }
 
@@ -18,6 +18,7 @@ export function ExistingBaselinePanel({
   onReject,
 }: ExistingBaselinePanelProps) {
   const [baseline, setBaseline] = useState<Project | null>(null);
+  const [analysisResult, setAnalysisResult] = useState<RuntimeMutationResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [approving, setApproving] = useState(false);
   const [error, setError] = useState("");
@@ -30,10 +31,11 @@ export function ExistingBaselinePanel({
     setLoading(true);
     setError("");
     try {
-      const project = await invokeWithTimeout<Project>("analyze_existing_project", {
+      const result = await invokeWithTimeout<RuntimeMutationResult>("analyze_existing_project_runtime", {
         projectName,
       });
-      setBaseline(project);
+      setAnalysisResult(result);
+      setBaseline(result.runtime_snapshot.project);
     } catch (e: any) {
       setError(String(e));
     } finally {
@@ -45,10 +47,10 @@ export function ExistingBaselinePanel({
     setApproving(true);
     setError("");
     try {
-      const project = await invokeWithTimeout<Project>("approve_existing_baseline", {
+      const result = await invokeWithTimeout<RuntimeMutationResult>("approve_existing_baseline_runtime", {
         projectName,
       });
-      onBaselineApproved(project);
+      onBaselineApproved(result);
     } catch (e: any) {
       setError(String(e));
     } finally {
@@ -230,7 +232,8 @@ export function ExistingBaselinePanel({
       {alreadyApproved && (
         <div style={{ textAlign: "center" }}>
           <button
-            onClick={() => onBaselineApproved(baseline!)}
+            onClick={() => { if (analysisResult) onBaselineApproved(analysisResult); }}
+            disabled={!analysisResult}
             style={{
               padding: "10px 28px", fontSize: "15px", fontWeight: 600,
               background: "#0969da", color: "#fff", border: "none", borderRadius: "8px",

@@ -1,8 +1,11 @@
 use crate::project::Project;
 use serde::{Deserialize, Serialize};
 
-pub const TASK_CONTROL_ALGORITHM_VERSION: &str = "v0.0.4-phase1";
-pub const TASK_CONTROL_SNAPSHOT_VERSION: &str = "task-control-snapshot-v1";
+pub const TASK_CONTROL_ALGORITHM_VERSION: &str = "v0.0.4-phase1-final";
+pub const TASK_CONTROL_SNAPSHOT_VERSION: &str = "task-control-snapshot-v2";
+pub const SERIAL_TAKEOVER_CONTRACT_VERSION: &str = "serial-takeover-v1";
+/// v0.0.4 第一阶段正式收口：仅新项目默认进入串行接管，磁盘旧项目保持原模式。
+pub const PHASE1_DEFAULT_TASK_CONTROL_MODE: TaskControlMode = TaskControlMode::SerialTakeover;
 
 /// Controls migration from the existing fixed workflow to the task controller.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -11,6 +14,14 @@ pub enum TaskControlMode {
     Legacy,
     Shadow,
     SerialTakeover,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum TakeoverCapabilityStatus {
+    #[default]
+    Unknown,
+    Ready,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,6 +62,16 @@ pub struct ShadowComparisonMetrics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskControlModeChangeRecord {
+    pub from: TaskControlMode,
+    pub to: TaskControlMode,
+    pub source: String,
+    pub reason: String,
+    pub changed_at: String,
+    pub project_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskControlState {
     #[serde(default)]
     pub mode: TaskControlMode,
@@ -58,6 +79,18 @@ pub struct TaskControlState {
     pub algorithm_version: String,
     #[serde(default = "default_snapshot_version")]
     pub snapshot_version: String,
+    #[serde(default = "default_takeover_version")]
+    pub takeover_version: String,
+    #[serde(default)]
+    pub takeover_capability_status: TakeoverCapabilityStatus,
+    #[serde(default)]
+    pub last_takeover_check_result: String,
+    #[serde(default)]
+    pub takeover_unavailable_reason: String,
+    #[serde(default)]
+    pub takeover_checked_at: Option<String>,
+    #[serde(default)]
+    pub mode_change_history: Vec<TaskControlModeChangeRecord>,
     #[serde(default)]
     pub last_shadow_decision_at: Option<String>,
     #[serde(default)]
@@ -106,12 +139,22 @@ fn default_snapshot_version() -> String {
     TASK_CONTROL_SNAPSHOT_VERSION.to_string()
 }
 
+fn default_takeover_version() -> String {
+    SERIAL_TAKEOVER_CONTRACT_VERSION.to_string()
+}
+
 impl Default for TaskControlState {
     fn default() -> Self {
         Self {
             mode: TaskControlMode::Legacy,
             algorithm_version: default_algorithm_version(),
             snapshot_version: default_snapshot_version(),
+            takeover_version: default_takeover_version(),
+            takeover_capability_status: TakeoverCapabilityStatus::Unknown,
+            last_takeover_check_result: String::new(),
+            takeover_unavailable_reason: String::new(),
+            takeover_checked_at: None,
+            mode_change_history: Vec::new(),
             last_shadow_decision_at: None,
             last_shadow_decision_summary: String::new(),
             shadow_comparison: ShadowComparisonMetrics::default(),
@@ -135,11 +178,99 @@ impl Default for TaskControlState {
     }
 }
 
+fn inspect_task_capabilities(
+    tasks: &[crate::project::Subtask],
+    parent_id: Option<&str>,
+    depth: u32,
+) -> Result<(), String> {
+    for task in tasks {
+        let compiled = crate::task_compiler::compile(task, parent_id, depth);
+        if compiled.contract.fingerprint.trim().is_empty() {
+            return Err(format!("任务 {} 无法生成稳定合同指纹", task.id));
+        }
+        for criterion in &task.acceptance_criteria {
+            if crate::validator_registry::validators_for(criterion).is_empty() {
+                return Err(format!(
+                    "任务 {} 的验收项缺少验证器：{}",
+                    task.id, criterion
+                ));
+            }
+        }
+        inspect_task_capabilities(&task.child_tasks, Some(&task.id), depth.saturating_add(1))?;
+    }
+    Ok(())
+}
+
+pub fn inspect_serial_takeover_capability(project: &Project) -> Result<(), String> {
+    crate::task_tree::validate_project_tree(project)
+        .map_err(|reason| format!("任务树不可用：{}", reason))?;
+    for milestone in &project.milestones {
+        inspect_task_capabilities(&milestone.subtasks, None, 0)?;
+        for stage in &milestone.mid_stages {
+            inspect_task_capabilities(&stage.subtasks, None, 0)?;
+        }
+    }
+    crate::control_action_executor::ensure_serial_takeover_actions_available()?;
+    crate::validator_registry::ensure_serial_takeover_validators_available()?;
+    crate::control_snapshot::build(project)
+        .map_err(|reason| format!("任务控制快照不可用：{}", reason))?;
+    Ok(())
+}
+
+/// Refreshes the cached takeover contract only while there is no active execution session.
+/// An in-flight task must keep the boundary that was checked before dispatch.
+pub fn refresh_serial_takeover_capability(project: &mut Project) -> bool {
+    if project
+        .execution_session
+        .as_ref()
+        .is_some_and(|session| session.active)
+    {
+        return project.task_control.takeover_capability_status == TakeoverCapabilityStatus::Ready;
+    }
+    let checked_at = chrono::Utc::now().to_rfc3339();
+    let result = inspect_serial_takeover_capability(project);
+    project.task_control.takeover_version = SERIAL_TAKEOVER_CONTRACT_VERSION.to_string();
+    project.task_control.takeover_checked_at = Some(checked_at);
+    match result {
+        Ok(()) => {
+            project.task_control.takeover_capability_status = TakeoverCapabilityStatus::Ready;
+            project.task_control.last_takeover_check_result =
+                "任务合同、任务树、动作执行器、验证器和控制快照均可用".to_string();
+            project.task_control.takeover_unavailable_reason.clear();
+            true
+        }
+        Err(reason) => {
+            project.task_control.takeover_capability_status = TakeoverCapabilityStatus::Unavailable;
+            project.task_control.last_takeover_check_result = reason.clone();
+            project.task_control.takeover_unavailable_reason = reason;
+            false
+        }
+    }
+}
+
+pub fn ensure_serial_takeover_capability(project: &Project) -> Result<(), String> {
+    if project.task_control.takeover_version != SERIAL_TAKEOVER_CONTRACT_VERSION {
+        return Err(format!(
+            "正式接管契约版本不匹配：项目={}，当前={}",
+            project.task_control.takeover_version, SERIAL_TAKEOVER_CONTRACT_VERSION
+        ));
+    }
+    if project.task_control.takeover_capability_status != TakeoverCapabilityStatus::Ready {
+        let reason = if project.task_control.takeover_unavailable_reason.is_empty() {
+            "正式接管能力尚未通过检查".to_string()
+        } else {
+            project.task_control.takeover_unavailable_reason.clone()
+        };
+        return Err(reason);
+    }
+    Ok(())
+}
+
 impl TaskControlState {
     pub fn for_new_project() -> Self {
         Self {
-            mode: TaskControlMode::Shadow,
-            control_source: "shadow_controller".to_string(),
+            mode: PHASE1_DEFAULT_TASK_CONTROL_MODE,
+            control_source: "task_controller".to_string(),
             ..Self::default()
         }
     }
@@ -237,6 +368,9 @@ pub fn hydrate_project(project: &mut Project) -> Result<(), String> {
     if project.task_control.snapshot_version.is_empty() {
         project.task_control.snapshot_version = TASK_CONTROL_SNAPSHOT_VERSION.to_string();
     }
+    if project.task_control.takeover_version.is_empty() {
+        project.task_control.takeover_version = SERIAL_TAKEOVER_CONTRACT_VERSION.to_string();
+    }
     if project.task_control.control_source.is_empty() {
         project.task_control.control_source = match project.task_control.mode {
             TaskControlMode::Legacy => "legacy_workflow",
@@ -256,6 +390,13 @@ pub fn hydrate_project(project: &mut Project) -> Result<(), String> {
         project.task_control.tree_revision = 1;
     }
     migrate_legacy_parent_session(project)?;
+    if !project
+        .execution_session
+        .as_ref()
+        .is_some_and(|session| session.active)
+    {
+        refresh_serial_takeover_capability(project);
+    }
     Ok(())
 }
 
@@ -492,14 +633,24 @@ mod tests {
     }
 
     #[test]
-    fn new_projects_start_in_shadow_while_missing_legacy_state_stays_legacy() {
+    fn phase1_runtime_contract_new_projects_default_to_serial_without_migrating_legacy() {
         assert_eq!(
             Project::new("new").task_control.mode,
-            TaskControlMode::Shadow
+            TaskControlMode::SerialTakeover
         );
         assert_eq!(
             Project::new_half("half", "/tmp/half").task_control.mode,
-            TaskControlMode::Shadow
+            TaskControlMode::SerialTakeover
+        );
+        assert_eq!(
+            Project::new("capable")
+                .task_control
+                .takeover_capability_status,
+            TakeoverCapabilityStatus::Ready
+        );
+        assert_eq!(
+            Project::new("source").task_control.control_source,
+            "task_controller"
         );
 
         let mut value = serde_json::to_value(Project::new("old-json")).unwrap();
@@ -512,6 +663,8 @@ mod tests {
     #[test]
     fn hydration_preserves_an_existing_control_mode() {
         let mut project = Project::new("existing-shadow");
+        project.task_control.mode = TaskControlMode::Shadow;
+        project.task_control.control_source = "shadow_controller".to_string();
         hydrate_project(&mut project).unwrap();
         assert_eq!(project.task_control.mode, TaskControlMode::Shadow);
         project.task_control.mode = TaskControlMode::SerialTakeover;

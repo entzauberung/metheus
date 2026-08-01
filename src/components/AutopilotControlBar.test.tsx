@@ -3,12 +3,18 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { GitConfirmationFailureKind, Project, RecoveryErrorKind, RecoveryPhase, VerificationStage } from "../types";
+import type {
+  Project,
+  RecoveryActionPresentation,
+  RecoveryCapability,
+  RecoveryPresentation,
+  RecoveryPresentationKind,
+} from "../types";
 import { AutopilotControlBar } from "./AutopilotControlBar";
 
-function blockedProject(failureKind: GitConfirmationFailureKind): Project {
+function project(): Project {
   return {
-    name: "git-confirmation-test",
+    name: "recovery-ui",
     milestones: [],
     workflow_state: {
       top_level_phase: "Console",
@@ -18,94 +24,48 @@ function blockedProject(failureKind: GitConfirmationFailureKind): Project {
       autopilot_state: {
         active: true,
         target_milestone_id: "milestone-1",
-        run_status: "ErrorStopped",
-        last_action: "Git 确认受阻",
-        last_action_at: "2026-07-25T00:00:00Z",
-        error_message: "confirmation blocked",
-        recovery_action: failureKind === "LegacyV1TagConflict"
-          ? "RetryGitConfirmation"
-          : "WaitHumanDecision",
+        run_status: "Paused",
+        last_action: "等待处理",
+        last_action_at: "2026-07-31T00:00:00Z",
+        error_message: "",
+        recovery_action: "None",
       },
-    },
-    execution_session: {
-      execution_id: "execution-1",
-      active: false,
-      milestone_id: "milestone-1",
-      mid_stage_id: "mid-1",
-      subtask_id: "subtask-1",
-      subtask_title: "测试小阶段",
-      status: "confirmation_blocked",
-      base_commit: "abc123",
-      failure_message: "immutable tag conflict",
-      confirmation_failure_kind: failureKind,
-      started_at: "2026-07-25T00:00:00Z",
-      state_entered_at: "2026-07-25T00:00:00Z",
-      plan_revision: 1,
-      subtask_index: 0,
-      total_subtasks: 1,
     },
   } as unknown as Project;
 }
 
-function validationProject(
-  errorKind: RecoveryErrorKind,
-  phase: RecoveryPhase,
-  options: {
-    verificationStage?: VerificationStage;
-    validationRetryCount?: number;
-    maxValidationRetries?: number;
-    nextValidationRetryAt?: string;
-    heartbeatAt?: string;
-    runStatus?: "Running" | "Paused" | "ErrorStopped";
-  } = {},
-): Project {
-  const runStatus = options.runStatus ?? (phase === "WaitingHuman" ? "ErrorStopped" : "Running");
+function action(capability: RecoveryCapability, label: string): RecoveryActionPresentation {
+  return { capability, label, enabled: true, disabled_reason: null };
+}
+
+function presentation(
+  kind: RecoveryPresentationKind,
+  primaryAction: RecoveryActionPresentation | null,
+  options: Partial<RecoveryPresentation> = {},
+): RecoveryPresentation {
+  const sync = action("SyncProject", "同步状态");
   return {
-    name: "validation-recovery-test",
-    milestones: [],
-    workflow_state: {
-      top_level_phase: "Console",
-      current_step: "Execution",
-      autopilot_active: true,
-      autopilot_target_milestone_id: "milestone-1",
-      autopilot_state: {
-        active: true,
-        target_milestone_id: "milestone-1",
-        run_status: runStatus,
-        last_action: "验证中",
-        last_action_at: "2026-07-26T00:00:00Z",
-        error_message: "validation blocked",
-        recovery_action: phase === "WaitingHuman" ? "WaitHumanDecision" : "RunAutomaticRecovery",
-        heartbeat_at: options.heartbeatAt,
-      },
-      recovery_state: {
-        error_kind: errorKind,
-        phase,
-        validation_retry_count: options.validationRetryCount ?? 0,
-        max_validation_retries: options.maxValidationRetries ?? 3,
-        next_validation_retry_at: options.nextValidationRetryAt,
-      },
-    },
-    execution_session: {
-      execution_id: "execution-1",
-      active: phase !== "WaitingHuman",
-      milestone_id: "milestone-1",
-      mid_stage_id: "mid-1",
-      subtask_id: "subtask-1",
-      subtask_title: "测试小阶段",
-      status: "awaiting_confirmation",
-      verification_stage: options.verificationStage,
-      base_commit: "abc123",
-      started_at: "2026-07-26T00:00:00Z",
-      state_entered_at: "2026-07-26T00:00:00Z",
-      plan_revision: 1,
-      subtask_index: 0,
-      total_subtasks: 1,
-    },
-  } as unknown as Project;
+    kind,
+    title: kind === "None" ? "" : `${kind} 标题`,
+    reason: kind === "None" ? "" : `${kind} 原因`,
+    severity: kind === "None" ? "Info" : "Error",
+    primary_action: primaryAction,
+    secondary_actions: kind === "None" ? [] : [sync],
+    preserve_current_code: kind !== "BaselineRecovery",
+    requires_baseline_restore: kind === "BaselineRecovery",
+    supports_preview: kind === "BaselineRecovery",
+    automatic_retry: false,
+    capabilities: [
+      ...(kind === "None" ? [] : ["SyncProject" as RecoveryCapability]),
+      ...(primaryAction ? [primaryAction.capability] : []),
+    ],
+    decision_options: [],
+    state_fingerprint: `fingerprint-${kind}`,
+    ...options,
+  };
 }
 
-describe("AutopilotControlBar Git confirmation recovery", () => {
+describe("AutopilotControlBar recovery presentation", () => {
   let host: HTMLDivElement;
   let root: Root;
 
@@ -123,290 +83,202 @@ describe("AutopilotControlBar Git confirmation recovery", () => {
     vi.restoreAllMocks();
   });
 
-  function render(failureKind: GitConfirmationFailureKind) {
-    const noop = vi.fn(async () => undefined);
+  function render(recovery: RecoveryPresentation | null, projectValue = project()) {
+    const handlers = {
+      toggle: vi.fn(async () => undefined),
+      sync: vi.fn(async () => undefined),
+      acknowledge: vi.fn(async () => undefined),
+      retryGit: vi.fn(async () => undefined),
+      resume: vi.fn(async () => undefined),
+      regenerate: vi.fn(async () => undefined),
+      prepare: vi.fn(async () => undefined),
+      refresh: vi.fn(async () => undefined),
+      runRecovery: vi.fn(async () => undefined),
+      resolve: vi.fn(async () => undefined),
+      noop: vi.fn(async () => undefined),
+    };
     act(() => {
       root.render(
         <AutopilotControlBar
-          project={blockedProject(failureKind)}
+          project={projectValue}
+          recoveryPresentation={recovery}
           executionStatus={null}
           busy={false}
-          onToggle={noop}
-          onStopManagedFlow={noop}
-          onPauseNow={noop}
-          onPauseAfterCurrent={noop}
-          onResume={noop}
-          onSync={noop}
-          onAcknowledgeRecovery={noop}
-          onRetryCurrent={noop}
-          onRetryGitConfirmation={noop}
+          onToggle={handlers.toggle}
+          onStopManagedFlow={handlers.noop}
+          onPauseNow={handlers.noop}
+          onPauseAfterCurrent={handlers.noop}
+          onResume={handlers.resume}
+          onSync={handlers.sync}
+          onAcknowledgeRecovery={handlers.acknowledge}
+          onRegeneratePlan={handlers.regenerate}
+          onPrepareWorkspace={handlers.prepare}
+          onRefreshWorkspace={handlers.refresh}
+          onRetryGitConfirmation={handlers.retryGit}
+          onRunAutomaticRecovery={handlers.runRecovery}
+          onResolveHumanRecovery={handlers.resolve}
         />,
       );
     });
-    return [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
+    return handlers;
   }
 
-  it("offers only confirmation retry for a legacy V1 collision", () => {
-    const buttons = render("LegacyV1TagConflict");
-
-    expect(host.textContent).toContain("Git 确认受阻");
-    expect(host.textContent).toContain("代码与质量结果已保留");
-    expect(buttons).toContain("重新确认提交");
-    expect(buttons).not.toContain("恢复基线并继续");
-    expect(buttons).not.toContain("恢复基线并重试");
-  });
-
-  it("requires manual review for a V2 integrity conflict", () => {
-    const buttons = render("V2TagIntegrityConflict");
-
-    expect(host.textContent).toContain("请人工核对 V2 不可变标签与确认提交");
-    expect(buttons).not.toContain("重新确认提交");
-    expect(buttons).not.toContain("恢复基线并继续");
-    expect(buttons).not.toContain("恢复基线并重试");
-  });
-
-  it("shows backend action and heartbeat without human recovery during automatic retry", () => {
-    const project = blockedProject("CommitFailed");
-    project.execution_session!.status = "execution_failed";
-    project.workflow_state.recovery_state = {
-      phase: "WaitingEngine",
-      error_kind: "EngineBlocked",
-    } as Project["workflow_state"]["recovery_state"];
-    Object.assign(project.workflow_state.autopilot_state!, {
-      run_status: "Running",
-      recovery_action: "RestoreExecutionBaseline",
-      current_action_kind: "execute_current_subtask",
-      heartbeat_at: "2026-07-25T00:00:10Z",
-      transient_retry_count: 2,
-      next_retry_at: "2026-07-25T00:00:30Z",
-      last_failure_kind: "ProviderUnavailable",
-    });
-    const noop = vi.fn(async () => undefined);
-
-    act(() => {
-      root.render(
-        <AutopilotControlBar
-          project={project}
-          executionStatus={null}
-          busy={false}
-          onToggle={noop}
-          onStopManagedFlow={noop}
-          onPauseNow={noop}
-          onPauseAfterCurrent={noop}
-          onResume={noop}
-          onSync={noop}
-          onAcknowledgeRecovery={noop}
-          onRetryCurrent={noop}
-          onResolveHumanRecovery={noop}
-        />,
-      );
-    });
-
-    const text = host.textContent ?? "";
+  it.each([
+    ["BaselineRecovery", "AcknowledgeExecutionRecovery", "预览并恢复执行基线"],
+    ["GitReconfirmation", "RetryGitConfirmation", "重新确认提交"],
+    ["EngineBlocked", "AcknowledgeExecutionRecovery", "检查引擎并重试"],
+    ["EvidenceInsufficient", "ResolveHumanRecovery", "补充证据并重新验证"],
+    ["HumanDecision", "ResolveHumanRecovery", "选择处理方式"],
+  ] as const)("renders one backend-controlled primary action for %s", (kind, capability, label) => {
+    render(presentation(kind, action(capability, label)));
     const buttons = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
-    expect(text).toContain("等待自动重试");
-    expect(text).toContain("当前：执行当前任务");
-    expect(text).toContain("重试 2/3");
-    expect(text).toContain("心跳");
-    expect(buttons).toContain("暂停自动驾驶");
-    expect(buttons).not.toContain("检查引擎并重试");
-    expect(buttons).not.toContain("恢复基线并继续");
-    expect(buttons).not.toContain("恢复基线并重试");
+
+    expect(host.querySelector(`[data-recovery-kind='${kind}']`)).not.toBeNull();
+    expect(buttons).toEqual(["同步状态", label]);
   });
 
-  it("keeps review service blocks at the settings and revalidation boundary", () => {
-    const project = validationProject("ReviewServiceBlocked", "WaitingHuman");
-    const onResolveHumanRecovery = vi.fn(async () => undefined);
-    const noop = vi.fn(async () => undefined);
-
-    act(() => {
-      root.render(
-        <AutopilotControlBar
-          project={project}
-          executionStatus={null}
-          busy={false}
-          onToggle={noop}
-          onStopManagedFlow={noop}
-          onPauseNow={noop}
-          onPauseAfterCurrent={noop}
-          onResume={noop}
-          onSync={noop}
-          onResolveHumanRecovery={onResolveHumanRecovery}
-        />,
-      );
-    });
-
+  it("shows validation retry as automatic without inventing a recovery button", () => {
+    render(presentation("ValidationRetry", null, {
+      title: "等待验证重试",
+      automatic_retry: true,
+      background_retry_active: true,
+      background_retry_summary: "后台重试进行中",
+    }));
     const buttons = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
-    expect(host.textContent).toContain("AI 审查认证或额度异常");
-    expect(buttons).toContain("打开决策模型设置");
-    expect(buttons).toContain("重新验证");
-    expect(buttons).not.toContain("恢复基线并继续");
-    expect(buttons).not.toContain("恢复基线并重试");
-    expect(buttons).not.toContain("手动修复后复测");
-    expect(buttons).not.toContain("重新规划当前任务");
-
-    act(() => {
-      host.querySelector("button[title='打开决策模型设置']")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-    expect(onResolveHumanRecovery).not.toHaveBeenCalled();
+    expect(host.textContent).toContain("后台重试进行中");
+    expect(buttons).toEqual(["同步状态"]);
   });
 
-  it("reports protocol exhaustion without exposing code recovery controls", () => {
-    const project = validationProject("ReviewProtocolFailure", "WaitingHuman");
-    const noop = vi.fn(async () => undefined);
-
-    act(() => {
-      root.render(
-        <AutopilotControlBar
-          project={project}
-          executionStatus={null}
-          busy={false}
-          onToggle={noop}
-          onStopManagedFlow={noop}
-          onPauseNow={noop}
-          onPauseAfterCurrent={noop}
-          onResume={noop}
-          onSync={noop}
-          onResolveHumanRecovery={noop}
-        />,
-      );
-    });
-
-    const buttons = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
-    expect(host.textContent).toContain("审查结果格式持续异常");
-    expect(buttons).toContain("重新验证");
-    expect(buttons).not.toContain("恢复基线并继续");
-    expect(buttons).not.toContain("恢复基线并重试");
-    expect(buttons).not.toContain("手动修复后复测");
-    expect(buttons).not.toContain("重新规划当前任务");
+  it("renders no recovery UI for None", () => {
+    render(presentation("None", null));
+    expect(host.querySelector("[data-recovery-kind]")).toBeNull();
+    expect(host.textContent).toContain("已暂停");
   });
 
-  it("shows only validation controls while a review retry is pending", () => {
-    const project = validationProject("ReviewTransientFailure", "Retesting", {
-      verificationStage: "ReviewRetry",
-      validationRetryCount: 1,
-      maxValidationRetries: 3,
-      nextValidationRetryAt: "2026-07-26T00:00:30Z",
-    });
-    const noop = vi.fn(async () => undefined);
+  it("uses capability routing and never substitutes baseline recovery for Git", () => {
+    const handlers = render(presentation(
+      "GitReconfirmation",
+      action("RetryGitConfirmation", "重新确认提交"),
+    ));
+    const button = [...host.querySelectorAll("button")]
+      .find(item => item.textContent?.includes("重新确认提交"));
+    act(() => button?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 
-    act(() => {
-      root.render(
-        <AutopilotControlBar
-          project={project}
-          executionStatus={null}
-          busy={false}
-          onToggle={noop}
-          onStopManagedFlow={noop}
-          onPauseNow={noop}
-          onPauseAfterCurrent={noop}
-          onResume={noop}
-          onSync={noop}
-          onAcknowledgeRecovery={noop}
-          onRetryCurrent={noop}
-          onResolveHumanRecovery={noop}
-        />,
-      );
-    });
-
-    const buttons = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
-    expect(host.textContent).toContain("等待验证重试");
-    expect(host.textContent).toContain("审查重试 1/3");
-    expect(host.textContent).toContain("验证阶段：重新请求 AI 审查");
-    expect(buttons).toContain("同步");
-    expect(buttons).toContain("暂停验证");
-    expect(buttons).not.toContain("恢复基线并继续");
-    expect(buttons).not.toContain("恢复基线并重试");
-    expect(buttons).not.toContain("检查引擎并重试");
-    expect(buttons).not.toContain("重新规划当前任务");
+    expect(handlers.retryGit).toHaveBeenCalledTimes(1);
+    expect(handlers.acknowledge).not.toHaveBeenCalled();
+    const buttons = [...host.querySelectorAll("button")].map(item => item.textContent ?? "");
+    expect(buttons.some(label => label.includes("恢复执行基线"))).toBe(false);
   });
 
-  it("flags a stale heartbeat during an active validation stage", () => {
-    const project = validationProject("ReviewTransientFailure", "Retesting", {
-      verificationStage: "ParsingReview",
-      validationRetryCount: 0,
-      maxValidationRetries: 0,
-      heartbeatAt: "2026-07-25T23:59:00Z",
-    });
-    const noop = vi.fn(async () => undefined);
+  it("shows the backend disabled reason for an unavailable action", () => {
+    const primary = action("RetryGitConfirmation", "等待人工核对 Git");
+    primary.enabled = false;
+    primary.disabled_reason = "系统不会覆盖不可变标签";
+    render(presentation("GitReconfirmation", primary));
 
-    act(() => {
-      root.render(
-        <AutopilotControlBar
-          project={project}
-          executionStatus={null}
-          busy={false}
-          onToggle={noop}
-          onStopManagedFlow={noop}
-          onPauseNow={noop}
-          onPauseAfterCurrent={noop}
-          onResume={noop}
-          onSync={noop}
-        />,
-      );
-    });
-
-    expect(host.textContent).toContain("心跳异常");
+    const button = [...host.querySelectorAll("button")]
+      .find(item => item.textContent?.includes("等待人工核对 Git"));
+    expect(button?.hasAttribute("disabled")).toBe(true);
+    expect(host.textContent).toContain("系统不会覆盖不可变标签");
   });
 
-  it("uses the same deep recovery leaf for quality and evidence status", () => {
-    const project = validationProject("EvidenceInsufficient", "WaitingHuman");
-    project.workflow_state.recovery_state!.subtask_id = "deep-leaf";
-    project.milestones = [{
+  it("opens backend decision options instead of guessing a resolution", async () => {
+    const handlers = render(presentation(
+      "HumanDecision",
+      action("ResolveHumanRecovery", "选择处理方式"),
+      {
+        decision_options: [{
+          resolution: "revalidate",
+          label: "重新验证",
+          enabled: true,
+          disabled_reason: null,
+          requires_reason: false,
+          requires_acceptance_selection: false,
+          requires_baseline_preview: false,
+        }],
+      },
+    ));
+    const openButton = [...host.querySelectorAll("button")]
+      .find(item => item.textContent?.includes("选择处理方式"));
+    act(() => openButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+
+    expect(document.body.textContent).toContain("重新验证");
+    const confirm = [...document.body.querySelectorAll("button")]
+      .find(item => item.textContent?.includes("确认处理"));
+    await act(async () => {
+      confirm?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(handlers.resolve).toHaveBeenCalledWith(
+      "revalidate",
+      "",
+      [],
+    );
+  });
+
+  it("keeps normal runtime target, retry, validation, heartbeat, and quality telemetry", () => {
+    const value = project();
+    const autopilot = value.workflow_state.autopilot_state!;
+    autopilot.current_action_kind = "execute_current_subtask";
+    autopilot.transient_retry_count = 2;
+    autopilot.next_retry_at = "2026-07-31T05:00:00Z";
+    autopilot.heartbeat_at = "2026-07-31T04:59:59Z";
+    value.execution_session = {
+      subtask_id: "task-1",
+      verification_stage: "AutomatedTests",
+    } as Project["execution_session"];
+    value.milestones = [{
       id: "milestone-1",
+      title: "同步稳定性",
       subtasks: [],
       mid_stages: [{
-        id: "mid-1",
         subtasks: [{
-          id: "parent",
-          status: "Pending",
-          child_tasks: [{
-            id: "child-parent",
-            status: "Pending",
-            child_tasks: [{
-              id: "deep-leaf",
-              status: "AwaitingConfirmation",
-              child_tasks: [],
-              test_result: {
-                passed: false,
-                issues: [],
-                suggestion: "",
-                automated_test_status: "Passed",
-              },
-              acceptance_ledger: [{
-                criterion_index: 1,
-                criterion: "深层证据",
-                status: "Unknown",
-                evidence: "",
-                evidence_references: [],
-                confidence: 0,
-                updated_at: "",
-              }],
-            }],
-          }],
+          id: "task-1",
+          child_tasks: [],
+          acceptance_ledger: [],
+          test_result: {
+            passed: true,
+            issues: [],
+            suggestion: "",
+            automated_test_status: "Passed",
+          },
         }],
       }],
     }] as unknown as Project["milestones"];
-    const noop = vi.fn(async () => undefined);
 
-    act(() => {
-      root.render(
-        <AutopilotControlBar
-          project={project}
-          executionStatus={null}
-          busy={false}
-          onToggle={noop}
-          onStopManagedFlow={noop}
-          onPauseNow={noop}
-          onPauseAfterCurrent={noop}
-          onResume={noop}
-          onSync={noop}
-          onResolveHumanRecovery={noop}
-        />,
-      );
-    });
-
+    render(null, value);
+    expect(host.textContent).toContain("目标：同步稳定性");
+    expect(host.textContent).toContain("当前：执行当前任务");
+    expect(host.textContent).toContain("重试 2/3");
+    expect(host.textContent).toContain("验证阶段：运行自动化测试");
+    expect(host.textContent).toContain("心跳");
     expect(host.textContent).toContain("自动化测试：通过");
-    expect(host.textContent).toContain("验收证据：不足");
+  });
+
+  it("keeps managed-flow target, action, heartbeat, and detail visible", () => {
+    const value = project();
+    value.workflow_state.autopilot_active = false;
+    value.workflow_state.managed_flow_state = {
+      active: true,
+      managed_state: "running",
+      managed_target: "MilestoneSelection",
+      last_action: "正在生成首个大阶段",
+      last_action_at: "2026-07-31T05:00:00Z",
+      run_status: "Running",
+      error_message: "",
+      job_id: "job-1",
+      job_generation: 1,
+      current_action: "generate_milestone_draft",
+      current_action_id: "action-1",
+      heartbeat_at: "2026-07-31T05:00:00Z",
+      retry_count: 0,
+      last_completed_action: "",
+    };
+
+    render(null, value);
+    expect(host.textContent).toContain("目标：完成首个大阶段批准");
+    expect(host.textContent).toContain("动作：生成大阶段草稿");
+    expect(host.textContent).toContain("心跳：");
+    expect(host.textContent).toContain("正在生成首个大阶段");
   });
 });

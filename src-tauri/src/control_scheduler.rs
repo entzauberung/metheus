@@ -88,8 +88,14 @@ pub fn decide_next_action(
             ControlActionKind::LocalValidate
         } else if modes.contains(&crate::validator_contract::VerificationMode::AutomatedTest) {
             ControlActionKind::AutomatedValidate
-        } else {
+        } else if local_was_unprovable
+            || modes.contains(&crate::validator_contract::VerificationMode::SemanticReview)
+        {
             ControlActionKind::TargetedValidate
+        } else if modes.contains(&crate::validator_contract::VerificationMode::HumanReview) {
+            ControlActionKind::Human
+        } else {
+            ControlActionKind::Human
         };
         (
             ControlAction::new(kind, "仅补充尚未证明的验收项"),
@@ -195,6 +201,23 @@ mod tests {
         task.contract_snapshot = Some(compiled.contract.clone());
         let decision = decide_next_action(&task, &compiled, "facts", false);
         assert_eq!(decision.action.kind, ControlActionKind::AutomatedValidate);
+    }
+
+    #[test]
+    fn human_review_contract_mode_enters_human_boundary() {
+        let mut task = Subtask::default();
+        task.id = "human".into();
+        task.acceptance_criteria = vec!["操作员确认真实桌面行为".into()];
+        task.status = SubtaskStatus::AwaitingConfirmation;
+        let compiled = crate::task_compiler::compile(&task, None, 0);
+        let mut contract = compiled.contract.clone();
+        contract.verification_modes =
+            vec![crate::validator_contract::VerificationMode::HumanReview];
+        crate::task_contract::refresh_fingerprint(&mut contract);
+        task.contract_snapshot = Some(contract);
+
+        let decision = decide_next_action(&task, &compiled, "facts", false);
+        assert_eq!(decision.action.kind, ControlActionKind::Human);
     }
 
     #[test]

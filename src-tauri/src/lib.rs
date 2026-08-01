@@ -25,6 +25,7 @@ mod cost_ledger;
 mod diff;
 mod engine;
 mod git_ops;
+mod human_action_policy;
 mod json_utils;
 mod managed_runtime;
 mod pipeline;
@@ -33,13 +34,16 @@ mod plan_compiler;
 mod plan_contract;
 mod project;
 mod project_facts;
+mod project_state_bus;
 mod prompts;
 mod quality_gate;
 mod recovery;
 mod recovery_checkpoint;
 mod recovery_learning;
+mod recovery_presentation;
 mod review_evidence;
 mod review_protocol;
+mod runtime_snapshot;
 mod settings;
 mod snapshot;
 mod task_aggregation;
@@ -55,7 +59,10 @@ mod validators;
 mod workflow_resolution;
 use crate::pipeline::PipelineState;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
+
+static PROJECT_WRITE_LOCK: StdMutex<()> = StdMutex::new(());
 
 /// 获取项目数据文件的统一存储路径
 ///
@@ -97,13 +104,64 @@ pub(crate) fn check_project_path(path: &str) -> project::PathValidationResult {
 ///保存项目数据到文件（原子写入：先写临时文件，再替换正式文件）
 pub(crate) fn save_project(project: &project::Project) -> Result<(), String> {
     let path = project_data_path(&project.name)?;
-    save_project_to_path(project, &path)
+    let persisted = {
+        let _guard = PROJECT_WRITE_LOCK
+            .lock()
+            .map_err(|_| "项目写锁已损坏".to_string())?;
+        write_project_to_path(project, &path)?
+    };
+    publish_persisted_project(&persisted);
+    Ok(())
+}
+
+pub(crate) fn save_project_if_revision(
+    project: &project::Project,
+    expected_project_revision: u64,
+    expected_tree_revision: u64,
+) -> Result<(), String> {
+    let path = project_data_path(&project.name)?;
+    let persisted = {
+        let _guard = PROJECT_WRITE_LOCK
+            .lock()
+            .map_err(|_| "项目写锁已损坏".to_string())?;
+        let current = load_project_from_path(&path)?;
+        if current.workflow_state.data_revision != expected_project_revision
+            || current.task_control.tree_revision != expected_tree_revision
+        {
+            return Err("人工终态动作校验后项目状态已变化，拒绝旧动作".to_string());
+        }
+        write_project_to_path(project, &path)?
+    };
+    publish_persisted_project(&persisted);
+    Ok(())
+}
+
+fn publish_persisted_project(persisted: &project::Project) {
+    if let Err(error) = crate::project_state_bus::publish_project_state(persisted) {
+        // The atomic replace already succeeded. Notification delivery is best effort and
+        // must never turn a successful durable write into a reported save failure.
+        eprintln!(
+            "项目状态已保存，但状态修订通知发布失败（project={}）：{}",
+            persisted.name, error
+        );
+    }
 }
 
 pub(crate) fn save_project_to_path(
     project: &project::Project,
     path: &std::path::Path,
 ) -> Result<(), String> {
+    write_project_to_path(project, path).map(|_| ())
+}
+
+/// Pure atomic file write used by tests and explicit alternate paths.
+///
+/// The returned value is the exact merged value written to disk. This function never
+/// publishes a project-state event; only `save_project` owns that side effect.
+fn write_project_to_path(
+    project: &project::Project,
+    path: &std::path::Path,
+) -> Result<project::Project, String> {
     //1. 确保目标目录存在
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{}", e))?;
@@ -126,7 +184,7 @@ pub(crate) fn save_project_to_path(
         let _ = fs::remove_file(&tmp_path);
         format!("替换项目文件失败: {}", e)
     })?;
-    Ok(())
+    Ok(value)
 }
 
 /// 根据项目名字，从硬盘文件里加载项目数据
@@ -191,6 +249,64 @@ pub fn run() {
             crate::commands::chat::greet,
             crate::commands::chat::send_message,
             crate::commands::project_ops::get_project,
+            crate::commands::project_state::subscribe_project_state,
+            crate::commands::project_state::unsubscribe_project_state,
+            crate::runtime_snapshot::get_runtime_snapshot,
+            crate::commands::runtime_mutations::select_milestone_runtime,
+            crate::commands::runtime_mutations::select_mid_stage_runtime,
+            crate::commands::runtime_mutations::generate_version_plan_runtime,
+            crate::commands::runtime_mutations::approve_version_plan_runtime,
+            crate::commands::runtime_mutations::reject_version_plan_runtime,
+            crate::commands::runtime_mutations::enter_console_runtime,
+            crate::commands::runtime_mutations::start_preflight_check_runtime,
+            crate::commands::runtime_mutations::analyze_existing_project_runtime,
+            crate::commands::runtime_mutations::approve_existing_baseline_runtime,
+            crate::commands::runtime_mutations::update_execution_profile_runtime,
+            crate::commands::runtime_mutations::migrate_project_workflow_runtime,
+            crate::commands::runtime_mutations::reconcile_on_startup_runtime,
+            crate::commands::runtime_mutations::return_to_discussion_runtime,
+            crate::commands::runtime_mutations::resume_plan_approval_runtime,
+            crate::commands::runtime_mutations::restart_discussion_from_approved_runtime,
+            crate::commands::runtime_mutations::restart_checks_runtime,
+            crate::commands::runtime_mutations::run_preflight_check_runtime,
+            crate::commands::runtime_mutations::reconcile_managed_milestone_state_runtime,
+            crate::commands::runtime_mutations::resolve_pause_decision_runtime,
+            crate::commands::runtime_mutations::confirm_rollback_runtime,
+            crate::commands::runtime_mutations::regenerate_execution_plan_runtime,
+            crate::commands::runtime_mutations::generate_future_milestone_draft_runtime,
+            crate::commands::runtime_mutations::approve_future_milestones_runtime,
+            crate::commands::runtime_mutations::start_managed_flow_runtime,
+            crate::commands::runtime_mutations::stop_managed_flow_runtime,
+            crate::commands::runtime_mutations::toggle_autopilot_runtime,
+            crate::commands::runtime_mutations::autopilot_pause_runtime,
+            crate::commands::runtime_mutations::autopilot_resume_runtime,
+            crate::commands::runtime_mutations::request_in_stop_runtime,
+            crate::commands::runtime_mutations::request_ed_stop_runtime,
+            crate::commands::runtime_mutations::confirm_subtask_result_runtime,
+            crate::commands::runtime_mutations::retry_git_confirmation_runtime,
+            crate::commands::runtime_mutations::reject_subtask_result_runtime,
+            crate::commands::runtime_mutations::run_error_recovery_runtime,
+            crate::commands::runtime_mutations::acknowledge_execution_recovery_runtime,
+            crate::commands::runtime_mutations::resolve_human_recovery_runtime,
+            crate::commands::runtime_mutations::approve_milestone_outcome_runtime,
+            crate::commands::runtime_mutations::summarize_milestone_runtime,
+            crate::commands::runtime_mutations::generate_milestone_draft_runtime,
+            crate::commands::runtime_mutations::regenerate_milestone_draft_runtime,
+            crate::commands::runtime_mutations::check_milestone_draft_runtime,
+            crate::commands::runtime_mutations::approve_milestone_draft_runtime,
+            crate::commands::runtime_mutations::continue_current_milestone_runtime,
+            crate::commands::runtime_mutations::generate_mid_stage_draft_runtime,
+            crate::commands::runtime_mutations::regenerate_mid_stage_draft_runtime,
+            crate::commands::runtime_mutations::check_mid_stage_draft_runtime,
+            crate::commands::runtime_mutations::approve_mid_stage_draft_runtime,
+            crate::commands::runtime_mutations::generate_execution_plan_runtime,
+            crate::commands::runtime_mutations::check_stage_plan_runtime,
+            crate::commands::runtime_mutations::approve_stage_plan_runtime,
+            crate::commands::runtime_mutations::prepare_execution_workspace_runtime,
+            crate::commands::runtime_mutations::refresh_execution_workspace_runtime,
+            crate::commands::runtime_mutations::execute_current_subtask_runtime,
+            crate::commands::runtime_mutations::pause_managed_flow_runtime,
+            crate::commands::runtime_mutations::resume_managed_flow_runtime,
             crate::commands::project_ops::check_engine_health,
             crate::commands::project_ops::verify_engine_authentication,
             crate::commands::project_ops::update_execution_profile,
@@ -203,6 +319,9 @@ pub fn run() {
             crate::commands::chat::chat_with_role,
             crate::commands::chat::chat_with_role_stream,
             crate::commands::chat::regenerate_chat_reply_stream,
+            crate::commands::chat::chat_with_role_runtime,
+            crate::commands::chat::chat_with_role_stream_runtime,
+            crate::commands::chat::regenerate_chat_reply_stream_runtime,
             crate::commands::chat::cancel_chat_stream,
             crate::commands::plan::generate_version_plan,
             crate::commands::plan::approve_version_plan,
@@ -243,6 +362,7 @@ pub fn run() {
             crate::pipeline::request_ed_stop,
             crate::pipeline::resolve_pause_decision,
             crate::pipeline::preview_rollback_impact,
+            crate::pipeline::preview_execution_recovery_impact,
             crate::pipeline::confirm_rollback,
             crate::pipeline::reconcile_on_startup,
             crate::pipeline::acknowledge_execution_recovery,
@@ -284,6 +404,8 @@ pub fn run() {
             crate::commands::task_control::get_task_control_snapshot,
             crate::commands::task_control::set_task_control_mode,
             crate::commands::task_control::apply_task_control_action,
+            crate::commands::task_control::set_task_control_mode_runtime,
+            crate::commands::task_control::apply_task_control_action_runtime,
             crate::commands::project_ops::initialize_project_entry,
             crate::commands::project_ops::validate_project_path,
             crate::commands::project_ops::get_project_files,
