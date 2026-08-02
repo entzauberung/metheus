@@ -341,6 +341,7 @@ export interface ProjectStateSubscription {
 
 export type RecoveryPresentationKind =
   | "None"
+  | "ControlActionOccupied"
   | "BaselineRecovery"
   | "GitReconfirmation"
   | "EngineBlocked"
@@ -358,6 +359,7 @@ export type RecoverySeverity = "Info" | "Warning" | "Error";
 
 export type RecoveryCapability =
   | "SyncProject"
+  | "ClearStaleControlLock"
   | "AcknowledgeExecutionRecovery"
   | "RetryGitConfirmation"
   | "RetryAutopilotAdvance"
@@ -433,6 +435,12 @@ export interface RecoveryPresentation {
   code_review_status?: string;
   review_protocol_status?: string;
   acceptance_evidence_status?: string;
+  control_lock_valid?: boolean | null;
+  control_action_description?: string;
+  control_action_elapsed_seconds?: number;
+  control_lock_last_heartbeat_at?: string | null;
+  control_lock_failure_reason?: string;
+  control_lock_cleanup_available?: boolean;
 }
 
 export interface RecoveryResultSummary {
@@ -1044,6 +1052,16 @@ export interface TaskControlModeChangeRecord {
   project_revision: number;
 }
 
+export interface ControlActionLease {
+  action_id: string;
+  owner_process_start_id: string;
+  action_kind: string;
+  task_id: string;
+  started_at: string;
+  heartbeat_at: string;
+  expected_max_duration_secs: number;
+}
+
 export interface TaskControlState {
   mode: TaskControlMode;
   algorithm_version: string;
@@ -1062,6 +1080,7 @@ export interface TaskControlState {
   last_decision?: TaskControlDecision;
   control_source: string;
   tree_revision?: number;
+  active_action_lease?: ControlActionLease;
   active_action_id?: string;
   active_action_kind?: string;
   active_action_task_id?: string;
@@ -1070,6 +1089,8 @@ export interface TaskControlState {
   last_completed_action_task_id?: string;
   last_action_result?: string;
   last_action_made_progress?: boolean;
+  last_action_clear_reason?: string;
+  last_action_cleared_at?: string;
 }
 
 export type TaskActionFamily = "Execute" | "Confirm" | "Repair" | "Wait" | "Human";
@@ -1436,6 +1457,8 @@ export type ExecutionEventType =
   | "GitConfirmationCommitCreated"
   | "GitConfirmationBlocked"
   | "GitConfirmationCompleted"
+  | "StaleControlLockCleared"
+  | "StaleControlActionNeedsHumanConfirmation"
   | "RetryScheduled"
   | "ExecutionFailed"
   | "RecoveryStarted"
@@ -1478,6 +1501,10 @@ export interface ExecutionHistoryEntry {
   action_id?: string;
   validator_id?: string;
   model_call_id?: string;
+  control_lock_owner_process_start_id?: string;
+  control_lock_heartbeat_at?: string;
+  control_lock_clear_reason?: string;
+  control_lock_post_task_state?: string;
 }
 
 export interface ChangeHistoryEntry {

@@ -136,6 +136,47 @@ pub(crate) fn save_project_if_revision(
     Ok(())
 }
 
+/// 在稳定的跨进程文件锁和进程内项目写锁下重新读取并修改项目。
+/// 控制动作的认领、心跳、完成和清理必须使用本入口，避免两个应用进程同时认领。
+pub(crate) fn mutate_project_for_control<T, F>(project_name: &str, mutate: F) -> Result<T, String>
+where
+    F: FnOnce(&mut project::Project) -> Result<(T, bool), String>,
+{
+    let path = project_data_path(project_name)?;
+    let lock_path = path.with_extension("control-action.lock");
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("创建控制锁目录失败：{}", error))?;
+    }
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| format!("打开控制动作事务锁失败：{}", error))?;
+    lock_file
+        .lock()
+        .map_err(|error| format!("获取控制动作事务锁失败：{}", error))?;
+
+    let (result, persisted) = {
+        let _guard = PROJECT_WRITE_LOCK
+            .lock()
+            .map_err(|_| "项目写锁已损坏".to_string())?;
+        let mut project = load_project_from_path(&path)?;
+        let (result, changed) = mutate(&mut project)?;
+        let persisted = if changed {
+            Some(write_project_to_path(&project, &path)?)
+        } else {
+            None
+        };
+        (result, persisted)
+    };
+    drop(lock_file);
+    if let Some(project) = persisted.as_ref() {
+        publish_persisted_project(project);
+    }
+    Ok(result)
+}
+
 fn publish_persisted_project(persisted: &project::Project) {
     if let Err(error) = crate::project_state_bus::publish_project_state(persisted) {
         // The atomic replace already succeeded. Notification delivery is best effort and

@@ -171,8 +171,9 @@ pub(crate) async fn migrate_project_workflow(
 ) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
 
-    // === 0. 执行会话对账（最先执行，防止误恢复） ===
-    reconcile_execution_in_migration(&mut proj);
+    // === 0. 执行会话与控制锁对账（最先执行，防止误恢复） ===
+    // 活跃的本地或其他进程租约会让该入口保持只读；陈旧租约则与 Git/执行事实一起收口。
+    crate::pipeline::reconcile_loaded_project_under_pipeline_lock(&mut proj, None);
 
     // === 0.5. autopilot sanity 检查 ===
     reconcile_autopilot_in_migration(&mut proj);
@@ -1354,14 +1355,24 @@ pub(crate) fn reconcile_managed_milestone_project(proj: &mut project::Project) -
 pub(crate) async fn reconcile_managed_milestone_state(
     project_name: String,
 ) -> Result<project::Project, String> {
-    let mut proj = crate::load_project(&project_name)?;
-    if !reconcile_managed_milestone_project(&mut proj) {
-        return Ok(proj);
-    }
-    let now = chrono::Utc::now().to_rfc3339();
-    proj.workflow_state.data_revision += 1;
-    proj.workflow_state.last_transition_at = now;
-    crate::save_and_reload_project(&proj)
+    reconcile_managed_milestone_state_with_pipeline(&project_name, None)
+}
+
+pub(crate) fn reconcile_managed_milestone_state_with_pipeline(
+    project_name: &str,
+    pipeline_status: Option<&crate::pipeline::PipelineState>,
+) -> Result<project::Project, String> {
+    crate::mutate_project_for_control(project_name, |proj| {
+        let mut changed =
+            crate::pipeline::reconcile_loaded_project_under_pipeline_lock(proj, pipeline_status);
+        let managed_changed = reconcile_managed_milestone_project(proj);
+        changed |= managed_changed;
+        if managed_changed {
+            proj.workflow_state.data_revision = proj.workflow_state.data_revision.saturating_add(1);
+            proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+        }
+        Ok((proj.clone(), changed))
+    })
 }
 
 /// 自动驾驶持久化错误信息最大长度，防止项目文件异常膨胀
@@ -2135,30 +2146,6 @@ pub(crate) async fn autopilot_next_step(project_name: String) -> Result<Autopilo
 // ===================================================================
 // 迁移时执行会话与 autopilot 对账
 // ===================================================================
-
-/// 在 migrate_project_workflow 中执行会话对账
-///
-/// 迁移时没有 AppState，因此无法获取内存 PipelineState。
-/// 此时传递 None 意味着：
-/// - "executing" 会话 → StartupRecoverable（保留会话，不判丢失）
-/// - "awaiting_confirmation" 会话 → AwaitingConfirmation（保留）
-/// - 无效/冲突会话 → 照常清理
-///
-/// 真正的 SessionLost 判断只发生在 reconcile_on_startup 中，
-/// 那时 PipelineState 已可用，可以准确区分"进程已死"和"刚启动尚未恢复"。
-fn reconcile_execution_in_migration(proj: &mut crate::project::Project) {
-    let reconciliation = { crate::pipeline::reconcile_execution_state(proj, None) };
-
-    // 只在真正不可恢复时才清理：无效会话、数据冲突。
-    // StartupRecoverable / Executing / AwaitingConfirmation 均保留不动。
-    if matches!(
-        reconciliation,
-        crate::pipeline::ExecutionReconciliation::SessionInvalid
-            | crate::pipeline::ExecutionReconciliation::DataConflict
-    ) {
-        crate::pipeline::apply_execution_reconciliation(proj, &reconciliation);
-    }
-}
 
 fn reconcile_discussion_threads_in_migration(proj: &mut project::Project) -> bool {
     let mut changed = false;

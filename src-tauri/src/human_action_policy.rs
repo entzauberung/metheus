@@ -97,6 +97,29 @@ pub fn evaluate(
         dependency_check,
     };
 
+    match crate::control_action_executor::classify_control_action_occupancy(
+        &project.task_control,
+        crate::project_state_bus::process_start_id(),
+        chrono::Utc::now(),
+    ) {
+        crate::control_action_executor::ControlActionOccupancy::Unoccupied => {}
+        crate::control_action_executor::ControlActionOccupancy::ActiveLocal(lease)
+        | crate::control_action_executor::ControlActionOccupancy::ActiveForeign(lease) => {
+            return denied(
+                format!("控制动作 {} 正在执行，请等待完成", lease.action_id),
+                Vec::new(),
+                String::new(),
+            )
+        }
+        crate::control_action_executor::ControlActionOccupancy::Stale { reason, .. } => {
+            return denied(
+                format!("陈旧控制动作锁尚未由后端清理：{}", reason),
+                Vec::new(),
+                String::new(),
+            )
+        }
+    }
+
     let task = match crate::task_tree::find_task(project, task_id) {
         Ok(Some(task)) => task,
         Ok(None) => {

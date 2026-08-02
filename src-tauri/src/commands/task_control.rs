@@ -188,6 +188,10 @@ pub(crate) async fn set_task_control_mode(
             action_id: None,
             validator_id: None,
             model_call_id: None,
+            control_lock_owner_process_start_id: None,
+            control_lock_heartbeat_at: None,
+            control_lock_clear_reason: None,
+            control_lock_post_task_state: None,
         });
     crate::save_and_reload_project(&project)
 }
@@ -723,6 +727,10 @@ fn append_event(
             action_id: (!request.action_id.is_empty()).then_some(request.action_id),
             validator_id: None,
             model_call_id: None,
+            control_lock_owner_process_start_id: None,
+            control_lock_heartbeat_at: None,
+            control_lock_clear_reason: None,
+            control_lock_post_task_state: None,
         });
     if project.execution_history.len() > project::MAX_EXECUTION_HISTORY {
         let excess = project.execution_history.len() - project::MAX_EXECUTION_HISTORY;
@@ -792,6 +800,36 @@ mod tests {
         });
         project.current_milestone_id = "m".to_string();
         project
+    }
+
+    #[test]
+    fn runtime_fault_regression_stale_lock_cleanup_restores_mode_switch() {
+        let mut project = project_with_task();
+        let now = chrono::Utc::now();
+        let lease = crate::task_control::ControlActionLease {
+            action_id: "stale-mode-action".to_string(),
+            owner_process_start_id: "old-process".to_string(),
+            action_kind: "execute".to_string(),
+            task_id: "task".to_string(),
+            started_at: (now - chrono::Duration::seconds(40)).to_rfc3339(),
+            heartbeat_at: (now - chrono::Duration::seconds(20)).to_rfc3339(),
+            expected_max_duration_secs: 1_200,
+        };
+        project.task_control.active_action_id = lease.action_id.clone();
+        project.task_control.active_action_kind = lease.action_kind.clone();
+        project.task_control.active_action_task_id = lease.task_id.clone();
+        project.task_control.active_action_lease = Some(lease);
+        assert!(mode_switch_blocker(&project).is_some());
+
+        assert!(
+            crate::control_action_executor::reconcile_stale_control_action_lock(
+                &mut project,
+                crate::project_state_bus::process_start_id(),
+                now,
+            )
+            .changed()
+        );
+        assert!(mode_switch_blocker(&project).is_none());
     }
 
     #[test]

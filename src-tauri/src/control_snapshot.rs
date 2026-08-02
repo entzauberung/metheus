@@ -426,15 +426,27 @@ fn node_capabilities(
         apply_human_action_denials(project, task, &mut disabled);
         return (capabilities, disabled, Vec::new());
     }
-    if !project.task_control.active_action_id.is_empty() {
-        let reason = format!(
-            "控制动作 {} 正在执行，当前快照不可写",
-            project.task_control.active_action_id
-        );
-        for action in NODE_ACTIONS {
-            deny(action, &reason);
+    match crate::control_action_executor::classify_control_action_occupancy(
+        &project.task_control,
+        crate::project_state_bus::process_start_id(),
+        chrono::Utc::now(),
+    ) {
+        crate::control_action_executor::ControlActionOccupancy::Unoccupied => {}
+        crate::control_action_executor::ControlActionOccupancy::ActiveLocal(lease)
+        | crate::control_action_executor::ControlActionOccupancy::ActiveForeign(lease) => {
+            let reason = format!("控制动作 {} 正在执行，当前快照不可写", lease.action_id);
+            for action in NODE_ACTIONS {
+                deny(action, &reason);
+            }
+            return (capabilities, disabled, Vec::new());
         }
-        return (capabilities, disabled, Vec::new());
+        crate::control_action_executor::ControlActionOccupancy::Stale { reason, .. } => {
+            let reason = format!("陈旧控制动作锁待后端清理：{}", reason);
+            for action in NODE_ACTIONS {
+                deny(action, &reason);
+            }
+            return (capabilities, disabled, Vec::new());
+        }
     }
 
     if task.status == crate::project::SubtaskStatus::Pending {
@@ -691,5 +703,73 @@ mod tests {
                 .map(String::as_str),
             Some("只能操作当前叶子或当前人工恢复会话绑定的任务")
         );
+    }
+
+    #[test]
+    fn runtime_fault_regression_stale_lock_cleanup_restores_node_capabilities() {
+        let mut project = Project::new("stale-capabilities");
+        project.current_milestone_id = "m".into();
+        project.milestones.push(Milestone {
+            id: "m".into(),
+            version: "v0.1".into(),
+            title: "Milestone".into(),
+            description: String::new(),
+            tech_stack: String::new(),
+            status: crate::project::MilestoneStatus::InProgress,
+            mode: crate::project::StageMode::Quick,
+            mid_stages: Vec::new(),
+            subtasks: vec![Subtask {
+                id: "task".into(),
+                title: "Task".into(),
+                status: crate::project::SubtaskStatus::Pending,
+                acceptance_criteria: vec!["file `a` exists".into()],
+                ..Default::default()
+            }],
+            qa_result: None,
+            git_commit_hash: String::new(),
+            decomposition_check: None,
+            review_status: None,
+            review_conclusion: None,
+            approved_at: None,
+            goal: String::new(),
+            scope: String::new(),
+            dependencies: Vec::new(),
+            expected_output: String::new(),
+            acceptance_criteria: Vec::new(),
+        });
+        let now = chrono::Utc::now();
+        let lease = crate::task_control::ControlActionLease {
+            action_id: "stale-action".into(),
+            owner_process_start_id: "old-process".into(),
+            action_kind: "execute".into(),
+            task_id: "task".into(),
+            started_at: (now - chrono::Duration::seconds(40)).to_rfc3339(),
+            heartbeat_at: (now - chrono::Duration::seconds(20)).to_rfc3339(),
+            expected_max_duration_secs: 1_200,
+        };
+        project.task_control.active_action_id = lease.action_id.clone();
+        project.task_control.active_action_kind = lease.action_kind.clone();
+        project.task_control.active_action_task_id = lease.task_id.clone();
+        project.task_control.active_action_lease = Some(lease);
+
+        let blocked = build(&project).unwrap();
+        assert!(blocked.nodes[0].children[0].capabilities.is_empty());
+        assert!(blocked.nodes[0].children[0]
+            .disabled_reasons
+            .get("execute")
+            .is_some_and(|reason| reason.contains("陈旧控制动作锁")));
+
+        assert!(
+            crate::control_action_executor::reconcile_stale_control_action_lock(
+                &mut project,
+                crate::project_state_bus::process_start_id(),
+                now,
+            )
+            .changed()
+        );
+        let restored = build(&project).unwrap();
+        assert!(restored.nodes[0].children[0]
+            .capabilities
+            .contains(&"execute".to_string()));
     }
 }

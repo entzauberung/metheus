@@ -281,8 +281,11 @@ pub(crate) async fn reconcile_managed_milestone_state_runtime(
     project_name: String,
 ) -> Result<RuntimeMutationResult, String> {
     let pipeline_state = state.pipeline_state.clone();
-    crate::commands::workflow::reconcile_managed_milestone_state(project_name.clone()).await?;
     let pipeline = pipeline_state.lock().await.clone();
+    crate::commands::workflow::reconcile_managed_milestone_state_with_pipeline(
+        &project_name,
+        pipeline.as_ref(),
+    )?;
     finish(&project_name, pipeline, "reconcile_managed_milestone_state")
 }
 

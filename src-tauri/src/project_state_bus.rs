@@ -200,6 +200,10 @@ fn bus() -> &'static ProjectStateBus {
     BUS.get_or_init(ProjectStateBus::default)
 }
 
+pub(crate) fn process_start_id() -> &'static str {
+    bus().process_start_id.as_str()
+}
+
 pub(crate) fn subscribe_project_state_channel(
     project_name: &str,
     channel: Channel<ProjectStateChangedEvent>,

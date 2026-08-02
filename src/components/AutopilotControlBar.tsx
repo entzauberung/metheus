@@ -142,6 +142,7 @@ export function AutopilotControlBar({
   const recoveryHandler = (capability: RecoveryCapability): (() => Promise<void>) | null => {
     switch (capability) {
       case "SyncProject": return onSync;
+      case "ClearStaleControlLock": return onSync;
       case "AcknowledgeExecutionRecovery": return onAcknowledgeRecovery ?? null;
       case "RetryGitConfirmation": return onRetryGitConfirmation ?? null;
       case "RetryAutopilotAdvance":
@@ -150,7 +151,8 @@ export function AutopilotControlBar({
       case "PrepareExecutionWorkspace": return onPrepareWorkspace ?? null;
       case "RefreshExecutionWorkspace": return onRefreshWorkspace ?? null;
       case "RunAutomaticRecovery": return onRunAutomaticRecovery ?? null;
-      case "ResolveHumanRecovery": return onResolveHumanRecovery && recovery?.decision_options.some(option => option.enabled)
+      case "ResolveHumanRecovery": return project.workflow_state.recovery_state
+        && onResolveHumanRecovery && recovery?.decision_options.some(option => option.enabled)
         ? async () => { setDecisionOpen(true); }
         : null;
       case "CloseAutopilot": return () => onToggle(false);
@@ -162,6 +164,9 @@ export function AutopilotControlBar({
     primary: boolean,
   ) => {
     if (!recovery?.capabilities.includes(action.capability)) return null;
+    if (action.capability === "ResolveHumanRecovery" && !project.workflow_state.recovery_state) {
+      return null;
+    }
     const handler = recoveryHandler(action.capability);
     const enabled = action.enabled && handler !== null;
     const disabledReason = action.disabled_reason
@@ -206,6 +211,16 @@ export function AutopilotControlBar({
               </span>
             )}
             {recovery.heartbeat_status && <span className="ap-bar-target">心跳：{recovery.heartbeat_status}</span>}
+            {recovery.control_action_description && (
+              <span className="ap-bar-target">占用：{recovery.control_action_description}</span>
+            )}
+            {recovery.control_action_elapsed_seconds !== undefined
+              && recovery.kind === "ControlActionOccupied" && (
+                <span className="ap-bar-target">已持续：{recovery.control_action_elapsed_seconds} 秒</span>
+              )}
+            {recovery.control_lock_failure_reason && (
+              <span className="ap-bar-warning">失效原因：{recovery.control_lock_failure_reason}</span>
+            )}
             {[recovery.automated_test_status, recovery.code_review_status,
               recovery.review_protocol_status, recovery.acceptance_evidence_status]
               .filter(Boolean)

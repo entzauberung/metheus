@@ -2865,27 +2865,31 @@ pub(crate) async fn generate_milestones(
     };
 
     // 步骤 4：使用 parse_json_with_retry 解析 AI 返回的 QAResult JSON
-    let qa_result =
-        match crate::json_utils::parse_json_with_retry::<project::QAResult>(&qa_response).await {
-            Ok(mut result) => {
-                result.checked_at = chrono::Utc::now().to_rfc3339();
-                result
+    let qa_result = match crate::json_utils::parse_json_with_contract::<project::QAResult>(
+        &qa_response,
+        &crate::json_utils::QA_RESULT_JSON_CONTRACT,
+    )
+    .await
+    {
+        Ok(mut result) => {
+            result.checked_at = chrono::Utc::now().to_rfc3339();
+            result
+        }
+        Err(e) => {
+            eprintln!(
+                "[generate_milestones] 质检 JSON 解析失败：{}，默认判定为不通过",
+                e
+            );
+            project::QAResult {
+                passed: false,
+                reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案".to_string(),
+                details: vec![],
+                attention_points: vec![],
+                checked_at: chrono::Utc::now().to_rfc3339(),
+                warnings: vec![format!("质检 JSON 解析失败：{}", e)],
             }
-            Err(e) => {
-                eprintln!(
-                    "[generate_milestones] 质检 JSON 解析失败：{}，默认判定为不通过",
-                    e
-                );
-                project::QAResult {
-                    passed: false,
-                    reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案".to_string(),
-                    details: vec![],
-                    attention_points: vec![],
-                    checked_at: chrono::Utc::now().to_rfc3339(),
-                    warnings: vec![format!("质检 JSON 解析失败：{}", e)],
-                }
-            }
-        };
+        }
+    };
 
     // 步骤 5：将 QAResult 写入每个 Milestone
     for milestone in &mut milestones {
@@ -2994,27 +2998,31 @@ pub(crate) async fn regenerate_milestones_with_feedback(
     };
 
     // 步骤 7.4：使用 parse_json_with_retry 解析 AI 返回的 QAResult JSON
-    let qa_result =
-        match crate::json_utils::parse_json_with_retry::<project::QAResult>(&qa_response).await {
-            Ok(mut result) => {
-                result.checked_at = chrono::Utc::now().to_rfc3339();
-                result
-            }
-            Err(e) => {
-                eprintln!(
+    let qa_result = match crate::json_utils::parse_json_with_contract::<project::QAResult>(
+        &qa_response,
+        &crate::json_utils::QA_RESULT_JSON_CONTRACT,
+    )
+    .await
+    {
+        Ok(mut result) => {
+            result.checked_at = chrono::Utc::now().to_rfc3339();
+            result
+        }
+        Err(e) => {
+            eprintln!(
                 "[regenerate_milestones_with_feedback] 质检 JSON 解析失败：{}，默认判定为不通过",
                 e
             );
-                project::QAResult {
-                    passed: false,
-                    reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案".to_string(),
-                    details: vec![],
-                    attention_points: vec![],
-                    checked_at: chrono::Utc::now().to_rfc3339(),
-                    warnings: vec![format!("质检 JSON 解析失败：{}", e)],
-                }
+            project::QAResult {
+                passed: false,
+                reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案".to_string(),
+                details: vec![],
+                attention_points: vec![],
+                checked_at: chrono::Utc::now().to_rfc3339(),
+                warnings: vec![format!("质检 JSON 解析失败：{}", e)],
             }
-        };
+        }
+    };
 
     // 步骤 7.5：将 QAResult 写入每个 Milestone
     for milestone in &mut milestones {
@@ -3296,9 +3304,13 @@ pub(crate) async fn regenerate_milestones_from_point(
             }
         };
 
-        let qa_result = match crate::json_utils::parse_json_with_retry_with_context::<
+        let qa_result = match crate::json_utils::parse_json_with_contract_and_context::<
             project::QAResult,
-        >(&qa_response, qa_context)
+        >(
+            &qa_response,
+            &crate::json_utils::QA_RESULT_JSON_CONTRACT,
+            qa_context,
+        )
         .await
         {
             Ok(mut result) => {

@@ -2731,6 +2731,10 @@ pub enum ExecutionEventType {
     GitConfirmationBlocked,
     /// Git 确认事务完成
     GitConfirmationCompleted,
+    /// 启动或同步对账清理了陈旧控制动作锁
+    StaleControlLockCleared,
+    /// 陈旧控制动作的完成事实无法安全确认，需要人工检查
+    StaleControlActionNeedsHumanConfirmation,
     /// 用户确认恢复基线并重新执行
     RetryScheduled,
     /// 执行器失败并完成状态收尾
@@ -2799,6 +2803,15 @@ pub struct ExecutionHistoryEntry {
     pub validator_id: Option<String>,
     #[serde(default)]
     pub model_call_id: Option<String>,
+    /// 陈旧控制锁审计字段；普通执行历史保持为空。
+    #[serde(default)]
+    pub control_lock_owner_process_start_id: Option<String>,
+    #[serde(default)]
+    pub control_lock_heartbeat_at: Option<String>,
+    #[serde(default)]
+    pub control_lock_clear_reason: Option<String>,
+    #[serde(default)]
+    pub control_lock_post_task_state: Option<String>,
 }
 
 /// 执行历史上限

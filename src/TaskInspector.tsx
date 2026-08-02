@@ -195,6 +195,9 @@ export default function TaskInspector({
                 {(recovery.retry_limit ?? 0) > 0 && <div><dt>重试计数</dt><dd>{recovery.retry_count}/{recovery.retry_limit}</dd></div>}
                 {(recovery.validation_retry_limit ?? 0) > 0 && <div><dt>验证重试</dt><dd>{recovery.validation_retry_count}/{recovery.validation_retry_limit}</dd></div>}
                 {recovery.heartbeat_status && <div><dt>心跳</dt><dd>{recovery.heartbeat_status}</dd></div>}
+                {recovery.control_action_description && <div><dt>控制占用</dt><dd>{recovery.control_action_description}</dd></div>}
+                {recovery.kind === "ControlActionOccupied" && <div><dt>已持续</dt><dd>{recovery.control_action_elapsed_seconds ?? 0} 秒</dd></div>}
+                {recovery.control_lock_failure_reason && <div><dt>失效原因</dt><dd>{recovery.control_lock_failure_reason}</dd></div>}
                 {recovery.automated_test_status && <div><dt>自动化测试</dt><dd>{recovery.automated_test_status}</dd></div>}
                 {recovery.code_review_status && <div><dt>代码审查</dt><dd>{recovery.code_review_status}</dd></div>}
                 {recovery.review_protocol_status && <div><dt>审查协议</dt><dd>{recovery.review_protocol_status}</dd></div>}

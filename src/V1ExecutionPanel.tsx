@@ -145,6 +145,9 @@ export default function V1ExecutionPanel({
               </div>
             )}
             {recoveryPresentation.heartbeat_status && <div style={{ marginTop: "4px" }}>心跳：{recoveryPresentation.heartbeat_status}</div>}
+            {recoveryPresentation.control_action_description && <div style={{ marginTop: "4px" }}>控制占用：{recoveryPresentation.control_action_description}</div>}
+            {recoveryPresentation.kind === "ControlActionOccupied" && <div style={{ marginTop: "4px" }}>已持续：{recoveryPresentation.control_action_elapsed_seconds ?? 0} 秒</div>}
+            {recoveryPresentation.control_lock_failure_reason && <div style={{ marginTop: "4px" }}>失效原因：{recoveryPresentation.control_lock_failure_reason}</div>}
             {[recoveryPresentation.automated_test_status, recoveryPresentation.code_review_status,
               recoveryPresentation.review_protocol_status, recoveryPresentation.acceptance_evidence_status]
               .filter(Boolean)

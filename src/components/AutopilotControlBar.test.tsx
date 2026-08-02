@@ -130,7 +130,13 @@ describe("AutopilotControlBar recovery presentation", () => {
     ["EvidenceInsufficient", "ResolveHumanRecovery", "补充证据并重新验证"],
     ["HumanDecision", "ResolveHumanRecovery", "选择处理方式"],
   ] as const)("renders one backend-controlled primary action for %s", (kind, capability, label) => {
-    render(presentation(kind, action(capability, label)));
+    const value = project();
+    if (capability === "ResolveHumanRecovery") {
+      value.workflow_state.recovery_state = {} as NonNullable<
+        Project["workflow_state"]["recovery_state"]
+      >;
+    }
+    render(presentation(kind, action(capability, label)), value);
     const buttons = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
 
     expect(host.querySelector(`[data-recovery-kind='${kind}']`)).not.toBeNull();
@@ -183,6 +189,10 @@ describe("AutopilotControlBar recovery presentation", () => {
   });
 
   it("opens backend decision options instead of guessing a resolution", async () => {
+    const value = project();
+    value.workflow_state.recovery_state = {} as NonNullable<
+      Project["workflow_state"]["recovery_state"]
+    >;
     const handlers = render(presentation(
       "HumanDecision",
       action("ResolveHumanRecovery", "选择处理方式"),
@@ -197,7 +207,7 @@ describe("AutopilotControlBar recovery presentation", () => {
           requires_baseline_preview: false,
         }],
       },
-    ));
+    ), value);
     const openButton = [...host.querySelectorAll("button")]
       .find(item => item.textContent?.includes("选择处理方式"));
     act(() => openButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
@@ -214,6 +224,51 @@ describe("AutopilotControlBar recovery presentation", () => {
       "",
       [],
     );
+  });
+
+  it("does not render a human recovery entry when recovery_state is absent", () => {
+    render(presentation(
+      "HumanDecision",
+      action("ResolveHumanRecovery", "选择处理方式"),
+      {
+        decision_options: [{
+          resolution: "revalidate",
+          label: "重新验证",
+          enabled: true,
+          disabled_reason: null,
+          requires_reason: false,
+          requires_acceptance_selection: false,
+          requires_baseline_preview: false,
+        }],
+      },
+    ));
+
+    expect(host.textContent).not.toContain("选择处理方式");
+    expect(host.querySelector("[role='dialog']")).toBeNull();
+  });
+
+  it("routes stale control lock cleanup through backend sync only", () => {
+    const view = presentation(
+      "ControlActionOccupied",
+      action("ClearStaleControlLock", "清理陈旧锁并恢复操作"),
+      {
+        secondary_actions: [],
+        capabilities: ["ClearStaleControlLock"],
+        control_lock_valid: false,
+        control_lock_cleanup_available: true,
+        control_action_description: "执行任务 · 动作 action-1",
+        control_action_elapsed_seconds: 20,
+        control_lock_failure_reason: "控制动作心跳已超时",
+      },
+    );
+    const handlers = render(view);
+    const buttons = [...host.querySelectorAll("button")];
+    expect(buttons.map(button => button.textContent?.trim())).toEqual([
+      "清理陈旧锁并恢复操作",
+    ]);
+    act(() => buttons[0]?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(handlers.sync).toHaveBeenCalledTimes(1);
+    expect(host.textContent).toContain("失效原因：控制动作心跳已超时");
   });
 
   it("keeps normal runtime target, retry, validation, heartbeat, and quality telemetry", () => {

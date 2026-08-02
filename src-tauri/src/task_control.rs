@@ -71,6 +71,19 @@ pub struct TaskControlModeChangeRecord {
     pub project_revision: u64,
 }
 
+/// 持久化控制动作租约。旧版的三个 `active_action_*` 字段继续保留，
+/// 但只有本结构具备持有者和生命周期信息，可被判定为有效占用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ControlActionLease {
+    pub action_id: String,
+    pub owner_process_start_id: String,
+    pub action_kind: String,
+    pub task_id: String,
+    pub started_at: String,
+    pub heartbeat_at: String,
+    pub expected_max_duration_secs: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskControlState {
     #[serde(default)]
@@ -108,6 +121,9 @@ pub struct TaskControlState {
     #[serde(default)]
     pub tree_revision: u64,
     #[serde(default)]
+    pub active_action_lease: Option<ControlActionLease>,
+    /// 兼容旧项目和旧前端读取；新代码不得仅凭此字段认定占用有效。
+    #[serde(default)]
     pub active_action_id: String,
     #[serde(default)]
     pub active_action_kind: String,
@@ -129,6 +145,10 @@ pub struct TaskControlState {
     pub last_action_after_fingerprint: String,
     #[serde(default)]
     pub last_action_at: Option<String>,
+    #[serde(default)]
+    pub last_action_clear_reason: String,
+    #[serde(default)]
+    pub last_action_cleared_at: Option<String>,
 }
 
 fn default_algorithm_version() -> String {
@@ -163,6 +183,7 @@ impl Default for TaskControlState {
             last_decision: None,
             control_source: "legacy_workflow".to_string(),
             tree_revision: 0,
+            active_action_lease: None,
             active_action_id: String::new(),
             active_action_kind: String::new(),
             active_action_task_id: String::new(),
@@ -174,6 +195,8 @@ impl Default for TaskControlState {
             last_action_before_fingerprint: String::new(),
             last_action_after_fingerprint: String::new(),
             last_action_at: None,
+            last_action_clear_reason: String::new(),
+            last_action_cleared_at: None,
         }
     }
 }
@@ -542,6 +565,10 @@ fn append_migration_event(project: &mut Project, task_id: &str, text: &str) {
             action_id: None,
             validator_id: None,
             model_call_id: None,
+            control_lock_owner_process_start_id: None,
+            control_lock_heartbeat_at: None,
+            control_lock_clear_reason: None,
+            control_lock_post_task_state: None,
         });
 }
 
@@ -630,6 +657,20 @@ mod tests {
         hydrate_project(&mut project).unwrap();
         assert_eq!(project.task_control.mode, TaskControlMode::Legacy);
         assert!(!project.task_control.algorithm_version.is_empty());
+    }
+
+    #[test]
+    fn runtime_fault_lock_lease_old_string_fields_remain_readable() {
+        let mut value = serde_json::to_value(TaskControlState::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("active_action_lease");
+        object.insert(
+            "active_action_id".to_string(),
+            serde_json::Value::String("legacy-action".to_string()),
+        );
+        let restored: TaskControlState = serde_json::from_value(value).unwrap();
+        assert!(restored.active_action_lease.is_none());
+        assert_eq!(restored.active_action_id, "legacy-action");
     }
 
     #[test]

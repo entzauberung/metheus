@@ -566,10 +566,13 @@ snapshot ──→ project, AppState
 |------|----------|
 | **决策模型密钥缺失** | 提示在应用设置填写，或使用 `METHEUS_DECISION_API_KEY` / 兼容 `API_KEY` 环境变量 |
 | **OpenAI Compatible API 超时** | 使用应用设置超时并返回分类错误 |
-| **决策模型返回非 JSON** | `sanitize_json_response` → `parse_json_with_retry` 最多 3 次修正 |
+| **决策模型返回非 JSON** | 宽松规划路径继续先清洗再修复；强类型路径必须携带目标字段、类型、枚举和必填契约 |
+| **强类型 JSON 字段类型不匹配** | 提取真实字段路径、期望类型和实际类型，只允许一次契约修复；无进展时确定性归一化或返回结构化协议失败，不得重复三次同一请求 |
+| **审查协议失败** | 归类为协议异常，不得归类为代码缺陷，也不得消耗代码修复次数 |
 | **应用设置并发修改** | 以 revision 乐观锁拒绝旧写；AI 请求或执行租约存续期间拒绝修改 |
 | **恢复设置快照漂移** | 修复前核对设置修订、模型、地址指纹和程序路径；不一致进入 `WaitingEngine` 且不消耗修复次数 |
-| **3 次 JSON 解析全败** | 返回 `Err` |
+| **控制动作锁残留** | 使用进程启动标识、心跳、开始时间和最长时长判定租约；启动、项目加载和手动同步由后端对账清理陈旧锁并写入审计 |
+| **另一进程持有新鲜控制锁** | 保持有效互斥并提示冲突，不得抢锁；心跳过期或超过最长时长后才进入陈旧锁对账 |
 | **执行引擎不可用** | 健康检查阻断 NotInstalled / Unauthenticated / UnsupportedVersion / VerificationRequired / VerificationFailed / Disabled；轻量构建选择内置 Grok 时返回稳定的 `Disabled`，禁止启动执行或静默切换引擎 |
 | **执行引擎执行失败** | 保存执行证据（含 `engine_provider`）；手动模式提供基线恢复，autopilot 进入 `ExecutionError` 恢复分支并先恢复执行基线 |
 | **执行引擎子进程卡死** | `EXECUTION_ENGINE_TIMEOUT_SECS`=600 强制 kill，按执行错误收尾，不在未知工作区上继续 |
@@ -626,6 +629,8 @@ snapshot ──→ project, AppState
 5. `CommitFailed`、`TagFailed`、`ProjectFinalizationFailed` 和临时 Git 元数据错误只允许对同一幂等确认事务自动续跑两次；代码和质量结果必须保留，不得创建重复提交。
 6. 前端刷新或长命令等待不得终止后端作业。控制命令保持短超时，长规划、执行与恢复只通过持久化动作、心跳、重试截止时间和轻量状态同步展示。
 7. 自动驾驶只运行到当前大阶段审阅边界。额度不足、认证失效、外部工作区修改、契约矛盾、重试耗尽和大阶段 A/B/C 审阅必须停止派发新动作。
+8. 控制动作租约的有效性与清理由 Rust 后端裁决。长时间执行、审查、修复和 Git 确认必须持续刷新心跳；心跳写入失败只记录脱敏诊断，不得中断正在收口的动作。
+9. 锁占用展示独立于 `RecoveryState`：有效占用只能等待，陈旧占用只能执行后端清理；没有 `RecoveryState` 时禁止展示人工恢复决策入口。
 
 ---
 
@@ -699,6 +704,9 @@ cd ~/metheus && npm run verify:core-light
 # 修改验收/恢复逻辑后：定向 Rust、TypeScript 和前端策略测试
 cd ~/metheus && npm run verify:quality
 
+# 修改控制动作锁、恢复展示或强类型 JSON 协议后：运行期故障注入门禁
+cd ~/metheus && ./scripts/verify-runtime-fault-recovery.sh
+
 # Grok 专项：单任务库类型检查，不执行最终链接
 cd ~/metheus && npm run verify:grok-check
 ```
@@ -763,10 +771,11 @@ cd ~/metheus && npm run verify:chat-ux
 
 1. `Project` 加载（`load_project`）
 2. `workflow` 迁移（`migrate_project_workflow`）
-3. `execution` 对账（`reconcile_execution_state`）
-4. `autopilot` sanity（检查 autopilot_state 与当前步骤自洽）
-5. `snapshot` 恢复（`restore_snapshot`）
-6. 解锁界面（释放 `startupRecoveryDoneRef`）
+3. 控制动作租约对账（仅后端判断有效、陈旧和 Git 幂等续跑事实）
+4. `execution` 对账（`reconcile_execution_state`）
+5. `autopilot` sanity（检查 autopilot_state 与当前步骤自洽）
+6. `snapshot` 恢复（`restore_snapshot`）
+7. 解锁界面（释放 `startupRecoveryDoneRef`）
 
 ### 17.3 恢复对账规则
 
@@ -781,6 +790,8 @@ cd ~/metheus && npm run verify:chat-ux
 | 恢复会话失联 | status="recovering" | 无（进程已死） | 将恢复阶段转回 Diagnosing，下次从基线安全重试 |
 | 会话无效 | active=false 或字段缺失 | 无关 | 清理 execution_session，回到当前步骤 |
 | 数据冲突 | 与当前 milestone/mid_stage 不匹配 | 无关 | cleanup，回 Discussion 或 Before |
+
+控制动作租约对账必须额外满足：新鲜本进程租约保持占用；新鲜异进程租约保持互斥并提示冲突；心跳超时、超过最长执行时长或旧字符串锁释放后写入结构化清理事件。Git 确认锁只负责解除阻断，提交是否已完成必须交给既有幂等确认事务判断，禁止根据锁状态创建新提交。
 
 ### 17.4 禁止事项
 

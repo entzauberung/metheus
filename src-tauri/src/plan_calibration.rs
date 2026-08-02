@@ -121,10 +121,13 @@ pub(crate) async fn calibrate_next_subtask(project: &mut project::Project) -> Re
     )
     .await
     .map_err(|error| format!("下一任务滚动校准失败：{}", error))?;
-    let patch: PlanPatchOutput =
-        crate::json_utils::parse_json_with_retry_with_context(&response.content, call_context)
-            .await
-            .map_err(|error| format!("计划补丁解析失败：{}", error))?;
+    let patch: PlanPatchOutput = crate::json_utils::parse_json_with_contract_and_context(
+        &response.content,
+        &crate::json_utils::PLAN_PATCH_JSON_CONTRACT,
+        call_context,
+    )
+    .await
+    .map_err(|error| format!("计划补丁协议失败：{}", error))?;
     if patch.implementation_guidance.trim().is_empty()
         || patch.context_summary.trim().is_empty()
         || patch.evidence_files.is_empty()

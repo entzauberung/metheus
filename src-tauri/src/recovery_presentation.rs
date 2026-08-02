@@ -4,11 +4,12 @@ use crate::project::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const RECOVERY_PRESENTATION_VERSION: &str = "recovery-presentation-v3";
+pub const RECOVERY_PRESENTATION_VERSION: &str = "recovery-presentation-v4";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RecoveryPresentationKind {
     None,
+    ControlActionOccupied,
     BaselineRecovery,
     GitReconfirmation,
     EngineBlocked,
@@ -33,6 +34,7 @@ pub enum RecoverySeverity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RecoveryCapability {
     SyncProject,
+    ClearStaleControlLock,
     AcknowledgeExecutionRecovery,
     RetryGitConfirmation,
     RetryAutopilotAdvance,
@@ -115,6 +117,12 @@ pub struct RecoveryPresentation {
     pub code_review_status: String,
     pub review_protocol_status: String,
     pub acceptance_evidence_status: String,
+    pub control_lock_valid: Option<bool>,
+    pub control_action_description: String,
+    pub control_action_elapsed_seconds: u64,
+    pub control_lock_last_heartbeat_at: Option<String>,
+    pub control_lock_failure_reason: String,
+    pub control_lock_cleanup_available: bool,
 }
 
 impl RecoveryPresentation {
@@ -156,6 +164,12 @@ impl RecoveryPresentation {
             code_review_status: String::new(),
             review_protocol_status: String::new(),
             acceptance_evidence_status: String::new(),
+            control_lock_valid: None,
+            control_action_description: String::new(),
+            control_action_elapsed_seconds: 0,
+            control_lock_last_heartbeat_at: None,
+            control_lock_failure_reason: String::new(),
+            control_lock_cleanup_available: false,
         }
     }
 }
@@ -268,6 +282,20 @@ fn retryable_git_confirmation(failure: Option<&GitConfirmationFailureKind>) -> b
     )
 }
 
+fn git_reconfirmation_reason(project: &Project) -> String {
+    const PRESERVATION_NOTICE: &str = "代码与质量结果已保留";
+    let base = reason(project, "请核对 Git 确认事务。");
+    if base.contains(PRESERVATION_NOTICE) {
+        base
+    } else {
+        format!(
+            "{}；{}。",
+            base.trim_end_matches(['。', '；']),
+            PRESERVATION_NOTICE
+        )
+    }
+}
+
 fn validation_recovery(kind: &RecoveryErrorKind) -> bool {
     matches!(
         kind,
@@ -282,7 +310,7 @@ fn fingerprint(project: &Project, kind: &RecoveryPresentationKind) -> String {
     let recovery = project.workflow_state.recovery_state.as_ref();
     let autopilot = project.workflow_state.autopilot_state.as_ref();
     let stable_state = format!(
-        "{}|{:?}|{}|{}|{:?}|{:?}|{}|{:?}",
+        "{}|{:?}|{}|{}|{:?}|{:?}|{}|{:?}|{}|{}",
         project.name,
         kind,
         session
@@ -295,6 +323,13 @@ fn fingerprint(project: &Project, kind: &RecoveryPresentationKind) -> String {
             .map(|value| value.error_signature.as_str())
             .unwrap_or(""),
         autopilot.map(|value| &value.recovery_action),
+        project.task_control.active_action_id,
+        project
+            .task_control
+            .active_action_lease
+            .as_ref()
+            .map(|lease| lease.heartbeat_at.as_str())
+            .unwrap_or(""),
     );
     let digest = Sha256::digest(stable_state.as_bytes());
     format!("{:x}", digest)
@@ -314,7 +349,9 @@ fn finish(
     automatic_retry: bool,
     decision_options: Vec<RecoveryDecisionOption>,
 ) -> RecoveryPresentation {
-    if kind != RecoveryPresentationKind::None {
+    if kind != RecoveryPresentationKind::None
+        && kind != RecoveryPresentationKind::ControlActionOccupied
+    {
         secondary_actions.insert(0, action(RecoveryCapability::SyncProject, "同步状态"));
     }
     let mut capabilities = primary_action
@@ -396,6 +433,12 @@ fn finish(
         code_review_status,
         review_protocol_status,
         acceptance_evidence_status: acceptance_evidence_status(ledger, test),
+        control_lock_valid: None,
+        control_action_description: String::new(),
+        control_action_elapsed_seconds: 0,
+        control_lock_last_heartbeat_at: None,
+        control_lock_failure_reason: String::new(),
+        control_lock_cleanup_available: false,
     }
 }
 
@@ -609,6 +652,7 @@ fn recovery_phase_label(project: &Project, kind: &RecoveryPresentationKind) -> S
         };
     }
     match kind {
+        RecoveryPresentationKind::ControlActionOccupied => "等待控制动作收口".to_string(),
         RecoveryPresentationKind::GitReconfirmation => "等待 Git 确认".to_string(),
         RecoveryPresentationKind::BaselineRecovery => "等待基线恢复".to_string(),
         RecoveryPresentationKind::SyncAndClose => "等待最终状态同步".to_string(),
@@ -623,8 +667,11 @@ fn post_action_expectation(
 ) -> String {
     if let Some(action) = primary_action {
         return match action.capability {
+            RecoveryCapability::ClearStaleControlLock => {
+                "后端将释放陈旧锁，并依据执行会话或 Git 确认事务事实恢复任务状态。".to_string()
+            }
             RecoveryCapability::RetryGitConfirmation => {
-                "保留当前代码与质量结果，续跑原 Git 确认事务。".to_string()
+                "续跑原 Git 确认事务，不重新执行代码任务或质量验证。".to_string()
             }
             RecoveryCapability::AcknowledgeExecutionRecovery => {
                 "确认影响后恢复执行基线，再由后端决定是否继续后台作业。".to_string()
@@ -637,6 +684,9 @@ fn post_action_expectation(
         };
     }
     match kind {
+        RecoveryPresentationKind::ControlActionOccupied => {
+            "控制动作结束或陈旧锁清理后将立即刷新项目状态。".to_string()
+        }
         RecoveryPresentationKind::AutomaticRecovery
         | RecoveryPresentationKind::ValidationRetry
         | RecoveryPresentationKind::EngineBlocked => {
@@ -647,6 +697,170 @@ fn post_action_expectation(
         }
         _ => String::new(),
     }
+}
+
+fn control_action_label(kind: &str) -> &str {
+    match kind {
+        "split" => "拆分任务",
+        "execute" => "执行任务",
+        "local_validate" => "本地验证",
+        "automated_validate" => "自动验证",
+        "targeted_validate" => "定向审查",
+        "repair" => "修复任务",
+        "recompile" => "重编译任务",
+        "accept_deviation" => "接受偏差",
+        "git_confirm" => "Git 确认",
+        "wait" => "等待",
+        "human" => "人工处理",
+        _ => "控制动作",
+    }
+}
+
+fn present_control_action_occupancy(
+    project: &Project,
+    occupancy: crate::control_action_executor::ControlActionOccupancy,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<RecoveryPresentation> {
+    use crate::control_action_executor::ControlActionOccupancy;
+
+    let (lease, valid, cleanup_available, failure_reason, owner_description) = match occupancy {
+        ControlActionOccupancy::Unoccupied => return None,
+        ControlActionOccupancy::ActiveLocal(lease) => {
+            (Some(lease), true, false, String::new(), "当前进程")
+        }
+        ControlActionOccupancy::ActiveForeign(lease) => {
+            (Some(lease), true, false, String::new(), "另一 Metheus 进程")
+        }
+        ControlActionOccupancy::Stale { lease, reason } => {
+            let cleanup_available =
+                crate::control_action_executor::stale_control_action_can_be_cleared(
+                    lease.as_ref(),
+                    crate::project_state_bus::process_start_id(),
+                    now,
+                );
+            (
+                lease,
+                !cleanup_available,
+                cleanup_available,
+                reason,
+                "原持有进程",
+            )
+        }
+    };
+    let action_id = lease
+        .as_ref()
+        .map(|value| value.action_id.as_str())
+        .unwrap_or(project.task_control.active_action_id.as_str());
+    let action_kind = lease
+        .as_ref()
+        .map(|value| value.action_kind.as_str())
+        .unwrap_or(project.task_control.active_action_kind.as_str());
+    let task_id = lease
+        .as_ref()
+        .map(|value| value.task_id.as_str())
+        .unwrap_or(project.task_control.active_action_task_id.as_str());
+    let elapsed = lease
+        .as_ref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value.started_at).ok())
+        .map(|started| {
+            now.signed_duration_since(started.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0) as u64
+        })
+        .unwrap_or(0);
+    let heartbeat_at = lease.as_ref().map(|value| value.heartbeat_at.clone());
+    let action_description = format!(
+        "{} · 动作 {}{}",
+        control_action_label(action_kind),
+        if action_id.is_empty() {
+            "未知"
+        } else {
+            action_id
+        },
+        if task_id.is_empty() {
+            String::new()
+        } else {
+            format!(" · 任务 {}", task_id)
+        }
+    );
+    let reason_text = if valid {
+        format!(
+            "{}正在执行{}，已持续 {} 秒；后端心跳仍有效。",
+            owner_description,
+            control_action_label(action_kind),
+            elapsed
+        )
+    } else {
+        format!("控制动作锁已失效：{}", failure_reason)
+    };
+    let primary = if cleanup_available {
+        action(
+            RecoveryCapability::ClearStaleControlLock,
+            "清理陈旧锁并恢复操作",
+        )
+    } else {
+        action(RecoveryCapability::SyncProject, "等待当前动作完成")
+    };
+    let mut presentation = finish(
+        project,
+        RecoveryPresentationKind::ControlActionOccupied,
+        if valid {
+            "控制动作正在执行"
+        } else {
+            "控制动作锁已失效"
+        },
+        reason_text,
+        if valid {
+            RecoverySeverity::Info
+        } else {
+            RecoverySeverity::Warning
+        },
+        Some(primary),
+        Vec::new(),
+        true,
+        false,
+        false,
+        false,
+        Vec::new(),
+    );
+    presentation.control_lock_valid = Some(valid);
+    presentation.control_action_description = action_description;
+    presentation.control_action_elapsed_seconds = elapsed;
+    presentation.control_lock_last_heartbeat_at = heartbeat_at.clone();
+    presentation.control_lock_failure_reason = failure_reason;
+    presentation.control_lock_cleanup_available = cleanup_available;
+    presentation.phase_label = if valid {
+        "等待后台动作完成".to_string()
+    } else {
+        "等待后端清理陈旧锁".to_string()
+    };
+    presentation.heartbeat_status = heartbeat_at
+        .map(|value| format!("最后更新 {}", value))
+        .unwrap_or_else(|| "缺少可验证心跳".to_string());
+    presentation.affected_task_label = crate::task_tree::find_task(project, task_id)
+        .ok()
+        .flatten()
+        .map(|task| {
+            if task.title.is_empty() {
+                task.id.clone()
+            } else {
+                task.title.clone()
+            }
+        })
+        .unwrap_or_else(|| task_id.to_string());
+    presentation.post_action_expectation = if valid {
+        "动作正常完成并由后端释放租约后，任务操作会自动恢复。".to_string()
+    } else {
+        "后端清理锁后会按磁盘执行事实重新开放任务决策；Git 确认只续跑原事务。".to_string()
+    };
+    presentation.stale_risk = !valid;
+    presentation.sync_needed = true;
+    presentation.sync_risk_summary = if valid {
+        "有效占用不会被强制清理。".to_string()
+    } else {
+        "锁清理由后端裁决，前端不会自行判断或改写项目文件。".to_string()
+    };
+    Some(presentation)
 }
 
 fn human_decision_options(project: &Project) -> Vec<RecoveryDecisionOption> {
@@ -765,6 +979,15 @@ fn human_decision_options(project: &Project) -> Vec<RecoveryDecisionOption> {
 }
 
 pub(crate) fn present_recovery(project: &Project) -> RecoveryPresentation {
+    let now = chrono::Utc::now();
+    let occupancy = crate::control_action_executor::classify_control_action_occupancy(
+        &project.task_control,
+        crate::project_state_bus::process_start_id(),
+        now,
+    );
+    if let Some(presentation) = present_control_action_occupancy(project, occupancy, now) {
+        return presentation;
+    }
     let session = project.execution_session.as_ref();
     let session_status = session
         .map(|value| value.status.to_ascii_lowercase())
@@ -795,7 +1018,7 @@ pub(crate) fn present_recovery(project: &Project) -> RecoveryPresentation {
             project,
             RecoveryPresentationKind::GitReconfirmation,
             "Git 确认受阻",
-            reason(project, "代码与质量结果已保留，请核对 Git 确认事务。"),
+            git_reconfirmation_reason(project),
             RecoverySeverity::Error,
             Some(primary),
             Vec::new(),
@@ -1023,12 +1246,13 @@ pub(crate) fn present_recovery(project: &Project) -> RecoveryPresentation {
             RecoveryCapability::RetryGitConfirmation,
             "重新确认提交",
         ),
-        AutopilotRecoveryAction::WaitHumanDecision => (
+        AutopilotRecoveryAction::WaitHumanDecision if recovery.is_some() => (
             RecoveryPresentationKind::HumanDecision,
             "等待人工决策",
             RecoveryCapability::ResolveHumanRecovery,
             "选择处理方式",
         ),
+        AutopilotRecoveryAction::WaitHumanDecision => return RecoveryPresentation::none(project),
         AutopilotRecoveryAction::None
         | AutopilotRecoveryAction::RestoreExecutionBaseline
         | AutopilotRecoveryAction::RunAutomaticRecovery => {
@@ -1113,6 +1337,31 @@ mod tests {
     }
 
     #[test]
+    fn runtime_fault_block_message_adds_preservation_notice_exactly_once() {
+        let mut project = Project::new("git-message-dedup");
+        project.execution_session = Some(ExecutionSession {
+            status: "confirmation_blocked".to_string(),
+            failure_message: "Git 标签身份冲突，请人工核对。".to_string(),
+            confirmation_failure_kind: Some(GitConfirmationFailureKind::V2TagIntegrityConflict),
+            ..ExecutionSession::default()
+        });
+
+        let presentation = present_recovery(&project);
+        assert_eq!(
+            presentation.reason.matches("代码与质量结果已保留").count(),
+            1
+        );
+        assert!(!presentation
+            .post_action_expectation
+            .contains("代码与质量结果已保留"));
+
+        project.execution_session.as_mut().unwrap().failure_message =
+            "历史原因；代码与质量结果已保留。".to_string();
+        let historical = present_recovery(&project);
+        assert_eq!(historical.reason.matches("代码与质量结果已保留").count(), 1);
+    }
+
+    #[test]
     fn phase1_runtime_contract_validation_and_evidence_failures_preserve_code() {
         let mut validation = Project::new("validation-retry");
         validation.workflow_state.recovery_state = Some(RecoveryState {
@@ -1165,5 +1414,113 @@ mod tests {
             present_recovery(&human).kind,
             RecoveryPresentationKind::HumanDecision
         );
+    }
+
+    fn project_with_control_lease(
+        owner: &str,
+        started_at: String,
+        heartbeat_at: String,
+    ) -> Project {
+        let mut project = Project::new("control-lock-presentation");
+        let lease = crate::task_control::ControlActionLease {
+            action_id: "control-action-1".to_string(),
+            owner_process_start_id: owner.to_string(),
+            action_kind: "execute".to_string(),
+            task_id: "task-1".to_string(),
+            started_at,
+            heartbeat_at,
+            expected_max_duration_secs: 1_200,
+        };
+        project.task_control.active_action_id = lease.action_id.clone();
+        project.task_control.active_action_kind = lease.action_kind.clone();
+        project.task_control.active_action_task_id = lease.task_id.clone();
+        project.task_control.active_action_lease = Some(lease);
+        project
+    }
+
+    #[test]
+    fn runtime_fault_control_lock_presentation_active_only_offers_wait() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let project = project_with_control_lease(
+            crate::project_state_bus::process_start_id(),
+            now.clone(),
+            now,
+        );
+        let presentation = present_recovery(&project);
+
+        assert_eq!(
+            presentation.kind,
+            RecoveryPresentationKind::ControlActionOccupied
+        );
+        assert_eq!(presentation.control_lock_valid, Some(true));
+        assert!(!presentation.control_lock_cleanup_available);
+        assert_eq!(
+            presentation
+                .primary_action
+                .as_ref()
+                .map(|action| &action.capability),
+            Some(&RecoveryCapability::SyncProject)
+        );
+        assert!(presentation.secondary_actions.is_empty());
+        assert!(presentation.decision_options.is_empty());
+        assert!(!presentation
+            .capabilities
+            .contains(&RecoveryCapability::ResolveHumanRecovery));
+    }
+
+    #[test]
+    fn runtime_fault_control_lock_presentation_stale_only_offers_backend_cleanup() {
+        let now = chrono::Utc::now();
+        let project = project_with_control_lease(
+            "old-process",
+            (now - chrono::Duration::seconds(40)).to_rfc3339(),
+            (now - chrono::Duration::seconds(20)).to_rfc3339(),
+        );
+        let presentation = present_recovery(&project);
+
+        assert_eq!(
+            presentation.kind,
+            RecoveryPresentationKind::ControlActionOccupied
+        );
+        assert_eq!(presentation.control_lock_valid, Some(false));
+        assert!(presentation.control_lock_cleanup_available);
+        assert_eq!(
+            presentation
+                .primary_action
+                .as_ref()
+                .map(|action| &action.capability),
+            Some(&RecoveryCapability::ClearStaleControlLock)
+        );
+        assert!(presentation.secondary_actions.is_empty());
+        assert!(presentation.decision_options.is_empty());
+    }
+
+    #[test]
+    fn runtime_fault_control_lock_presentation_precedes_code_recovery() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut project = project_with_control_lease(
+            crate::project_state_bus::process_start_id(),
+            now.clone(),
+            now,
+        );
+        project.workflow_state.recovery_state = Some(RecoveryState {
+            phase: RecoveryPhase::WaitingHuman,
+            error_kind: RecoveryErrorKind::HumanRequired,
+            ..RecoveryState::default()
+        });
+
+        assert_eq!(
+            present_recovery(&project).kind,
+            RecoveryPresentationKind::ControlActionOccupied
+        );
+    }
+
+    #[test]
+    fn runtime_fault_control_lock_presentation_never_invents_human_recovery_without_state() {
+        let project = autopilot_project(AutopilotRecoveryAction::WaitHumanDecision);
+        let presentation = present_recovery(&project);
+        assert_eq!(presentation.kind, RecoveryPresentationKind::None);
+        assert!(presentation.primary_action.is_none());
+        assert!(presentation.decision_options.is_empty());
     }
 }

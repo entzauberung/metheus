@@ -173,6 +173,10 @@ pub(crate) fn write_execution_history_with_source(
         action_id: None,
         validator_id: None,
         model_call_id: None,
+        control_lock_owner_process_start_id: None,
+        control_lock_heartbeat_at: None,
+        control_lock_clear_reason: None,
+        control_lock_post_task_state: None,
     };
     proj.execution_history.push(entry);
     // 限制历史上限
@@ -1738,7 +1742,7 @@ fn mark_confirmation_blocked_with_source(
     if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
         autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
         autopilot.error_message = message.clone();
-        autopilot.last_action = "Git 确认受阻，代码与质量结果已保留".to_string();
+        autopilot.last_action = "Git 确认受阻".to_string();
         autopilot.last_action_at = now;
         autopilot.recovery_action = confirmation_recovery_action(&failure_kind);
     }
@@ -1755,7 +1759,7 @@ fn mark_confirmation_blocked_with_source(
             "error",
             project::ExecutionEventType::GitConfirmationBlocked,
             operation_source,
-            format!("Git 确认受阻：{}；代码与质量结果已保留", message),
+            format!("Git 确认受阻：{}", message),
             Some(&milestone_id),
             Some(&mid_stage_id),
             Some(&subtask_id),
@@ -2019,7 +2023,7 @@ pub(crate) async fn confirm_subtask_result_with_source(
                 operation_source,
             );
             crate::save_project(&proj)?;
-            return Err(format!("确认提交失败：{}。代码与质量结果已保留。", message));
+            return Err(format!("确认提交失败：{}", message));
         }
     };
 
@@ -2116,7 +2120,7 @@ pub(crate) async fn confirm_subtask_result_with_source(
                     operation_source,
                 );
                 crate::save_project(&proj)?;
-                return Err(format!("确认提交失败：{}。代码与质量结果已保留。", message));
+                return Err(format!("确认提交失败：{}", message));
             }
         }
     };
@@ -3307,10 +3311,7 @@ fn recoverable_execution_session(
     if proj.execution_session.as_ref().is_some_and(|session| {
         session.parsed_status() == project::ExecutionSessionStatus::ConfirmationBlocked
     }) {
-        return Err(
-            "当前是 Git 确认受阻，代码与质量结果已保留；请使用“重新确认提交”，不得恢复执行基线。"
-                .to_string(),
-        );
+        return Err("当前是 Git 确认受阻；请使用“重新确认提交”，不得恢复执行基线。".to_string());
     }
     proj.execution_session
         .as_ref()
@@ -4694,8 +4695,7 @@ fn migrate_legacy_v1_confirmation_conflict(proj: &mut project::Project) -> bool 
         return false;
     }
 
-    let message =
-        "检测到旧 V1 标签身份碰撞；代码与质量结果已保留，可改用 V2 标签重新确认提交。".to_string();
+    let message = "检测到旧 V1 标签身份碰撞，可改用 V2 标签重新确认提交。".to_string();
     mark_confirmation_blocked(
         proj,
         project::GitConfirmationFailureKind::LegacyV1TagConflict,
@@ -4708,6 +4708,18 @@ pub(crate) fn reconcile_loaded_project_under_pipeline_lock(
     proj: &mut project::Project,
     pipeline_status: Option<&PipelineState>,
 ) -> bool {
+    if matches!(
+        crate::control_action_executor::classify_control_action_occupancy(
+            &proj.task_control,
+            crate::project_state_bus::process_start_id(),
+            chrono::Utc::now(),
+        ),
+        crate::control_action_executor::ControlActionOccupancy::ActiveLocal(_)
+            | crate::control_action_executor::ControlActionOccupancy::ActiveForeign(_)
+    ) {
+        // 活跃控制动作拥有项目事实修改权；启动/同步对账不得覆盖其心跳或中间状态。
+        return false;
+    }
     let mut modified = normalize_legacy_confirmation_conflict_kind(proj);
     modified |= migrate_legacy_v1_confirmation_conflict(proj);
     let reconciliation = reconcile_execution_state(proj, pipeline_status);
@@ -4726,7 +4738,7 @@ pub(crate) fn reconcile_loaded_project_under_pipeline_lock(
                     mark_confirmation_blocked(
                         proj,
                         project::GitConfirmationFailureKind::ProjectFinalizationFailed,
-                        "上次 Git 确认在收口前中断；代码与质量结果已保留。".to_string(),
+                        "上次 Git 确认在收口前中断。".to_string(),
                     );
                 } else if let Some(session) = proj.execution_session.as_mut() {
                     session.status = "awaiting_confirmation".to_string();
@@ -4744,7 +4756,14 @@ pub(crate) fn reconcile_loaded_project_under_pipeline_lock(
             _ => {}
         }
     }
-    apply_execution_reconciliation(proj, &reconciliation) || modified
+    modified |= apply_execution_reconciliation(proj, &reconciliation);
+    let lock_reconciliation = crate::control_action_executor::reconcile_stale_control_action_lock(
+        proj,
+        crate::project_state_bus::process_start_id(),
+        chrono::Utc::now(),
+    );
+    modified |= lock_reconciliation.changed();
+    modified
 }
 
 /// 启动时对账执行状态：取流水线锁 → 加载最新项目 → reconcile → apply → 保存。
@@ -4759,22 +4778,20 @@ pub(crate) async fn reconcile_on_startup(
 ) -> Result<project::Project, String> {
     // 先取锁，再 load：与后台完成/ED Stop 同一互斥周期，杜绝旧快照覆盖新结果。
     let guard = state.pipeline_state.lock().await;
-    let mut proj = crate::load_project(&project_name)?;
-    let mut modified = reconcile_loaded_project_under_pipeline_lock(&mut proj, guard.as_ref());
-    crate::commands::workflow::reconcile_autopilot_in_migration(&mut proj);
-    modified |= crate::commands::workflow::reconcile_workflow_closure_state(&mut proj);
-    let should_start_autopilot = crate::autopilot_runtime::reconcile_startup_job(&mut proj);
-    let should_start_managed = crate::managed_runtime::reconcile_startup_job(&mut proj);
-    modified |= proj.workflow_state.autopilot_state.is_some();
-    modified |= proj.workflow_state.managed_flow_state.is_some();
-
-    let result = if modified {
-        crate::save_project(&proj)?;
-        // 仍在锁内重读，保证返回值与磁盘最终事实一致
-        crate::load_project(&project_name)?
-    } else {
-        proj
-    };
+    let (result, should_start_autopilot, should_start_managed) =
+        crate::mutate_project_for_control(&project_name, |proj| {
+            let mut modified = reconcile_loaded_project_under_pipeline_lock(proj, guard.as_ref());
+            crate::commands::workflow::reconcile_autopilot_in_migration(proj);
+            modified |= crate::commands::workflow::reconcile_workflow_closure_state(proj);
+            let should_start_autopilot = crate::autopilot_runtime::reconcile_startup_job(proj);
+            let should_start_managed = crate::managed_runtime::reconcile_startup_job(proj);
+            modified |= proj.workflow_state.autopilot_state.is_some();
+            modified |= proj.workflow_state.managed_flow_state.is_some();
+            Ok((
+                (proj.clone(), should_start_autopilot, should_start_managed),
+                modified,
+            ))
+        })?;
     drop(guard);
     if should_start_autopilot {
         state
@@ -7639,6 +7656,67 @@ mod tests {
     }
 
     #[test]
+    fn runtime_fault_stale_lock_reconciliation_preserves_git_transaction_facts() {
+        let mut session = execution_session("confirming", "execution-claim", "HEAD");
+        session.confirmation_transaction_id = "transaction-interrupted".to_string();
+        session.confirmation_phase = project::ConfirmationPhase::CommitCreated;
+        session.confirmation_commit = "commit-interrupted".to_string();
+        let mut proj = execution_project(
+            "claim-crash-with-lock",
+            Path::new(""),
+            project::SubtaskStatus::AwaitingConfirmation,
+            Some(session),
+        );
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState::default());
+        let now = chrono::Utc::now();
+        let lease = crate::task_control::ControlActionLease {
+            action_id: "git-confirm-action".to_string(),
+            owner_process_start_id: "old-process".to_string(),
+            action_kind: crate::control_action::ControlActionKind::GitConfirm
+                .as_str()
+                .to_string(),
+            task_id: "subtask-1".to_string(),
+            started_at: (now - chrono::Duration::seconds(40)).to_rfc3339(),
+            heartbeat_at: (now - chrono::Duration::seconds(20)).to_rfc3339(),
+            expected_max_duration_secs: 900,
+        };
+        proj.task_control.active_action_id = lease.action_id.clone();
+        proj.task_control.active_action_kind = lease.action_kind.clone();
+        proj.task_control.active_action_task_id = lease.task_id.clone();
+        proj.task_control.active_action_lease = Some(lease);
+
+        assert!(reconcile_loaded_project_under_pipeline_lock(
+            &mut proj, None
+        ));
+        let reconciled = proj.execution_session.as_ref().unwrap();
+        assert_eq!(reconciled.status, "confirmation_blocked");
+        assert_eq!(
+            reconciled.confirmation_phase,
+            project::ConfirmationPhase::CommitCreated
+        );
+        assert_eq!(reconciled.confirmation_commit, "commit-interrupted");
+        assert_eq!(
+            reconciled.confirmation_transaction_id,
+            "transaction-interrupted"
+        );
+        assert!(proj.task_control.active_action_lease.is_none());
+        assert_eq!(
+            proj.execution_history.last().unwrap().event_type,
+            project::ExecutionEventType::StaleControlLockCleared
+        );
+        assert_eq!(
+            proj.execution_history
+                .iter()
+                .filter(|entry| {
+                    entry.event_type == project::ExecutionEventType::GitConfirmationCommitCreated
+                })
+                .count(),
+            0,
+            "锁对账不得创建或重复记录 Git 提交"
+        );
+    }
+
+    #[test]
     fn git_confirmation_claim_is_exclusive_and_reuses_transaction() -> Result<(), String> {
         let project_name = unique_project_name("claim-excl");
         let _guard = ProjectDataGuard::new(&project_name)?;
@@ -7815,7 +7893,7 @@ mod tests {
         let error = confirm_subtask_result_with_pipeline(&pipeline, project_name.clone())
             .await
             .expect_err("V2 标签完整性冲突必须阻断确认");
-        assert!(error.contains("代码与质量结果已保留"));
+        assert!(!error.contains("代码与质量结果已保留"));
 
         let blocked = crate::load_project(&project_name)?;
         let blocked_session = blocked

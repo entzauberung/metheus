@@ -3,7 +3,12 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Project, TaskControlSnapshot, TaskTreeNodeView } from "./types";
+import type {
+  Project,
+  RecoveryPresentation,
+  TaskControlSnapshot,
+  TaskTreeNodeView,
+} from "./types";
 import TaskInspector from "./TaskInspector";
 
 const TASK_CAPABILITIES = ["revalidate", "accept_deviation"];
@@ -100,6 +105,36 @@ function snapshot(currentTaskId: string): TaskControlSnapshot {
   } as unknown as TaskControlSnapshot;
 }
 
+function staleControlLockPresentation(): RecoveryPresentation {
+  return {
+    presentation_version: "1",
+    kind: "ControlActionOccupied",
+    title: "控制动作占用已失效",
+    reason: "原进程已退出",
+    severity: "Warning",
+    primary_action: {
+      capability: "ClearStaleControlLock",
+      label: "清理陈旧锁并恢复操作",
+      enabled: true,
+      disabled_reason: null,
+    },
+    secondary_actions: [],
+    preserve_current_code: true,
+    requires_baseline_restore: false,
+    supports_preview: false,
+    automatic_retry: false,
+    capabilities: ["ClearStaleControlLock"],
+    decision_options: [],
+    state_fingerprint: "stale-lock",
+    control_lock_valid: false,
+    control_action_description: "执行任务 selected",
+    control_action_elapsed_seconds: 37,
+    control_lock_last_heartbeat_at: "2026-07-29T00:00:00Z",
+    control_lock_failure_reason: "持有进程与当前进程不一致",
+    control_lock_cleanup_available: true,
+  };
+}
+
 describe("TaskInspector", () => {
   let host: HTMLDivElement;
   let root: Root;
@@ -121,6 +156,7 @@ describe("TaskInspector", () => {
   function render(
     currentTaskId = "selected",
     syncState: { error?: string; detailsSyncing?: boolean } = {},
+    recoveryPresentation: RecoveryPresentation | null = null,
   ) {
     const onClose = vi.fn();
     const onAction = vi.fn();
@@ -136,7 +172,7 @@ describe("TaskInspector", () => {
           selectedTaskId="selected"
           busy={false}
           error={syncState.error ?? ""}
-          recoveryPresentation={null}
+          recoveryPresentation={recoveryPresentation}
           expectedEventSequence={4}
           detailsSyncing={syncState.detailsSyncing ?? false}
           onClose={onClose}
@@ -217,5 +253,20 @@ describe("TaskInspector", () => {
     });
     expect(host.textContent).toContain("详细快照生成失败");
     expect(host.textContent).toContain("主状态已更新，正在后台重试");
+  });
+
+  it("shows stale control-lock facts without offering a recovery decision", () => {
+    render("selected", {}, staleControlLockPresentation());
+    const recoveryTab = host.querySelector('[role="tab"][title="决策与恢复"]');
+    act(() => recoveryTab?.dispatchEvent(new MouseEvent("mousedown", {
+      bubbles: true,
+      button: 0,
+    })));
+
+    const details = host.querySelector(".task-recovery-details");
+    expect(details?.textContent).toContain("执行任务 selected");
+    expect(details?.textContent).toContain("37 秒");
+    expect(details?.textContent).toContain("持有进程与当前进程不一致");
+    expect(host.textContent).not.toContain("选择人工恢复处理方式");
   });
 });

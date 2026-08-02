@@ -12,7 +12,7 @@ readonly GROK_MIN_MEMORY_KIB=6291456
 readonly DESKTOP_META_SUFFIX=".build-meta"
 
 case "${TRACK}" in
-  core)
+  core|runtime-fault)
     readonly MIN_DISK_KIB="${CORE_MIN_DISK_KIB}"
     readonly MIN_MEMORY_KIB="${CORE_MIN_MEMORY_KIB}"
     ;;
@@ -58,6 +58,23 @@ if [[ -n "${AVAILABLE_MEMORY_KIB}" ]]; then
 fi
 
 echo "资源预检通过：track=${TRACK} disk_kib=${AVAILABLE_DISK_KIB} memory_kib=${AVAILABLE_MEMORY_KIB:-unknown}"
+
+if [[ "${TRACK}" == "runtime-fault" ]]; then
+  readonly FAULT_TEMP_PARENT="${TMPDIR:-/tmp}"
+  if [[ ! -d "${FAULT_TEMP_PARENT}" || ! -w "${FAULT_TEMP_PARENT}" ]]; then
+    echo "资源预检失败：运行期故障轨道需要可写临时目录 ${FAULT_TEMP_PARENT}。" >&2
+    exit 1
+  fi
+  AVAILABLE_TEMP_DISK_KIB="$(df -Pk "${FAULT_TEMP_PARENT}" | awk 'NR == 2 { print $4 }')"
+  if [[ ! "${AVAILABLE_TEMP_DISK_KIB}" =~ ^[0-9]+$ ]] \
+    || (( AVAILABLE_TEMP_DISK_KIB < CORE_MIN_DISK_KIB )); then
+    echo "资源预检失败：运行期故障临时目录至少需要 ${CORE_MIN_DISK_KIB} KiB 可用空间。" >&2
+    exit 1
+  fi
+  FAULT_TEMP_PROBE="$(mktemp -d "${FAULT_TEMP_PARENT}/metheus-runtime-preflight.XXXXXX")"
+  rmdir -- "${FAULT_TEMP_PROBE}"
+  echo "RUNTIME_FAULT_INJECTION_ELIGIBLE=yes temp_parent=${FAULT_TEMP_PARENT}"
+fi
 
 if [[ "${TRACK}" == "desktop" ]]; then
   mapfile -t DESKTOP_SOURCE_FILES < <(

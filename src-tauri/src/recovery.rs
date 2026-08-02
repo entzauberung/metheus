@@ -1225,9 +1225,13 @@ async fn replan_current_subtask(
     .await
     .map_err(|error| format!("当前任务重规划 AI 调用失败：{}", error))?;
     let output: crate::plan_calibration::PlanPatchOutput =
-        crate::json_utils::parse_json_with_retry_with_context(&response.content, call_context)
-            .await
-            .map_err(|error| format!("当前任务重规划结果解析失败：{}", error))?;
+        crate::json_utils::parse_json_with_contract_and_context(
+            &response.content,
+            &crate::json_utils::PLAN_PATCH_JSON_CONTRACT,
+            call_context,
+        )
+        .await
+        .map_err(|error| format!("当前任务重规划协议失败：{}", error))?;
     let output = validate_replan_output(output)?;
     let contract_before = crate::plan_calibration::immutable_contract(subtask)?;
     let mut contract_candidate = subtask.clone();
@@ -3044,6 +3048,19 @@ pub(crate) async fn resolve_human_recovery(
 ) -> Result<project::Project, String> {
     let mut pipeline_guard = state.pipeline_state.lock().await;
     let mut proj = crate::load_project(&project_name)?;
+    if proj.workflow_state.recovery_state.is_none() {
+        return Err("当前没有错误恢复任务。".to_string());
+    }
+    if !matches!(
+        crate::control_action_executor::classify_control_action_occupancy(
+            &proj.task_control,
+            crate::project_state_bus::process_start_id(),
+            chrono::Utc::now(),
+        ),
+        crate::control_action_executor::ControlActionOccupancy::Unoccupied
+    ) {
+        return Err("控制动作锁尚未收口，请先等待动作完成或同步清理陈旧锁。".to_string());
+    }
     let (recovery, mut session, subtask) = current_recovery_context(&proj)?;
     if recovery.phase == project::RecoveryPhase::WaitingEngine
         || recovery.error_kind == project::RecoveryErrorKind::EngineBlocked
@@ -3542,6 +3559,30 @@ mod tests {
         assert_eq!(next_evidence_strategy(&recovery), None);
         assert_eq!(recovery.attempt, 2);
         assert!(recovery.replan_attempted);
+    }
+
+    #[test]
+    fn runtime_fault_regression_protocol_failure_does_not_spend_code_repair_attempts() {
+        let mut recovery = project::RecoveryState {
+            attempt: 2,
+            replan_attempted: true,
+            ..Default::default()
+        };
+        let test = project::TestResult {
+            review_failure_kind: Some(project::ReviewFailureKind::FieldTypeMismatch),
+            review_protocol_attempts: 1,
+            ..Default::default()
+        };
+
+        record_review_protocol_strategies(&mut recovery, &test);
+        assert_eq!(recovery.attempt, 2);
+        assert!(recovery.replan_attempted);
+        assert!(recovery
+            .validation_strategies
+            .contains(&project::ValidationRetryStrategy::DeterministicNormalization));
+        assert!(recovery
+            .validation_strategies
+            .contains(&project::ValidationRetryStrategy::ProtocolRepair));
     }
 
     #[test]

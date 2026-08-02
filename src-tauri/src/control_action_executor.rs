@@ -1,10 +1,452 @@
 use crate::control_action::{ControlActionKind, ControlActionLifecycle};
 use crate::pipeline::PipelineState;
 use crate::project;
+use crate::task_control::{ControlActionLease, TaskControlState};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+pub(crate) const CONTROL_ACTION_HEARTBEAT_INTERVAL_SECS: u64 = 2;
+pub(crate) const CONTROL_ACTION_STALE_AFTER_SECS: i64 = 15;
+pub(crate) const CONTROL_ACTION_MAX_EXECUTION_SECS: u64 = 60 * 60;
+
+const CONTROL_ACTION_SIMPLE_EXPECTED_SECS: u64 = 120;
+const CONTROL_ACTION_VALIDATION_EXPECTED_SECS: u64 = 15 * 60;
+const CONTROL_ACTION_EXECUTION_EXPECTED_SECS: u64 = 20 * 60;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControlActionOccupancy {
+    Unoccupied,
+    ActiveLocal(ControlActionLease),
+    ActiveForeign(ControlActionLease),
+    Stale {
+        lease: Option<ControlActionLease>,
+        reason: String,
+    },
+}
+
+pub(crate) fn expected_action_duration_secs(action: ControlActionKind) -> u64 {
+    match action {
+        ControlActionKind::Execute => CONTROL_ACTION_EXECUTION_EXPECTED_SECS,
+        ControlActionKind::LocalValidate
+        | ControlActionKind::AutomatedValidate
+        | ControlActionKind::TargetedValidate
+        | ControlActionKind::GitConfirm => CONTROL_ACTION_VALIDATION_EXPECTED_SECS,
+        ControlActionKind::Repair => CONTROL_ACTION_MAX_EXECUTION_SECS,
+        ControlActionKind::Split
+        | ControlActionKind::Recompile
+        | ControlActionKind::AcceptDeviation
+        | ControlActionKind::Wait
+        | ControlActionKind::Human => CONTROL_ACTION_SIMPLE_EXPECTED_SECS,
+    }
+}
+
+pub(crate) fn classify_control_action_occupancy(
+    state: &TaskControlState,
+    current_process_start_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ControlActionOccupancy {
+    let Some(lease) = state.active_action_lease.as_ref() else {
+        return if state.active_action_id.is_empty() {
+            ControlActionOccupancy::Unoccupied
+        } else {
+            ControlActionOccupancy::Stale {
+                lease: None,
+                reason: "旧格式控制锁缺少持有者与心跳".to_string(),
+            }
+        };
+    };
+    if lease.action_id.trim().is_empty()
+        || lease.owner_process_start_id.trim().is_empty()
+        || lease.action_kind.trim().is_empty()
+        || lease.started_at.trim().is_empty()
+        || lease.heartbeat_at.trim().is_empty()
+    {
+        return ControlActionOccupancy::Stale {
+            lease: Some(lease.clone()),
+            reason: "控制锁租约字段不完整".to_string(),
+        };
+    }
+    if (!state.active_action_id.is_empty() && state.active_action_id != lease.action_id)
+        || (!state.active_action_kind.is_empty() && state.active_action_kind != lease.action_kind)
+        || (!state.active_action_task_id.is_empty() && state.active_action_task_id != lease.task_id)
+    {
+        return ControlActionOccupancy::Stale {
+            lease: Some(lease.clone()),
+            reason: "结构化租约与兼容锁字段不一致".to_string(),
+        };
+    }
+    let heartbeat = match chrono::DateTime::parse_from_rfc3339(&lease.heartbeat_at) {
+        Ok(value) => value.with_timezone(&chrono::Utc),
+        Err(_) => {
+            return ControlActionOccupancy::Stale {
+                lease: Some(lease.clone()),
+                reason: "控制锁心跳时间无效".to_string(),
+            }
+        }
+    };
+    let started = match chrono::DateTime::parse_from_rfc3339(&lease.started_at) {
+        Ok(value) => value.with_timezone(&chrono::Utc),
+        Err(_) => {
+            return ControlActionOccupancy::Stale {
+                lease: Some(lease.clone()),
+                reason: "控制锁开始时间无效".to_string(),
+            }
+        }
+    };
+    if now.signed_duration_since(heartbeat).num_seconds() > CONTROL_ACTION_STALE_AFTER_SECS {
+        return ControlActionOccupancy::Stale {
+            lease: Some(lease.clone()),
+            reason: "控制动作心跳已超时".to_string(),
+        };
+    }
+    let expected = lease
+        .expected_max_duration_secs
+        .max(1)
+        .min(CONTROL_ACTION_MAX_EXECUTION_SECS);
+    if now.signed_duration_since(started).num_seconds() > expected as i64 {
+        return ControlActionOccupancy::Stale {
+            lease: Some(lease.clone()),
+            reason: "控制动作已超过预期最长执行时长".to_string(),
+        };
+    }
+    if lease.owner_process_start_id == current_process_start_id {
+        ControlActionOccupancy::ActiveLocal(lease.clone())
+    } else {
+        ControlActionOccupancy::ActiveForeign(lease.clone())
+    }
+}
+
+fn install_action_lease(
+    state: &mut TaskControlState,
+    request: &ControlActionRequest,
+    owner_process_start_id: &str,
+    now: &str,
+) {
+    let lease = ControlActionLease {
+        action_id: request.action_id.clone(),
+        owner_process_start_id: owner_process_start_id.to_string(),
+        action_kind: request.action.as_str().to_string(),
+        task_id: request.task_id.clone(),
+        started_at: now.to_string(),
+        heartbeat_at: now.to_string(),
+        expected_max_duration_secs: expected_action_duration_secs(request.action),
+    };
+    state.active_action_id = lease.action_id.clone();
+    state.active_action_kind = lease.action_kind.clone();
+    state.active_action_task_id = lease.task_id.clone();
+    state.active_action_lease = Some(lease);
+}
+
+pub(crate) fn clear_action_lease(state: &mut TaskControlState, reason: &str, cleared_at: &str) {
+    state.active_action_lease = None;
+    state.active_action_id.clear();
+    state.active_action_kind.clear();
+    state.active_action_task_id.clear();
+    state.last_action_clear_reason = reason.to_string();
+    state.last_action_cleared_at = Some(cleared_at.to_string());
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ControlActionLockReconciliation {
+    Unchanged,
+    Cleared {
+        action_id: String,
+        completed: bool,
+        needs_human_confirmation: bool,
+        reason: String,
+        post_task_state: String,
+    },
+}
+
+impl ControlActionLockReconciliation {
+    pub(crate) fn changed(&self) -> bool {
+        matches!(self, Self::Cleared { .. })
+    }
+}
+
+pub(crate) fn stale_control_action_can_be_cleared(
+    lease: Option<&ControlActionLease>,
+    current_process_start_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    !lease.is_some_and(|value| {
+        value.owner_process_start_id == current_process_start_id
+            && chrono::DateTime::parse_from_rfc3339(&value.heartbeat_at)
+                .ok()
+                .map(|heartbeat| {
+                    now.signed_duration_since(heartbeat.with_timezone(&chrono::Utc))
+                        .num_seconds()
+                        <= CONTROL_ACTION_STALE_AFTER_SECS
+                })
+                .unwrap_or(false)
+    })
+}
+
+fn known_control_action_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "split"
+            | "execute"
+            | "local_validate"
+            | "automated_validate"
+            | "targeted_validate"
+            | "repair"
+            | "recompile"
+            | "accept_deviation"
+            | "git_confirm"
+            | "wait"
+            | "human"
+    )
+}
+
+fn task_state_label(project: &project::Project, task_id: &str) -> String {
+    if task_id.is_empty() {
+        return "unscoped".to_string();
+    }
+    match crate::task_tree::find_task(project, task_id) {
+        Ok(Some(task)) => format!("{:?}", task.status),
+        Ok(None) => "task_missing".to_string(),
+        Err(_) => "task_state_unavailable".to_string(),
+    }
+}
+
+fn has_persisted_action_completion(
+    project: &project::Project,
+    action_id: &str,
+    action_kind: &str,
+    task_id: &str,
+    made_progress: bool,
+) -> bool {
+    if !action_id.is_empty()
+        && (project.task_control.last_completed_action_id == action_id
+            || project.execution_history.iter().rev().any(|entry| {
+                entry.action_id.as_deref() == Some(action_id) && entry.level == "success"
+            }))
+    {
+        return true;
+    }
+    if action_kind == ControlActionKind::GitConfirm.as_str() {
+        return crate::task_tree::find_task(project, task_id)
+            .ok()
+            .flatten()
+            .is_some_and(|task| task.status == project::SubtaskStatus::Passed);
+    }
+    made_progress
+        && matches!(
+            action_kind,
+            "split"
+                | "execute"
+                | "local_validate"
+                | "automated_validate"
+                | "targeted_validate"
+                | "recompile"
+                | "accept_deviation"
+                | "wait"
+                | "human"
+        )
+}
+
+/// 对已加载项目中的控制动作锁做后端裁决。调用方必须在控制动作文件锁下持久化结果。
+/// 新鲜的其他进程租约始终保留；本进程仍有新鲜心跳的超时动作也先等待正常收口。
+pub(crate) fn reconcile_stale_control_action_lock(
+    project: &mut project::Project,
+    current_process_start_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> ControlActionLockReconciliation {
+    let occupancy =
+        classify_control_action_occupancy(&project.task_control, current_process_start_id, now);
+    let (lease, reason) = match occupancy {
+        ControlActionOccupancy::Unoccupied
+        | ControlActionOccupancy::ActiveLocal(_)
+        | ControlActionOccupancy::ActiveForeign(_) => {
+            return ControlActionLockReconciliation::Unchanged;
+        }
+        ControlActionOccupancy::Stale { lease, reason } => (lease, reason),
+    };
+
+    if !stale_control_action_can_be_cleared(lease.as_ref(), current_process_start_id, now) {
+        return ControlActionLockReconciliation::Unchanged;
+    }
+
+    let action_id = lease
+        .as_ref()
+        .map(|value| value.action_id.clone())
+        .unwrap_or_else(|| project.task_control.active_action_id.clone());
+    let action_kind = lease
+        .as_ref()
+        .map(|value| value.action_kind.clone())
+        .unwrap_or_else(|| project.task_control.active_action_kind.clone());
+    let task_id = lease
+        .as_ref()
+        .map(|value| value.task_id.clone())
+        .unwrap_or_else(|| project.task_control.active_action_task_id.clone());
+    let owner_process_start_id = lease
+        .as_ref()
+        .map(|value| value.owner_process_start_id.clone());
+    let heartbeat_at = lease.as_ref().map(|value| value.heartbeat_at.clone());
+    let after_fingerprint = control_fingerprint(project, &task_id).unwrap_or_default();
+    let made_progress = !project
+        .task_control
+        .last_action_before_fingerprint
+        .is_empty()
+        && !after_fingerprint.is_empty()
+        && project.task_control.last_action_before_fingerprint != after_fingerprint;
+    let completed =
+        has_persisted_action_completion(project, &action_id, &action_kind, &task_id, made_progress);
+    let needs_human_confirmation = lease.is_none()
+        || action_id.is_empty()
+        || !known_control_action_kind(&action_kind)
+        || (action_kind == ControlActionKind::Repair.as_str() && made_progress);
+
+    let cleared_at = now.to_rfc3339();
+    let clear_reason = format!("stale_reconciliation: {}", reason);
+    clear_action_lease(&mut project.task_control, &clear_reason, &cleared_at);
+    if completed {
+        project.task_control.last_completed_action_id = action_id.clone();
+        project.task_control.last_completed_action_kind = action_kind.clone();
+        project.task_control.last_completed_action_task_id = task_id.clone();
+        project.task_control.last_action_result =
+            "陈旧锁已清理，磁盘完成事实已由对账确认".to_string();
+        project.task_control.last_action_made_progress = made_progress;
+        project.task_control.last_action_after_fingerprint = after_fingerprint;
+        project.task_control.last_action_at = Some(cleared_at.clone());
+    } else {
+        project.task_control.last_decision = None;
+        project.task_control.last_decision_id.clear();
+        project.task_control.last_decision_fingerprint.clear();
+    }
+    if needs_human_confirmation {
+        if let Some(autopilot) = project.workflow_state.autopilot_state.as_mut() {
+            autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
+            autopilot.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+            autopilot.error_message =
+                "陈旧控制锁已释放，但原动作完成事实无法确认，请检查任务状态。".to_string();
+        }
+    }
+    let post_task_state = task_state_label(project, &task_id);
+    project
+        .execution_history
+        .push(project::ExecutionHistoryEntry {
+            timestamp: cleared_at.clone(),
+            level: if needs_human_confirmation {
+                "pause"
+            } else if completed {
+                "success"
+            } else {
+                "info"
+            }
+            .to_string(),
+            event_type: if needs_human_confirmation {
+                project::ExecutionEventType::StaleControlActionNeedsHumanConfirmation
+            } else {
+                project::ExecutionEventType::StaleControlLockCleared
+            },
+            source: project::OperationSource::System,
+            text: if completed {
+                "陈旧控制动作锁已清理；磁盘完成事实已确认。".to_string()
+            } else if needs_human_confirmation {
+                "陈旧控制动作锁已清理；原动作需人工确认。".to_string()
+            } else {
+                "陈旧控制动作锁已清理；任务已恢复为可重新决策。".to_string()
+            },
+            milestone_id: (!project.current_milestone_id.is_empty())
+                .then(|| project.current_milestone_id.clone()),
+            mid_stage_id: (!project.current_mid_stage_id.is_empty())
+                .then(|| project.current_mid_stage_id.clone()),
+            subtask_id: (!task_id.is_empty()).then(|| task_id.clone()),
+            criterion_index: None,
+            decision_id: None,
+            action_id: (!action_id.is_empty()).then(|| action_id.clone()),
+            validator_id: None,
+            model_call_id: None,
+            control_lock_owner_process_start_id: owner_process_start_id,
+            control_lock_heartbeat_at: heartbeat_at,
+            control_lock_clear_reason: Some(reason.clone()),
+            control_lock_post_task_state: Some(post_task_state.clone()),
+        });
+    if project.execution_history.len() > project::MAX_EXECUTION_HISTORY {
+        let excess = project.execution_history.len() - project::MAX_EXECUTION_HISTORY;
+        project.execution_history.drain(0..excess);
+    }
+    project.workflow_state.data_revision = project.workflow_state.data_revision.saturating_add(1);
+    project.workflow_state.last_transition_at = cleared_at;
+
+    ControlActionLockReconciliation::Cleared {
+        action_id,
+        completed,
+        needs_human_confirmation,
+        reason,
+        post_task_state,
+    }
+}
+
+fn touch_action_heartbeat(
+    project_name: &str,
+    action_id: &str,
+    owner_process_start_id: &str,
+) -> Result<bool, String> {
+    crate::mutate_project_for_control(project_name, |project| {
+        let Some(lease) = project.task_control.active_action_lease.as_mut() else {
+            return Ok((false, false));
+        };
+        if lease.action_id != action_id || lease.owner_process_start_id != owner_process_start_id {
+            return Ok((false, false));
+        }
+        lease.heartbeat_at = chrono::Utc::now().to_rfc3339();
+        Ok((true, true))
+    })
+}
+
+struct ActionHeartbeatGuard {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ActionHeartbeatGuard {
+    fn start(project_name: String, action_id: String, owner_process_start_id: String) -> Self {
+        let (stop, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("metheus-control-heartbeat".to_string())
+            .spawn(move || loop {
+                match receiver.recv_timeout(std::time::Duration::from_secs(
+                    CONTROL_ACTION_HEARTBEAT_INTERVAL_SECS,
+                )) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        match touch_action_heartbeat(
+                            &project_name,
+                            &action_id,
+                            &owner_process_start_id,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(_) => {
+                                eprintln!("控制动作心跳持久化失败（action_kind=runtime_control）")
+                            }
+                        }
+                    }
+                }
+            })
+            .ok();
+        Self {
+            stop: Some(stop),
+            handle,
+        }
+    }
+}
+
+impl Drop for ActionHeartbeatGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
 
 pub fn ensure_serial_takeover_actions_available() -> Result<(), String> {
     use ControlActionKind::*;
@@ -90,45 +532,105 @@ pub async fn execute(
     if request.action_id.trim().is_empty() {
         request.action_id = uuid::Uuid::new_v4().to_string();
     }
-    let mut project = crate::load_project(&project_name)?;
-    validate_request(&project, &request)?;
-    if project.task_control.last_completed_action_id == request.action_id {
-        return Ok(previous_result(&project, &request));
+    enum ClaimOutcome {
+        Immediate(ControlActionExecutionResult),
+        Claimed {
+            before_fingerprint: String,
+            project_revision: u64,
+            tree_revision: u64,
+        },
     }
-    if !project.task_control.active_action_id.is_empty() {
-        if project.task_control.active_action_id == request.action_id {
-            return Ok(ControlActionExecutionResult {
-                action_id: request.action_id,
-                action: request.action,
-                task_id: request.task_id,
-                lifecycle: ControlActionLifecycle::Running,
-                idempotent: true,
-                queued: true,
-                made_progress: false,
-                before_fingerprint: project.task_control.last_action_before_fingerprint.clone(),
-                after_fingerprint: String::new(),
+    let owner_process_start_id = crate::project_state_bus::process_start_id().to_string();
+    let claim = crate::mutate_project_for_control(&project_name, |project| {
+        validate_request(project, &request)?;
+        if project.task_control.last_completed_action_id == request.action_id {
+            return Ok((
+                ClaimOutcome::Immediate(previous_result(project, &request)),
+                false,
+            ));
+        }
+        match classify_control_action_occupancy(
+            &project.task_control,
+            &owner_process_start_id,
+            chrono::Utc::now(),
+        ) {
+            ControlActionOccupancy::Unoccupied => {}
+            ControlActionOccupancy::ActiveLocal(lease)
+            | ControlActionOccupancy::ActiveForeign(lease)
+                if lease.action_id == request.action_id =>
+            {
+                return Ok((
+                    ClaimOutcome::Immediate(ControlActionExecutionResult {
+                        action_id: request.action_id.clone(),
+                        action: request.action,
+                        task_id: request.task_id.clone(),
+                        lifecycle: ControlActionLifecycle::Running,
+                        idempotent: true,
+                        queued: true,
+                        made_progress: false,
+                        before_fingerprint: project
+                            .task_control
+                            .last_action_before_fingerprint
+                            .clone(),
+                        after_fingerprint: String::new(),
+                        project_revision: project.workflow_state.data_revision,
+                        tree_revision: project.task_control.tree_revision,
+                        message: "同一控制动作正在执行".to_string(),
+                    }),
+                    false,
+                ));
+            }
+            ControlActionOccupancy::ActiveLocal(lease) => {
+                return Err(format!("已有控制动作正在执行：{}", lease.action_id));
+            }
+            ControlActionOccupancy::ActiveForeign(lease) => {
+                return Err(format!(
+                    "另一 Metheus 进程正在执行控制动作：{}，请等待其完成",
+                    lease.action_id
+                ));
+            }
+            ControlActionOccupancy::Stale { reason, .. } => {
+                return Err(format!(
+                    "检测到陈旧控制动作锁：{}；请先同步项目状态",
+                    reason
+                ));
+            }
+        }
+
+        let before_fingerprint = control_fingerprint(project, &request.task_id)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        install_action_lease(
+            &mut project.task_control,
+            &request,
+            &owner_process_start_id,
+            &now,
+        );
+        project.task_control.last_action_before_fingerprint = before_fingerprint.clone();
+        project.task_control.last_action_at = Some(now);
+        project.workflow_state.data_revision =
+            project.workflow_state.data_revision.saturating_add(1);
+        Ok((
+            ClaimOutcome::Claimed {
+                before_fingerprint,
                 project_revision: project.workflow_state.data_revision,
                 tree_revision: project.task_control.tree_revision,
-                message: "同一控制动作正在执行".to_string(),
-            });
-        }
-        return Err(format!(
-            "已有控制动作正在执行：{}",
-            project.task_control.active_action_id
-        ));
-    }
-
-    let before_fingerprint = control_fingerprint(&project, &request.task_id)?;
-    project.task_control.active_action_id = request.action_id.clone();
-    project.task_control.active_action_kind = request.action.as_str().to_string();
-    project.task_control.active_action_task_id = request.task_id.clone();
-    project.task_control.last_action_before_fingerprint = before_fingerprint.clone();
-    project.task_control.last_action_at = Some(chrono::Utc::now().to_rfc3339());
-    project.workflow_state.data_revision = project.workflow_state.data_revision.saturating_add(1);
-    crate::save_project(&project)?;
-
-    let claimed_project_revision = project.workflow_state.data_revision;
-    let claimed_tree_revision = project.task_control.tree_revision;
+            },
+            true,
+        ))
+    })?;
+    let (before_fingerprint, claimed_project_revision, claimed_tree_revision) = match claim {
+        ClaimOutcome::Immediate(result) => return Ok(result),
+        ClaimOutcome::Claimed {
+            before_fingerprint,
+            project_revision,
+            tree_revision,
+        } => (before_fingerprint, project_revision, tree_revision),
+    };
+    let heartbeat = ActionHeartbeatGuard::start(
+        project_name.clone(),
+        request.action_id.clone(),
+        owner_process_start_id,
+    );
     let dispatched = dispatch(
         pipeline_state,
         &project_name,
@@ -137,6 +639,7 @@ pub async fn execute(
         claimed_tree_revision,
     )
     .await;
+    drop(heartbeat);
     match dispatched {
         Ok(message) => finish_action(&project_name, &request, before_fingerprint, message, true),
         Err(error) => {
@@ -446,10 +949,17 @@ fn validate_claimed_dispatch(
     {
         return Err("控制动作认领后项目状态已变化，拒绝旧动作".to_string());
     }
-    if project.task_control.active_action_id != request.action_id
-        || project.task_control.active_action_kind != request.action.as_str()
-        || project.task_control.active_action_task_id != request.task_id
-    {
+    let lease_matches = project
+        .task_control
+        .active_action_lease
+        .as_ref()
+        .is_some_and(|lease| {
+            lease.action_id == request.action_id
+                && lease.action_kind == request.action.as_str()
+                && lease.task_id == request.task_id
+                && lease.owner_process_start_id == crate::project_state_bus::process_start_id()
+        });
+    if !lease_matches {
         return Err("控制动作认领已被新的项目状态取代".to_string());
     }
     let mut revalidated = request.clone();
@@ -737,57 +1247,77 @@ fn finish_action(
     message: String,
     succeeded: bool,
 ) -> Result<ControlActionExecutionResult, String> {
-    let mut project = crate::load_project(project_name)?;
-    if project.task_control.active_action_id != request.action_id {
-        return Err("控制动作已被新的项目状态取代".to_string());
-    }
-    let after_fingerprint = control_fingerprint(&project, &request.task_id)?;
-    let made_progress = succeeded && after_fingerprint != before_fingerprint;
-    project.task_control.active_action_id.clear();
-    project.task_control.active_action_kind.clear();
-    project.task_control.active_action_task_id.clear();
-    project.task_control.last_completed_action_id = request.action_id.clone();
-    project.task_control.last_completed_action_kind = request.action.as_str().to_string();
-    project.task_control.last_completed_action_task_id = request.task_id.clone();
-    project.task_control.last_action_result = message.clone();
-    project.task_control.last_action_made_progress = made_progress;
-    project.task_control.last_action_before_fingerprint = before_fingerprint.clone();
-    project.task_control.last_action_after_fingerprint = after_fingerprint.clone();
-    project.task_control.last_action_at = Some(chrono::Utc::now().to_rfc3339());
-    if succeeded
-        && !matches!(
-            request.action,
-            ControlActionKind::Wait | ControlActionKind::Human
-        )
-    {
-        if let Some(state) = project.workflow_state.autopilot_state.as_mut() {
-            state.consecutive_no_progress = if made_progress {
-                0
-            } else {
-                state.consecutive_no_progress.saturating_add(1)
-            };
+    let owner_process_start_id = crate::project_state_bus::process_start_id().to_string();
+    crate::mutate_project_for_control(project_name, |project| {
+        let lease_matches = project
+            .task_control
+            .active_action_lease
+            .as_ref()
+            .is_some_and(|lease| {
+                lease.action_id == request.action_id
+                    && lease.owner_process_start_id == owner_process_start_id
+            });
+        if !lease_matches {
+            return Err("控制动作已被新的项目状态取代".to_string());
         }
-    }
-    append_control_event(&mut project, request, &message, succeeded);
-    project.workflow_state.data_revision = project.workflow_state.data_revision.saturating_add(1);
-    crate::save_project(&project)?;
-    Ok(ControlActionExecutionResult {
-        action_id: request.action_id.clone(),
-        action: request.action,
-        task_id: request.task_id.clone(),
-        lifecycle: if succeeded {
-            ControlActionLifecycle::Completed
-        } else {
-            ControlActionLifecycle::Failed
-        },
-        idempotent: false,
-        queued: false,
-        made_progress,
-        before_fingerprint,
-        after_fingerprint,
-        project_revision: project.workflow_state.data_revision,
-        tree_revision: project.task_control.tree_revision,
-        message,
+        let after_fingerprint = control_fingerprint(project, &request.task_id)?;
+        let made_progress = succeeded && after_fingerprint != before_fingerprint;
+        let now = chrono::Utc::now().to_rfc3339();
+        clear_action_lease(
+            &mut project.task_control,
+            if succeeded {
+                "normal_completion"
+            } else {
+                "action_failed"
+            },
+            &now,
+        );
+        project.task_control.last_completed_action_id = request.action_id.clone();
+        project.task_control.last_completed_action_kind = request.action.as_str().to_string();
+        project.task_control.last_completed_action_task_id = request.task_id.clone();
+        project.task_control.last_action_result = message.clone();
+        project.task_control.last_action_made_progress = made_progress;
+        project.task_control.last_action_before_fingerprint = before_fingerprint.clone();
+        project.task_control.last_action_after_fingerprint = after_fingerprint.clone();
+        project.task_control.last_action_at = Some(now);
+        if succeeded
+            && !matches!(
+                request.action,
+                ControlActionKind::Wait | ControlActionKind::Human
+            )
+        {
+            if let Some(state) = project.workflow_state.autopilot_state.as_mut() {
+                state.consecutive_no_progress = if made_progress {
+                    0
+                } else {
+                    state.consecutive_no_progress.saturating_add(1)
+                };
+            }
+        }
+        append_control_event(project, request, &message, succeeded);
+        project.workflow_state.data_revision =
+            project.workflow_state.data_revision.saturating_add(1);
+        Ok((
+            ControlActionExecutionResult {
+                action_id: request.action_id.clone(),
+                action: request.action,
+                task_id: request.task_id.clone(),
+                lifecycle: if succeeded {
+                    ControlActionLifecycle::Completed
+                } else {
+                    ControlActionLifecycle::Failed
+                },
+                idempotent: false,
+                queued: false,
+                made_progress,
+                before_fingerprint: before_fingerprint.clone(),
+                after_fingerprint,
+                project_revision: project.workflow_state.data_revision,
+                tree_revision: project.task_control.tree_revision,
+                message: message.clone(),
+            },
+            true,
+        ))
     })
 }
 
@@ -832,6 +1362,10 @@ fn append_control_event(
             action_id: Some(request.action_id.clone()),
             validator_id,
             model_call_id,
+            control_lock_owner_process_start_id: None,
+            control_lock_heartbeat_at: None,
+            control_lock_clear_reason: None,
+            control_lock_post_task_state: None,
         });
     if project.execution_history.len() > project::MAX_EXECUTION_HISTORY {
         let excess = project.execution_history.len() - project::MAX_EXECUTION_HISTORY;
@@ -1007,9 +1541,18 @@ mod tests {
             criterion: "criterion".to_string(),
             ..Default::default()
         }];
-        project.task_control.active_action_id = "action".to_string();
-        project.task_control.active_action_kind = "accept_deviation".to_string();
-        project.task_control.active_action_task_id = "task".to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        install_action_lease(
+            &mut project.task_control,
+            &ControlActionRequest {
+                action_id: "action".to_string(),
+                action: ControlActionKind::AcceptDeviation,
+                task_id: "task".to_string(),
+                ..Default::default()
+            },
+            crate::project_state_bus::process_start_id(),
+            &now,
+        );
         project.workflow_state.data_revision = 8;
         project.task_control.tree_revision = 3;
         let request = ControlActionRequest {
@@ -1023,6 +1566,230 @@ mod tests {
         validate_claimed_dispatch(&project, &request, 8, 3).unwrap();
         project.workflow_state.data_revision = 9;
         assert!(validate_claimed_dispatch(&project, &request, 8, 3).is_err());
+    }
+
+    fn test_lease(owner: &str, started_at: &str, heartbeat_at: &str) -> ControlActionLease {
+        ControlActionLease {
+            action_id: "action-1".to_string(),
+            owner_process_start_id: owner.to_string(),
+            action_kind: "execute".to_string(),
+            task_id: "task-1".to_string(),
+            started_at: started_at.to_string(),
+            heartbeat_at: heartbeat_at.to_string(),
+            expected_max_duration_secs: CONTROL_ACTION_EXECUTION_EXPECTED_SECS,
+        }
+    }
+
+    fn state_with_lease(lease: ControlActionLease) -> TaskControlState {
+        TaskControlState {
+            active_action_id: lease.action_id.clone(),
+            active_action_kind: lease.action_kind.clone(),
+            active_action_task_id: lease.task_id.clone(),
+            active_action_lease: Some(lease),
+            ..TaskControlState::default()
+        }
+    }
+
+    #[test]
+    fn runtime_fault_lock_lease_fresh_local_and_foreign_owners_remain_active() {
+        let now = chrono::Utc::now();
+        let timestamp = now.to_rfc3339();
+        let local = state_with_lease(test_lease("process-a", &timestamp, &timestamp));
+        assert!(matches!(
+            classify_control_action_occupancy(&local, "process-a", now),
+            ControlActionOccupancy::ActiveLocal(_)
+        ));
+        assert!(matches!(
+            classify_control_action_occupancy(&local, "process-b", now),
+            ControlActionOccupancy::ActiveForeign(_)
+        ));
+    }
+
+    #[test]
+    fn runtime_fault_lock_lease_expired_heartbeat_is_stale() {
+        let now = chrono::Utc::now();
+        let started = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        let heartbeat = (now - chrono::Duration::seconds(16)).to_rfc3339();
+        let state = state_with_lease(test_lease("process-a", &started, &heartbeat));
+        assert!(matches!(
+            classify_control_action_occupancy(&state, "process-a", now),
+            ControlActionOccupancy::Stale { reason, .. } if reason.contains("心跳")
+        ));
+    }
+
+    #[test]
+    fn runtime_fault_lock_lease_expected_duration_is_bounded_by_hard_limit() {
+        let now = chrono::Utc::now();
+        let started = (now
+            - chrono::Duration::seconds(CONTROL_ACTION_MAX_EXECUTION_SECS as i64 + 1))
+        .to_rfc3339();
+        let heartbeat = now.to_rfc3339();
+        let mut lease = test_lease("process-a", &started, &heartbeat);
+        lease.expected_max_duration_secs = CONTROL_ACTION_MAX_EXECUTION_SECS * 2;
+        let state = state_with_lease(lease);
+        assert!(matches!(
+            classify_control_action_occupancy(&state, "process-a", now),
+            ControlActionOccupancy::Stale { reason, .. } if reason.contains("最长执行时长")
+        ));
+    }
+
+    #[test]
+    fn runtime_fault_lock_lease_legacy_string_lock_requires_reconciliation() {
+        let state = TaskControlState {
+            active_action_id: "legacy-action".to_string(),
+            ..TaskControlState::default()
+        };
+        assert!(matches!(
+            classify_control_action_occupancy(&state, "process-a", chrono::Utc::now()),
+            ControlActionOccupancy::Stale { lease: None, reason } if reason.contains("旧格式")
+        ));
+    }
+
+    #[test]
+    fn runtime_fault_stale_lock_reconciliation_clears_and_audits_expired_lease() {
+        let now = chrono::Utc::now();
+        let started = (now - chrono::Duration::seconds(40)).to_rfc3339();
+        let heartbeat = (now - chrono::Duration::seconds(20)).to_rfc3339();
+        let mut project = project_with_task(project::SubtaskStatus::Pending);
+        let mut lease = test_lease("old-process", &started, &heartbeat);
+        lease.task_id = "task".to_string();
+        project.task_control = state_with_lease(lease);
+
+        let result = reconcile_stale_control_action_lock(&mut project, "new-process", now);
+        assert!(matches!(
+            result,
+            ControlActionLockReconciliation::Cleared {
+                completed: false,
+                needs_human_confirmation: false,
+                ..
+            }
+        ));
+        assert!(project.task_control.active_action_lease.is_none());
+        assert!(project.task_control.active_action_id.is_empty());
+        assert!(project
+            .task_control
+            .last_action_clear_reason
+            .contains("心跳"));
+        let event = project.execution_history.last().unwrap();
+        assert_eq!(
+            event.event_type,
+            project::ExecutionEventType::StaleControlLockCleared
+        );
+        assert_eq!(
+            event.control_lock_owner_process_start_id.as_deref(),
+            Some("old-process")
+        );
+        assert_eq!(
+            event.control_lock_heartbeat_at.as_deref(),
+            Some(heartbeat.as_str())
+        );
+        assert_eq!(
+            event.control_lock_post_task_state.as_deref(),
+            Some("Pending")
+        );
+    }
+
+    #[test]
+    fn runtime_fault_stale_lock_reconciliation_preserves_fresh_foreign_owner() {
+        let now = chrono::Utc::now();
+        let timestamp = now.to_rfc3339();
+        let mut project = project_with_task(project::SubtaskStatus::Pending);
+        let mut lease = test_lease("live-other-process", &timestamp, &timestamp);
+        lease.task_id = "task".to_string();
+        project.task_control = state_with_lease(lease);
+
+        assert_eq!(
+            reconcile_stale_control_action_lock(&mut project, "this-process", now),
+            ControlActionLockReconciliation::Unchanged
+        );
+        assert!(project.task_control.active_action_lease.is_some());
+        assert!(project.execution_history.is_empty());
+    }
+
+    #[test]
+    fn runtime_fault_stale_lock_reconciliation_legacy_lock_requires_human_audit() {
+        let mut project = project_with_task(project::SubtaskStatus::Pending);
+        project.task_control.active_action_id = "legacy-action".to_string();
+
+        let result =
+            reconcile_stale_control_action_lock(&mut project, "this-process", chrono::Utc::now());
+        assert!(matches!(
+            result,
+            ControlActionLockReconciliation::Cleared {
+                needs_human_confirmation: true,
+                ..
+            }
+        ));
+        assert!(project.task_control.active_action_id.is_empty());
+        assert_eq!(
+            project.execution_history.last().unwrap().event_type,
+            project::ExecutionEventType::StaleControlActionNeedsHumanConfirmation
+        );
+    }
+
+    #[test]
+    fn runtime_fault_stale_lock_reconciliation_publishes_project_change() -> Result<(), String> {
+        let now = chrono::Utc::now();
+        let started = (now - chrono::Duration::seconds(40)).to_rfc3339();
+        let heartbeat = (now - chrono::Duration::seconds(20)).to_rfc3339();
+        let project_name = format!("stale-lock-notify-{}", uuid::Uuid::new_v4());
+        let mut project = project_with_task(project::SubtaskStatus::Pending);
+        project.name = project_name.clone();
+        let mut lease = test_lease("old-process", &started, &heartbeat);
+        lease.task_id = "task".to_string();
+        project.task_control = state_with_lease(lease);
+        crate::save_project(&project)?;
+        let before = crate::project_state_bus::project_state_cursor(&project_name)?;
+
+        crate::mutate_project_for_control(&project_name, |persisted| {
+            let result =
+                reconcile_stale_control_action_lock(persisted, "new-process", chrono::Utc::now());
+            Ok(((), result.changed()))
+        })?;
+        let after = crate::project_state_bus::project_state_cursor(&project_name)?;
+        assert!(after.event_sequence > before.event_sequence);
+        assert!(crate::load_project(&project_name)?
+            .task_control
+            .active_action_id
+            .is_empty());
+
+        let data_path = crate::project_data_path(&project_name)?;
+        let lock_path = data_path.with_extension("control-action.lock");
+        let _ = std::fs::remove_file(data_path);
+        let _ = std::fs::remove_file(lock_path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_fault_regression_fresh_occupancy_rejects_new_action() -> Result<(), String> {
+        let project_name = format!("active-lock-reject-{}", uuid::Uuid::new_v4());
+        let mut project = project_with_task(project::SubtaskStatus::Pending);
+        project.name = project_name.clone();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut lease = test_lease("live-other-process", &now, &now);
+        lease.task_id = "task".to_string();
+        project.task_control = state_with_lease(lease);
+        crate::save_project(&project)?;
+
+        let error = execute(
+            Arc::new(Mutex::new(None)),
+            project_name.clone(),
+            ControlActionRequest {
+                action_id: "new-action".to_string(),
+                action: ControlActionKind::Execute,
+                task_id: "task".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("fresh occupancy must reject a different action");
+        assert!(error.contains("另一 Metheus 进程正在执行控制动作"));
+
+        let data_path = crate::project_data_path(&project_name)?;
+        let lock_path = data_path.with_extension("control-action.lock");
+        let _ = std::fs::remove_file(data_path);
+        let _ = std::fs::remove_file(lock_path);
+        Ok(())
     }
 
     #[test]
