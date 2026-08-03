@@ -246,8 +246,21 @@ pub fn authorize(
         {
             return Err("只能接受当前未满足或证据不足的验收项".to_string());
         }
-    } else if !requested_criteria.is_empty() {
-        return Err("当前人工动作不能携带验收项选择".to_string());
+    } else if action == HumanTerminalAction::ConfirmActualPass && !requested_criteria.is_empty() {
+        if requested_criteria
+            .iter()
+            .any(|index| !decision.actionable_criteria.contains(index))
+        {
+            return Err("只能确认当前未满足或证据不足的验收项".to_string());
+        }
+        let task = crate::task_tree::find_task(project, task_id)?
+            .ok_or_else(|| format!("任务节点不存在：{}", task_id))?;
+        if requested_criteria.iter().any(|index| {
+            crate::validator_registry::verification_mode_for(task, *index)
+                != crate::validator_contract::VerificationMode::HumanReview
+        }) {
+            return Err("逐项人工通过只能作用于 HumanReview 验收项".to_string());
+        }
     }
     Ok(decision)
 }
@@ -316,8 +329,13 @@ pub fn validate_recorded_human_acceptance(
         {
             return Err("接受偏差记录与验收项事实不一致".to_string());
         }
-    } else if !verification.accepted_criteria.is_empty() {
-        return Err("确认实际通过记录不能携带偏差验收项".to_string());
+    } else if verification.accepted_criteria.iter().any(|index| {
+        !task.acceptance_ledger.iter().any(|item| {
+            item.criterion_index == *index && item.status == AcceptanceStatus::Satisfied
+        }) || crate::validator_registry::verification_mode_for(task, *index)
+            != crate::validator_contract::VerificationMode::HumanReview
+    }) {
+        return Err("逐项人工通过记录与 HumanReview 验收事实不一致".to_string());
     }
     Ok(())
 }
@@ -518,5 +536,35 @@ mod tests {
         assert!(decision.allowed);
         assert!(decision.destructive);
         assert!(decision.requires_preview);
+    }
+
+    #[test]
+    fn provability_closeout_item_confirmation_is_limited_to_human_review() {
+        let mut human = task("leaf", SubtaskStatus::AwaitingConfirmation, Some(true));
+        human.acceptance_criteria = vec!["视觉表现与打磨前一致".to_string()];
+        human.acceptance_criteria_meta =
+            crate::provability::normalize_metadata(&human.acceptance_criteria, &[]);
+        human.acceptance_ledger[0].criterion = human.acceptance_criteria[0].clone();
+        let project = project_with_tasks(vec![human]);
+        authorize(
+            &project,
+            "leaf",
+            HumanTerminalAction::ConfirmActualPass,
+            &[1],
+            "已在真实桌面逐项检查",
+        )
+        .expect("HumanReview item should accept a scoped human conclusion");
+
+        let mut semantic = project.clone();
+        semantic.milestones[0].subtasks[0].acceptance_criteria_meta[0].provability =
+            crate::provability::Provability::SemanticReview;
+        assert!(authorize(
+            &semantic,
+            "leaf",
+            HumanTerminalAction::ConfirmActualPass,
+            &[1],
+            "不能用人工按钮替代语义审查",
+        )
+        .is_err());
     }
 }

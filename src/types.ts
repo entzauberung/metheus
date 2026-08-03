@@ -101,6 +101,20 @@ export type EngineFailureKind =
   | "TaskExecutionError";
 
 export type AcceptanceStatus = "Satisfied" | "Unsatisfied" | "Unknown" | "Contradictory" | "AcceptedDeviation";
+export type Provability = "Deterministic" | "AutomatedTest" | "SemanticReview" | "HumanReview" | "Unprovable";
+export type ProvabilitySource = "PlanningExplicit" | "SystemInferred" | "HumanCorrected";
+export type EvidenceSourceType = "LocalScan" | "AutomatedTestOutput" | "CodeSnippet" | "ExpandedCodeSnippet" | "RuntimeOrHuman";
+export interface EvidenceSourceFingerprint {
+  fingerprint: string;
+  source_types: EvidenceSourceType[];
+  covered_files: string[];
+  validator_type: string;
+}
+export interface AcceptanceCriterion {
+  text: string;
+  provability: Provability;
+  provability_source: ProvabilitySource;
+}
 export type ReviewIssueSeverity = "Blocking" | "Warning" | "Suggestion";
 export type EvidenceSourceKind =
   | "GitDiff"
@@ -247,6 +261,7 @@ export interface RecoveryState {
   evidence_rebuild_attempts: number;
   pending_evidence_criteria: number[];
   evidence_strategies: ReviewEvidenceStrategy[];
+  evidence_source_history: EvidenceSourceFingerprint[];
   validation_retry_count: number;
   max_validation_retries: number;
   next_validation_retry_at?: string;
@@ -326,7 +341,8 @@ export interface ProjectStateChangedEvent {
   execution_session_status: string | null;
   autopilot_status: AutopilotRunStatus | null;
   recovery_action: AutopilotRecoveryAction;
-  task_tree_revision: number;
+  task_control_tree_revision: number;
+  task_control_snapshot_version: string;
   control_action_id: string | null;
   control_mode: TaskControlMode;
   task_control_dirty: boolean;
@@ -882,6 +898,7 @@ export interface Subtask {
   evidence_files: string[];
   context_summary: string;
   acceptance_criteria: string[];
+  acceptance_criteria_meta?: AcceptanceCriterion[];
   stop_rules: string[];
   execution_prompt: string;
   confirmed_by_user?: boolean;
@@ -1132,6 +1149,7 @@ export interface TaskContract {
   new_file_paths: string[];
   evidence_files: string[];
   acceptance_criteria: string[];
+  acceptance_criteria_meta?: AcceptanceCriterion[];
   verification_modes: VerificationMode[];
   stop_rules: string[];
   dependencies: string[];

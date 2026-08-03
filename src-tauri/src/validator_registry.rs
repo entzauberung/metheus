@@ -64,21 +64,38 @@ pub fn preferred_mode(criterion: &str) -> VerificationMode {
     }
 }
 
+pub fn preferred_mode_with_label(
+    criterion: &str,
+    provability: Option<crate::provability::Provability>,
+) -> VerificationMode {
+    provability
+        .map(crate::provability::Provability::verification_mode)
+        .unwrap_or_else(|| preferred_mode(criterion))
+}
+
 pub fn verification_mode_for(
     task: &crate::project::Subtask,
     criterion_index: u32,
 ) -> VerificationMode {
     let offset = criterion_index.saturating_sub(1) as usize;
-    task.contract_snapshot
-        .as_ref()
-        .and_then(|contract| contract.verification_modes.get(offset))
-        .copied()
-        .unwrap_or_else(|| {
-            task.acceptance_criteria
-                .get(offset)
-                .map(|criterion| preferred_mode(criterion))
-                .unwrap_or(VerificationMode::SemanticReview)
-        })
+    crate::provability::criterion_provability(
+        &task.acceptance_criteria,
+        &task.acceptance_criteria_meta,
+        criterion_index,
+    )
+    .map(crate::provability::Provability::verification_mode)
+    .or_else(|| {
+        task.contract_snapshot
+            .as_ref()
+            .and_then(|contract| contract.verification_modes.get(offset))
+            .copied()
+    })
+    .unwrap_or_else(|| {
+        task.acceptance_criteria
+            .get(offset)
+            .map(|criterion| preferred_mode(criterion))
+            .unwrap_or(VerificationMode::SemanticReview)
+    })
 }
 
 /// Returns None unless every criterion has a deterministic proof strategy.
@@ -156,7 +173,14 @@ pub fn try_validate_locally(
 }
 
 pub fn validators_for(criterion: &str) -> Vec<ValidatorDescriptor> {
-    match preferred_mode(criterion) {
+    validators_for_with_label(criterion, None)
+}
+
+pub fn validators_for_with_label(
+    criterion: &str,
+    provability: Option<crate::provability::Provability>,
+) -> Vec<ValidatorDescriptor> {
+    match preferred_mode_with_label(criterion, provability) {
         VerificationMode::Deterministic => {
             let (name, scope) = crate::validators::capability(criterion)
                 .unwrap_or(("local_proof", "conservative local proof"));
@@ -226,6 +250,28 @@ mod tests {
     fn semantic_criteria_are_the_only_model_fallback() {
         let validators = validators_for("the user can complete checkout");
         assert_eq!(validators[0].mode, VerificationMode::SemanticReview);
+    }
+
+    #[test]
+    fn provability_closeout_human_label_routes_to_human_validator() {
+        let validators = validators_for_with_label(
+            "视觉表现与打磨前一致",
+            Some(crate::provability::Provability::HumanReview),
+        );
+        assert_eq!(validators[0].mode, VerificationMode::HumanReview);
+        assert_eq!(validators[0].name, "human_boundary_review");
+    }
+
+    #[test]
+    fn provability_closeout_unlabeled_mode_keeps_legacy_fallback() {
+        assert_eq!(
+            preferred_mode_with_label("页面显示测试按钮", None),
+            VerificationMode::SemanticReview
+        );
+        assert_eq!(
+            preferred_mode_with_label("cargo test 测试通过", None),
+            VerificationMode::AutomatedTest
+        );
     }
 
     #[test]

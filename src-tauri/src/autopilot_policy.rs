@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub(crate) const MAX_PLANNING_REGENERATIONS: u32 = 2;
+pub(crate) const MAX_PLAN_NO_PROGRESS: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AutopilotDecisionKind {
@@ -184,6 +185,7 @@ pub(crate) enum PlanningAction {
     CheckMidStage,
     RegenerateMidStage,
     CheckPlan,
+    PassPlanCheck,
     RegeneratePlan,
     Stop(String),
 }
@@ -217,12 +219,52 @@ fn normalized_group(values: &[String]) -> String {
 
 pub(crate) fn plan_failure_fingerprint(result: &project::StagePlanCheckResult) -> String {
     digest(&format!(
-        "omissions:{}\nout_of_scope:{}\nnot_executable:{}\nsuggestions:{}",
+        "omissions:{}\nout_of_scope:{}\nnot_executable:{}",
         normalized_group(&result.omissions),
         normalized_group(&result.out_of_scope),
         normalized_group(&result.not_executable),
-        normalized_group(&result.suggestions),
     ))
+}
+
+fn suggestion_only_issue(value: &str) -> bool {
+    let normalized = normalize_text(value);
+    ["可考虑", "建议", "可选", "optional"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn normalize_issue_group(values: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() || normalized.iter().any(|existing| existing == value) {
+            continue;
+        }
+        normalized.push(value.to_string());
+    }
+    normalized
+}
+
+fn move_suggestions(blocking: &mut Vec<String>, suggestions: &mut Vec<String>) {
+    let (misclassified, retained): (Vec<_>, Vec<_>) = std::mem::take(blocking)
+        .into_iter()
+        .partition(|issue| suggestion_only_issue(issue));
+    *blocking = retained;
+    suggestions.extend(misclassified);
+}
+
+pub(crate) fn normalize_plan_check_result(
+    mut result: project::StagePlanCheckResult,
+) -> project::StagePlanCheckResult {
+    move_suggestions(&mut result.omissions, &mut result.suggestions);
+    move_suggestions(&mut result.out_of_scope, &mut result.suggestions);
+    move_suggestions(&mut result.not_executable, &mut result.suggestions);
+    result.omissions = normalize_issue_group(result.omissions);
+    result.out_of_scope = normalize_issue_group(result.out_of_scope);
+    result.not_executable = normalize_issue_group(result.not_executable);
+    result.suggestions = normalize_issue_group(result.suggestions);
+    result.passed = blocking_plan_issue_count(&result) == 0;
+    result
 }
 
 pub(crate) fn blocking_plan_issue_count(result: &project::StagePlanCheckResult) -> u32 {
@@ -285,14 +327,29 @@ pub(crate) fn plan_planning_action(project: &project::Project) -> PlanningAction
     let Some(check) = mid_stage.plan_check_result.as_ref() else {
         return PlanningAction::CheckPlan;
     };
-    if check.passed {
-        return PlanningAction::CheckPlan;
+    let blocking_count = blocking_plan_issue_count(check);
+    if blocking_count == 0 {
+        return PlanningAction::PassPlanCheck;
     }
+    let blockers = check
+        .omissions
+        .iter()
+        .chain(&check.out_of_scope)
+        .chain(&check.not_executable)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("；");
     if mid_stage.plan_regeneration_count >= MAX_PLANNING_REGENERATIONS {
-        return PlanningAction::Stop("执行计划自动重生成已达到两次上限。".to_string());
+        return PlanningAction::Stop(format!(
+            "执行计划自动重生成已达到两次上限。具体硬阻断：{}",
+            blockers
+        ));
     }
-    if mid_stage.plan_no_progress_count > 0 {
-        return PlanningAction::Stop("执行计划重生成没有减少阻断问题。".to_string());
+    if mid_stage.plan_no_progress_count >= MAX_PLAN_NO_PROGRESS {
+        return PlanningAction::Stop(format!(
+            "执行计划连续两次没有减少硬阻断。具体硬阻断：{}",
+            blockers
+        ));
     }
     PlanningAction::RegeneratePlan
 }
@@ -577,6 +634,12 @@ pub(crate) fn decide_next_step(
                 "检查执行计划",
                 project::AutopilotCommandResultKind::ProjectState,
             ),
+            PlanningAction::PassPlanCheck => transition(
+                project_name,
+                "PlanApproving",
+                "autopilot: 计划仅有建议或硬阻断为空，按后端分级通过",
+                "计划硬阻断为空，进入批准阶段",
+            ),
             PlanningAction::RegeneratePlan => {
                 let Some(mid) = target
                     .mid_stages
@@ -792,7 +855,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fingerprints_ignore_whitespace_order_and_duplicates() {
+    fn check_convergence_fingerprints_ignore_whitespace_order_and_duplicates() {
         let left = project::StagePlanCheckResult {
             passed: false,
             omissions: vec![" Missing API ".to_string(), "missing api".to_string()],
@@ -811,5 +874,42 @@ mod tests {
             plan_failure_fingerprint(&right)
         );
         assert_eq!(blocking_plan_issue_count(&left), 3);
+    }
+
+    #[test]
+    fn check_convergence_suggestions_do_not_block_or_change_failure_fingerprint() {
+        let base = project::StagePlanCheckResult {
+            passed: false,
+            omissions: vec!["可考虑调用 loadSearchConfig 优化兼容性".to_string()],
+            out_of_scope: vec![],
+            not_executable: vec![],
+            suggestions: vec!["可选：补充说明".to_string()],
+            checked_at: String::new(),
+        };
+        let normalized = normalize_plan_check_result(base);
+        assert!(normalized.passed);
+        assert!(normalized.omissions.is_empty());
+        assert_eq!(normalized.suggestions.len(), 2);
+
+        let mut changed_suggestions = normalized.clone();
+        changed_suggestions.suggestions = vec!["另一条建议".to_string()];
+        assert_eq!(
+            plan_failure_fingerprint(&normalized),
+            plan_failure_fingerprint(&changed_suggestions)
+        );
+    }
+
+    #[test]
+    fn check_convergence_real_plan_omissions_remain_blocking() {
+        let normalized = normalize_plan_check_result(project::StagePlanCheckResult {
+            passed: true,
+            omissions: vec!["缺少必需的配置持久化产物".to_string()],
+            out_of_scope: vec![],
+            not_executable: vec![],
+            suggestions: vec![],
+            checked_at: String::new(),
+        });
+        assert!(!normalized.passed);
+        assert_eq!(blocking_plan_issue_count(&normalized), 1);
     }
 }

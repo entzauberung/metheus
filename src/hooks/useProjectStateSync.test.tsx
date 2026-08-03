@@ -67,7 +67,8 @@ function event(sequence: number, overrides: Partial<ProjectStateChangedEvent> = 
     execution_session_status: "execution_failed",
     autopilot_status: null,
     recovery_action: "RestoreExecutionBaseline",
-    task_tree_revision: sequence,
+    task_control_tree_revision: sequence,
+    task_control_snapshot_version: "task-control-snapshot-v1",
     control_action_id: null,
     control_mode: "Shadow",
     task_control_dirty: true,
@@ -176,6 +177,45 @@ describe("useProjectStateSync", () => {
     expect(getSnapshot).toHaveBeenCalledTimes(2);
   });
 
+  it("does not fetch a full snapshot when an event carries no newer revision", async () => {
+    getSnapshot.mockResolvedValue(snapshot("alpha", 1, "none", 1));
+    render("alpha");
+    await flush();
+
+    act(() => channels[0].onmessage(event(2, {
+      data_revision: 1,
+      task_control_tree_revision: 1,
+      task_control_dirty: false,
+    })));
+    await act(async () => {
+      vi.advanceTimersByTime(10);
+      await Promise.resolve();
+    });
+
+    expect(getSnapshot).toHaveBeenCalledTimes(1);
+    expect(controller?.state.lastEventSequence).toBe(2);
+    expect(controller?.state.pendingRevision).toBeNull();
+  });
+
+  it("keeps the connected fallback at sixty seconds", async () => {
+    getSnapshot.mockResolvedValue(snapshot("alpha", 0));
+    render("alpha");
+    await flush();
+
+    await act(async () => {
+      vi.advanceTimersByTime(15_000);
+      await Promise.resolve();
+    });
+    expect(getSnapshot).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(45_000);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getSnapshot).toHaveBeenCalledTimes(2);
+  });
+
   it("requests a same-cursor detailed snapshot only while the inspector asks for it", async () => {
     getSnapshot.mockImplementation(async (_projectName: string, includeDetail: boolean) => {
       const next = snapshot("alpha", 0);
@@ -226,7 +266,7 @@ describe("useProjectStateSync", () => {
     expect(controller?.state.taskControlEventSequence).toBe(0);
     act(() => channels[0].onmessage(event(2, {
       task_control_dirty: true,
-      task_tree_revision: 8,
+      task_control_tree_revision: 8,
     })));
     expect(controller?.state.taskControlEventSequence).toBe(2);
     expect(controller?.state.taskControlTreeRevision).toBe(8);
@@ -241,7 +281,7 @@ describe("useProjectStateSync", () => {
 
     act(() => channels[0].onmessage(event(1, {
       task_control_dirty: false,
-      task_tree_revision: 4,
+      task_control_tree_revision: 4,
     })));
     await act(async () => {
       vi.advanceTimersByTime(10);

@@ -136,6 +136,28 @@ pub(crate) async fn transition_workflow(
     if to_step == project::WorkflowStep::PlanApproval && proj.plan_draft.is_none() {
         return Err("没有可审批的项目方案草稿，无法进入 PlanApproval。".to_string());
     }
+    if current == project::WorkflowStep::PlanCheck
+        && to_step == project::WorkflowStep::PlanApproving
+    {
+        let milestone_id = proj.current_milestone_id.clone();
+        let mid_stage_id = proj.current_mid_stage_id.clone();
+        let check = proj
+            .milestones
+            .iter_mut()
+            .find(|milestone| milestone.id == milestone_id)
+            .and_then(|milestone| {
+                milestone
+                    .mid_stages
+                    .iter_mut()
+                    .find(|mid_stage| mid_stage.id == mid_stage_id)
+            })
+            .and_then(|mid_stage| mid_stage.plan_check_result.as_mut())
+            .ok_or_else(|| "执行计划尚未检查，无法进入批准阶段。".to_string())?;
+        *check = crate::autopilot_policy::normalize_plan_check_result(check.clone());
+        if !check.passed {
+            return Err("执行计划仍有硬阻断，无法进入批准阶段。".to_string());
+        }
+    }
 
     // Update workflow state
     proj.workflow_state.current_step = to_step.clone();
@@ -2514,8 +2536,31 @@ pub(crate) fn reconcile_autopilot_in_migration(proj: &mut crate::project::Projec
     }
 
     let mut exhausted_current_plan = false;
+    let mut current_plan_unblocked = false;
     for milestone in &mut proj.milestones {
         for mid in &mut milestone.mid_stages {
+            if let Some(check) = mid.plan_check_result.as_mut() {
+                let normalized =
+                    crate::autopilot_policy::normalize_plan_check_result(check.clone());
+                let changed = normalized.passed != check.passed
+                    || normalized.omissions != check.omissions
+                    || normalized.out_of_scope != check.out_of_scope
+                    || normalized.not_executable != check.not_executable
+                    || normalized.suggestions != check.suggestions;
+                if changed {
+                    let was_blocked = !check.passed;
+                    *check = normalized;
+                    mid.last_plan_failure_fingerprint.clear();
+                    mid.last_plan_issue_count =
+                        crate::autopilot_policy::blocking_plan_issue_count(check);
+                    mid.plan_no_progress_count = 0;
+                    current_plan_unblocked |= was_blocked
+                        && check.passed
+                        && milestone.id == proj.current_milestone_id
+                        && mid.id == proj.current_mid_stage_id;
+                    convergence_changed = true;
+                }
+            }
             let Some(check) = mid.plan_check_result.as_ref().filter(|check| !check.passed) else {
                 continue;
             };
@@ -2537,6 +2582,12 @@ pub(crate) fn reconcile_autopilot_in_migration(proj: &mut crate::project::Projec
                 exhausted_current_plan = true;
             }
         }
+    }
+    if current_plan_unblocked
+        && proj.workflow_state.current_step == project::WorkflowStep::PlanCheck
+    {
+        proj.workflow_state.current_step = project::WorkflowStep::PlanApproving;
+        convergence_changed = true;
     }
     if exhausted_current_plan {
         if let Some(state) = proj.workflow_state.autopilot_state.as_mut() {
@@ -4151,9 +4202,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn autopilot_plan_check_failure_stops_when_regeneration_makes_no_progress(
-    ) -> Result<(), String> {
-        let project_name = unique_project_name("ap-plan-convergence");
+    async fn check_convergence_plan_with_only_suggestions_skips_regeneration() -> Result<(), String>
+    {
+        let project_name = unique_project_name("ap-plan-suggestions");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.current_step = project::WorkflowStep::PlanCheck;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id = "mid-1".to_string();
+        let mut mid = test_mid_stage(project::MidStageStatus::Ready);
+        mid.plan_check_result = Some(project::StagePlanCheckResult {
+            passed: false,
+            omissions: vec![],
+            out_of_scope: vec![],
+            not_executable: vec![],
+            suggestions: vec!["可考虑调用 loadSearchConfig".to_string()],
+            checked_at: chrono::Utc::now().to_rfc3339(),
+        });
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone.mid_stages = vec![mid];
+        proj.milestones = vec![milestone];
+        activate_autopilot(&mut proj, "milestone-1");
+        crate::save_project(&proj)?;
+
+        let decision = autopilot_next_step(project_name.clone()).await?;
+        assert_eq!(decision.command, "transition_workflow");
+        assert_eq!(decision.args["targetStep"], "PlanApproving");
+        let transitioned = transition_workflow(
+            project_name,
+            "PlanApproving".to_string(),
+            "test: suggestions are non-blocking".to_string(),
+        )
+        .await?;
+        assert_eq!(
+            transitioned.workflow_state.current_step,
+            project::WorkflowStep::PlanApproving
+        );
+        assert!(transitioned.milestones[0].mid_stages[0]
+            .plan_check_result
+            .as_ref()
+            .is_some_and(|check| check.passed));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_convergence_plan_allows_one_no_progress_regeneration() -> Result<(), String> {
+        let project_name = unique_project_name("ap-plan-one-no-progress");
         let _guard = ProjectDataGuard::new(&project_name)?;
         let mut proj = project::Project::new(&project_name);
         proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
@@ -4163,6 +4262,41 @@ mod tests {
         let mut mid = test_mid_stage(project::MidStageStatus::Ready);
         mid.plan_regeneration_count = 1;
         mid.plan_no_progress_count = 1;
+        mid.plan_check_result = Some(project::StagePlanCheckResult {
+            passed: true,
+            omissions: vec!["缺少停止条件".to_string()],
+            out_of_scope: vec![],
+            not_executable: vec![],
+            suggestions: vec![],
+            checked_at: chrono::Utc::now().to_rfc3339(),
+        });
+        let mut milestone = test_milestone(
+            "milestone-1",
+            "测试大阶段",
+            project::MilestoneStatus::InProgress,
+        );
+        milestone.mid_stages = vec![mid];
+        proj.milestones = vec![milestone];
+        activate_autopilot(&mut proj, "milestone-1");
+        crate::save_project(&proj)?;
+
+        let decision = autopilot_next_step(project_name).await?;
+        assert_eq!(decision.command, "regenerate_execution_plan");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_convergence_plan_stops_after_no_progress_threshold() -> Result<(), String> {
+        let project_name = unique_project_name("ap-plan-convergence");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.current_step = project::WorkflowStep::PlanCheck;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id = "mid-1".to_string();
+        let mut mid = test_mid_stage(project::MidStageStatus::Ready);
+        mid.plan_regeneration_count = 1;
+        mid.plan_no_progress_count = crate::autopilot_policy::MAX_PLAN_NO_PROGRESS;
         mid.plan_check_result = Some(project::StagePlanCheckResult {
             passed: false,
             omissions: vec!["缺少停止条件".to_string()],
@@ -4183,7 +4317,8 @@ mod tests {
 
         let stopped = autopilot_next_step(project_name.clone()).await?;
         assert!(stopped.is_error);
-        assert!(stopped.error_message.contains("没有减少阻断问题"));
+        assert!(stopped.error_message.contains("没有减少硬阻断"));
+        assert!(stopped.error_message.contains("缺少停止条件"));
         let persisted = crate::load_project(&project_name)?;
         assert_eq!(
             persisted.workflow_state.autopilot_state.unwrap().run_status,

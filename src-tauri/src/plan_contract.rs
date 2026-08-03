@@ -86,6 +86,10 @@ fn validate_execution_prompt_contract(
 }
 
 pub(crate) fn hydrate_subtask_contract(subtask: &mut project::Subtask) {
+    subtask.acceptance_criteria_meta = crate::provability::normalize_metadata(
+        &subtask.acceptance_criteria,
+        &subtask.acceptance_criteria_meta,
+    );
     subtask.required_identifiers = acceptance_identifiers(&subtask.acceptance_criteria)
         .into_iter()
         .collect();

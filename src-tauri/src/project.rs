@@ -701,6 +701,10 @@ pub struct RecoveryState {
     /// Evidence strategies already used by this recovery session.
     #[serde(default)]
     pub evidence_strategies: Vec<ReviewEvidenceStrategy>,
+    /// Evidence-source fingerprints in observation order. More snippets from
+    /// the same files and validator intentionally retain the same fingerprint.
+    #[serde(default)]
+    pub evidence_source_history: Vec<crate::provability::EvidenceSourceFingerprint>,
     /// 验证服务或协议恢复次数；不得计入代码修复 attempt。
     #[serde(default)]
     pub validation_retry_count: u32,
@@ -747,6 +751,7 @@ impl Default for RecoveryState {
             evidence_rebuild_attempts: 0,
             pending_evidence_criteria: vec![],
             evidence_strategies: vec![],
+            evidence_source_history: vec![],
             validation_retry_count: 0,
             max_validation_retries: default_validation_retry_limit(),
             next_validation_retry_at: None,
@@ -1049,6 +1054,9 @@ pub struct Subtask {
     /// 验收标准列表
     #[serde(default)]
     pub acceptance_criteria: Vec<String>,
+    /// 与验收标准按索引对齐的可证明性元数据；旧项目由本地迁移补齐。
+    #[serde(default)]
+    pub acceptance_criteria_meta: Vec<crate::provability::AcceptanceCriterion>,
     /// 不可跨越的边界
     #[serde(default)]
     pub stop_rules: Vec<String>,
@@ -3228,6 +3236,7 @@ mod tests {
         for field in [
             "required_identifiers",
             "acceptance_ledger",
+            "acceptance_criteria_meta",
             "fact_snapshot",
             "plan_patch_revision",
             "depends_on",
@@ -3239,6 +3248,7 @@ mod tests {
             serde_json::from_value(subtask_value).map_err(|error| error.to_string())?;
         assert!(subtask.required_identifiers.is_empty());
         assert!(subtask.acceptance_ledger.is_empty());
+        assert!(subtask.acceptance_criteria_meta.is_empty());
         assert!(subtask.fact_snapshot.is_none());
         assert_eq!(subtask.plan_patch_revision, 0);
         assert!(subtask.depends_on.is_empty());
@@ -3276,6 +3286,7 @@ mod tests {
         recovery_object.remove("evidence_rebuild_attempts");
         recovery_object.remove("pending_evidence_criteria");
         recovery_object.remove("evidence_strategies");
+        recovery_object.remove("evidence_source_history");
         recovery_object.remove("validation_retry_count");
         recovery_object.remove("max_validation_retries");
         recovery_object.remove("next_validation_retry_at");
@@ -3285,6 +3296,7 @@ mod tests {
         assert_eq!(recovery.evidence_rebuild_attempts, 0);
         assert!(recovery.pending_evidence_criteria.is_empty());
         assert!(recovery.evidence_strategies.is_empty());
+        assert!(recovery.evidence_source_history.is_empty());
         assert_eq!(recovery.validation_retry_count, 0);
         assert_eq!(recovery.max_validation_retries, 3);
         assert!(recovery.next_validation_retry_at.is_none());

@@ -247,11 +247,22 @@ fn pending_evidence_criteria(ledger: &[project::AcceptanceLedgerItem]) -> Vec<u3
 fn next_evidence_strategy(
     recovery: &project::RecoveryState,
 ) -> Option<project::ReviewEvidenceStrategy> {
+    if evidence_source_stalled(recovery) {
+        return None;
+    }
     match recovery.evidence_rebuild_attempts {
         0 => Some(project::ReviewEvidenceStrategy::Targeted),
         1 => Some(project::ReviewEvidenceStrategy::ExpandedTargeted),
         _ => None,
     }
+}
+
+fn evidence_source_stalled(recovery: &project::RecoveryState) -> bool {
+    recovery
+        .evidence_source_history
+        .windows(2)
+        .last()
+        .is_some_and(|pair| pair[0].fingerprint == pair[1].fingerprint)
 }
 
 fn merge_targeted_review(
@@ -581,6 +592,7 @@ fn create_recovery_state(
         evidence_rebuild_attempts: 0,
         pending_evidence_criteria: vec![],
         evidence_strategies: vec![],
+        evidence_source_history: vec![],
         validation_retry_count: 0,
         max_validation_retries: 3,
         next_validation_retry_at: None,
@@ -607,6 +619,79 @@ fn set_autopilot_waiting(proj: &mut project::Project, description: &str) {
         autopilot.error_message = description.to_string();
         autopilot.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
     }
+}
+
+pub(crate) fn enter_human_review_boundary(
+    proj: &mut project::Project,
+    task_id: &str,
+    criterion_indexes: &[u32],
+    reason: &str,
+) -> Result<String, String> {
+    let session = proj
+        .execution_session
+        .as_ref()
+        .filter(|session| session.subtask_id == task_id)
+        .cloned()
+        .ok_or_else(|| "人工验收边界缺少当前执行会话".to_string())?;
+    let task = crate::task_tree::find_task(proj, task_id)?
+        .ok_or_else(|| format!("任务节点不存在：{}", task_id))?
+        .clone();
+    let pending = if criterion_indexes.is_empty() {
+        crate::acceptance::revalidation_target_indexes(&task, &[])?
+            .into_iter()
+            .filter(|index| {
+                crate::validator_registry::verification_mode_for(&task, *index)
+                    == crate::validator_contract::VerificationMode::HumanReview
+            })
+            .collect::<Vec<_>>()
+    } else {
+        criterion_indexes.to_vec()
+    };
+    if pending.is_empty() {
+        return Err("当前任务没有待人工确认的验收项".to_string());
+    }
+    if pending.iter().any(|index| {
+        crate::validator_registry::verification_mode_for(&task, *index)
+            != crate::validator_contract::VerificationMode::HumanReview
+    }) {
+        return Err("人工边界只能接收 HumanReview 验收项".to_string());
+    }
+
+    let routing_reason = reason.trim();
+    let message = format!(
+        "验收项 {} 属于视觉、体验或运行时人工边界，等待显式人工结论；这不是代码质量失败{}",
+        pending
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+        if routing_reason.is_empty() {
+            String::new()
+        } else {
+            format!("（路由依据：{}）", routing_reason)
+        }
+    );
+    let mut recovery = create_recovery_state(
+        project::RecoveryErrorKind::HumanRequired,
+        task_id.to_string(),
+        session.execution_id.clone(),
+        session.base_commit.clone(),
+        message.clone(),
+    );
+    recovery.phase = project::RecoveryPhase::WaitingHuman;
+    recovery.pending_evidence_criteria = pending;
+    recovery.last_diagnosis = "验收项按可证明性标签直接路由到人工确认，未进入 AI 补证".to_string();
+    recovery.last_repair_summary = message.clone();
+    proj.workflow_state.recovery_state = Some(recovery);
+    if let Some(current) = proj.execution_session.as_mut() {
+        current.active = true;
+        current.status = "quality_blocked".to_string();
+        current.failure_message = message.clone();
+        current.state_entered_at = chrono::Utc::now().to_rfc3339();
+    }
+    set_autopilot_waiting(proj, &message);
+    touch(proj);
+    Ok(message)
 }
 
 pub(crate) fn begin_execution_recovery(
@@ -711,6 +796,13 @@ pub(crate) fn ensure_quality_recovery(
             subtask.acceptance_ledger.clone()
         };
         recovery.pending_evidence_criteria = pending_evidence_criteria(&ledger);
+        if let Some(test) = subtask.test_result.as_ref() {
+            recovery
+                .evidence_source_history
+                .push(crate::acceptance::evidence_source_fingerprint(
+                    test, &ledger,
+                ));
+        }
         recovery.active_issues.clear();
     }
     if let Some(limit) = validation_retry_limit(&kind) {
@@ -1728,7 +1820,9 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             next_evidence_strategy(&recovery)
         };
         let Some(strategy) = strategy else {
-            let message = if pending.is_empty() {
+            let message = if evidence_source_stalled(&recovery) {
+                "补证熔断：验证器类型、证据种类与覆盖文件未变化；这不是代码质量失败，等待人工处理"
+            } else if pending.is_empty() {
                 "没有可定向补证的验收项，等待人工补充证据"
             } else {
                 "两次定向补证后验收证据仍不足，等待人工处理"
@@ -2452,6 +2546,13 @@ pub(crate) fn finish_retest(
     } else {
         fresh_ledger
     };
+    if evidence_recovery {
+        let fingerprint =
+            crate::acceptance::evidence_source_fingerprint(&test, &test.acceptance_results);
+        if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
+            recovery.evidence_source_history.push(fingerprint);
+        }
+    }
     let quality = crate::quality_gate::evaluate(
         Some(&test),
         &test.acceptance_results,
@@ -2711,8 +2812,14 @@ pub(crate) fn finish_retest(
             .as_ref()
             .map(|recovery| recovery.evidence_rebuild_attempts)
             .unwrap_or_default();
-        let evidence_exhausted =
-            pending.is_empty() || evidence_attempts >= MAX_EVIDENCE_REBUILD_ATTEMPTS;
+        let source_stalled = proj
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .is_some_and(evidence_source_stalled);
+        let evidence_exhausted = pending.is_empty()
+            || evidence_attempts >= MAX_EVIDENCE_REBUILD_ATTEMPTS
+            || source_stalled;
         if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
             recovery.error_kind = project::RecoveryErrorKind::EvidenceInsufficient;
             recovery.phase = if evidence_exhausted {
@@ -2739,7 +2846,14 @@ pub(crate) fn finish_retest(
             current_session.state_entered_at = chrono::Utc::now().to_rfc3339();
         }
         if evidence_exhausted {
-            set_autopilot_waiting(proj, "验收证据仍不足，等待人工处理");
+            set_autopilot_waiting(
+                proj,
+                if source_stalled {
+                    "补证熔断：验证器类型、证据种类与覆盖文件均未变化；这不是代码质量失败，等待人工处理"
+                } else {
+                    "验收证据仍不足，等待人工处理"
+                },
+            );
         } else {
             set_autopilot_recovering(proj, "验收证据仍不足，准备定向补证");
         }
@@ -3117,8 +3231,18 @@ pub(crate) async fn resolve_human_recovery(
             item.status = project::SubtaskStatus::AwaitingConfirmation;
             for ledger in &mut item.acceptance_ledger {
                 if accepted.contains(&ledger.criterion_index) {
-                    ledger.status = project::AcceptanceStatus::AcceptedDeviation;
-                    ledger.evidence = reason.trim().to_string();
+                    ledger.status = if human_resolution == project::HumanResolution::AcceptDeviation
+                    {
+                        project::AcceptanceStatus::AcceptedDeviation
+                    } else {
+                        project::AcceptanceStatus::Satisfied
+                    };
+                    ledger.evidence =
+                        if human_resolution == project::HumanResolution::AcceptDeviation {
+                            format!("人工接受偏差：{}", reason.trim())
+                        } else {
+                            format!("人工确认：{}", reason.trim())
+                        };
                     ledger.updated_at = chrono::Utc::now().to_rfc3339();
                 }
             }
@@ -3559,6 +3683,24 @@ mod tests {
         assert_eq!(next_evidence_strategy(&recovery), None);
         assert_eq!(recovery.attempt, 2);
         assert!(recovery.replan_attempted);
+    }
+
+    #[test]
+    fn provability_closeout_same_evidence_source_trips_strategy_circuit_breaker() {
+        let fingerprint = crate::provability::EvidenceSourceFingerprint {
+            fingerprint: "sha256:same".to_string(),
+            source_types: vec![crate::provability::EvidenceSourceType::CodeSnippet],
+            covered_files: vec!["index.html".to_string()],
+            validator_type: "CodeReviewOnly".to_string(),
+        };
+        let recovery = project::RecoveryState {
+            evidence_rebuild_attempts: 1,
+            evidence_source_history: vec![fingerprint.clone(), fingerprint],
+            ..Default::default()
+        };
+        assert!(evidence_source_stalled(&recovery));
+        assert_eq!(next_evidence_strategy(&recovery), None);
+        assert_eq!(recovery.attempt, 0);
     }
 
     #[test]

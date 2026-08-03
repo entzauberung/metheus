@@ -78,6 +78,8 @@ pub struct TaskContract {
     #[serde(default)]
     pub acceptance_criteria: Vec<String>,
     #[serde(default)]
+    pub acceptance_criteria_meta: Vec<crate::provability::AcceptanceCriterion>,
+    #[serde(default)]
     pub verification_modes: Vec<VerificationMode>,
     #[serde(default)]
     pub stop_rules: Vec<String>,
@@ -106,10 +108,13 @@ pub fn compile_subtask(
     parent_task_id: Option<&str>,
     depth: u32,
 ) -> TaskContract {
-    let verification_modes = subtask
-        .acceptance_criteria
+    let acceptance_criteria_meta = crate::provability::normalize_metadata(
+        &subtask.acceptance_criteria,
+        &subtask.acceptance_criteria_meta,
+    );
+    let verification_modes = acceptance_criteria_meta
         .iter()
-        .map(|criterion| crate::validator_registry::validators_for(criterion)[0].mode)
+        .map(|criterion| criterion.provability.verification_mode())
         .collect::<Vec<_>>();
     let artifacts = TaskArtifactConstraint {
         expected_files: subtask
@@ -157,6 +162,7 @@ pub fn compile_subtask(
         new_file_paths: subtask.new_file_paths.clone(),
         evidence_files: subtask.evidence_files.clone(),
         acceptance_criteria: subtask.acceptance_criteria.clone(),
+        acceptance_criteria_meta,
         verification_modes,
         stop_rules: subtask.stop_rules.clone(),
         dependencies: subtask.depends_on.clone(),

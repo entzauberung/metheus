@@ -60,6 +60,11 @@
 
 ## 当前执行记录
 
+- 验证可证明性收尾（2026-08-03）：已实现五档可证明性元数据、规划显式打标与本地保守校准、旧项目纯本地迁移、标签优先分拣、逐项人工确认入口、证据来源指纹熔断，以及按动作类型收紧的租约窗口。实际运行 `scripts/verify-provability-closeout.sh`：资源预检、Rust 格式、TypeScript、静态链路门禁与 `git diff --check` 通过；`.build/core`、最多两个 Cargo 任务、`--no-default-features` 下 14 项 Rust 定向测试通过（409 项过滤），任务检查器 8 项通过，仅有 14 条既有未使用代码告警。
+
+- 检查收敛与同步专项：2026-08-02 已通过本轮定向代码门禁。`.build/core`、`CARGO_BUILD_JOBS=2`、`--no-default-features` 下 `check_convergence_` 11 项 Rust 测试通过、399 项过滤；TypeScript 无输出检查通过，`projectSyncPolicy` 与 `useProjectStateSync` 共 17 项前端测试通过。覆盖建议不阻断、建议误分类回收、硬阻断指纹、三类检查契约与协议失败、确定性预检、重生成阈值、修订未前进不拉全量及健康 Channel 60 秒兜底。
+- 本专项桌面验收：未执行。未运行 Tauri dev/build、Grok Build、真实模型、无过滤 Rust 测试、Clippy 或发布构建；因此只证明 Core 协议与前端策略，不证明真实长链路桌面顿挫已经完成发布级验收。
+- 本专项验证过程说明：首次定向 Cargo 命令漏设 `CARGO_TARGET_DIR`，约 1 秒后被中断并计入两个 Cargo 任务之一；随后唯一一次完整 Cargo 任务显式使用 `.build/core` 并通过。中断任务触及既有 `src-tauri/target` 缓存，未作为验收证据，也未清理或覆盖用户缓存。
 - Core 自动化契约：2026-07-31 已通过。资源预检和 Rust 格式通过；`.build/core`、最多两个 Cargo 任务、`--no-default-features` 下 6 项定向 Rust 测试通过、360 项过滤，仅有 13 条既有未使用代码告警；TypeScript、11 个指定前端测试文件共 60 项测试、静态命令覆盖和 `git diff --check` 通过。
 - Core 代码封板门禁：2026-08-01 已通过。资源预检与 Rust 格式通过；`.build/core`、`CARGO_BUILD_JOBS=2`、`--no-default-features` 下 10 项人工终态安全 Rust 测试通过、365 项过滤；TypeScript 无输出检查、5 个指定前端测试文件共 46 项测试、静态旁路门禁与 `git diff --check` 通过。仅有既有未使用代码告警。
 - 运行期故障注入门禁：2026-08-02 已通过。四类故障夹具全部位于临时目录；22 项 `runtime_fault` Rust 定向测试通过、379 项过滤，2 个指定前端测试文件共 21 项测试通过；TypeScript、Rust 格式、`git diff --check` 和主仓库文件状态前后比较通过。仅有 14 条未使用代码告警，未发送真实模型请求。

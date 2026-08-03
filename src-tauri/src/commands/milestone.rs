@@ -24,6 +24,115 @@ fn mark_model_output(
     crate::cost_ledger::mark_call_outcome_best_effort(project_name, call_id, outcome);
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct MilestoneCheckResponse {
+    passed: bool,
+    summary: String,
+    omissions: Vec<String>,
+    overlaps: Vec<String>,
+    out_of_scope: Vec<String>,
+    ordering_issues: Vec<String>,
+    suggestions: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MidStageCheckResponse {
+    passed: bool,
+    summary: String,
+    omissions: Vec<String>,
+    overlaps: Vec<String>,
+    ordering_issues: Vec<String>,
+    suggestions: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ExecutionPlanCheckResponse {
+    passed: bool,
+    summary: String,
+    omissions: Vec<String>,
+    out_of_scope: Vec<String>,
+    not_executable: Vec<String>,
+    suggestions: Vec<String>,
+}
+
+fn normalized_stage_check_summary(
+    summary: String,
+    mut blocking_groups: Vec<Vec<String>>,
+    suggestions: Vec<String>,
+    model_passed: bool,
+) -> (bool, String) {
+    let mut blocking = Vec::new();
+    for group in blocking_groups.drain(..) {
+        blocking.extend(group);
+    }
+    let normalized =
+        crate::autopilot_policy::normalize_plan_check_result(project::StagePlanCheckResult {
+            passed: model_passed,
+            omissions: blocking,
+            out_of_scope: Vec::new(),
+            not_executable: Vec::new(),
+            suggestions,
+            checked_at: String::new(),
+        });
+    let mut details = vec![format!(
+        "{}：{}",
+        if normalized.passed {
+            "检查通过"
+        } else {
+            "检查未通过"
+        },
+        summary.trim()
+    )];
+    if !normalized.omissions.is_empty() {
+        details.push(format!("硬阻断：{}", normalized.omissions.join("；")));
+    }
+    if !normalized.suggestions.is_empty() {
+        details.push(format!("建议：{}", normalized.suggestions.join("；")));
+    }
+    (normalized.passed, details.join("\n"))
+}
+
+impl MilestoneCheckResponse {
+    fn into_decision(self) -> (bool, String) {
+        normalized_stage_check_summary(
+            self.summary,
+            vec![
+                self.omissions,
+                self.overlaps,
+                self.out_of_scope,
+                self.ordering_issues,
+            ],
+            self.suggestions,
+            self.passed,
+        )
+    }
+}
+
+impl MidStageCheckResponse {
+    fn into_decision(self) -> (bool, String) {
+        normalized_stage_check_summary(
+            self.summary,
+            vec![self.omissions, self.overlaps, self.ordering_issues],
+            self.suggestions,
+            self.passed,
+        )
+    }
+}
+
+impl ExecutionPlanCheckResponse {
+    fn into_result(self) -> project::StagePlanCheckResult {
+        let _summary = self.summary;
+        crate::autopilot_policy::normalize_plan_check_result(project::StagePlanCheckResult {
+            passed: self.passed,
+            omissions: self.omissions,
+            out_of_scope: self.out_of_scope,
+            not_executable: self.not_executable,
+            suggestions: self.suggestions,
+            checked_at: chrono::Utc::now().to_rfc3339(),
+        })
+    }
+}
+
 fn required_string(value: &serde_json::Value, field: &str, entity: &str) -> Result<String, String> {
     let result = value
         .get(field)
@@ -491,10 +600,11 @@ pub(crate) async fn check_milestone_draft(
     );
 
     // 5. 调用 AI 检查器
+    let call_context = model_context(&proj, crate::cost_ledger::ModelCallPurpose::MilestoneCheck);
     let response = match crate::api::call_deepseek_api_json_with_context(
         crate::prompts::MILESTONE_CHECK_PROMPT,
         &check_context,
-        model_context(&proj, crate::cost_ledger::ModelCallPurpose::MilestoneCheck),
+        call_context.clone(),
     )
     .await
     {
@@ -504,19 +614,14 @@ pub(crate) async fn check_milestone_draft(
         }
     };
 
-    let check_json: serde_json::Value = serde_json::from_str(&response.content)
-        .map_err(|e| format!("解析检查结果 JSON 失败：{}", e))?;
-
-    let passed = check_json["passed"]
-        .as_bool()
-        .ok_or("检查结果缺少 'passed' 字段")?;
-    let summary = check_json
-        .get("summary")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|summary| !summary.is_empty())
-        .ok_or_else(|| "检查结果缺少有效 summary 字段".to_string())?
-        .to_string();
+    let check: MilestoneCheckResponse = crate::json_utils::parse_json_with_contract_and_context(
+        &response.content,
+        &crate::json_utils::MILESTONE_CHECK_JSON_CONTRACT,
+        call_context,
+    )
+    .await
+    .map_err(|error| format!("大阶段检查协议失败：{}", error))?;
+    let (passed, summary) = check.into_decision();
 
     // 6. 重新加载并保存结果
     let mut proj = crate::load_project(&project_name)?;
@@ -1025,25 +1130,23 @@ pub(crate) async fn check_mid_stage_draft(
         milestone.title, milestone.goal, candidates_text
     );
 
+    let call_context = model_context(&proj, crate::cost_ledger::ModelCallPurpose::MidStageCheck);
     let response = crate::api::call_deepseek_api_json_with_context(
         crate::prompts::MID_STAGE_CHECK_PROMPT,
         &context,
-        model_context(&proj, crate::cost_ledger::ModelCallPurpose::MidStageCheck),
+        call_context.clone(),
     )
     .await
     .map_err(|e| format!("中阶段检查 AI 调用失败：{}", e))?;
 
-    let check: serde_json::Value =
-        serde_json::from_str(&response.content).map_err(|e| format!("解析检查结果失败：{}", e))?;
-
-    let passed = check["passed"].as_bool().ok_or("缺少 passed 字段")?;
-    let summary = check
-        .get("summary")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|summary| !summary.is_empty())
-        .ok_or_else(|| "中阶段检查结果缺少有效 summary 字段".to_string())?
-        .to_string();
+    let check: MidStageCheckResponse = crate::json_utils::parse_json_with_contract_and_context(
+        &response.content,
+        &crate::json_utils::MID_STAGE_CHECK_JSON_CONTRACT,
+        call_context,
+    )
+    .await
+    .map_err(|error| format!("中阶段检查协议失败：{}", error))?;
+    let (passed, summary) = check.into_decision();
 
     let mut proj = crate::load_project(&project_name)?;
     if proj.workflow_state.current_step != project::WorkflowStep::MidStageCheck {
@@ -1261,7 +1364,6 @@ fn plan_check_feedback(result: &project::StagePlanCheckResult) -> String {
         ("遗漏", &result.omissions),
         ("越界", &result.out_of_scope),
         ("不可执行", &result.not_executable),
-        ("建议", &result.suggestions),
     ]
     .into_iter()
     .filter(|(_, items)| !items.is_empty())
@@ -1420,6 +1522,9 @@ async fn parse_execution_plan_tasks(
                 ));
             }
             let execution_prompt = required_string(item, "execution_prompt", &entity)?;
+            let acceptance_criteria = required_string_array(item, "acceptance_criteria", &entity)?;
+            let acceptance_criteria_meta =
+                parse_acceptance_criteria_meta(item, &acceptance_criteria, &entity);
             Ok(project::Subtask {
                 id: uuid::Uuid::new_v4().to_string(),
                 title: required_string(item, "title", &entity)?,
@@ -1436,7 +1541,8 @@ async fn parse_execution_plan_tasks(
                 new_file_paths: string_array(item, "new_file_paths", &entity)?,
                 evidence_files: string_array(item, "evidence_files", &entity)?,
                 context_summary: required_string(item, "context_summary", &entity)?,
-                acceptance_criteria: required_string_array(item, "acceptance_criteria", &entity)?,
+                acceptance_criteria,
+                acceptance_criteria_meta,
                 stop_rules: required_string_array(item, "stop_rules", &entity)?,
                 execution_prompt,
                 confirmed_by_user: None,
@@ -1496,6 +1602,65 @@ async fn parse_execution_plan_tasks(
     }
     crate::plan_contract::validate_subtasks(&tasks)?;
     Ok(tasks)
+}
+
+fn parse_acceptance_criteria_meta(
+    item: &serde_json::Value,
+    criteria: &[String],
+    entity: &str,
+) -> Vec<crate::provability::AcceptanceCriterion> {
+    let declared = item
+        .get("acceptance_criteria_meta")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|raw| {
+                    let text = raw
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    let provability = raw
+                        .get("provability")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(parse_provability_label)
+                        .unwrap_or(crate::provability::Provability::Unprovable);
+                    crate::provability::AcceptanceCriterion {
+                        text,
+                        provability,
+                        provability_source: crate::provability::ProvabilitySource::PlanningExplicit,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let normalized = crate::provability::normalize_metadata(criteria, &declared);
+    if declared.len() != criteria.len()
+        || normalized.iter().any(|criterion| {
+            criterion.provability_source == crate::provability::ProvabilitySource::SystemInferred
+        })
+    {
+        eprintln!(
+            "{}的验收可证明性标签缺失或偏乐观，已执行本地保守校准",
+            entity
+        );
+    }
+    normalized
+}
+
+fn parse_provability_label(value: &str) -> Option<crate::provability::Provability> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "deterministic" => Some(crate::provability::Provability::Deterministic),
+        "automatedtest" | "automated_test" => Some(crate::provability::Provability::AutomatedTest),
+        "semanticreview" | "semantic_review" => {
+            Some(crate::provability::Provability::SemanticReview)
+        }
+        "humanreview" | "human_review" => Some(crate::provability::Provability::HumanReview),
+        "unprovable" => Some(crate::provability::Provability::Unprovable),
+        _ => None,
+    }
 }
 
 /// 生成执行计划（V1：动态任务数量，精准上下文注入）
@@ -1695,7 +1860,8 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
         .find(|m| m.id == *mid_stage_id)
         .ok_or("中阶段不存在。")?;
 
-    if let Err(error) = crate::plan_contract::validate_subtasks(&mid.subtasks) {
+    let deterministic = crate::plan_deterministic_checks::check_execution_plan(&mid.subtasks);
+    if !deterministic.is_empty() {
         let ms = proj
             .milestones
             .iter_mut()
@@ -1708,10 +1874,10 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
             .ok_or("中阶段不存在。")?;
         let result = project::StagePlanCheckResult {
             passed: false,
-            omissions: vec![],
-            out_of_scope: vec![],
-            not_executable: vec![error],
-            suggestions: vec!["请重新生成执行计划并补全合法的文件范围。".to_string()],
+            omissions: deterministic.omissions,
+            out_of_scope: deterministic.out_of_scope,
+            not_executable: deterministic.not_executable,
+            suggestions: vec!["修复以上结构硬阻断后再运行语义检查。".to_string()],
             checked_at: chrono::Utc::now().to_rfc3339(),
         };
         mid.last_plan_failure_fingerprint =
@@ -1769,21 +1935,28 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
         plan_text
     );
 
+    let call_context = model_context(
+        &proj,
+        crate::cost_ledger::ModelCallPurpose::ExecutionPlanCheck,
+    );
     let response = crate::api::call_deepseek_api_json_with_context(
         crate::prompts::EXECUTION_PLAN_CHECK_PROMPT,
         &context,
-        model_context(
-            &proj,
-            crate::cost_ledger::ModelCallPurpose::ExecutionPlanCheck,
-        ),
+        call_context.clone(),
     )
     .await
     .map_err(|e| format!("执行计划检查 AI 调用失败：{}", e))?;
 
-    let check: serde_json::Value =
-        serde_json::from_str(&response.content).map_err(|e| format!("解析检查结果失败：{}", e))?;
-
-    let passed = check["passed"].as_bool().ok_or("缺少 passed 字段")?;
+    let check: ExecutionPlanCheckResponse =
+        crate::json_utils::parse_json_with_contract_and_context(
+            &response.content,
+            &crate::json_utils::EXECUTION_PLAN_CHECK_JSON_CONTRACT,
+            call_context,
+        )
+        .await
+        .map_err(|error| format!("执行计划检查协议失败：{}", error))?;
+    let result = check.into_result();
+    let passed = result.passed;
 
     let mut proj = crate::load_project(&project_name)?;
     if proj.workflow_state.current_step != project::WorkflowStep::PlanCheck {
@@ -1800,14 +1973,6 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
         .iter_mut()
         .find(|m| m.id == *mid_stage_id)
         .ok_or("中阶段不存在。")?;
-    let result = project::StagePlanCheckResult {
-        passed,
-        omissions: arr_str(&check["omissions"]),
-        out_of_scope: arr_str(&check["out_of_scope"]),
-        not_executable: arr_str(&check["not_executable"]),
-        suggestions: arr_str(&check["suggestions"]),
-        checked_at: chrono::Utc::now().to_rfc3339(),
-    };
     if passed {
         mid.last_plan_failure_fingerprint.clear();
         mid.last_plan_issue_count = 0;
@@ -1817,8 +1982,9 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
         let issue_count = crate::autopilot_policy::blocking_plan_issue_count(&result);
         let repeated = !mid.last_plan_failure_fingerprint.is_empty()
             && mid.last_plan_failure_fingerprint == fingerprint;
-        let did_not_improve = mid.last_plan_issue_count > 0
-            && (issue_count >= mid.last_plan_issue_count || !result.out_of_scope.is_empty());
+        let did_not_improve = issue_count > 0
+            && mid.last_plan_issue_count > 0
+            && issue_count >= mid.last_plan_issue_count;
         if repeated || did_not_improve {
             mid.plan_no_progress_count = mid.plan_no_progress_count.saturating_add(1);
         }
@@ -1862,6 +2028,21 @@ pub(crate) async fn approve_stage_plan(project_name: String) -> Result<project::
 
     let milestone_id = &proj.current_milestone_id;
     let mid_stage_id = &proj.current_mid_stage_id;
+
+    if let Some(check) = proj
+        .milestones
+        .iter_mut()
+        .find(|milestone| milestone.id == *milestone_id)
+        .and_then(|milestone| {
+            milestone
+                .mid_stages
+                .iter_mut()
+                .find(|mid_stage| mid_stage.id == *mid_stage_id)
+        })
+        .and_then(|mid_stage| mid_stage.plan_check_result.as_mut())
+    {
+        *check = crate::autopilot_policy::normalize_plan_check_result(check.clone());
+    }
 
     let ms = proj
         .milestones
@@ -3549,6 +3730,35 @@ mod tests {
 
     fn unique_project_name(label: &str) -> String {
         format!("test-{}-{}", label, uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn provability_closeout_plan_labels_are_checked_and_missing_labels_are_inferred() {
+        let raw = serde_json::json!({
+            "acceptance_criteria_meta": [
+                {"text": "视觉表现与打磨前一致", "provability": "SemanticReview"},
+                {"text": "cargo test 测试通过", "provability": "AutomatedTest"}
+            ]
+        });
+        let criteria = vec![
+            "视觉表现与打磨前一致".to_string(),
+            "cargo test 测试通过".to_string(),
+            "令人满意的最终结果".to_string(),
+        ];
+        let metadata = parse_acceptance_criteria_meta(&raw, &criteria, "测试任务");
+        assert_eq!(metadata.len(), criteria.len());
+        assert_eq!(
+            metadata[0].provability,
+            crate::provability::Provability::HumanReview
+        );
+        assert_eq!(
+            metadata[1].provability,
+            crate::provability::Provability::AutomatedTest
+        );
+        assert_eq!(
+            metadata[2].provability_source,
+            crate::provability::ProvabilitySource::SystemInferred
+        );
     }
 
     fn completed_mid_stage() -> project::MidStage {

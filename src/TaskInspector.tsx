@@ -18,6 +18,7 @@ import type {
   TaskControlMode,
   TaskControlSnapshot,
   TaskTreeNodeView,
+  Provability,
 } from "./types";
 
 interface Props {
@@ -33,6 +34,7 @@ interface Props {
   onClose: () => void;
   onRefresh: () => void;
   onAction: (name: string, options?: { criterionIndexes?: number[]; reason?: string }) => void;
+  onConfirmHumanReview?: (criterionIndex: number, reason: string) => void;
   onChangeMode: (mode: TaskControlMode, reason?: string) => void;
 }
 
@@ -60,11 +62,14 @@ export default function TaskInspector({
   onClose,
   onRefresh,
   onAction,
+  onConfirmHumanReview,
   onChangeMode,
 }: Props) {
   const [activeTab, setActiveTab] = useState("overview");
   const [deviationCriterion, setDeviationCriterion] = useState("");
   const [deviationReason, setDeviationReason] = useState("");
+  const [humanCriterion, setHumanCriterion] = useState("");
+  const [humanReason, setHumanReason] = useState("");
   const selectedSubtask = useMemo(
     () => findProjectSubtaskById(project, selectedTaskId),
     [project, selectedTaskId],
@@ -74,6 +79,18 @@ export default function TaskInspector({
   const deviationOptions = acceptance.filter(item => (
     actionableAcceptance.includes(item.criterion_index)
   ));
+  const provabilityByIndex = useMemo(() => Object.fromEntries(
+    acceptance.map(item => {
+      const offset = item.criterion_index - 1;
+      const tagged = selectedSubtask?.acceptance_criteria_meta?.[offset]?.provability;
+      const contracted = selectedNode?.contract?.verification_modes?.[offset] as Provability | undefined;
+      return [item.criterion_index, tagged ?? contracted];
+    }),
+  ) as Partial<Record<number, Provability>>, [acceptance, selectedNode, selectedSubtask]);
+  const humanOptions = acceptance.filter(item => (
+    actionableAcceptance.includes(item.criterion_index)
+    && provabilityByIndex[item.criterion_index] === "HumanReview"
+  ));
   const isCurrentTask = !!selectedNode && selectedNode.id === snapshot?.current_task_id;
   const recovery = recoveryPresentation?.kind !== "None" ? recoveryPresentation : null;
   const snapshotStale = !!snapshot
@@ -82,6 +99,11 @@ export default function TaskInspector({
   const writesDisabled = !snapshot || snapshotStale || detailsSyncing;
   const canAcceptDeviation = !writesDisabled
     && (selectedNode?.capabilities ?? []).includes("accept_deviation");
+  const canConfirmHumanReview = !writesDisabled
+    && !!onConfirmHumanReview
+    && (selectedNode?.capabilities ?? []).includes("confirm_actual_pass")
+    && project.workflow_state.recovery_state?.phase === "WaitingHuman"
+    && project.workflow_state.recovery_state.subtask_id === selectedTaskId;
   const relatedEvents = selectedNode?.node_type === "Subtask"
     ? (snapshot?.events ?? []).filter(event => event.task_id === selectedNode.id)
     : snapshot?.events ?? [];
@@ -91,6 +113,12 @@ export default function TaskInspector({
       setDeviationCriterion(deviationOptions[0] ? String(deviationOptions[0].criterion_index) : "");
     }
   }, [deviationCriterion, deviationOptions]);
+
+  useEffect(() => {
+    if (!humanOptions.some(item => String(item.criterion_index) === humanCriterion)) {
+      setHumanCriterion(humanOptions[0] ? String(humanOptions[0].criterion_index) : "");
+    }
+  }, [humanCriterion, humanOptions]);
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -147,7 +175,24 @@ export default function TaskInspector({
               </dl>
             </section>
           )}
-          <AcceptanceLedgerPanel items={acceptance} />
+          <AcceptanceLedgerPanel items={acceptance} provabilityByIndex={provabilityByIndex} />
+          {canConfirmHumanReview && humanOptions.length > 0 && (
+            <section className="task-control-panel task-control-human-review-form">
+              <h3>人工确认边界</h3>
+              <p className="task-control-muted">视觉、体验或真实运行时结果不能由静态代码证据代替，请只确认你实际检查过的验收项。</p>
+              <select value={humanCriterion} onChange={event => setHumanCriterion(event.target.value)} aria-label="人工确认的验收项">
+                {humanOptions.map(item => <option key={item.criterion_index} value={item.criterion_index}>#{item.criterion_index} {item.criterion}</option>)}
+              </select>
+              <textarea value={humanReason} onChange={event => setHumanReason(event.target.value)} placeholder="记录实际检查方式与结论" aria-label="人工确认依据" />
+              <button
+                type="button"
+                onClick={() => onConfirmHumanReview?.(Number(humanCriterion), humanReason.trim())}
+                disabled={busy || !humanCriterion || !humanReason.trim()}
+              >
+                <CheckCircle2 size={14} />我已确认该项
+              </button>
+            </section>
+          )}
           {canAcceptDeviation && deviationOptions.length > 0 && (
             <section className="task-control-panel task-control-deviation-form">
               <h3>接受验收偏差</h3>

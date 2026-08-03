@@ -19,8 +19,8 @@ interface Props {
   onRefreshWorkspace: () => Promise<void>;
 }
 
-function checkDetails(check: StagePlanCheckResult): string[] {
-  return [...check.omissions, ...check.out_of_scope, ...check.not_executable, ...check.suggestions];
+function blockingCheckDetails(check: StagePlanCheckResult): string[] {
+  return [...check.omissions, ...check.out_of_scope, ...check.not_executable];
 }
 
 function PlanCards({ tasks }: { tasks: Subtask[] }) {
@@ -60,7 +60,8 @@ export function ExecutionPlanStep(props: Props) {
         <ActionButton icon={<SearchCheck size={16} />} loading={props.busy} disabled={tasks.length === 0} onClick={props.onCheck}>运行检查</ActionButton>
         <ActionButton icon={<RefreshCw size={16} />} variant="danger" loading={props.busy} onClick={() => props.onRegenerate("check_failed")}>重新生成</ActionButton>
       </WorkflowActionBar>}>
-      {check && <FeedbackBanner type={check.passed ? "success" : "error"} message={check.passed ? "检查通过" : "检查未通过"} details={checkDetails(check)} />}
+      {check && <FeedbackBanner type={check.passed ? "success" : "error"} message={check.passed ? "检查通过" : "检查未通过"} details={blockingCheckDetails(check)} />}
+      {check && check.suggestions.length > 0 && <FeedbackBanner type="warning" message="非阻断建议" details={check.suggestions} />}
       <PlanCards tasks={tasks} />
       {check && !check.passed && <textarea className="console-feedback-input" value={props.regenerationFeedback} onChange={(event) => props.setRegenerationFeedback(event.target.value)} placeholder="补充重新生成反馈" disabled={props.busy} />}
     </ConsoleStepShell>
@@ -93,6 +94,7 @@ export function ExecutionPlanStep(props: Props) {
     </WorkflowActionBar>)}>
     {isApproved && <FeedbackBanner type="success" message="执行计划已冻结，已进入执行阶段。" />}
     {!isApproved && check?.passed && <FeedbackBanner type="success" message="检查已通过" />}
+    {!isApproved && check && check.suggestions.length > 0 && <FeedbackBanner type="warning" message="非阻断建议" details={check.suggestions} />}
     {!isApproved && props.workspaceStatus && !workspaceReady && (
       <>
         <FeedbackBanner

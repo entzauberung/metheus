@@ -4720,7 +4720,8 @@ pub(crate) fn reconcile_loaded_project_under_pipeline_lock(
         // 活跃控制动作拥有项目事实修改权；启动/同步对账不得覆盖其心跳或中间状态。
         return false;
     }
-    let mut modified = normalize_legacy_confirmation_conflict_kind(proj);
+    let mut modified = crate::provability::migrate_project_metadata(proj);
+    modified |= normalize_legacy_confirmation_conflict_kind(proj);
     modified |= migrate_legacy_v1_confirmation_conflict(proj);
     let reconciliation = reconcile_execution_state(proj, pipeline_status);
     if reconciliation == ExecutionReconciliation::AwaitingConfirmation {

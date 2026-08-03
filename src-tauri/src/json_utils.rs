@@ -282,6 +282,162 @@ pub(crate) const PLAN_PATCH_JSON_CONTRACT: JsonTargetContract = JsonTargetContra
     fields: PLAN_PATCH_FIELDS,
 };
 
+const MILESTONE_CHECK_FIELDS: &[JsonFieldContract] = &[
+    JsonFieldContract {
+        path: "$",
+        expected_type: JsonExpectedType::Object,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.passed",
+        expected_type: JsonExpectedType::Boolean,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.summary",
+        expected_type: JsonExpectedType::String,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.omissions",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.overlaps",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.out_of_scope",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.ordering_issues",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.suggestions",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+];
+
+pub(crate) const MILESTONE_CHECK_JSON_CONTRACT: JsonTargetContract = JsonTargetContract {
+    name: "MilestoneCheckResult",
+    fields: MILESTONE_CHECK_FIELDS,
+};
+
+const MID_STAGE_CHECK_FIELDS: &[JsonFieldContract] = &[
+    JsonFieldContract {
+        path: "$",
+        expected_type: JsonExpectedType::Object,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.passed",
+        expected_type: JsonExpectedType::Boolean,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.summary",
+        expected_type: JsonExpectedType::String,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.omissions",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.overlaps",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.ordering_issues",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.suggestions",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+];
+
+pub(crate) const MID_STAGE_CHECK_JSON_CONTRACT: JsonTargetContract = JsonTargetContract {
+    name: "MidStageCheckResult",
+    fields: MID_STAGE_CHECK_FIELDS,
+};
+
+const EXECUTION_PLAN_CHECK_FIELDS: &[JsonFieldContract] = &[
+    JsonFieldContract {
+        path: "$",
+        expected_type: JsonExpectedType::Object,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.passed",
+        expected_type: JsonExpectedType::Boolean,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.summary",
+        expected_type: JsonExpectedType::String,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.omissions",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.out_of_scope",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.not_executable",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+    JsonFieldContract {
+        path: "$.suggestions",
+        expected_type: JsonExpectedType::StringArray,
+        allowed_values: &[],
+        required: true,
+    },
+];
+
+pub(crate) const EXECUTION_PLAN_CHECK_JSON_CONTRACT: JsonTargetContract = JsonTargetContract {
+    name: "ExecutionPlanCheckResult",
+    fields: EXECUTION_PLAN_CHECK_FIELDS,
+};
+
 const QA_RESULT_FIELDS: &[JsonFieldContract] = &[
     JsonFieldContract {
         path: "$",
@@ -624,9 +780,20 @@ fn normalize_contract_leaf(
                 *changed = true;
             }
         }
-        JsonExpectedType::StringArray if value.is_string() => {
-            *value = serde_json::Value::Array(vec![value.clone()]);
-            *changed = true;
+        JsonExpectedType::StringArray => {
+            if value.is_string() {
+                *value = serde_json::Value::Array(vec![value.clone()]);
+                *changed = true;
+            } else if let Some(items) = value.as_array_mut() {
+                for item in items {
+                    if !item.is_string() {
+                        if let Ok(rendered) = serde_json::to_string(item) {
+                            *item = serde_json::Value::String(rendered);
+                            *changed = true;
+                        }
+                    }
+                }
+            }
         }
         _ => {}
     }
@@ -961,6 +1128,86 @@ mod tests {
 
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(parsed.implementation_guidance.contains("rebuild"));
+    }
+
+    #[tokio::test]
+    async fn check_convergence_stage_contracts_accept_declared_shapes_without_repair() {
+        let cases = [
+            (
+                r#"{"passed":true,"summary":"ok","omissions":[],"overlaps":[],"out_of_scope":[],"ordering_issues":[],"suggestions":[]}"#,
+                &MILESTONE_CHECK_JSON_CONTRACT,
+            ),
+            (
+                r#"{"passed":true,"summary":"ok","omissions":[],"overlaps":[],"ordering_issues":[],"suggestions":[]}"#,
+                &MID_STAGE_CHECK_JSON_CONTRACT,
+            ),
+            (
+                r#"{"passed":true,"summary":"ok","omissions":[],"out_of_scope":[],"not_executable":[],"suggestions":[]}"#,
+                &EXECUTION_PLAN_CHECK_JSON_CONTRACT,
+            ),
+        ];
+
+        for (raw, contract) in cases {
+            let parsed: serde_json::Value = parse_json_with_contract_using(
+                raw,
+                contract,
+                |_original, _description, _error| async move {
+                    Err("valid check JSON must not request repair".to_string())
+                },
+            )
+            .await
+            .expect("declared stage check shape should parse");
+            assert_eq!(parsed["passed"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn check_convergence_contract_repairs_then_compresses_string_positions() {
+        #[derive(Debug, serde::Deserialize)]
+        struct CheckOutput {
+            summary: String,
+            omissions: Vec<String>,
+        }
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let raw = r#"{
+            "passed":false,
+            "summary":{"status":"review"},
+            "omissions":[{"issue":"missing artifact"}],
+            "out_of_scope":[],
+            "not_executable":[],
+            "suggestions":[]
+        }"#;
+        let parsed: CheckOutput = parse_json_with_contract_using(
+            raw,
+            &EXECUTION_PLAN_CHECK_JSON_CONTRACT,
+            move |original, _description, _error| {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { Ok(original) }
+            },
+        )
+        .await
+        .expect("one repair followed by deterministic compression should recover the shape");
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(parsed.summary.contains("review"));
+        assert!(parsed.omissions[0].contains("missing artifact"));
+    }
+
+    #[tokio::test]
+    async fn check_convergence_protocol_failure_remains_distinct_from_quality_failure() {
+        let failure = parse_json_with_contract_using::<serde_json::Value, _, _>(
+            r#"{"passed":"no","summary":"bad protocol","omissions":[],"out_of_scope":[],"not_executable":[],"suggestions":[]}"#,
+            &EXECUTION_PLAN_CHECK_JSON_CONTRACT,
+            |original, _description, _error| async move { Ok(original) },
+        )
+        .await
+        .expect_err("an unrepaired boolean mismatch must stay a protocol failure");
+
+        assert_eq!(failure.contract_name, "ExecutionPlanCheckResult");
+        assert_eq!(failure.final_error.path, "$.passed");
+        assert!(failure.no_progress);
     }
 
     #[tokio::test]

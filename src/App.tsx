@@ -2157,6 +2157,9 @@ function App() {
               onClose={() => setInspectorOpen(false)}
               onRefresh={() => { void taskControlWorkspace.refresh(); }}
               onAction={(name, options) => { void runTaskControlAction(name, options); }}
+              onConfirmHumanReview={(criterionIndex, reason) => {
+                void handleResolveHumanRecovery("confirm_actual_pass", reason, [criterionIndex]);
+              }}
               onChangeMode={(mode, reason) => { void changeTaskControlMode(mode, reason); }}
             />
           </div>

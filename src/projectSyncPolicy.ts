@@ -7,6 +7,19 @@ import type {
 export const TASK_CONTROL_DETAIL_STALE_AFTER_MS = 45_000;
 export const TASK_CONTROL_FALLBACK_INTERVAL_MS = 30_000;
 export const TASK_CONTROL_MAX_SYNC_FAILURES = 3;
+export const PROJECT_SYNC_CONNECTED_FALLBACK_MS = 60_000;
+export const PROJECT_SYNC_DISCONNECTED_FALLBACK_MS = 15_000;
+
+export function projectSyncFallbackIntervalMs(
+  subscriptionStatus: "idle" | "connected" | "reconnecting",
+  runtimeSyncStatus: "idle" | "syncing" | "synced" | "delayed" | "disconnected",
+  connectedIntervalMs = PROJECT_SYNC_CONNECTED_FALLBACK_MS,
+): number {
+  if (subscriptionStatus === "connected" && runtimeSyncStatus !== "disconnected") {
+    return connectedIntervalMs;
+  }
+  return Math.min(connectedIntervalMs, PROJECT_SYNC_DISCONNECTED_FALLBACK_MS);
+}
 
 export type TaskControlFallbackReason =
   | "channel_reconnecting"
@@ -69,6 +82,11 @@ export interface ProjectSyncCursor {
   projectName: string;
   processStartId: string;
   eventSequence: number;
+  dataRevision: number;
+  taskControlTreeRevision: number;
+  taskControlSnapshotVersion: string;
+  taskControlActionId: string | null;
+  taskControlMode: ProjectStateChangedEvent["control_mode"] | null;
 }
 
 export function shouldAcceptProjectStateEvent(
@@ -86,11 +104,56 @@ export function advanceProjectSyncCursor(
   eventSequence: number,
 ): ProjectSyncCursor {
   if (processStartId !== cursor.processStartId) {
-    return { ...cursor, processStartId, eventSequence };
+    return {
+      ...cursor,
+      processStartId,
+      eventSequence,
+      dataRevision: 0,
+      taskControlTreeRevision: 0,
+      taskControlSnapshotVersion: "",
+      taskControlActionId: null,
+      taskControlMode: null,
+    };
   }
   return {
     ...cursor,
     eventSequence: Math.max(cursor.eventSequence, eventSequence),
+  };
+}
+
+export function shouldRequestRuntimeSnapshot(
+  cursor: ProjectSyncCursor,
+  event: ProjectStateChangedEvent,
+): boolean {
+  if (!shouldAcceptProjectStateEvent(cursor, event)) return false;
+  if (event.process_start_id !== cursor.processStartId) return true;
+  if (event.data_revision > cursor.dataRevision) return true;
+  return event.task_control_dirty && (
+    event.task_control_tree_revision > cursor.taskControlTreeRevision
+    || event.task_control_snapshot_version !== cursor.taskControlSnapshotVersion
+    || event.control_action_id !== cursor.taskControlActionId
+    || event.control_mode !== cursor.taskControlMode
+  );
+}
+
+export function advanceProjectSyncRevisions(
+  cursor: ProjectSyncCursor,
+  dataRevision: number,
+  taskControlTreeRevision: number,
+  taskControlSnapshotVersion: string,
+  taskControlActionId: string | null,
+  taskControlMode: ProjectSyncCursor["taskControlMode"],
+): ProjectSyncCursor {
+  return {
+    ...cursor,
+    dataRevision: Math.max(cursor.dataRevision, dataRevision),
+    taskControlTreeRevision: Math.max(
+      cursor.taskControlTreeRevision,
+      taskControlTreeRevision,
+    ),
+    taskControlSnapshotVersion,
+    taskControlActionId,
+    taskControlMode,
   };
 }
 

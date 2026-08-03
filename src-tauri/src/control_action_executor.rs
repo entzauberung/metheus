@@ -9,11 +9,12 @@ use tokio::sync::Mutex;
 
 pub(crate) const CONTROL_ACTION_HEARTBEAT_INTERVAL_SECS: u64 = 2;
 pub(crate) const CONTROL_ACTION_STALE_AFTER_SECS: i64 = 15;
-pub(crate) const CONTROL_ACTION_MAX_EXECUTION_SECS: u64 = 60 * 60;
+pub(crate) const CONTROL_ACTION_MAX_EXECUTION_SECS: u64 = 12 * 60;
 
 const CONTROL_ACTION_SIMPLE_EXPECTED_SECS: u64 = 120;
-const CONTROL_ACTION_VALIDATION_EXPECTED_SECS: u64 = 15 * 60;
-const CONTROL_ACTION_EXECUTION_EXPECTED_SECS: u64 = 20 * 60;
+const CONTROL_ACTION_VALIDATION_EXPECTED_SECS: u64 = 5 * 60;
+const CONTROL_ACTION_EXECUTION_EXPECTED_SECS: u64 = 10 * 60;
+const CONTROL_ACTION_REPAIR_EXPECTED_SECS: u64 = 10 * 60;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlActionOccupancy {
@@ -33,7 +34,7 @@ pub(crate) fn expected_action_duration_secs(action: ControlActionKind) -> u64 {
         | ControlActionKind::AutomatedValidate
         | ControlActionKind::TargetedValidate
         | ControlActionKind::GitConfirm => CONTROL_ACTION_VALIDATION_EXPECTED_SECS,
-        ControlActionKind::Repair => CONTROL_ACTION_MAX_EXECUTION_SECS,
+        ControlActionKind::Repair => CONTROL_ACTION_REPAIR_EXPECTED_SECS,
         ControlActionKind::Split
         | ControlActionKind::Recompile
         | ControlActionKind::AcceptDeviation
@@ -168,19 +169,18 @@ impl ControlActionLockReconciliation {
 
 pub(crate) fn stale_control_action_can_be_cleared(
     lease: Option<&ControlActionLease>,
-    current_process_start_id: &str,
+    _current_process_start_id: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     !lease.is_some_and(|value| {
-        value.owner_process_start_id == current_process_start_id
-            && chrono::DateTime::parse_from_rfc3339(&value.heartbeat_at)
-                .ok()
-                .map(|heartbeat| {
-                    now.signed_duration_since(heartbeat.with_timezone(&chrono::Utc))
-                        .num_seconds()
-                        <= CONTROL_ACTION_STALE_AFTER_SECS
-                })
-                .unwrap_or(false)
+        chrono::DateTime::parse_from_rfc3339(&value.heartbeat_at)
+            .ok()
+            .map(|heartbeat| {
+                now.signed_duration_since(heartbeat.with_timezone(&chrono::Utc))
+                    .num_seconds()
+                    <= CONTROL_ACTION_STALE_AFTER_SECS
+            })
+            .unwrap_or(false)
     })
 }
 
@@ -905,14 +905,41 @@ async fn dispatch(
         ControlActionKind::Wait => Ok("控制器等待新的项目事实".to_string()),
         ControlActionKind::Human => {
             let mut project = claimed_project;
-            let message = enter_human_boundary(&mut project, request);
+            let message = enter_human_boundary(&mut project, request)?;
             crate::save_project(&project)?;
             Ok(message)
         }
     }
 }
 
-fn enter_human_boundary(project: &mut project::Project, request: &ControlActionRequest) -> String {
+fn enter_human_boundary(
+    project: &mut project::Project,
+    request: &ControlActionRequest,
+) -> Result<String, String> {
+    if !request.task_id.is_empty() {
+        let task = crate::task_tree::find_task(project, &request.task_id)?
+            .ok_or_else(|| format!("任务节点不存在：{}", request.task_id))?
+            .clone();
+        let human_targets = if request.criterion_indexes.is_empty() {
+            crate::acceptance::revalidation_target_indexes(&task, &[])?
+                .into_iter()
+                .filter(|index| {
+                    crate::validator_registry::verification_mode_for(&task, *index)
+                        == crate::validator_contract::VerificationMode::HumanReview
+                })
+                .collect::<Vec<_>>()
+        } else {
+            request.criterion_indexes.clone()
+        };
+        if !human_targets.is_empty() {
+            return crate::recovery::enter_human_review_boundary(
+                project,
+                &request.task_id,
+                &human_targets,
+                &request.reason,
+            );
+        }
+    }
     let message = if request.criterion_indexes.is_empty() {
         "控制器已进入人工边界".to_string()
     } else {
@@ -935,7 +962,7 @@ fn enter_human_boundary(project: &mut project::Project, request: &ControlActionR
             request.reason.clone()
         };
     }
-    message
+    Ok(message)
 }
 
 fn validate_claimed_dispatch(
@@ -1634,6 +1661,42 @@ mod tests {
     }
 
     #[test]
+    fn provability_closeout_lock_windows_are_short_and_keep_normal_actions_safe() {
+        assert!(CONTROL_ACTION_EXECUTION_EXPECTED_SECS < 27 * 60);
+        assert!(CONTROL_ACTION_EXECUTION_EXPECTED_SECS > 105);
+        assert!(CONTROL_ACTION_VALIDATION_EXPECTED_SECS < CONTROL_ACTION_EXECUTION_EXPECTED_SECS);
+        assert_eq!(
+            expected_action_duration_secs(ControlActionKind::Execute),
+            10 * 60
+        );
+        assert_eq!(
+            expected_action_duration_secs(ControlActionKind::TargetedValidate),
+            5 * 60
+        );
+    }
+
+    #[test]
+    fn provability_closeout_fresh_overdue_foreign_lease_is_not_force_cleared() {
+        let now = chrono::Utc::now();
+        let started = (now - chrono::Duration::seconds(11 * 60)).to_rfc3339();
+        let heartbeat = now.to_rfc3339();
+        let mut project = project_with_task(project::SubtaskStatus::Pending);
+        let mut lease = test_lease("live-other-process", &started, &heartbeat);
+        lease.task_id = "task".to_string();
+        project.task_control = state_with_lease(lease);
+
+        assert!(matches!(
+            classify_control_action_occupancy(&project.task_control, "this-process", now),
+            ControlActionOccupancy::Stale { reason, .. } if reason.contains("最长执行时长")
+        ));
+        assert_eq!(
+            reconcile_stale_control_action_lock(&mut project, "this-process", now),
+            ControlActionLockReconciliation::Unchanged
+        );
+        assert!(project.task_control.active_action_lease.is_some());
+    }
+
+    #[test]
     fn runtime_fault_lock_lease_legacy_string_lock_requires_reconciliation() {
         let state = TaskControlState {
             active_action_id: "legacy-action".to_string(),
@@ -1909,15 +1972,26 @@ mod tests {
     }
 
     #[test]
-    fn human_review_boundary_preserves_ledger_and_uses_human_validator_audit() {
+    fn provability_closeout_human_review_boundary_preserves_ledger_and_uses_human_validator_audit()
+    {
         let mut project = project_with_task(project::SubtaskStatus::AwaitingConfirmation);
         project.workflow_state.autopilot_state = Some(project::AutopilotState::default());
-        project.milestones[0].subtasks[0].acceptance_ledger = vec![project::AcceptanceLedgerItem {
+        let task = &mut project.milestones[0].subtasks[0];
+        task.acceptance_criteria = vec!["操作员确认真实桌面行为".to_string()];
+        task.acceptance_criteria_meta =
+            crate::provability::normalize_metadata(&task.acceptance_criteria, &[]);
+        task.acceptance_ledger = vec![project::AcceptanceLedgerItem {
             criterion_index: 1,
             criterion: "操作员确认真实桌面行为".to_string(),
             status: project::AcceptanceStatus::Unknown,
             ..Default::default()
         }];
+        project.execution_session = Some(project::ExecutionSession {
+            subtask_id: "task".to_string(),
+            execution_id: "execution-human".to_string(),
+            active: true,
+            ..Default::default()
+        });
         let before = project.milestones[0].subtasks[0].acceptance_ledger.clone();
         let request = ControlActionRequest {
             action: ControlActionKind::Human,
@@ -1927,7 +2001,7 @@ mod tests {
             ..Default::default()
         };
 
-        let message = enter_human_boundary(&mut project, &request);
+        let message = enter_human_boundary(&mut project, &request).unwrap();
         assert!(message.contains("等待显式人工结论"));
         assert_eq!(project.milestones[0].subtasks[0].acceptance_ledger, before);
         let state = project.workflow_state.autopilot_state.as_ref().unwrap();

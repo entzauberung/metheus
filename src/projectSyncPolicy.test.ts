@@ -3,8 +3,10 @@ import type { ProjectStateChangedEvent, RuntimeSnapshot } from "./types";
 import {
   advanceProjectSyncCursor,
   mergePendingProjectEvent,
+  projectSyncFallbackIntervalMs,
   shouldAcceptProjectStateEvent,
   shouldAcceptRuntimeSnapshot,
+  shouldRequestRuntimeSnapshot,
   taskControlFallbackDecision,
   type ProjectSyncCursor,
 } from "./projectSyncPolicy";
@@ -13,6 +15,11 @@ const cursor: ProjectSyncCursor = {
   projectName: "alpha",
   processStartId: "process-a",
   eventSequence: 8,
+  dataRevision: 4,
+  taskControlTreeRevision: 8,
+  taskControlSnapshotVersion: "task-control-snapshot-v1",
+  taskControlActionId: null,
+  taskControlMode: "Shadow",
 };
 
 function event(sequence: number, overrides: Partial<ProjectStateChangedEvent> = {}): ProjectStateChangedEvent {
@@ -25,7 +32,8 @@ function event(sequence: number, overrides: Partial<ProjectStateChangedEvent> = 
     execution_session_status: "execution_failed",
     autopilot_status: null,
     recovery_action: "RestoreExecutionBaseline",
-    task_tree_revision: sequence,
+    task_control_tree_revision: sequence,
+    task_control_snapshot_version: "task-control-snapshot-v1",
     control_action_id: null,
     control_mode: "Shadow",
     task_control_dirty: true,
@@ -76,7 +84,35 @@ describe("projectSyncPolicy", () => {
     const restarted = event(1, { process_start_id: "process-b" });
     expect(shouldAcceptProjectStateEvent(cursor, restarted)).toBe(true);
     expect(advanceProjectSyncCursor(cursor, restarted.process_start_id, restarted.event_sequence))
-      .toEqual({ ...cursor, processStartId: "process-b", eventSequence: 1 });
+      .toEqual({
+        ...cursor,
+        processStartId: "process-b",
+        eventSequence: 1,
+        dataRevision: 0,
+        taskControlTreeRevision: 0,
+        taskControlSnapshotVersion: "",
+        taskControlActionId: null,
+        taskControlMode: null,
+      });
+  });
+
+  it("does not request a full snapshot when event revisions do not advance", () => {
+    expect(shouldRequestRuntimeSnapshot(cursor, event(9, {
+      data_revision: 4,
+      task_control_tree_revision: 8,
+      task_control_dirty: false,
+    }))).toBe(false);
+    expect(shouldRequestRuntimeSnapshot(cursor, event(9, {
+      data_revision: 5,
+      task_control_tree_revision: 8,
+      task_control_dirty: false,
+    }))).toBe(true);
+  });
+
+  it("uses a low-frequency fallback while the channel is healthy", () => {
+    expect(projectSyncFallbackIntervalMs("connected", "synced")).toBe(60_000);
+    expect(projectSyncFallbackIntervalMs("reconnecting", "delayed")).toBe(15_000);
+    expect(projectSyncFallbackIntervalMs("connected", "disconnected")).toBe(15_000);
   });
 
   it("rejects a snapshot older than the latest invalidation event", () => {

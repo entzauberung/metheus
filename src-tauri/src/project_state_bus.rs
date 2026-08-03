@@ -15,7 +15,8 @@ pub struct ProjectStateChangedEvent {
     pub execution_session_status: Option<String>,
     pub autopilot_status: Option<AutopilotRunStatus>,
     pub recovery_action: AutopilotRecoveryAction,
-    pub task_tree_revision: u64,
+    pub task_control_tree_revision: u64,
+    pub task_control_snapshot_version: String,
     pub control_action_id: Option<String>,
     pub control_mode: TaskControlMode,
     pub task_control_dirty: bool,
@@ -177,7 +178,8 @@ fn event_from_project(
         recovery_action: autopilot
             .map(|state| state.recovery_action.clone())
             .unwrap_or_default(),
-        task_tree_revision: project.task_control.tree_revision,
+        task_control_tree_revision: project.task_control.tree_revision,
+        task_control_snapshot_version: project.task_control.snapshot_version.clone(),
         control_action_id: current_control_action_id(project),
         control_mode: project.task_control.mode,
         task_control_dirty,
@@ -256,7 +258,7 @@ mod tests {
         assert!(first.task_control_dirty);
         assert!(!project_only.task_control_dirty);
         assert!(task_control.task_control_dirty);
-        assert_eq!(task_control.task_tree_revision, 1);
+        assert_eq!(task_control.task_control_tree_revision, 1);
         Ok(())
     }
 

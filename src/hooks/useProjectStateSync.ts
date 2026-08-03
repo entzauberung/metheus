@@ -9,15 +9,19 @@ import type {
 } from "../types";
 import {
   advanceProjectSyncCursor,
+  advanceProjectSyncRevisions,
   mergePendingProjectEvent,
+  PROJECT_SYNC_CONNECTED_FALLBACK_MS,
+  projectSyncFallbackIntervalMs,
   shouldAcceptProjectStateEvent,
   shouldAcceptRuntimeSnapshot,
+  shouldRequestRuntimeSnapshot,
   type ProjectSyncCursor,
 } from "../projectSyncPolicy";
 import { invokeWithTimeout } from "../utils/invokeWithTimeout";
 
 const DEFAULT_COALESCE_MS = 40;
-const DEFAULT_FALLBACK_INTERVAL_MS = 15_000;
+const DEFAULT_FALLBACK_INTERVAL_MS = PROJECT_SYNC_CONNECTED_FALLBACK_MS;
 const DISCONNECTED_FAILURE_COUNT = 3;
 
 interface ProjectEventChannel {
@@ -132,6 +136,11 @@ export function useProjectStateSync({
     projectName: "",
     processStartId: "",
     eventSequence: 0,
+    dataRevision: 0,
+    taskControlTreeRevision: 0,
+    taskControlSnapshotVersion: "",
+    taskControlActionId: null,
+    taskControlMode: null,
   });
   const inFlightRef = useRef<Promise<RuntimeSnapshot | null> | null>(null);
   const inFlightGenerationRef = useRef(0);
@@ -203,6 +212,14 @@ export function useProjectStateSync({
                 snapshot.process_start_id,
                 snapshot.event_sequence,
               );
+              cursorRef.current = advanceProjectSyncRevisions(
+                cursorRef.current,
+                snapshot.project.workflow_state.data_revision,
+                snapshot.task_control_tree_revision,
+                snapshot.task_control_snapshot_version,
+                snapshot.task_control_action_id,
+                snapshot.task_control_mode,
+              );
               pendingEventRef.current = null;
               onSnapshotRef.current(snapshot);
               latest = snapshot;
@@ -273,39 +290,54 @@ export function useProjectStateSync({
   const scheduleEventSync = useCallback((event: ProjectStateChangedEvent) => {
     const cursor = cursorRef.current;
     if (!shouldAcceptProjectStateEvent(cursor, event)) return;
+    const requestSnapshot = shouldRequestRuntimeSnapshot(cursor, event);
+    const taskControlChanged = requestSnapshot && event.task_control_dirty;
     cursorRef.current = advanceProjectSyncCursor(
       cursor,
       event.process_start_id,
       event.event_sequence,
     );
-    pendingEventRef.current = mergePendingProjectEvent(pendingEventRef.current, event);
+    cursorRef.current = advanceProjectSyncRevisions(
+      cursorRef.current,
+      event.data_revision,
+      event.task_control_tree_revision,
+      event.task_control_snapshot_version,
+      event.control_action_id,
+      event.control_mode,
+    );
+    if (requestSnapshot) {
+      pendingEventRef.current = mergePendingProjectEvent(pendingEventRef.current, event);
+    }
     setState(current => ({
       ...current,
       lastEventSequence: cursorRef.current.eventSequence,
-      pendingRevision: Math.max(current.pendingRevision ?? 0, event.data_revision),
-      taskControlEventSequence: event.task_control_dirty
+      pendingRevision: requestSnapshot
+        ? Math.max(current.pendingRevision ?? 0, event.data_revision)
+        : current.pendingRevision,
+      taskControlEventSequence: taskControlChanged
         ? event.event_sequence
         : current.taskControlEventSequence,
-      taskControlProcessStartId: event.task_control_dirty
+      taskControlProcessStartId: taskControlChanged
         ? event.process_start_id
         : current.taskControlProcessStartId,
-      taskControlProjectRevision: event.task_control_dirty
+      taskControlProjectRevision: taskControlChanged
         ? event.data_revision
         : current.taskControlProjectRevision,
-      taskControlTreeRevision: event.task_control_dirty
-        ? event.task_tree_revision
+      taskControlTreeRevision: taskControlChanged
+        ? event.task_control_tree_revision
         : current.taskControlTreeRevision,
-      taskControlDirty: current.taskControlDirty || event.task_control_dirty,
-      taskControlActionId: event.task_control_dirty
+      taskControlDirty: current.taskControlDirty || taskControlChanged,
+      taskControlActionId: taskControlChanged
         ? event.control_action_id
         : current.taskControlActionId,
-      taskControlMode: event.task_control_dirty
+      taskControlMode: taskControlChanged
         ? event.control_mode
         : current.taskControlMode,
-      taskControlDetailStatus: event.task_control_dirty && includeTaskControlSnapshotRef.current
+      taskControlDetailStatus: taskControlChanged && includeTaskControlSnapshotRef.current
         ? "syncing"
         : current.taskControlDetailStatus,
     }));
+    if (!requestSnapshot) return;
     if (coalesceTimerRef.current) return;
     coalesceTimerRef.current = setTimeout(() => {
       coalesceTimerRef.current = null;
@@ -319,7 +351,16 @@ export function useProjectStateSync({
       projectName,
       enabled: enabled && Boolean(projectName),
     };
-    cursorRef.current = { projectName, processStartId: "", eventSequence: 0 };
+    cursorRef.current = {
+      projectName,
+      processStartId: "",
+      eventSequence: 0,
+      dataRevision: 0,
+      taskControlTreeRevision: 0,
+      taskControlSnapshotVersion: "",
+      taskControlActionId: null,
+      taskControlMode: null,
+    };
     pendingEventRef.current = null;
     requestedSyncRef.current = 0;
     completedSyncRef.current = 0;
@@ -372,10 +413,6 @@ export function useProjectStateSync({
     subscribeChannel();
 
     void syncNowRef.current(true);
-    const fallbackTimer = setInterval(() => {
-      void syncNowRef.current();
-    }, fallbackIntervalMs);
-
     return () => {
       cancelled = true;
       scopeRef.current = {
@@ -383,7 +420,6 @@ export function useProjectStateSync({
         projectName: "",
         enabled: false,
       };
-      clearInterval(fallbackTimer);
       if (subscriptionRetryTimerRef.current) clearTimeout(subscriptionRetryTimerRef.current);
       subscriptionRetryTimerRef.current = null;
       if (coalesceTimerRef.current) clearTimeout(coalesceTimerRef.current);
@@ -395,7 +431,20 @@ export function useProjectStateSync({
         void transportRef.current.unsubscribe(subscriptionId).catch(() => {});
       }
     };
-  }, [enabled, fallbackIntervalMs, projectName, scheduleEventSync]);
+  }, [enabled, projectName, scheduleEventSync]);
+
+  useEffect(() => {
+    if (!enabled || !projectName) return;
+    const intervalMs = projectSyncFallbackIntervalMs(
+      state.subscriptionStatus,
+      state.status,
+      fallbackIntervalMs,
+    );
+    const fallbackTimer = setInterval(() => {
+      void syncNowRef.current();
+    }, intervalMs);
+    return () => clearInterval(fallbackTimer);
+  }, [enabled, fallbackIntervalMs, projectName, state.status, state.subscriptionStatus]);
 
   useEffect(() => {
     const previous = previousIncludeTaskControlSnapshotRef.current;

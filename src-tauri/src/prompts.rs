@@ -313,6 +313,8 @@ pub(crate) const MILESTONE_CHECK_PROMPT: &str = "\
 3. 越界检查：大阶段中是否存在方案未提及的内容（过度设计）？\
 4. 顺序检查：大阶段的排列顺序是否合理？依赖关系是否正确？\
 5. 可执行性检查：每个大阶段的验收标准是否可验证？范围是否可执行？\
+6. 检查结论必须分级：缺失必需产物、越权、契约不满足、不可执行或依赖错误才是硬阻断；“可考虑”“建议”“可选增强”和非必需 criteria 只能写入 suggestions。\
+7. 只有硬阻断可以令 passed=false；仅有 suggestions 时必须令 passed=true，禁止把建议写入 omissions、overlaps、out_of_scope 或 ordering_issues。\
 \
 输出格式：JSON 对象，包含以下字段：\
 - passed：布尔值，是否通过检查。\
@@ -358,6 +360,8 @@ pub(crate) const MID_STAGE_CHECK_PROMPT: &str = "\
 2. 依赖检查：中阶段之间的依赖关系是否正确（无循环依赖）？\
 3. 边界检查：是否存在范围重叠或遗漏的功能？\
 4. 可验证性检查：每个中阶段的验收标准是否可验证？\
+5. 检查结论必须分级：缺失必需产物、契约不满足、不可执行或依赖错误才是硬阻断；“可考虑”“建议”“可选增强”和非必需 criteria 只能写入 suggestions。\
+6. 只有硬阻断可以令 passed=false；仅有 suggestions 时必须令 passed=true，禁止把建议写入 omissions、overlaps 或 ordering_issues。\
 \
 输出格式：JSON 对象，字段包括 passed（布尔）、summary（字符串）、\
 omissions（字符串数组）、overlaps（字符串数组）、ordering_issues（字符串数组）、suggestions（字符串数组）。\
@@ -386,6 +390,7 @@ pub(crate) const EXECUTION_PLAN_PROMPT: &str = "\
 - evidence_files：字符串数组，执行前必须读取的证据文件路径。\
 - context_summary：字符串，注入给模型的精确背景信息（100-300 字）。\
 - acceptance_criteria：字符串数组，可验证的验收标准。\
+- acceptance_criteria_meta：与 acceptance_criteria 等长、按索引对齐的对象数组；每项包含 text（必须与对应验收文本完全一致）和 provability。provability 只能是 Deterministic（结构/语法/符号/本地扫描可证明）、AutomatedTest（测试命令可证明）、SemanticReview（需 AI 语义审查）、HumanReview（视觉/体验/主观或真实运行时确认）、Unprovable（当前契约无法证明）。视觉、样式一致、体验、美观及“与……保持一致”必须标 HumanReview；Unprovable 必须改写，确实不能改写时由后端降级为 HumanReview。\
 - stop_rules：字符串数组，信息不足、发现范围外问题时的停止规则。\
 - execution_prompt：字符串，面向编码执行引擎的实现指引（最终提示由后端编译）。\
 - depends_on_orders：整数数组，硬依赖任务的 order；只能引用当前任务之前的 order，无依赖时为 []。\
@@ -408,6 +413,8 @@ pub(crate) const EXECUTION_PLAN_CHECK_PROMPT: &str = "\
 7. 技术可行性检查：验收标准在当前 API 和技术栈下是否能够实现，验收项之间是否矛盾？\
 8. 依赖检查：depends_on_orders 是否只引用更早任务、是否遗漏硬依赖，dependency_notes 是否能证明无依赖任务可独立执行？\
 9. 顺序检查：小阶段的执行顺序是否合理？\
+10. 检查结论必须分级：缺失必需产物、越权、契约不满足、不可执行或依赖错误才是硬阻断；“可考虑”“建议”“可选增强”和非必需 criteria 只能写入 suggestions。\
+11. 只有硬阻断可以令 passed=false；仅有 suggestions 时必须令 passed=true，禁止把建议写入 omissions、out_of_scope 或 not_executable。\
 \
 输出格式：JSON 对象，字段包括 passed（布尔）、summary（字符串）、\
 omissions（字符串数组）、out_of_scope（字符串数组）、not_executable（字符串数组）、suggestions（字符串数组）。\

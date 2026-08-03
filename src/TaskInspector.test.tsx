@@ -210,6 +210,53 @@ describe("TaskInspector", () => {
     expect(host.textContent).toContain("接受验收偏差");
   });
 
+  it("provability closeout shows a distinct human-review badge and confirmation entry", () => {
+    const humanProject = project();
+    humanProject.workflow_state.recovery_state = {
+      phase: "WaitingHuman",
+      subtask_id: "selected",
+    } as Project["workflow_state"]["recovery_state"];
+    const subtask = humanProject.milestones[0].mid_stages[0].subtasks[0];
+    subtask.acceptance_criteria_meta = [{
+      text: "恢复并渲染保存的数据",
+      provability: "HumanReview",
+      provability_source: "PlanningExplicit",
+    }];
+    const humanNode = node("selected", [...TASK_CAPABILITIES, "confirm_actual_pass"]);
+    humanNode.actionable_acceptance_criteria = [1];
+    const onConfirmHumanReview = vi.fn();
+    act(() => {
+      root.render(
+        <TaskInspector
+          project={humanProject}
+          snapshot={snapshot("selected")}
+          selectedNode={humanNode}
+          selectedTaskId="selected"
+          busy={false}
+          error=""
+          recoveryPresentation={null}
+          expectedEventSequence={4}
+          detailsSyncing={false}
+          onClose={vi.fn()}
+          onRefresh={vi.fn()}
+          onAction={vi.fn()}
+          onConfirmHumanReview={onConfirmHumanReview}
+          onChangeMode={vi.fn()}
+        />,
+      );
+    });
+    const acceptanceTab = host.querySelector('[role="tab"][title="验收与证据"]');
+    act(() => acceptanceTab?.dispatchEvent(new MouseEvent("mousedown", {
+      bubbles: true,
+      button: 0,
+    })));
+
+    expect(host.textContent).toContain("人工确认边界");
+    expect(host.textContent).toContain("人工确认");
+    expect(host.textContent).toContain("我已确认该项");
+    expect(host.textContent).not.toContain("AI 证据不足");
+  });
+
   it("does not render deviation controls for a future task", () => {
     render("other-task");
     const acceptanceTab = host.querySelector('[role="tab"][title="验收与证据"]');

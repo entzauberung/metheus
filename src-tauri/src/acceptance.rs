@@ -1,5 +1,76 @@
 use crate::project;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+
+pub(crate) fn evidence_source_fingerprint(
+    test: &project::TestResult,
+    ledger: &[project::AcceptanceLedgerItem],
+) -> crate::provability::EvidenceSourceFingerprint {
+    use crate::provability::EvidenceSourceType;
+
+    let references = ledger
+        .iter()
+        .flat_map(|item| item.evidence_references.iter())
+        .collect::<Vec<_>>();
+    let mut source_types = BTreeSet::new();
+    let mut covered_files = references
+        .iter()
+        .map(|reference| reference.file.clone())
+        .filter(|file| !file.trim().is_empty())
+        .collect::<BTreeSet<_>>();
+    if test.verification_kind == project::VerificationKind::DeterministicLocal {
+        source_types.insert(EvidenceSourceType::LocalScan);
+    }
+    if !test.test_command.trim().is_empty()
+        || !matches!(
+            test.automated_test_status,
+            project::AutomatedTestStatus::Unknown
+        )
+    {
+        source_types.insert(EvidenceSourceType::AutomatedTestOutput);
+    }
+    if !references.is_empty() {
+        let expanded = references.iter().any(|reference| {
+            matches!(
+                reference.source_kind,
+                project::EvidenceSourceKind::IdentifierContext
+                    | project::EvidenceSourceKind::SymbolDefinition
+                    | project::EvidenceSourceKind::SymbolReference
+                    | project::EvidenceSourceKind::LifecycleContext
+            )
+        });
+        source_types.insert(if expanded {
+            EvidenceSourceType::ExpandedCodeSnippet
+        } else {
+            EvidenceSourceType::CodeSnippet
+        });
+    } else if matches!(
+        test.verification_kind,
+        project::VerificationKind::CodeReviewOnly
+            | project::VerificationKind::AutomatedTestAndReview
+    ) {
+        source_types.insert(EvidenceSourceType::CodeSnippet);
+    }
+    if test.verification_kind == project::VerificationKind::HumanOverride {
+        source_types.insert(EvidenceSourceType::RuntimeOrHuman);
+    }
+    for issue in &test.review_issues {
+        if !issue.file.trim().is_empty() {
+            covered_files.insert(issue.file.clone());
+        }
+    }
+    let source_types = source_types.into_iter().collect::<Vec<_>>();
+    let covered_files = covered_files.into_iter().collect::<Vec<_>>();
+    let validator_type = format!("{:?}", test.verification_kind);
+    let bytes =
+        serde_json::to_vec(&(&source_types, &covered_files, &validator_type)).unwrap_or_default();
+    crate::provability::EvidenceSourceFingerprint {
+        fingerprint: format!("sha256:{:x}", Sha256::digest(bytes)),
+        source_types,
+        covered_files,
+        validator_type,
+    }
+}
 
 pub(crate) fn revalidation_target_indexes(
     task: &project::Subtask,
@@ -377,6 +448,32 @@ mod tests {
         assert!(revalidation_target_indexes(&task, &[1, 2, 3])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn provability_closeout_evidence_fingerprint_ignores_more_same_source_snippets() {
+        let test = project::TestResult {
+            verification_kind: project::VerificationKind::CodeReviewOnly,
+            ..Default::default()
+        };
+        let first = vec![project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            evidence_references: vec![evidence_reference()],
+            ..Default::default()
+        }];
+        let mut second = first.clone();
+        second[0]
+            .evidence_references
+            .push(project::ReviewEvidenceReference {
+                block_id: "E002".to_string(),
+                start_line: Some(5),
+                end_line: Some(8),
+                ..evidence_reference()
+            });
+        assert_eq!(
+            evidence_source_fingerprint(&test, &first).fingerprint,
+            evidence_source_fingerprint(&test, &second).fingerprint
+        );
     }
 
     fn criterion_review(
