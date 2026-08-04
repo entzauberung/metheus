@@ -2,7 +2,7 @@
 
 > 弥 · 复杂任务编译系统 — 用精准上下文注入和滚动宪法，把模糊想法编译成可执行、可检查、可回退的代码变更。
 
-> 最后同步：2026-08-02。本文描述 Metheus 仓库当前实现；`src-tauri/CONSTITUTION.md` 是测试/目标项目生成出的项目宪法，不是本仓库的开发约束来源。
+> 最后同步：2026-08-03。本文描述 Metheus 仓库当前实现；`src-tauri/CONSTITUTION.md` 是测试/目标项目生成出的项目宪法，不是本仓库的开发约束来源。
 
 ---
 
@@ -60,23 +60,27 @@
 ### 关键架构原则
 
 - **前端不直接调用任何 AI API**，所有 AI 调用必须经过 Rust 后端
-- **允许使用纯前端交互组件库**（如 Radix UI），但禁止引入后端依赖和复杂状态管理库
+- **依赖引入原则**：新增 Cargo 或前端依赖必须在 PR 说明中注明用途、许可证（须与 MIT/Apache/AGPL 兼容）、是否引入远程通信能力、是否增加超过 10MB 的二进制体积。禁止引入商业闭源依赖和不兼容 AGPL 的许可证。
+- **允许使用纯前端交互组件库**（如 Radix UI）；桌面前端不得直接接入 Node.js 原生模块或数据库驱动，复杂状态能力优先沿用现有后端事实源与 React 状态模型
 - **允许使用图标组件库**（如 lucide-react）
 - **当前安装的前端组件**：@radix-ui/react-dialog, @radix-ui/react-tabs, @radix-ui/react-tooltip, lucide-react。已有对应能力的交互禁止手写替代品。
 - **不使用复杂状态管理库**（Redux、Zustand 等），只用 React 自带的 `useState` / `useEffect`
 - **不使用路由库**，视图由统一工作流状态控制
-- **不在 MVP 阶段引入 WebSocket**，前端通过 Tauri IPC `invoke()` 调用后端
+- **桌面进程通信原则**：Metheus 是桌面应用，进程内通信使用 Tauri IPC/Channel，不引入面向远程网络的通信协议（如 WebSocket）
 - **`project.rs` 只定义数据结构**，业务逻辑分散在各功能模块中
 - **Rust 端 `project.rs` 与前端 `types.ts` 的数据结构必须保持一一对应**
 - **统一工作流状态是业务页面和按钮权限的唯一判断依据**。旧的 Project.status、viewMode 和 isExecuting 只能作为兼容或纯视觉状态。
 - **所有业务事实必须由后端确认并持久化**。前端不得通过临时对象或完整项目覆盖完成关键业务变更。
 - **禁止前端通过 persist_project 任意提交完整项目对象完成关键业务状态变更**。每个审批、检查、生成、执行和回退动作必须调用对应的后端业务接口。
 - **治理模式必须显式区分**：手动模式逐步点击；Managed Flow 只覆盖 ThreeChecks 后到大阶段批准；autopilot 只覆盖已批准大阶段内部流程。任何模式都不得绕过检查、批准、文件范围和 Git 安全边界。
+- **任务控制模式事实（2026-08-03 固化）**：新项目默认使用 `SerialTakeover` 模式，新控制器真实接管任务执行阶段。`Shadow` 为对照审计/回退模式，`Legacy` 为历史兼容模式。
 - **自动驾驶（autopilot）语义（2026-07-15 固化）**：autopilot 只在大阶段边界（`MilestoneReview`）停下由人做 A/B/C；大阶段内部的中阶段生成/检查/批准、执行计划生成/检查/批准、执行、确认全部自动代点；只保留暂停键；执行中暂停等同 In Stop 回退到最近已完成小阶段；autopilot 自动选择下一个未完成大阶段，用户不手选；autopilot 永不自动做 A/B/C 决策。
 - **执行引擎隔离原则（2026-07-25 固化）**：执行层通过 `engine/` 抽象，禁止业务代码直接拼装具体 CLI 参数或引用 `metheus_grok_engine`。`ExecutionProfile` 描述 runtime/provider/permission；执行开始后冻结 profile、应用设置修订、模型、API 后端、接口指纹、内置源码修订或插件可执行路径。合法组合：`Plugin + ClaudeCode`、`Plugin + Codex`、`Plugin + KimiCli`、`Plugin + GrokBuild`、`BuiltIn + GrokBuild`。默认特性为空；只有 `builtin-grok` 或包含它的 `full-product` 才编译内置运行时。轻量模式保留旧项目选择但以 `Disabled` 明确阻断，插件路由不受影响。恢复时任一快照事实不一致必须进入 `WaitingEngine`，经用户明确确认后才能使用新配置。
+- **执行器参数边界（2026-08-03 固化）**：执行引擎的具体参数由各适配器负责，宪法只约束安全边界：禁止执行授权范围外的文件修改，禁止越权操作。
 - **应用设置与密钥原则（2026-07-23 固化）**：非敏感设置持久化到 `~/.metheus/config/app-settings.json`；决策模型和预装 Grok Build API Key 可安全保存到系统凭据库，或由用户明确选择仅本次会话使用；环境变量仅作兼容回退。密钥不得进入项目、设置文件、执行会话、日志、错误文本或前端持久状态。
 - **稳定性原则（2026-07-15 固化）**：不再保留任何"执行前重新生成提示词 / 固定管线自动重拆"的路径；执行端只执行用户或 autopilot 已确认的既定计划（`execution_prompt`），杜绝 AI 歧义。
 - **确定性验证优先原则（2026-08-02 固化）**：路径、字段、依赖、环、顺序、重复和其他可由本地规则判定的事实，必须先由确定性检查裁决，禁止交给 AI 反复挑刺。AI 只补充本地规则不能可靠判断的语义、设计和体验结论；验证深度按变更风险、证据缺口和影响范围伸缩，不使用固定长度流水线代替风险判断。
+- **自适应执行原则（2026-08-03 固化）**：任务的检查深度、验证方式和执行步骤按任务复杂度和风险自适应决定。简单任务可一步执行并通过本地确定性验证；高风险任务才需要多轮计划检查和 AI 语义审查。
 - **检查结论分级原则（2026-08-02 固化）**：检查结果必须区分硬阻断与建议项。缺失必需产物、越权、契约不满足、不可执行和依赖错误属于硬阻断；优化方向、“可考虑”、可选增强和非必需 criteria 只能属于建议。只有硬阻断可以使检查不通过、触发重生成或进入人工停止，建议不得改变 `passed`。
 - **Git 确认事务原则（2026-07-25 固化）**：小阶段与中阶段 V2 标签由大阶段、中阶段、小阶段实体 ID 和稳定确认事务 ID 组成；版本、标题和序号只用于展示。提交、标签和项目收口分阶段持久化，重试复用同一事务和提交。Git 确认受阻必须保留代码与质量结果，不得依据工作区脏状态误分类为执行失败或恢复基线。
 - **不可变标签审计原则（2026-07-25 固化）**：V1/V2 标签均不得删除、覆盖或移动；标签树和回滚使用项目保存的实际标签，回退只调整工作树与项目引用。
@@ -348,7 +352,7 @@ snapshot ──→ project, AppState
 | 函数 | 说明 |
 |------|------|
 | `call_deepseek_api*` | 保留既有业务入口，内部读取一致的设置和密钥快照 |
-| `send_openai_compatible` | 按配置发送普通文本或结构化 OpenAI Chat Completions 请求 |
+| `send_openai_compatible` | 按配置发送普通文本或结构化 OpenAI Chat Completions 请求；正文先按独立超时读取原始字节，再区分网络截断、服务非 JSON 和协议错误并输出脱敏诊断前缀 |
 | `test_model_connection` | 返回模型、延迟和脱敏错误类别，不返回密钥 |
 
 ### `src-tauri/src/json_utils.rs` — JSON 清洗
@@ -395,7 +399,7 @@ snapshot ──→ project, AppState
 | `contract.rs` | 统一契约：健康状态、配置错误、程序来源、原始文本/JSONL 输出协议和进程规格 |
 | `service.rs` | 以一次设置租约冻结健康检查到进程完成；按 runtime/provider 双维路由；注入文件范围约束 |
 | `process_runner.rs` | 通用子进程运行器：环境覆盖、JSONL 映射、流式输出、暂停取消、规格超时、PID 清理 |
-| `claude_code.rs` | Claude Code 适配器：`claude --dangerously-skip-permissions --model … -p <prompt>` |
+| `claude_code.rs` | Claude Code 适配器：具体 CLI 参数由适配器维护，并受统一授权路径与越权阻断边界约束 |
 | `codex.rs` | Codex 适配器：`codex exec … --sandbox danger-full-access -`（prompt 走 stdin） |
 | `kimi_cli.rs` | Kimi CLI 适配器：无人值守 prompt、`stream-json` 与必需能力探测 |
 | `grok_cli.rs` | Grok Build CLI 适配器：无人值守、禁用 memory/subagent/web search、`streaming-json` |
@@ -518,7 +522,7 @@ snapshot ──→ project, AppState
 
 ## 10. 前端组件规则
 
-### 当前安装的依赖（本轮不新增）
+### 当前安装的前端交互依赖
 
 | 依赖 | 用途 |
 |------|------|
@@ -535,13 +539,13 @@ snapshot ──→ project, AppState
 - `StatusBadge` — 统一等待、进行中、通过、失败、暂停和过期状态
 - `FeedbackBanner` — 统一成功、警告、错误和信息提示（支持重试动作）
 
-### 禁止的前端依赖
+### 前端架构边界
 
 - 前端状态管理库（Redux, Zustand, MobX 等）
 - 路由库（React Router, TanStack Router 等）
 - 网络请求库（axios, SWR, TanStack Query 等）
 - 完整主题/UI 框架（Tailwind, Ant Design, Material UI, Chakra UI 等）
-- 后端依赖（Node.js 原生模块、数据库驱动等）
+- Node.js 原生模块、数据库驱动等不得直接进入桌面前端运行时；确需新增的后端能力必须经 Rust 适配层和上述依赖引入审查
 
 ---
 
@@ -669,6 +673,14 @@ snapshot ──→ project, AppState
 12. 执行启动时把项目 `execution_profile` 复制到 `execution_session.engine_snapshot`；同一次执行与恢复链路必须使用该快照，不得读取可能已被用户改写的项目 profile。
 13. 启动执行前必须 `prepare_engine`，在同一设置租约内完成 profile 校验、健康检查、会话快照和实际执行；健康状态阻断时不得启动子进程。
 14. 自动修复前必须核对会话设置快照；设置或可执行路径漂移时进入 `WaitingEngine`，不得静默使用新配置。
+
+### 14.1 运行期执行路径强制接入点
+
+1. **受管改动语义**：工作区改动是否受管，判据是“改动文件是否在当前叶子的授权路径内”，与 Git HEAD 是否等于执行会话基线 commit 无关。HEAD 前进（叶子已 commit）不影响后续叶子的受管路径识别；`base_commit` 仍用于恢复和确认事务。
+2. **split 按独立产物拆分**：split 的合法依据只能是独立产物、独立验收范围或明确依赖顺序。禁止按验收项数量或 `required_identifiers` 机械拆分；单文件单功能无法证明独立边界时直接执行，单次 split 最多生成 4 个叶子。
+3. **新增执行路径收口**：新增执行路径（包括新引擎适配、split 叶子和任务树新路径）必须同时接入受管改动识别、成本账本写记录、事件聚合后推送、JSON 响应容错读取。这四项是架构接入的强制检查点。
+4. **Grok Build 内置 token 可见**：Grok Build 内置引擎执行后必须向成本账本写调用记录。供应方不返回 usage 时，记录调用次数和耗时，token 显示“未知”。
+5. **流式执行事件聚合**：流式执行引擎（含 Grok Build 内置）的文本 token 必须在适配层聚合后推送，禁止 token 级别事件上报到日志面板；工具调用、完成和错误等结构化事件仍独立推送。
 
 ---
 
@@ -1482,7 +1494,7 @@ Phase 30、Phase 31 记录的独立任务控制标签页是当时已经完成并
 - 新项目默认 `SerialTakeover`；`Shadow` 只用于对照审计和显式回退，`Legacy` 只用于兼容。旧项目已有模式和缺失字段的迁移规则保持不变。
 - 验证流程按风险、影响范围和证据缺口伸缩；轻量 Core 门禁继续使用 `.build/core`、关闭默认特性并限制最多两个 Cargo 任务，不以固定长度流水线冒充风险判断。
 - 既有动作租约、陈旧锁自愈、恢复展示分类、成本账本和一次 Schema 协议修复继续作为运行时基础设施，不因本阶段调整而绕过或降级。
-- 项目状态同步以 Tauri Channel 事件为主，事件修订未前进时不得全量拉取；健康通道只保留低频兜底，断开或重连时才提高兜底频率。禁止为此引入 WebSocket。
+- 项目状态同步以 Tauri Channel 事件为主，事件修订未前进时不得全量拉取；健康通道只保留低频兜底，断开或重连时才提高兜底频率。Metheus 的进程内同步只使用 Tauri IPC/Channel，不引入面向远程网络的通信协议。
 
 本阶段的实现与轻量验证结果只在对应代码和定向门禁真实通过后补录，不预写未来日期或虚假通过结论。
 
@@ -1521,3 +1533,23 @@ Phase 30、Phase 31 记录的独立任务控制标签页是当时已经完成并
 - `.build/core`、`CARGO_BUILD_JOBS=2`、`--no-default-features` 下，规划标签校准、标签路由、旧 JSON 兼容迁移、逐项人工边界、同源补证熔断和动作租约窗口共 14 项 Rust 定向测试通过，409 项过滤；仅报告 14 条既有未使用代码告警。
 - `TaskInspector.test.tsx` 8 项通过，覆盖人工证明方式徽标与独立确认入口。未运行无过滤 Rust 全量测试/构建、Clippy、Tauri dev/build、Grok Build、真实模型或发布构建；未新增依赖、未修改锁文件、未执行任何 Git 写操作。
 - 真实桌面烟雾仍未执行；视觉/体验人工确认、长动作超过窗口后的正常收口、强退重启和陈旧锁释放仍须使用与当前源码指纹匹配的 Core 桌面二进制复验。
+
+---
+
+## 37. Phase: 运行期专项修复与执行路径收口（2026-08-03）
+
+### 37.1 实现记录
+
+- split 后续叶子的受管改动只按当前叶子授权路径识别，不再要求 Git HEAD 等于会话基线；授权范围外改动仍按外部改动阻断。
+- OpenAI Compatible 普通响应改为带独立超时的原始字节读取，并区分超时、网络截断、空正文、服务端非 JSON 和完整但形态错误的 JSON；诊断只保留脱敏后的 500 字节前缀。
+- Grok Build 内置执行结果携带可选 token usage，并按任务、模型和执行耗时写入成本账本；供应方缺少 usage 时保留调用与耗时、token 记为未知，账本写入失败不阻断执行。
+- split 只按精确授权文件形成可独立验收的产物组；`required_identifiers` 和反引号标识符不再成为拆分维度，单文件任务保持直接执行，单次拆分上限为 4 个叶子。
+- Grok Build 文本流在适配层按 150ms、换行或 4KB 边界聚合；结构化事件先刷新文本再独立推送。聚合日志通过项目状态 Channel 的 `runtime_dirty` 事件触发前端实时快照同步。
+- 依赖、执行步骤、默认控制模式、桌面进程通信和执行器参数等治理原则已按当前架构修订；运行期四项接入检查点已写入第 14.1 节。
+
+### 37.2 轻量验证记录与边界
+
+- `.build/core`、关闭默认特性且限制两个 Cargo 任务：受管/外部/混合工作区与 split 前序提交回归共 9 项通过；OpenAI Compatible 响应分类与既有 API 测试共 25 项通过。
+- 在两个 Cargo 任务额度用尽后，事件桥使用直接 `rustc --test` 验证 4 项通过；TypeScript 无输出检查通过，项目同步策略与 Hook 共 17 项前端测试通过。`scripts/verify-runtime-fixes.sh --static-only` 的 Rust 格式、宪法文本、依赖锁文件和 `git diff --check` 门禁通过。
+- 成本账本、split 和事件同步的后续 Rust 收口改动只完成了格式、静态链路与直接事件测试验证，未在本轮追加第三个 Cargo 任务，因此本记录不宣称这些后续改动已完成 Cargo 编译封板。新增脚本的完整模式固定为两个定向 Cargo 任务，供下一次独立验证窗口复验。
+- 本轮未运行无过滤 Rust 构建/测试、Clippy、Tauri dev/build 或打包、Grok Build 全量编译、真实模型请求；未新增依赖、未修改锁文件，未执行任何 Git 写操作。

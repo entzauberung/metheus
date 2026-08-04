@@ -1589,6 +1589,7 @@ fn merge_execution_result(
         stdout: repair.stdout,
         stderr: repair.stderr,
         engine_failure_kind: repair.engine_failure_kind,
+        token_usage: repair.token_usage,
     }
 }
 

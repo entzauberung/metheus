@@ -1209,6 +1209,9 @@ pub struct ExecutionResult {
     /// 执行器错误的确定性分类；前端不得解析文本。
     #[serde(default)]
     pub engine_failure_kind: Option<EngineFailureKind>,
+    /// 供应方返回的执行 token；未返回 usage 时保持 None。
+    #[serde(default)]
+    pub token_usage: Option<crate::cost_ledger::ProviderUsage>,
 }
 
 /// 执行引擎错误分类。它描述执行环境事实，不代表项目代码质量。
@@ -3215,6 +3218,7 @@ mod tests {
             "stdout",
             "stderr",
             "engine_failure_kind",
+            "token_usage",
         ] {
             result_value
                 .as_object_mut()
@@ -3228,6 +3232,7 @@ mod tests {
         assert!(result.engine_api_backend.is_empty());
         assert!(result.stderr.is_empty());
         assert!(result.engine_failure_kind.is_none());
+        assert!(result.token_usage.is_none());
         assert_eq!(result.engine_runtime, ExecutionRuntime::Plugin);
         assert_eq!(result.engine_settings_revision, 0);
 

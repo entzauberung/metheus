@@ -127,6 +127,7 @@ export function shouldRequestRuntimeSnapshot(
 ): boolean {
   if (!shouldAcceptProjectStateEvent(cursor, event)) return false;
   if (event.process_start_id !== cursor.processStartId) return true;
+  if (event.runtime_dirty) return true;
   if (event.data_revision > cursor.dataRevision) return true;
   return event.task_control_dirty && (
     event.task_control_tree_revision > cursor.taskControlTreeRevision

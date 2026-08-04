@@ -183,6 +183,7 @@ pub(crate) async fn execute(
         stdout: output.stdout,
         stderr: output.stderr,
         engine_failure_kind,
+        token_usage: None,
     })
 }
 

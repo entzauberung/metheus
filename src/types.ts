@@ -346,6 +346,7 @@ export interface ProjectStateChangedEvent {
   control_action_id: string | null;
   control_mode: TaskControlMode;
   task_control_dirty: boolean;
+  runtime_dirty: boolean;
   occurred_at: string;
 }
 
@@ -824,6 +825,13 @@ export type ProjectStatus = "Idle" | "Discussing" | "Planning" | "MilestoneReady
 
 export type MilestoneStatus = "Pending" | "InProgress" | "Completed" | "Paused";
 
+export interface ProviderUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  cached_input_tokens?: number;
+}
+
 export interface ExecutionResult {
   success: boolean;
   output: string;
@@ -838,6 +846,7 @@ export interface ExecutionResult {
   stdout: string;
   stderr: string;
   engine_failure_kind?: EngineFailureKind;
+  token_usage?: ProviderUsage;
 }
 
 export interface TestResult {

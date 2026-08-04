@@ -116,11 +116,17 @@ impl fmt::Debug for GrokBuildExecutionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrokBuildExecutionResult {
     pub output: String,
     pub turns: u32,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
+    pub token_usage: Option<TokenUsage>,
     pub files_written: Vec<String>,
     pub source_revision: String,
 }

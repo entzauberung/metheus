@@ -72,6 +72,7 @@ function event(sequence: number, overrides: Partial<ProjectStateChangedEvent> = 
     control_action_id: null,
     control_mode: "Shadow",
     task_control_dirty: true,
+    runtime_dirty: false,
     occurred_at: "2026-07-31T00:00:00Z",
     ...overrides,
   };

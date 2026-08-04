@@ -589,6 +589,13 @@ pub(crate) fn split_task(project: &mut project::Project, task_id: &str) -> Resul
                 .as_ref()
                 .ok_or_else(|| "任务编译器未返回安全拆分计划".to_string())?;
             let children = crate::task_compiler::materialize_child_tasks(task, depth, plan)?;
+            if children.len() > crate::task_compiler::MAX_SPLIT_LEAVES {
+                return Err(format!(
+                    "拆分结果包含 {} 个叶子，超过单次拆分上限 {}",
+                    children.len(),
+                    crate::task_compiler::MAX_SPLIT_LEAVES
+                ));
+            }
             task.contract_snapshot = Some(compiled.contract);
             task.child_tasks = children;
             true
@@ -756,6 +763,7 @@ mod tests {
             subtasks: vec![project::Subtask {
                 id: "task".to_string(),
                 title: "Task".to_string(),
+                allowed_file_paths: vec!["a".into(), "b".into(), "c".into(), "d".into()],
                 acceptance_criteria: vec![
                     "file `a` exists".to_string(),
                     "file `b` exists".to_string(),
@@ -833,11 +841,12 @@ mod tests {
     }
 
     #[test]
-    fn split_is_scoped_and_idempotent() {
+    fn runtime_fix_split_is_scoped_bounded_and_idempotent() {
         let mut project = project_with_task();
         split_task(&mut project, "task").unwrap();
         let first_count = project.milestones[0].subtasks[0].child_tasks.len();
         assert_eq!(first_count, 4);
+        assert!(first_count <= crate::task_compiler::MAX_SPLIT_LEAVES);
         split_task(&mut project, "task").unwrap();
         assert_eq!(
             project.milestones[0].subtasks[0].child_tasks.len(),
@@ -847,6 +856,45 @@ mod tests {
             .child_tasks
             .iter()
             .all(|child| child.depends_on.is_empty()));
+    }
+
+    #[test]
+    fn runtime_fix_split_does_not_materialize_identifier_fragments() {
+        let mut project = project_with_task();
+        let task = &mut project.milestones[0].subtasks[0];
+        task.allowed_file_paths = vec!["index.html".to_string()];
+        task.acceptance_criteria = vec![
+            "`updateClock` exists".to_string(),
+            "`Date` is used".to_string(),
+            "`clock` is updated".to_string(),
+            "`</body>` remains present".to_string(),
+            "`0` is padded".to_string(),
+        ];
+        task.required_identifiers = vec![
+            "updateClock".to_string(),
+            "Date".to_string(),
+            "clock".to_string(),
+            "</body>".to_string(),
+            "0".to_string(),
+        ];
+
+        let error = split_task(&mut project, "task").expect_err("单文件任务不得机械拆分");
+        assert!(error.contains("保持单一执行单元"));
+        assert!(project.milestones[0].subtasks[0].child_tasks.is_empty());
+    }
+
+    #[test]
+    fn runtime_fix_split_rejects_more_than_four_leaves_at_command_boundary() {
+        let mut project = project_with_task();
+        let task = &mut project.milestones[0].subtasks[0];
+        task.allowed_file_paths = (0..5).map(|index| format!("src/{index}.rs")).collect();
+        task.acceptance_criteria = (0..5)
+            .map(|index| format!("src/{index}.rs independently passes its check"))
+            .collect();
+
+        let error = split_task(&mut project, "task").expect_err("超过四个叶子必须拒绝拆分");
+        assert!(error.contains("超过单次拆分上限 4"));
+        assert!(project.milestones[0].subtasks[0].child_tasks.is_empty());
     }
 
     #[test]

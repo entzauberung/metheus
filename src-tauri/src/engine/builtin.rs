@@ -306,39 +306,53 @@ fn event_sink(
     execution_id: String,
 ) -> RuntimeEventSink {
     RuntimeEventSink::new(move |event| {
-        let Ok(mut guard) = state.try_lock() else {
-            return;
-        };
-        let Some(pipeline) = guard.as_mut() else {
-            return;
-        };
-        if pipeline.execution_id != execution_id || pipeline.status != PipelineStatus::Running {
-            return;
-        }
-        let text = match event {
-            GrokBuildRuntimeEvent::Started { source_revision } => {
-                format!(
-                    "[Grok Build 内置] 运行时启动 · 源码 {}",
-                    &source_revision[..8]
-                )
+        let project_name = {
+            let mut guard = state.blocking_lock();
+            let Some(pipeline) = guard.as_mut() else {
+                return;
+            };
+            if pipeline.execution_id != execution_id || pipeline.status != PipelineStatus::Running {
+                return;
             }
-            GrokBuildRuntimeEvent::ModelText { text } => {
-                let display: String = text.chars().take(2_000).collect();
-                format!("[Grok Build 内置] {}", display.trim())
+            let text = match event {
+                GrokBuildRuntimeEvent::Started { source_revision } => {
+                    let short_revision = source_revision.get(..8).unwrap_or(&source_revision);
+                    format!(
+                        "[Grok Build 内置] 运行时启动 · 源码 {}",
+                        short_revision
+                    )
+                }
+                GrokBuildRuntimeEvent::ModelText { text } => {
+                    format!("[Grok Build 内置] {text}")
+                }
+                GrokBuildRuntimeEvent::ToolStarted { name } => {
+                    format!("[Grok Build 内置] 调用工具 {name}")
+                }
+                GrokBuildRuntimeEvent::ToolCompleted { name, .. } => {
+                    format!("[Grok Build 内置] 工具 {name} 已完成")
+                }
+                GrokBuildRuntimeEvent::TokenUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                } => format!(
+                    "[Grok Build 内置] Token · 输入 {prompt_tokens} · 输出 {completion_tokens} · 总计 {total_tokens}"
+                ),
+                GrokBuildRuntimeEvent::Completed {
+                    turns,
+                    files_written,
+                } => {
+                    format!("[Grok Build 内置] 完成 · {turns} 轮 · 写入 {files_written} 个授权文件")
+                }
+            };
+            if text.trim().is_empty() {
+                return;
             }
-            GrokBuildRuntimeEvent::ToolStarted { name } => {
-                format!("[Grok Build 内置] 调用工具 {name}")
-            }
-            GrokBuildRuntimeEvent::ToolCompleted { name, .. } => {
-                format!("[Grok Build 内置] 工具 {name} 已完成")
-            }
-            GrokBuildRuntimeEvent::Completed {
-                turns,
-                files_written,
-            } => format!("[Grok Build 内置] 完成 · {turns} 轮 · 写入 {files_written} 个授权文件"),
-        };
-        if !text.trim().is_empty() {
             append_runtime_log(pipeline, "info", text);
+            pipeline.project_name.clone()
+        };
+        if !project_name.is_empty() {
+            let _ = crate::project_state_bus::publish_project_runtime_state(&project_name);
         }
     })
 }
@@ -393,6 +407,14 @@ pub(super) async fn execute(
     match result {
         Ok(result) => {
             let output = result.output;
+            let token_usage = result
+                .token_usage
+                .map(|usage| crate::cost_ledger::ProviderUsage {
+                    input_tokens: Some(usage.prompt_tokens),
+                    output_tokens: Some(usage.completion_tokens),
+                    total_tokens: Some(usage.total_tokens),
+                    cached_input_tokens: None,
+                });
             Ok(ExecutionResult {
                 success: true,
                 output: output.clone(),
@@ -411,6 +433,7 @@ pub(super) async fn execute(
                 stdout: output,
                 stderr: String::new(),
                 engine_failure_kind: None,
+                token_usage,
             })
         }
         Err(error) if error.kind == GrokBuildRuntimeErrorKind::Cancelled => {
@@ -440,6 +463,7 @@ pub(super) async fn execute(
                 stdout: String::new(),
                 stderr: message,
                 engine_failure_kind: Some(map_failure_kind(error.kind)),
+                token_usage: None,
             })
         }
     }

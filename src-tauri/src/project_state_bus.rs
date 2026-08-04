@@ -20,6 +20,9 @@ pub struct ProjectStateChangedEvent {
     pub control_action_id: Option<String>,
     pub control_mode: TaskControlMode,
     pub task_control_dirty: bool,
+    /// 仅运行期快照（如流式日志）已变化；项目数据修订号可以保持不变。
+    #[serde(default)]
+    pub runtime_dirty: bool,
     pub occurred_at: String,
 }
 
@@ -113,6 +116,14 @@ impl ProjectStateBus {
     }
 
     fn publish(&self, project: &Project) -> Result<ProjectStateChangedEvent, String> {
+        self.publish_with_runtime_state(project, false)
+    }
+
+    fn publish_with_runtime_state(
+        &self,
+        project: &Project,
+        runtime_dirty: bool,
+    ) -> Result<ProjectStateChangedEvent, String> {
         let mut streams = self
             .streams
             .lock()
@@ -131,6 +142,7 @@ impl ProjectStateBus {
             &self.process_start_id,
             stream.event_sequence,
             task_control_dirty,
+            runtime_dirty,
         );
 
         // Keep publication and delivery under the same lock so concurrent saves cannot
@@ -162,6 +174,7 @@ fn event_from_project(
     process_start_id: &str,
     event_sequence: u64,
     task_control_dirty: bool,
+    runtime_dirty: bool,
 ) -> ProjectStateChangedEvent {
     let autopilot = project.workflow_state.autopilot_state.as_ref();
     ProjectStateChangedEvent {
@@ -183,6 +196,7 @@ fn event_from_project(
         control_action_id: current_control_action_id(project),
         control_mode: project.task_control.mode,
         task_control_dirty,
+        runtime_dirty,
         occurred_at: chrono::Utc::now().to_rfc3339(),
     }
 }
@@ -221,6 +235,13 @@ pub(crate) fn publish_project_state(project: &Project) -> Result<ProjectStateCha
     bus().publish(project)
 }
 
+pub(crate) fn publish_project_runtime_state(
+    project_name: &str,
+) -> Result<ProjectStateChangedEvent, String> {
+    let project = crate::load_project(project_name)?;
+    bus().publish_with_runtime_state(&project, true)
+}
+
 pub(crate) fn project_state_cursor(project_name: &str) -> Result<ProjectStateSubscription, String> {
     bus().cursor(project_name)
 }
@@ -242,6 +263,22 @@ mod tests {
         assert_eq!(first.process_start_id, second.process_start_id);
         assert!(first.task_control_dirty);
         assert!(!second.task_control_dirty);
+        assert!(!first.runtime_dirty);
+        assert!(!second.runtime_dirty);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_fix_runtime_change_is_explicit_without_data_revision() -> Result<(), String> {
+        let bus = ProjectStateBus::default();
+        let project = Project::new("runtime-state-sequence");
+
+        let persisted = bus.publish(&project)?;
+        let runtime = bus.publish_with_runtime_state(&project, true)?;
+
+        assert_eq!(runtime.data_revision, persisted.data_revision);
+        assert_eq!(runtime.event_sequence, persisted.event_sequence + 1);
+        assert!(runtime.runtime_dirty);
         Ok(())
     }
 

@@ -4,7 +4,7 @@ use crate::task_contract::{compile_subtask, TaskComplexity, TaskContract};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-pub const MAX_CHILD_TASKS_PER_SPLIT: usize = 6;
+pub const MAX_SPLIT_LEAVES: usize = 4;
 pub const MIN_INDEPENDENT_ARTIFACT_GROUPS: usize = 2;
 pub const CHILD_TARGET_SIMILARITY_THRESHOLD: f32 = 0.5;
 
@@ -72,16 +72,22 @@ pub fn compile(subtask: &Subtask, parent_task_id: Option<&str>, depth: u32) -> T
             child_count_hint: 0,
         }
     } else if !atomic {
-        match split_plan.as_ref().filter(|plan| plan.safe) {
-            Some(plan) => TaskCompileDecision {
+        match split_plan.as_ref() {
+            Some(plan) if plan.safe => TaskCompileDecision {
                 kind: TaskCompileDecisionKind::SplitFurther,
                 reason: plan.reason.clone(),
                 max_depth: MAX_DEFAULT_SPLIT_DEPTH,
                 child_count_hint: plan.groups.len() as u32,
             },
-            None => TaskCompileDecision {
+            Some(plan) if plan.groups.len() > MAX_SPLIT_LEAVES => TaskCompileDecision {
                 kind: TaskCompileDecisionKind::HumanBoundary,
-                reason: "任务复杂但无法确定可独立验证的安全拆分边界".to_string(),
+                reason: plan.reason.clone(),
+                max_depth: MAX_DEFAULT_SPLIT_DEPTH,
+                child_count_hint: 0,
+            },
+            _ => TaskCompileDecision {
+                kind: TaskCompileDecisionKind::DirectExecute,
+                reason: "无法确定多个独立产物边界，保守保持单一执行单元".to_string(),
                 max_depth: MAX_DEFAULT_SPLIT_DEPTH,
                 child_count_hint: 0,
             },
@@ -113,6 +119,9 @@ pub fn build_split_plan(subtask: &Subtask) -> Option<TaskSplitPlan> {
         .chain(subtask.new_file_paths.iter())
         .cloned()
         .collect::<BTreeSet<_>>();
+    if authorized_files.len() < MIN_INDEPENDENT_ARTIFACT_GROUPS {
+        return None;
+    }
     let mut working = Vec::<WorkingGroup>::new();
     for (index, criterion) in subtask.acceptance_criteria.iter().enumerate() {
         let anchors = criterion_anchors(criterion, &authorized_files);
@@ -124,7 +133,12 @@ pub fn build_split_plan(subtask: &Subtask) -> Option<TaskSplitPlan> {
             })
             .collect::<Vec<_>>();
         if anchors.is_empty() {
-            if let Some(group) = working.iter_mut().find(|group| group.anchors.is_empty()) {
+            // An unanchored acceptance item is context for the immediately preceding artifact,
+            // never a split dimension of its own. Leading unanchored items remain conservative
+            // and make the eventual plan unsafe instead of being guessed onto an artifact.
+            if let Some(group) = working.last_mut().filter(|group| !group.anchors.is_empty()) {
+                group.push(index as u32 + 1, criterion.clone(), anchors);
+            } else if let Some(group) = working.iter_mut().find(|group| group.anchors.is_empty()) {
                 group.push(index as u32 + 1, criterion.clone(), anchors);
             } else {
                 working.push(WorkingGroup::new(
@@ -151,11 +165,6 @@ pub fn build_split_plan(subtask: &Subtask) -> Option<TaskSplitPlan> {
     if working.len() < MIN_INDEPENDENT_ARTIFACT_GROUPS {
         return None;
     }
-    while working.len() > MAX_CHILD_TASKS_PER_SPLIT {
-        let overflow = working.pop()?;
-        working.last_mut()?.merge(overflow);
-    }
-
     let inferred_parent_anchors = working
         .iter()
         .flat_map(|group| group.anchors.iter())
@@ -173,20 +182,29 @@ pub fn build_split_plan(subtask: &Subtask) -> Option<TaskSplitPlan> {
         .max()
         .unwrap_or(parent_complexity);
     let reduction = parent_complexity.saturating_sub(maximum_child_complexity);
-    let safe = groups.iter().all(|group| group.independently_verifiable)
+    let within_child_limit = groups.len() <= MAX_SPLIT_LEAVES;
+    let safe = within_child_limit
+        && groups.iter().all(|group| group.independently_verifiable)
         && reduction > 0
         && groups.len() >= MIN_INDEPENDENT_ARTIFACT_GROUPS;
     let parallel_safe = groups_are_disjoint(&groups);
     for group in &mut groups {
         group.future_parallel_safe = parallel_safe;
     }
+    let group_count = groups.len();
+    let reason = if group_count > MAX_SPLIT_LEAVES {
+        format!(
+            "候选独立产物共 {} 个，超过单次拆分上限 {}，需要人工或重新规划",
+            group_count, MAX_SPLIT_LEAVES
+        )
+    } else if safe {
+        "任务已按独立授权文件产物拆分，子任务可分别执行与验收".to_string()
+    } else {
+        "候选子任务不能证明独立验收，保留人工边界".to_string()
+    };
     Some(TaskSplitPlan {
         groups,
-        reason: if safe {
-            "任务已按独立产物和实现锚点拆分，子任务可分别执行与验收".to_string()
-        } else {
-            "候选子任务不能证明独立验收，保留人工边界".to_string()
-        },
+        reason,
         parent_complexity,
         maximum_child_complexity,
         estimated_complexity_reduction: reduction,
@@ -199,8 +217,22 @@ pub fn materialize_child_tasks(
     parent_depth: u32,
     plan: &TaskSplitPlan,
 ) -> Result<Vec<Subtask>, String> {
+    if plan.groups.len() > MAX_SPLIT_LEAVES {
+        return Err(format!(
+            "拆分计划包含 {} 个叶子，超过单次拆分上限 {}",
+            plan.groups.len(),
+            MAX_SPLIT_LEAVES
+        ));
+    }
     if !plan.safe || plan.groups.len() < MIN_INDEPENDENT_ARTIFACT_GROUPS {
         return Err("拆分计划未达到安全执行标准".to_string());
+    }
+    if plan.groups.iter().any(|group| {
+        !group.independently_verifiable
+            || group.expected_artifacts.is_empty()
+            || group.write_file_paths.is_empty()
+    }) {
+        return Err("拆分计划包含无法独立验收的产物组".to_string());
     }
     let mut children = Vec::with_capacity(plan.groups.len());
     for (index, group) in plan.groups.iter().enumerate() {
@@ -320,13 +352,19 @@ impl WorkingGroup {
             .filter(|anchor| authorized_files.contains(*anchor))
             .cloned()
             .collect::<Vec<_>>();
-        let related_symbols = self
-            .anchors
+        let related_symbols = parent
+            .related_symbols
             .iter()
-            .filter(|anchor| !authorized_files.contains(*anchor))
+            .filter(|symbol| {
+                self.criteria
+                    .iter()
+                    .any(|criterion| criterion.contains(symbol.as_str()))
+            })
             .cloned()
             .collect::<Vec<_>>();
-        let expected_artifacts = self.anchors.iter().cloned().collect::<Vec<_>>();
+        let expected_artifacts = write_file_paths.clone();
+        let split_basis = format!("独立写入产物：{}", write_file_paths.join("、"));
+        let independently_verifiable = !write_file_paths.is_empty();
         TaskSplitGroup {
             criterion_indexes: self.criterion_indexes,
             criteria: self.criteria,
@@ -339,44 +377,19 @@ impl WorkingGroup {
                 .cloned()
                 .collect(),
             write_file_paths,
-            split_basis: format!(
-                "共同实现锚点：{}",
-                self.anchors.iter().cloned().collect::<Vec<_>>().join("、")
-            ),
-            independently_verifiable: !self.anchors.is_empty(),
+            split_basis,
+            independently_verifiable,
             future_parallel_safe: false,
         }
     }
 }
 
 fn criterion_anchors(criterion: &str, authorized_files: &BTreeSet<String>) -> BTreeSet<String> {
-    let mut anchors = authorized_files
+    authorized_files
         .iter()
         .filter(|path| criterion.contains(path.as_str()))
         .cloned()
-        .collect::<BTreeSet<_>>();
-    anchors.extend(extract_backtick_tokens(criterion));
-    anchors.extend(crate::plan_contract::acceptance_identifiers(&[
-        criterion.to_string()
-    ]));
-    anchors
-}
-
-fn extract_backtick_tokens(value: &str) -> BTreeSet<String> {
-    let mut result = BTreeSet::new();
-    let mut remainder = value;
-    while let Some(start) = remainder.find('`') {
-        remainder = &remainder[start + 1..];
-        let Some(end) = remainder.find('`') else {
-            break;
-        };
-        let token = remainder[..end].trim();
-        if !token.is_empty() {
-            result.insert(token.to_string());
-        }
-        remainder = &remainder[end + 1..];
-    }
-    result
+        .collect()
 }
 
 fn anchors_overlap(left: &BTreeSet<String>, right: &BTreeSet<String>) -> bool {
@@ -464,19 +477,67 @@ mod tests {
     }
 
     #[test]
-    fn generic_complex_task_requires_human_boundary() {
+    fn generic_complex_task_stays_direct_without_artifact_boundaries() {
         let mut task = Subtask::default();
         task.id = "t".into();
         task.allowed_file_paths = (0..6).map(|i| format!("src/{i}.rs")).collect();
         task.acceptance_criteria = (0..4).map(|i| format!("generic criterion {i}")).collect();
         assert_eq!(
             compile(&task, None, 0).decision.kind,
-            TaskCompileDecisionKind::HumanBoundary
+            TaskCompileDecisionKind::DirectExecute
         );
     }
 
     #[test]
-    fn materialized_children_do_not_gain_mechanical_sibling_dependencies() {
+    fn runtime_fix_one_file_identifiers_never_become_split_dimensions() {
+        let mut task = Subtask::default();
+        task.id = "clock".into();
+        task.allowed_file_paths = vec!["index.html".into()];
+        task.acceptance_criteria = vec![
+            "`updateClock` exists".into(),
+            "`Date` is used".into(),
+            "`clock` is updated".into(),
+            "`</body>` remains present".into(),
+            "`0` is padded".into(),
+        ];
+        task.required_identifiers = vec![
+            "updateClock".into(),
+            "Date".into(),
+            "clock".into(),
+            "</body>".into(),
+            "0".into(),
+        ];
+
+        let compiled = compile(&task, None, 0);
+        assert_eq!(
+            compiled.decision.kind,
+            TaskCompileDecisionKind::DirectExecute
+        );
+        assert!(compiled.split_plan.is_none());
+    }
+
+    #[test]
+    fn runtime_fix_more_than_four_artifacts_require_human_replanning() {
+        let mut task = Subtask::default();
+        task.id = "too-many-artifacts".into();
+        task.allowed_file_paths = (0..5).map(|index| format!("src/{index}.rs")).collect();
+        task.acceptance_criteria = (0..5)
+            .map(|index| format!("src/{index}.rs independently passes its check"))
+            .collect();
+
+        let compiled = compile(&task, None, 0);
+        assert_eq!(
+            compiled.decision.kind,
+            TaskCompileDecisionKind::HumanBoundary
+        );
+        let plan = compiled.split_plan.expect("应保留超限诊断计划");
+        assert_eq!(plan.groups.len(), 5);
+        assert!(!plan.safe);
+        assert!(materialize_child_tasks(&task, 0, &plan).is_err());
+    }
+
+    #[test]
+    fn runtime_fix_materialized_children_are_independently_verifiable() {
         let mut task = Subtask::default();
         task.id = "t".into();
         task.title = "Task".into();
@@ -489,8 +550,13 @@ mod tests {
         ];
         let plan = build_split_plan(&task).unwrap();
         let children = materialize_child_tasks(&task, 0, &plan).unwrap();
-        assert!(children.len() >= 2);
+        assert!((2..=MAX_SPLIT_LEAVES).contains(&children.len()));
         assert!(children.iter().all(|child| child.depends_on.is_empty()));
+        assert!(children.iter().all(|child| {
+            child.independently_verifiable
+                && !child.expected_artifacts.is_empty()
+                && !child.acceptance_criteria.is_empty()
+        }));
         assert!(children
             .iter()
             .all(|child| child.acceptance_criteria.len() < task.acceptance_criteria.len()));

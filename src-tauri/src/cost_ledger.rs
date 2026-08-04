@@ -526,6 +526,73 @@ pub fn record_from_metadata(ledger: &mut CostLedger, metadata: &ModelCallMetadat
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn record_execution_call(
+    ledger: &mut CostLedger,
+    call_id: &str,
+    context: &ModelCallContext,
+    provider: &str,
+    model: &str,
+    started_at: String,
+    ended_at: String,
+    elapsed_ms: u64,
+    usage: Option<&ProviderUsage>,
+    produced_change: bool,
+    failure_kind: &str,
+) {
+    ledger.record(ModelCallRecord {
+        call_id: call_id.to_string(),
+        task_id: context.task_id.clone(),
+        stage_id: context.stage_id.clone(),
+        milestone_id: context.milestone_id.clone(),
+        purpose: Some(ModelCallPurpose::Execution),
+        model: model.to_string(),
+        provider: provider.to_string(),
+        started_at,
+        ended_at,
+        input_tokens: usage.and_then(|usage| usage.input_tokens),
+        output_tokens: usage.and_then(|usage| usage.output_tokens),
+        total_tokens: usage.and_then(|usage| usage.total_tokens),
+        elapsed_ms: Some(elapsed_ms),
+        cache_hit: false,
+        produced_change,
+        no_progress: !produced_change,
+        failure_kind: failure_kind.to_string(),
+        ..Default::default()
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_execution_call_best_effort(
+    project_name: &str,
+    call_id: &str,
+    context: &ModelCallContext,
+    provider: &str,
+    model: &str,
+    started_at: String,
+    elapsed_ms: u64,
+    usage: Option<&ProviderUsage>,
+    produced_change: bool,
+    failure_kind: &str,
+) {
+    let _ = crate::mutate_project_for_control(project_name, |project| {
+        record_execution_call(
+            &mut project.cost_ledger,
+            call_id,
+            context,
+            provider,
+            model,
+            started_at,
+            chrono::Utc::now().to_rfc3339(),
+            elapsed_ms,
+            usage,
+            produced_change,
+            failure_kind,
+        );
+        Ok(((), true))
+    });
+}
+
 pub fn record_metadata_best_effort(metadata: &ModelCallMetadata) {
     if metadata.context.project_name.is_empty() {
         return;
@@ -696,6 +763,69 @@ mod tests {
         assert_eq!(summary.known_total_tokens, 0);
         assert_eq!(summary.usage_known_calls, 0);
         assert_eq!(summary.usage_unknown_calls, 1);
+    }
+
+    #[test]
+    fn runtime_fix_grok_execution_records_usage_and_task_context() {
+        let mut ledger = CostLedger::default();
+        record_execution_call(
+            &mut ledger,
+            "execution-1",
+            &ModelCallContext {
+                project_name: "project".to_string(),
+                milestone_id: "milestone".to_string(),
+                stage_id: "stage".to_string(),
+                task_id: "leaf".to_string(),
+                ..Default::default()
+            },
+            "Grok Build",
+            "grok-code-fast-1",
+            "2026-08-03T00:00:00Z".to_string(),
+            "2026-08-03T00:00:01Z".to_string(),
+            1_000,
+            Some(&ProviderUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(5),
+                total_tokens: Some(17),
+                cached_input_tokens: None,
+            }),
+            true,
+            "",
+        );
+
+        assert_eq!(ledger.calls.len(), 1);
+        let call = &ledger.calls[0];
+        assert_eq!(call.provider, "Grok Build");
+        assert_eq!(call.model, "grok-code-fast-1");
+        assert_eq!(call.task_id, "leaf");
+        assert_eq!(call.total_tokens, Some(17));
+        assert_eq!(call.elapsed_ms, Some(1_000));
+        assert_eq!(ledger.summary_for_task("leaf").known_total_tokens, 17);
+    }
+
+    #[test]
+    fn runtime_fix_grok_execution_without_usage_stays_unknown() {
+        let mut ledger = CostLedger::default();
+        record_execution_call(
+            &mut ledger,
+            "execution-2",
+            &ModelCallContext {
+                task_id: "leaf".to_string(),
+                ..Default::default()
+            },
+            "Grok Build",
+            "grok-code-fast-1",
+            String::new(),
+            String::new(),
+            25,
+            None,
+            false,
+            "",
+        );
+
+        assert_eq!(ledger.calls[0].total_tokens, None);
+        assert_eq!(ledger.project_summary.usage_unknown_calls, 1);
+        assert_eq!(ledger.calls[0].elapsed_ms, Some(25));
     }
 
     #[test]

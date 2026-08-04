@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 const MAX_ERROR_CHARS: usize = 2_000;
+const MAX_RESPONSE_DIAGNOSTIC_BYTES: usize = 500;
 const MAX_STREAM_REPLY_CHARS: usize = 200_000;
 const MAX_STREAM_EVENT_BYTES: usize = 64 * 1024;
 const MAX_ORDINARY_RESPONSE_BYTES: usize = MAX_STREAM_REPLY_CHARS * 4;
@@ -542,7 +543,7 @@ async fn send_openai_compatible_with_usage(
         .await
         .map_err(|error| classify_transport_error(error, settings.timeout_secs))?;
 
-    parse_response_with_usage(response, api_key).await
+    parse_response_with_usage(response, api_key, settings.timeout_secs).await
 }
 
 async fn send_openai_compatible_stream<F>(
@@ -976,25 +977,106 @@ fn extract_content_value(content: &serde_json::Value) -> Option<String> {
 async fn parse_response_with_usage(
     response: reqwest::Response,
     api_key: &str,
+    timeout_secs: u64,
+) -> Result<ProviderResponse, ApiRequestError> {
+    parse_response_with_usage_timeout(
+        response,
+        api_key,
+        std::time::Duration::from_secs(timeout_secs),
+    )
+    .await
+}
+
+async fn parse_response_with_usage_timeout(
+    response: reqwest::Response,
+    api_key: &str,
+    read_timeout: std::time::Duration,
 ) -> Result<ProviderResponse, ApiRequestError> {
     let status = response.status();
+    let response_bytes = match tokio::time::timeout(read_timeout, response.bytes()).await {
+        Err(_) => {
+            return Err(ApiRequestError::new(
+                ModelConnectionErrorKind::Timeout,
+                format!(
+                    "读取 OpenAI Compatible 响应超时（超过 {} 秒）",
+                    read_timeout.as_secs_f64()
+                ),
+            ));
+        }
+        Ok(Err(error)) if error.is_timeout() => {
+            return Err(ApiRequestError::new(
+                ModelConnectionErrorKind::Timeout,
+                "读取 OpenAI Compatible 响应超时",
+            ));
+        }
+        Ok(Err(error)) => {
+            let reason = if error.is_body() || error.is_decode() {
+                "响应正文未完整到达"
+            } else {
+                "连接在读取响应正文时中断"
+            };
+            return Err(ApiRequestError::new(
+                ModelConnectionErrorKind::Network,
+                format!("OpenAI Compatible 响应网络读取失败：{reason}"),
+            ));
+        }
+        Ok(Ok(bytes)) => bytes,
+    };
+
     if !status.is_success() {
-        let body = response.text().await.map_err(|error| {
-            ApiRequestError::new(
-                ModelConnectionErrorKind::Protocol,
-                format!("接口返回 HTTP {status}，且错误正文读取失败：{error}"),
-            )
-        })?;
+        let body = String::from_utf8_lossy(&response_bytes);
         let sanitized = sanitize_api_error(&body, api_key);
         return Err(classify_status_error(status, &sanitized));
     }
 
-    let response_data: serde_json::Value = response.json().await.map_err(|error| {
-        ApiRequestError::new(
-            ModelConnectionErrorKind::Protocol,
-            format!("解析 OpenAI Compatible 响应失败：{error}"),
-        )
-    })?;
+    if response_bytes.is_empty() {
+        return Err(ApiRequestError::new(
+            ModelConnectionErrorKind::Network,
+            "OpenAI Compatible 响应正文为空，可能在正文到达前断开连接",
+        ));
+    }
+
+    let response_text = String::from_utf8_lossy(&response_bytes);
+    let first_non_whitespace = response_text.trim_start().chars().next();
+    if !matches!(first_non_whitespace, Some('{') | Some('[')) {
+        let diagnostic = response_body_diagnostic(&response_bytes, api_key);
+        return Err(ApiRequestError::new(
+            ModelConnectionErrorKind::ProviderUnavailable,
+            format!(
+                "OpenAI Compatible 服务返回了非 JSON 正文；响应前缀（已脱敏，最多 500 字节）：{diagnostic}"
+            ),
+        ));
+    }
+
+    let response_data: serde_json::Value = match serde_json::from_slice(&response_bytes) {
+        Ok(value) => value,
+        Err(error) if error.classify() == serde_json::error::Category::Eof => {
+            let diagnostic = response_body_diagnostic(&response_bytes, api_key);
+            return Err(ApiRequestError::new(
+                ModelConnectionErrorKind::Network,
+                format!(
+                    "OpenAI Compatible 响应在 JSON 完成前中断；响应前缀（已脱敏，最多 500 字节）：{diagnostic}"
+                ),
+            ));
+        }
+        Err(initial_error) => {
+            // 与上层 Schema 修复链共用同一确定性清洗入口；仅完整但形态错误的
+            // JSON 进入该路径，EOF/网络截断不会消耗修复机会。
+            let cleaned = crate::json_utils::sanitize_json_response(&response_text);
+            match serde_json::from_str(&cleaned) {
+                Ok(value) => value,
+                Err(cleaned_error) => {
+                    let diagnostic = response_body_diagnostic(&response_bytes, api_key);
+                    return Err(ApiRequestError::new(
+                        ModelConnectionErrorKind::Protocol,
+                        format!(
+                            "解析 OpenAI Compatible JSON 响应失败：{initial_error}；确定性清洗后仍失败：{cleaned_error}；响应前缀（已脱敏，最多 500 字节）：{diagnostic}"
+                        ),
+                    ));
+                }
+            }
+        }
+    };
     let content = extract_message_content(&response_data).ok_or_else(|| {
         ApiRequestError::new(
             ModelConnectionErrorKind::Protocol,
@@ -1121,6 +1203,23 @@ fn sanitize_api_error(value: &str, api_key: &str) -> String {
     };
     let bearer_redacted = redact_bearer_tokens(&exact_redacted);
     truncate_chars(&bearer_redacted, MAX_ERROR_CHARS)
+}
+
+fn response_body_diagnostic(bytes: &[u8], api_key: &str) -> String {
+    let raw = String::from_utf8_lossy(bytes);
+    let sanitized = sanitize_api_error(&raw, api_key);
+    truncate_utf8_bytes(&sanitized, MAX_RESPONSE_DIAGNOSTIC_BYTES)
+}
+
+fn truncate_utf8_bytes(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    let mut end = limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[截断]", &value[..end])
 }
 
 fn redact_bearer_tokens(value: &str) -> String {
@@ -1285,6 +1384,37 @@ mod tests {
         Ok((format!("http://{address}/custom/chat"), handle))
     }
 
+    async fn delayed_response_body(
+        body: &'static str,
+        delay: std::time::Duration,
+    ) -> Result<(String, tokio::task::JoinHandle<Result<(), String>>), String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.map_err(|error| error.to_string())?;
+            let mut buffer = vec![0u8; 16 * 1024];
+            socket
+                .read(&mut buffer)
+                .await
+                .map_err(|error| error.to_string())?;
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .map_err(|error| error.to_string())?;
+            socket.flush().await.map_err(|error| error.to_string())?;
+            tokio::time::sleep(delay).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+            Ok(())
+        });
+        Ok((format!("http://{address}/custom/chat"), handle))
+    }
+
     fn test_settings(request_url: String) -> DecisionModelSettings {
         DecisionModelSettings {
             request_url,
@@ -1389,6 +1519,99 @@ mod tests {
         request
             .await
             .map_err(|join_error| join_error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_fix_classifies_empty_success_body_as_network_failure() -> Result<(), String> {
+        let (url, request) = one_shot_server("200 OK", "").await?;
+        let error = send_openai_compatible(&test_settings(url), "secret", vec![], false, 0.0)
+            .await
+            .expect_err("空响应必须失败");
+
+        assert_eq!(error.kind, ModelConnectionErrorKind::Network);
+        assert!(error.message.contains("响应正文为空"));
+        assert!(!error.message.contains("error decoding response body"));
+        request.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_fix_classifies_truncated_json_as_network_with_prefix() -> Result<(), String> {
+        let body = r#"{"choices":[{"message":{"content":"partial"}}"#;
+        let (url, request) = one_shot_server("200 OK", body).await?;
+        let error = send_openai_compatible(&test_settings(url), "secret", vec![], false, 0.0)
+            .await
+            .expect_err("截断 JSON 必须失败");
+
+        assert_eq!(error.kind, ModelConnectionErrorKind::Network);
+        assert!(error.message.contains("JSON 完成前中断"));
+        assert!(error.message.contains("partial"));
+        request.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_fix_classifies_html_as_unavailable_and_redacts_prefix() -> Result<(), String> {
+        let body = "<html>gateway echoed Bearer metheus-secret-sentinel</html>";
+        let (url, request) = one_shot_server_with_content_type("200 OK", "text/html", body).await?;
+        let error = send_openai_compatible(
+            &test_settings(url),
+            "metheus-secret-sentinel",
+            vec![],
+            false,
+            0.0,
+        )
+        .await
+        .expect_err("HTML 正文必须失败");
+
+        assert_eq!(error.kind, ModelConnectionErrorKind::ProviderUnavailable);
+        assert!(error.message.contains("非 JSON 正文"));
+        assert!(error.message.contains("[REDACTED]"));
+        assert!(!error.message.contains("metheus-secret-sentinel"));
+        request.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_fix_classifies_malformed_json_as_protocol_with_prefix() -> Result<(), String> {
+        let body = r#"{"choices":!}"#;
+        let (url, request) = one_shot_server("200 OK", body).await?;
+        let error = send_openai_compatible(&test_settings(url), "secret", vec![], false, 0.0)
+            .await
+            .expect_err("形态错误 JSON 必须失败");
+
+        assert_eq!(error.kind, ModelConnectionErrorKind::Protocol);
+        assert!(error.message.contains("确定性清洗后仍失败"));
+        assert!(error.message.contains(body));
+        request.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_fix_classifies_body_timeout_without_json_repair() -> Result<(), String> {
+        let (url, request) = delayed_response_body(
+            r#"{"choices":[{"message":{"content":"late"}}]}"#,
+            std::time::Duration::from_millis(100),
+        )
+        .await?;
+        let response = reqwest::Client::new()
+            .post(url)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let error = parse_response_with_usage_timeout(
+            response,
+            "secret",
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .expect_err("正文读取超时必须失败");
+
+        assert_eq!(error.kind, ModelConnectionErrorKind::Timeout);
+        assert!(error.message.contains("读取 OpenAI Compatible 响应超时"));
+        assert!(!error.message.contains("JSON"));
+        request.await.map_err(|error| error.to_string())??;
         Ok(())
     }
 

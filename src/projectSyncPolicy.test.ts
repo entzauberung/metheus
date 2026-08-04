@@ -37,6 +37,7 @@ function event(sequence: number, overrides: Partial<ProjectStateChangedEvent> = 
     control_action_id: null,
     control_mode: "Shadow",
     task_control_dirty: true,
+    runtime_dirty: false,
     occurred_at: "2026-01-01T00:00:00Z",
     ...overrides,
   };
@@ -106,6 +107,12 @@ describe("projectSyncPolicy", () => {
       data_revision: 5,
       task_control_tree_revision: 8,
       task_control_dirty: false,
+    }))).toBe(true);
+    expect(shouldRequestRuntimeSnapshot(cursor, event(9, {
+      data_revision: 4,
+      task_control_tree_revision: 8,
+      task_control_dirty: false,
+      runtime_dirty: true,
     }))).toBe(true);
   });
 

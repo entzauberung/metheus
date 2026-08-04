@@ -768,7 +768,12 @@ async fn execute_current_subtask_background(
 ) -> Result<(), BackgroundExecutionFailure> {
     let execution_started_at = chrono::Utc::now().to_rfc3339();
     let execution_timer = std::time::Instant::now();
-    let exec_result = match crate::engine::execute(
+    let execution_model = if execution_profile.runtime == project::ExecutionRuntime::BuiltIn {
+        prepared_engine.settings().built_in_grok_build.model.clone()
+    } else {
+        execution_profile.provider.display_name().to_string()
+    };
+    let engine_result = crate::engine::execute(
         prepared_engine,
         crate::engine::ExecutionRequest {
             project_path: project_path.clone(),
@@ -779,21 +784,62 @@ async fn execute_current_subtask_background(
         },
         pipeline_state.clone(),
     )
-    .await
-    {
-        Ok(result) => result,
-        Err(crate::engine::EngineError::Cancelled) => return Ok(()),
+    .await;
+    let execution_elapsed_ms = execution_timer.elapsed().as_millis() as u64;
+    let execution_context = crate::cost_ledger::ModelCallContext {
+        project_name: project_name.clone(),
+        milestone_id: milestone_id.clone(),
+        stage_id: mid_stage_id.clone(),
+        task_id: subtask_id.clone(),
+        purpose: Some(crate::cost_ledger::ModelCallPurpose::Execution),
+        ..Default::default()
+    };
+    let record_execution_cost =
+        |usage: Option<&crate::cost_ledger::ProviderUsage>, produced_change, failure_kind: &str| {
+            crate::cost_ledger::record_execution_call_best_effort(
+                &project_name,
+                &execution_id,
+                &execution_context,
+                execution_profile.provider.display_name(),
+                &execution_model,
+                execution_started_at.clone(),
+                execution_elapsed_ms,
+                usage,
+                produced_change,
+                failure_kind,
+            );
+        };
+    let exec_result = match engine_result {
+        Ok(result) => {
+            let failure_kind = result
+                .engine_failure_kind
+                .as_ref()
+                .map(|kind| format!("{kind:?}"))
+                .unwrap_or_default();
+            record_execution_cost(
+                result.token_usage.as_ref(),
+                !result.file_changes.is_empty(),
+                &failure_kind,
+            );
+            result
+        }
+        Err(crate::engine::EngineError::Cancelled) => {
+            record_execution_cost(None, false, "Cancelled");
+            return Ok(());
+        }
         Err(crate::engine::EngineError::Timeout) => {
+            record_execution_cost(None, false, "Timeout");
             return Err(BackgroundExecutionFailure::engine(
                 project::RecoveryErrorKind::ExecutionError,
                 project::EngineFailureKind::Timeout,
                 "执行超时".to_string(),
                 None,
-            ))
+            ));
         }
         Err(error) => {
             let message = error.to_string();
             let kind = crate::engine::classify_process_failure(None, &message, "");
+            record_execution_cost(None, false, &format!("{kind:?}"));
             return Err(BackgroundExecutionFailure::engine(
                 project::RecoveryErrorKind::ExecutionError,
                 kind,
@@ -802,7 +848,6 @@ async fn execute_current_subtask_background(
             ));
         }
     };
-    let execution_elapsed_ms = execution_timer.elapsed().as_millis() as u64;
 
     if !exec_result.success {
         let message = if exec_result.error_log.is_empty() {
@@ -971,29 +1016,6 @@ async fn execute_current_subtask_background(
             "任务合同在执行期间发生变化，拒绝旧结果写回",
         ));
     }
-
-    proj.cost_ledger
-        .record(crate::cost_ledger::ModelCallRecord {
-            call_id: uuid::Uuid::new_v4().to_string(),
-            task_id: subtask_id.clone(),
-            stage_id: mid_stage_id.clone(),
-            purpose: Some(crate::cost_ledger::ModelCallPurpose::Execution),
-            model: execution_profile.provider.display_name().to_string(),
-            provider: execution_profile.provider.display_name().to_string(),
-            started_at: execution_started_at,
-            ended_at: chrono::Utc::now().to_rfc3339(),
-            input_tokens: None,
-            output_tokens: None,
-            total_tokens: None,
-            elapsed_ms: Some(execution_elapsed_ms),
-            cache_hit: false,
-            produced_change: !exec_result.file_changes.is_empty(),
-            produced_evidence: false,
-            produced_plan: false,
-            no_progress: exec_result.file_changes.is_empty(),
-            failure_kind: String::new(),
-            ..Default::default()
-        });
 
     {
         let subtask = crate::task_tree::find_task_mut(&mut proj, &subtask_id)
@@ -3179,17 +3201,7 @@ fn get_execution_workspace_status_for_project(
     }
 
     let managed_paths = proj.execution_session.as_ref().and_then(|session| {
-        if !session.active || session.base_commit.is_empty() {
-            return None;
-        }
-        let current_head = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&proj.project_path)
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())?;
-        if current_head != session.base_commit {
+        if !session.active || session.base_commit.is_empty() || session.subtask_id.is_empty() {
             return None;
         }
         let subtask = crate::task_tree::find_task(proj, &session.subtask_id)
@@ -5586,7 +5598,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_classifies_active_task_changes_separately() -> Result<(), String> {
+    fn runtime_fix_workspace_classifies_managed_external_and_mixed() -> Result<(), String> {
         let repo = TempGitRepo::new("managed-workspace")?;
         let session = execution_session("awaiting_confirmation", "execution-1", &repo.head()?);
         let project = execution_project(
@@ -5612,6 +5624,50 @@ mod tests {
         assert!(mixed.has_managed_task_changes);
         assert!(mixed.has_external_changes);
         assert!(mixed.status_message.contains("范围外"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_fix_workspace_keeps_split_leaf_managed_after_prior_commit() -> Result<(), String> {
+        let repo = TempGitRepo::new("split-managed-workspace")?;
+        let split_base_commit = repo.head()?;
+
+        std::fs::write(repo.path.join("first-leaf.txt"), "first leaf result\n")
+            .map_err(|error| error.to_string())?;
+        repo.git(&["add", "first-leaf.txt"])?;
+        repo.git(&["commit", "--quiet", "-m", "complete first split leaf"])?;
+        assert_ne!(repo.head()?, split_base_commit);
+
+        let mut session =
+            execution_session("awaiting_confirmation", "execution-2", &split_base_commit);
+        session.subtask_id = "subtask-2".to_string();
+        session.subtask_title = "第二个 split 叶子".to_string();
+        session.subtask_index = 1;
+        session.total_subtasks = 2;
+        session.task_path = vec!["subtask-2".to_string()];
+        session.top_level_task_id = "subtask-2".to_string();
+
+        let mut project = execution_project(
+            "split-managed-workspace",
+            &repo.path,
+            project::SubtaskStatus::Passed,
+            Some(session),
+        );
+        let mut second_leaf = test_subtask(project::SubtaskStatus::AwaitingConfirmation);
+        second_leaf.id = "subtask-2".to_string();
+        second_leaf.title = "第二个 split 叶子".to_string();
+        second_leaf.order = 2;
+        project.milestones[0].mid_stages[0]
+            .subtasks
+            .push(second_leaf);
+
+        std::fs::write(repo.path.join("tracked.txt"), "second leaf change\n")
+            .map_err(|error| error.to_string())?;
+        let status = get_execution_workspace_status_for_project(&project)?;
+
+        assert!(status.has_managed_task_changes);
+        assert!(!status.has_external_changes);
+        assert!(status.changes.iter().all(|change| change.managed));
         Ok(())
     }
 

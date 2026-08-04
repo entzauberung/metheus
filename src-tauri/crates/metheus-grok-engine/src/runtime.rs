@@ -1,6 +1,6 @@
 use crate::config::{
     GrokBuildApiBackend, GrokBuildExecutionConfig, GrokBuildExecutionRequest,
-    GrokBuildExecutionResult,
+    GrokBuildExecutionResult, TokenUsage,
 };
 use crate::error::{GrokBuildRuntimeError, GrokBuildRuntimeErrorKind};
 use crate::event_bridge::{GrokBuildRuntimeEvent, emit};
@@ -70,14 +70,24 @@ pub async fn execute(
     let result = xai_grok_shell::metheus_embedded::execute(embedded_config, embedded_request)
         .await
         .map_err(map_embedded_error)?;
+    let token_usage = token_usage(result.prompt_tokens, result.completion_tokens);
     let result = GrokBuildExecutionResult {
         output: result.output,
         turns: result.turns,
-        prompt_tokens: result.prompt_tokens,
-        completion_tokens: result.completion_tokens,
+        token_usage,
         files_written: result.files_written,
         source_revision: COMBINED_SOURCE_REVISION.to_string(),
     };
+    if let Some(usage) = result.token_usage.as_ref() {
+        emit(
+            request.event_sink.as_ref(),
+            GrokBuildRuntimeEvent::TokenUsage {
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+            },
+        );
+    }
     emit(
         request.event_sink.as_ref(),
         GrokBuildRuntimeEvent::Completed {
@@ -86,6 +96,14 @@ pub async fn execute(
         },
     );
     Ok(result)
+}
+
+fn token_usage(prompt_tokens: u64, completion_tokens: u64) -> Option<TokenUsage> {
+    (prompt_tokens > 0 || completion_tokens > 0).then_some(TokenUsage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+    })
 }
 
 fn map_embedded_error(error: EmbeddedError) -> GrokBuildRuntimeError {
@@ -161,6 +179,15 @@ impl Drop for SelfTestDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_fix_token_usage_is_optional_and_totals_provider_counts() {
+        assert!(token_usage(0, 0).is_none());
+        let usage = token_usage(12, 5).expect("供应方 usage 应被保留");
+        assert_eq!(usage.prompt_tokens, 12);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 17);
+    }
 
     #[test]
     fn maps_all_embedded_error_categories() {
