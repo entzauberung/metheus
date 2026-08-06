@@ -96,6 +96,16 @@ pub fn build_at_event(
     event_sequence: u64,
 ) -> Result<TaskControlSnapshot, String> {
     crate::task_tree::validate_project_tree(project)?;
+    let has_tasks = project.milestones.iter().any(|milestone| {
+        !milestone.subtasks.is_empty()
+            || milestone
+                .mid_stages
+                .iter()
+                .any(|stage| !stage.subtasks.is_empty())
+    });
+    let workload = has_tasks
+        .then(|| crate::workload_policy::current_profile(project))
+        .transpose()?;
     let selected_address = crate::task_tree::select_current_leaf(project)?;
     let selected_task_id = selected_address
         .as_ref()
@@ -103,7 +113,12 @@ pub fn build_at_event(
         .unwrap_or_default();
     let mut nodes = Vec::new();
     for milestone in &project.milestones {
-        nodes.push(milestone_node(project, milestone, &selected_task_id));
+        nodes.push(milestone_node(
+            project,
+            milestone,
+            &selected_task_id,
+            workload,
+        ));
     }
     let selected = crate::task_tree::find_task(project, &selected_task_id)?;
     let (selected_contract, acceptance, selected_can_split) = if let Some(task) = selected {
@@ -114,6 +129,7 @@ pub fn build_at_event(
             task,
             address.ancestor_task_ids.last().map(String::as_str),
             address.depth,
+            workload.expect("selected task requires a workload profile"),
         );
         (
             Some(result.contract.clone()),
@@ -129,6 +145,9 @@ pub fn build_at_event(
         .as_ref()
         .filter(|decision| decision.task_id == selected_task_id)
         .cloned();
+    let plan_target_id = crate::plan_scope::PlanScope::resolve(project)
+        .map(|scope| scope.target_id(project).to_string())
+        .unwrap_or_default();
     let events = project
         .execution_history
         .iter()
@@ -176,9 +195,7 @@ pub fn build_at_event(
         recent_action: recent_action(project),
         control_capabilities: control_capabilities(project, selected, selected_can_split),
         cost: project.cost_ledger.project_summary.clone(),
-        stage_cost: project
-            .cost_ledger
-            .summary_for_stage(&project.current_mid_stage_id),
+        stage_cost: project.cost_ledger.summary_for_stage(&plan_target_id),
         task_cost: project.cost_ledger.summary_for_task(&selected_task_id),
         provider_costs: project.cost_ledger.summaries_by_provider(),
         purpose_costs: project.cost_ledger.summaries_by_purpose(),
@@ -278,17 +295,28 @@ fn milestone_node(
     project: &Project,
     milestone: &Milestone,
     current_task_id: &str,
+    workload: Option<&crate::project::WorkloadProfile>,
 ) -> TaskTreeNodeView {
     let mut children = milestone
         .mid_stages
         .iter()
-        .map(|stage| mid_stage_node(project, stage, current_task_id))
+        .map(|stage| mid_stage_node(project, stage, current_task_id, workload))
         .collect::<Vec<_>>();
     if children.is_empty() {
         children = milestone
             .subtasks
             .iter()
-            .map(|task| subtask_node(project, task, None, 1, current_task_id))
+            .map(|task| {
+                subtask_node(
+                    project,
+                    task,
+                    None,
+                    1,
+                    0,
+                    current_task_id,
+                    workload.expect("task node requires a workload profile"),
+                )
+            })
             .collect();
     }
     TaskTreeNodeView {
@@ -311,7 +339,12 @@ fn milestone_node(
     }
 }
 
-fn mid_stage_node(project: &Project, stage: &MidStage, current_task_id: &str) -> TaskTreeNodeView {
+fn mid_stage_node(
+    project: &Project,
+    stage: &MidStage,
+    current_task_id: &str,
+    workload: Option<&crate::project::WorkloadProfile>,
+) -> TaskTreeNodeView {
     TaskTreeNodeView {
         id: stage.id.clone(),
         title: stage.title.clone(),
@@ -331,7 +364,17 @@ fn mid_stage_node(project: &Project, stage: &MidStage, current_task_id: &str) ->
         children: stage
             .subtasks
             .iter()
-            .map(|task| subtask_node(project, task, Some(&stage.id), 2, current_task_id))
+            .map(|task| {
+                subtask_node(
+                    project,
+                    task,
+                    Some(&stage.id),
+                    2,
+                    0,
+                    current_task_id,
+                    workload.expect("task node requires a workload profile"),
+                )
+            })
             .collect(),
     }
 }
@@ -340,10 +383,12 @@ fn subtask_node(
     project: &Project,
     task: &Subtask,
     parent: Option<&str>,
-    depth: u32,
+    view_depth: u32,
+    task_depth: u32,
     current_task_id: &str,
+    workload: &crate::project::WorkloadProfile,
 ) -> TaskTreeNodeView {
-    let result = compile(task, parent, depth);
+    let result = compile(task, parent, task_depth, workload);
     let (capabilities, disabled_reasons, actionable_acceptance_criteria) =
         node_capabilities(project, task, task.id == current_task_id, &result);
     TaskTreeNodeView {
@@ -351,7 +396,7 @@ fn subtask_node(
         title: task.title.clone(),
         node_type: "Subtask".to_string(),
         status: format!("{:?}", task.status),
-        depth,
+        depth: view_depth,
         complexity: format!("{:?}", result.contract.complexity),
         risk: format!("{:?}", result.contract.risk),
         contract_fingerprint: result.contract.fingerprint.clone(),
@@ -365,7 +410,17 @@ fn subtask_node(
         children: task
             .child_tasks
             .iter()
-            .map(|child| subtask_node(project, child, Some(&task.id), depth + 1, current_task_id))
+            .map(|child| {
+                subtask_node(
+                    project,
+                    child,
+                    Some(&task.id),
+                    view_depth.saturating_add(1),
+                    task_depth.saturating_add(1),
+                    current_task_id,
+                    workload,
+                )
+            })
             .collect(),
     }
 }
@@ -549,8 +604,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_supports_quick_and_professional_trees() {
+    fn adaptive_execution_contract_snapshot_supports_both_topologies() {
         let mut project = Project::new("snapshot");
+        project.workload_profile = Some(crate::workload_policy::test_profile(
+            crate::project::WorkloadScale::Standard,
+        ));
         project.milestones.push(Milestone {
             id: "m".into(),
             version: "v0.1".into(),
@@ -575,6 +633,7 @@ mod tests {
             dependencies: Vec::new(),
             expected_output: String::new(),
             acceptance_criteria: Vec::new(),
+            ..Default::default()
         });
         project.current_milestone_id = "m".into();
         let snapshot = build(&project).unwrap();
@@ -585,6 +644,9 @@ mod tests {
     #[test]
     fn snapshot_uses_the_persisted_decision_without_regenerating_it() {
         let mut project = Project::new("snapshot-decision");
+        project.workload_profile = Some(crate::workload_policy::test_profile(
+            crate::project::WorkloadScale::Standard,
+        ));
         project.milestones.push(Milestone {
             id: "m".into(),
             version: "v0.1".into(),
@@ -610,10 +672,11 @@ mod tests {
             dependencies: Vec::new(),
             expected_output: String::new(),
             acceptance_criteria: Vec::new(),
+            ..Default::default()
         });
         project.current_milestone_id = "m".into();
         let task = &project.milestones[0].subtasks[0];
-        let compiled = compile(task, None, 1);
+        let compiled = compile(task, None, 0, project.workload_profile.as_ref().unwrap());
         let decision =
             crate::control_scheduler::decide_next_action(task, &compiled, "facts", false);
         let decision_id = decision.decision_id.clone();
@@ -664,6 +727,9 @@ mod tests {
             ..Default::default()
         };
         let mut project = Project::new("node-capabilities");
+        project.workload_profile = Some(crate::workload_policy::test_profile(
+            crate::project::WorkloadScale::Standard,
+        ));
         project.current_milestone_id = "m".into();
         project.milestones.push(Milestone {
             id: "m".into(),
@@ -686,6 +752,7 @@ mod tests {
             dependencies: Vec::new(),
             expected_output: String::new(),
             acceptance_criteria: Vec::new(),
+            ..Default::default()
         });
 
         let snapshot = build(&project).unwrap();
@@ -708,6 +775,9 @@ mod tests {
     #[test]
     fn runtime_fault_regression_stale_lock_cleanup_restores_node_capabilities() {
         let mut project = Project::new("stale-capabilities");
+        project.workload_profile = Some(crate::workload_policy::test_profile(
+            crate::project::WorkloadScale::Standard,
+        ));
         project.current_milestone_id = "m".into();
         project.milestones.push(Milestone {
             id: "m".into(),
@@ -736,6 +806,7 @@ mod tests {
             dependencies: Vec::new(),
             expected_output: String::new(),
             acceptance_criteria: Vec::new(),
+            ..Default::default()
         });
         let now = chrono::Utc::now();
         let lease = crate::task_control::ControlActionLease {

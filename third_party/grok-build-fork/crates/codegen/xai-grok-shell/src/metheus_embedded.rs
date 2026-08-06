@@ -19,8 +19,10 @@ use tokio::sync::oneshot;
 use xai_grok_tools::implementations::metheus_embedded::EMBEDDED_PATH_NOT_FOUND;
 use xai_grok_tools::implementations::metheus_embedded::EmbeddedFilePolicy;
 
-pub const FORK_REVISION: &str = "metheus.2";
+pub const FORK_REVISION: &str = "metheus.3";
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_EVENT_TEXT_CHARS: usize = 2_000;
+const TRUNCATION_SUFFIX: &str = "...[truncated]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbeddedApiBackend {
@@ -37,6 +39,8 @@ pub struct EmbeddedConfig {
     pub api_key: String,
     pub timeout: Duration,
     pub max_turns: usize,
+    pub max_transport_retries: u32,
+    pub max_doom_loop_retries: u32,
 }
 
 impl fmt::Debug for EmbeddedConfig {
@@ -49,6 +53,8 @@ impl fmt::Debug for EmbeddedConfig {
             .field("api_key_configured", &!self.api_key.is_empty())
             .field("timeout", &self.timeout)
             .field("max_turns", &self.max_turns)
+            .field("max_transport_retries", &self.max_transport_retries)
+            .field("max_doom_loop_retries", &self.max_doom_loop_retries)
             .finish()
     }
 }
@@ -80,18 +86,69 @@ pub enum EmbeddedEvent {
     ModelText(String),
     ToolStarted(String),
     ToolCompleted(String),
+    ToolFailed(String),
+    RetryScheduled {
+        attempt: u32,
+        max_retries: u32,
+        reason: String,
+    },
+    RetryExhausted {
+        attempts: u32,
+        reason: String,
+        is_rate_limited: bool,
+    },
+    RetryFailed {
+        error_type: String,
+        message: String,
+    },
 }
 
 #[derive(Clone)]
-pub struct EmbeddedEventSink(Arc<dyn Fn(EmbeddedEvent) + Send + Sync>);
+pub struct EmbeddedEventSink {
+    sender: std::sync::mpsc::Sender<EmbeddedEventDispatch>,
+}
+
+enum EmbeddedEventDispatch {
+    Event(EmbeddedEvent),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
 
 impl EmbeddedEventSink {
     pub fn new(callback: impl Fn(EmbeddedEvent) + Send + Sync + 'static) -> Self {
-        Self(Arc::new(callback))
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name("metheus-grok-embedded-events".to_string())
+            .spawn(move || {
+                while let Ok(dispatch) = receiver.recv() {
+                    match dispatch {
+                        EmbeddedEventDispatch::Event(event) => callback(event),
+                        EmbeddedEventDispatch::Flush(completed) => {
+                            let _ = completed.send(());
+                        }
+                    }
+                }
+            });
+        Self { sender }
     }
 
     fn emit(&self, event: EmbeddedEvent) {
-        (self.0)(event);
+        // Never run the host callback on SessionActor. The unbounded queue keeps notification
+        // delivery non-blocking; a stopped worker simply closes it.
+        let _ = self.sender.send(EmbeddedEventDispatch::Event(event));
+    }
+
+    /// Wait until every event previously emitted by SessionActor has reached the host callback.
+    /// This is called only after the actor has returned, before the adapter publishes its final
+    /// result, so it cannot add backpressure to SessionActor.
+    pub fn flush(&self) {
+        let (completed, receiver) = std::sync::mpsc::sync_channel(0);
+        if self
+            .sender
+            .send(EmbeddedEventDispatch::Flush(completed))
+            .is_ok()
+        {
+            let _ = receiver.recv();
+        }
     }
 }
 
@@ -223,6 +280,7 @@ async fn execute_local(
     let client = Arc::new(RestrictedClient::new(
         policy.clone(),
         request.event_sink.clone(),
+        config.api_key.clone(),
     ));
     let (gateway, receiver) = xai_acp_lib::acp_gateway::<acp::AgentSide, _>(client.clone());
     let gateway_task = tokio::task::spawn_local(receiver.run());
@@ -243,11 +301,20 @@ async fn execute_local(
             xai_grok_sampler::AuthScheme::Bearer
         },
         context_window: 128_000,
-        max_retries: Some(2),
+        max_retries: Some(config.max_transport_retries),
         stream_tool_calls: true,
         idle_timeout_secs: Some(config.timeout.as_secs()),
         client_identifier: Some("metheus-embedded".to_string()),
         client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        doom_loop_recovery: (config.max_doom_loop_retries > 0).then(|| {
+            xai_grok_sampling_types::DoomLoopRecoveryPolicy {
+                max_threshold:
+                    xai_grok_sampling_types::DoomLoopRecoveryPolicy::DEFAULT_MAX_THRESHOLD,
+                max_retries: xai_grok_sampling_types::DoomLoopRecoveryPolicy::clamp_max_retries(
+                    config.max_doom_loop_retries,
+                ),
+            }
+        }),
         ..Default::default()
     };
     let max_turns = u32::try_from(config.max_turns).map_err(|_| {
@@ -433,7 +500,7 @@ async fn execute_local(
         output: client
             .output
             .lock()
-            .map(|value| value.clone())
+            .map(|value| value.text.clone())
             .unwrap_or_default(),
         turns,
         prompt_tokens,
@@ -500,30 +567,82 @@ fn validate(config: &EmbeddedConfig, request: &EmbeddedRequest) -> Result<(), Em
 
 struct RestrictedClient {
     policy: EmbeddedFilePolicy,
-    output: Mutex<String>,
+    output: Mutex<OutputState>,
     written: Mutex<BTreeSet<String>>,
     tool_names: Mutex<HashMap<String, String>>,
     policy_violation: Mutex<Option<String>>,
     policy_notify: tokio::sync::Notify,
     event_sink: Option<EmbeddedEventSink>,
+    api_key: String,
+    last_retry_attempt: Mutex<u32>,
+}
+
+#[derive(Default)]
+struct OutputState {
+    text: String,
+    attempt_start: Option<usize>,
+}
+
+impl OutputState {
+    fn push_attempt_text(&mut self, text: &str) {
+        self.attempt_start.get_or_insert(self.text.len());
+        self.text.push_str(text);
+    }
+
+    fn accept_attempt(&mut self) {
+        self.attempt_start = None;
+    }
+
+    fn discard_attempt(&mut self) {
+        if let Some(start) = self.attempt_start {
+            self.text.truncate(start);
+        }
+    }
 }
 
 impl RestrictedClient {
-    fn new(policy: EmbeddedFilePolicy, event_sink: Option<EmbeddedEventSink>) -> Self {
+    fn new(
+        policy: EmbeddedFilePolicy,
+        event_sink: Option<EmbeddedEventSink>,
+        api_key: String,
+    ) -> Self {
         Self {
             policy,
-            output: Mutex::new(String::new()),
+            output: Mutex::new(OutputState::default()),
             written: Mutex::new(BTreeSet::new()),
             tool_names: Mutex::new(HashMap::new()),
             policy_violation: Mutex::new(None),
             policy_notify: tokio::sync::Notify::new(),
             event_sink,
+            api_key,
+            last_retry_attempt: Mutex::new(0),
         }
     }
 
     fn emit(&self, event: EmbeddedEvent) {
         if let Some(sink) = &self.event_sink {
             sink.emit(event);
+        }
+    }
+
+    fn sanitize_event_text(&self, value: impl Into<String>) -> String {
+        let value = value.into();
+        let redacted = if self.api_key.is_empty() {
+            value
+        } else {
+            value.replace(&self.api_key, "[REDACTED]")
+        };
+        if redacted.chars().count() <= MAX_EVENT_TEXT_CHARS {
+            redacted
+        } else {
+            format!(
+                "{}{}",
+                redacted
+                    .chars()
+                    .take(MAX_EVENT_TEXT_CHARS - TRUNCATION_SUFFIX.chars().count())
+                    .collect::<String>(),
+                TRUNCATION_SUFFIX,
+            )
         }
     }
 
@@ -551,14 +670,23 @@ impl acp::Client for RestrictedClient {
     async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
         match args.update {
             acp::SessionUpdate::AgentMessageChunk(chunk) => {
+                if let Ok(mut attempt) = self.last_retry_attempt.lock() {
+                    *attempt = 0;
+                }
                 if let acp::ContentBlock::Text(text) = chunk.content {
                     if let Ok(mut output) = self.output.lock() {
-                        output.push_str(&text.text);
+                        output.push_attempt_text(&text.text);
                     }
                     self.emit(EmbeddedEvent::ModelText(text.text));
                 }
             }
             acp::SessionUpdate::ToolCall(call) => {
+                if let Ok(mut attempt) = self.last_retry_attempt.lock() {
+                    *attempt = 0;
+                }
+                if let Ok(mut output) = self.output.lock() {
+                    output.accept_attempt();
+                }
                 let id = call.tool_call_id.to_string();
                 if let Ok(mut names) = self.tool_names.lock() {
                     names.insert(id, call.title.clone());
@@ -572,15 +700,99 @@ impl acp::Client for RestrictedClient {
                 ) =>
             {
                 let id = update.tool_call_id.to_string();
+                let remembered_name = self
+                    .tool_names
+                    .lock()
+                    .ok()
+                    .and_then(|mut names| names.remove(&id));
                 let name = update
                     .fields
                     .title
-                    .or_else(|| self.tool_names.lock().ok()?.get(&id).cloned())
+                    .or(remembered_name)
                     .unwrap_or_else(|| "tool".to_string());
-                self.emit(EmbeddedEvent::ToolCompleted(name));
+                match update.fields.status {
+                    Some(acp::ToolCallStatus::Completed) => {
+                        self.emit(EmbeddedEvent::ToolCompleted(name));
+                    }
+                    Some(acp::ToolCallStatus::Failed) => {
+                        self.emit(EmbeddedEvent::ToolFailed(name));
+                    }
+                    _ => {}
+                }
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    async fn ext_notification(&self, args: acp::ExtNotification) -> acp::Result<()> {
+        if args.method.as_ref() != "x.ai/session_notification" {
+            return Ok(());
+        }
+        let Ok(notification) = serde_json::from_str::<
+            crate::extensions::notification::SessionNotification,
+        >(args.params.get()) else {
+            return Ok(());
+        };
+        let crate::extensions::notification::SessionUpdate::RetryState(state) = notification.update
+        else {
+            return Ok(());
+        };
+        use crate::extensions::notification::RetryState;
+        let event = match state {
+            RetryState::Retrying {
+                attempt,
+                max_retries,
+                reason,
+            } => {
+                if let Ok(mut output) = self.output.lock() {
+                    output.discard_attempt();
+                }
+                if let Ok(mut last_attempt) = self.last_retry_attempt.lock() {
+                    *last_attempt = attempt;
+                }
+                EmbeddedEvent::RetryScheduled {
+                    attempt,
+                    max_retries,
+                    reason: self.sanitize_event_text(reason),
+                }
+            }
+            RetryState::Exhausted {
+                attempts,
+                reason,
+                is_rate_limited,
+            } => {
+                let attempts = if let Ok(mut last_attempt) = self.last_retry_attempt.lock() {
+                    let normalized = if attempts == 0 {
+                        last_attempt.saturating_add(1).max(1)
+                    } else {
+                        attempts
+                    };
+                    *last_attempt = 0;
+                    normalized
+                } else {
+                    attempts.max(1)
+                };
+                EmbeddedEvent::RetryExhausted {
+                    attempts,
+                    reason: self.sanitize_event_text(reason),
+                    is_rate_limited,
+                }
+            }
+            RetryState::Failed {
+                error_type,
+                message,
+            } => {
+                if let Ok(mut attempt) = self.last_retry_attempt.lock() {
+                    *attempt = 0;
+                }
+                EmbeddedEvent::RetryFailed {
+                    error_type: self.sanitize_event_text(error_type),
+                    message: self.sanitize_event_text(message),
+                }
+            }
+        };
+        self.emit(event);
         Ok(())
     }
 

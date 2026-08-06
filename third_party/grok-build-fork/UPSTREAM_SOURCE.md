@@ -8,8 +8,8 @@
 - Imported: 2026-07-23
 - License: Apache-2.0
 - Required Rust toolchain: 1.92
-- Metheus fork revision: `metheus.2`
-- Metheus adapter version: 2
+- Metheus fork revision: `metheus.3`
+- Metheus adapter version: 3
 
 This directory starts from the unmodified archive recorded above and contains
 the controlled Metheus changes listed in `PATCHSET.md`. The pristine audit
@@ -21,3 +21,7 @@ facade drives the upstream `MvpAgent`, `AgentBuilder`, and `SessionActor` in the
 application process. It does not invoke the Grok CLI. Its model-visible tools
 are restricted to `read_file`, `search_replace`, `list_dir`, and `grep`, all
 under a frozen project-root and exact write authorization policy.
+
+The `metheus.3` facade additionally freezes sampler transport retries and
+upstream Doom-loop recovery retries per task, and forwards structured
+SessionActor failure/retry events without expanding the tool surface.

@@ -7,6 +7,7 @@ import { FeedbackBanner } from "../components/FeedbackBanner";
 import { Modal } from "../components/Modal";
 import { StageCandidateCard } from "../components/StageCandidateCard";
 import { WorkflowActionBar } from "../components/WorkflowActionBar";
+import { resolvePlanTarget } from "../planTargetPolicy";
 
 interface Props {
   project: Project; busy: boolean; feedback: ConsoleFeedback | null;
@@ -38,13 +39,14 @@ function PlanCards({ tasks }: { tasks: Subtask[] }) {
 
 export function ExecutionPlanStep(props: Props) {
   const step = props.project.workflow_state.current_step;
-  const milestone = props.project.milestones.find((item) => item.id === props.project.current_milestone_id);
-  const midStage = milestone?.mid_stages.find((item) => item.id === props.project.current_mid_stage_id);
-  const tasks = midStage?.subtasks ?? [];
-  const check = midStage?.plan_check_result;
+  const target = resolvePlanTarget(props.project);
+  const tasks = target?.subtasks ?? [];
+  const check = target?.planCheckResult ?? undefined;
+
+  if (!target) return <EmptyState title="计划目标不可用" message="当前工作负载画像与执行树不一致，请同步项目状态。" />;
 
   if (step === "PlanGeneration") return (
-    <ConsoleStepShell icon={<ClipboardList />} title="生成执行计划" description={midStage?.title || "当前中阶段"}
+    <ConsoleStepShell icon={<ClipboardList />} title="生成执行计划" description={target.title}
       status={props.busy ? "progress" : "pending"} statusLabel={props.busy ? "生成中" : "待生成"}
       feedback={props.feedback} busy={props.busy}
       actions={props.busy ? undefined : <WorkflowActionBar><ActionButton icon={<WandSparkles size={16} />} loading={props.busy} loadingLabel="生成中" onClick={props.onGenerate}>生成执行计划</ActionButton></WorkflowActionBar>}>
@@ -67,7 +69,7 @@ export function ExecutionPlanStep(props: Props) {
     </ConsoleStepShell>
   );
 
-  const isApproved = midStage?.plan_approved_at != null && (midStage?.plan_revision ?? 0) > 0;
+  const isApproved = target.planApprovedAt != null && target.planRevision > 0;
   const isAtApprovalStep = step === "PlanApproving";
 
   // If plan is approved but step hasn't transitioned to Execution (e.g., after refresh),

@@ -7,6 +7,7 @@ import { MilestonePlanningStep } from "./console/MilestonePlanningStep";
 import { MidStagePlanningStep } from "./console/MidStagePlanningStep";
 import { ExecutionPlanStep } from "./console/ExecutionPlanStep";
 import { getManagedFlowPresentation } from "./managedFlowPolicy";
+import { resolvePlanTarget } from "./planTargetPolicy";
 
 interface Props {
   project: Project;
@@ -160,11 +161,10 @@ export function ConsoleWorkflowPanel({
   };
 
   const handleRegeneratePlan = async (source: RegenerationSource) => {
-    const milestone = project.milestones.find((item) => item.id === project.current_milestone_id);
-    const midStage = milestone?.mid_stages.find((item) => item.id === project.current_mid_stage_id);
-    if (!midStage || !beginAction("regenerate_execution_plan")) return;
+    const target = resolvePlanTarget(project);
+    if (!target || !beginAction("regenerate_execution_plan")) return;
     const revision = project.workflow_state.data_revision;
-    const planRevision = midStage.plan_draft_revision;
+    const planRevision = target.planDraftRevision;
     setFeedback(null);
     try {
       const result = await invokeWithTimeout<RuntimeMutationResult>("regenerate_execution_plan_runtime", {
@@ -177,9 +177,9 @@ export function ConsoleWorkflowPanel({
     } catch (error) {
       if (isInvokeTimeoutError(error)) {
         const done = await coordinate((latest) => {
-          const latestMilestone = latest.milestones.find((item) => item.id === latest.current_milestone_id);
-          const latestMid = latestMilestone?.mid_stages.find((item) => item.id === latest.current_mid_stage_id);
-          return latest.workflow_state.data_revision > revision && (latestMid?.plan_draft_revision ?? 0) > planRevision;
+          const latestTarget = resolvePlanTarget(latest);
+          return latest.workflow_state.data_revision > revision
+            && (latestTarget?.planDraftRevision ?? 0) > planRevision;
         });
         if (done) { setPlanModalOpen(false); setFeedback({ type: "success", message: "已同步新执行计划。" }); }
         else setFeedback({ type: "info", message: "后端未完成，请稍后同步项目状态。" });

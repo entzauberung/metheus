@@ -7,8 +7,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use xai_grok_shell::metheus_embedded::{
-    EmbeddedApiBackend, EmbeddedConfig, EmbeddedErrorKind, EmbeddedRequest, execute,
+    EmbeddedApiBackend, EmbeddedConfig, EmbeddedErrorKind, EmbeddedEvent, EmbeddedEventSink,
+    EmbeddedRequest, execute,
 };
+use xai_grok_test_support::sse::{
+    responses_api_doom_loop_terminal_only_events, responses_api_reasoning_and_text_events,
+};
+use xai_grok_test_support::{MockInferenceServer, ScriptedResponse};
 
 fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -117,6 +122,41 @@ fn tool_turn() -> String {
     ])
 }
 
+fn failed_tool_turn() -> String {
+    sse_response(&[
+        serde_json::json!({
+            "id": "chatcmpl-tool-failed",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-failed-write",
+                        "type": "function",
+                        "function": {
+                            "name": "search_replace",
+                            "arguments": "{\"file_path\":\"allowed.txt\",\"old_string\":\"missing text\",\"new_string\":\"replacement\",\"replace_all\":false}"
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        }),
+        serde_json::json!({
+            "id": "chatcmpl-tool-failed",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "test-model",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+        }),
+    ])
+}
+
 fn text_turn() -> String {
     sse_response(&[
         serde_json::json!({
@@ -149,6 +189,8 @@ fn test_config(address: SocketAddr) -> EmbeddedConfig {
         api_key: "local-test-secret".to_string(),
         timeout: Duration::from_secs(5),
         max_turns: 3,
+        max_transport_retries: 2,
+        max_doom_loop_retries: 0,
     }
 }
 
@@ -172,6 +214,61 @@ fn embedded_config_debug_redacts_api_key() {
     let debug = format!("{config:?}");
     assert!(!debug.contains("metheus-secret-sentinel"));
     assert!(debug.contains("api_key_configured: true"));
+    assert!(debug.contains("max_transport_retries: 2"));
+    assert!(debug.contains("max_doom_loop_retries: 0"));
+}
+
+fn status_response(status: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+    )
+}
+
+fn json_status_response(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
+fn rate_limit_response() -> String {
+    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".to_string()
+}
+
+fn event_request(
+    root: &Path,
+    execution_id: &str,
+    sender: std::sync::mpsc::Sender<EmbeddedEvent>,
+) -> (EmbeddedRequest, EmbeddedEventSink) {
+    let event_sink = EmbeddedEventSink::new(move |event| {
+        let _ = sender.send(event);
+    });
+    let request = EmbeddedRequest {
+        project_root: root.to_path_buf(),
+        authorized_write_paths: Vec::new(),
+        prompt: "Inspect the project, then finish.".to_string(),
+        execution_id: execution_id.to_string(),
+        cancellation: Arc::new(AtomicBool::new(false)),
+        event_sink: Some(event_sink.clone()),
+    };
+    (request, event_sink)
+}
+
+fn collect_events(receiver: std::sync::mpsc::Receiver<EmbeddedEvent>) -> Vec<EmbeddedEvent> {
+    let mut events = Vec::new();
+    while let Ok(event) = receiver.recv_timeout(Duration::from_millis(250)) {
+        events.push(event);
+    }
+    events
+}
+
+fn responses_request_count(server: &MockInferenceServer) -> usize {
+    server
+        .requests()
+        .iter()
+        .filter(|entry| entry.method == "POST" && entry.path.contains("/responses"))
+        .count()
 }
 
 #[tokio::test]
@@ -334,17 +431,310 @@ async fn upstream_session_actor_enforces_max_turns() -> Result<(), Box<dyn std::
     config.max_turns = 1;
     let result = execute(
         config,
-        test_request(
-            directory.path(),
-            "max-turns-test",
-            Arc::new(AtomicBool::new(false)),
-        ),
+        EmbeddedRequest {
+            project_root: directory.path().to_path_buf(),
+            authorized_write_paths: vec![PathBuf::from("allowed.txt")],
+            prompt: "Use the tools, then finish.".to_string(),
+            execution_id: "max-turns-test".to_string(),
+            cancellation: Arc::new(AtomicBool::new(false)),
+            event_sink: None,
+        },
     )
     .await;
     server.join().map_err(|_| "server thread panicked")??;
     assert_eq!(
         result.expect_err("turn limit must stop the loop").kind,
         EmbeddedErrorKind::MaxTurns
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_tool_status_is_never_reported_as_completed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        for response in [failed_tool_turn(), text_turn()] {
+            let (mut stream, _) = listener.accept()?;
+            let _ = read_request(&mut stream)?;
+            stream.write_all(response.as_bytes())?;
+        }
+        Ok(())
+    });
+    let directory = tempfile::tempdir()?;
+    std::fs::write(directory.path().join("allowed.txt"), "original text\n")?;
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let (mut request, event_sink) = event_request(directory.path(), "tool-failed-event", event_tx);
+    request.authorized_write_paths = vec![PathBuf::from("allowed.txt")];
+    let result = execute(test_config(address), request).await;
+    event_sink.flush();
+    server.join().map_err(|_| "server thread panicked")??;
+    assert!(
+        result.is_ok(),
+        "the model must recover after the tool failure"
+    );
+    let events = collect_events(event_rx);
+    assert!(
+        events.iter().any(
+            |event| matches!(event, EmbeddedEvent::ToolFailed(name) if name == "search_replace")
+        ),
+        "events: {events:#?}"
+    );
+    assert!(!events.iter().any(
+        |event| matches!(event, EmbeddedEvent::ToolCompleted(name) if name == "search_replace")
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn transport_retry_budget_emits_scheduled_and_failed_states()
+-> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept()?;
+            let _ = read_request(&mut stream)?;
+            stream.write_all(status_response("503 Service Unavailable").as_bytes())?;
+        }
+        Ok(())
+    });
+    let directory = tempfile::tempdir()?;
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let (request, event_sink) = event_request(directory.path(), "retry-exhausted", event_tx);
+    let result = execute(
+        EmbeddedConfig {
+            timeout: Duration::from_secs(15),
+            max_transport_retries: 2,
+            ..test_config(address)
+        },
+        request,
+    )
+    .await;
+    event_sink.flush();
+    server.join().map_err(|_| "server thread panicked")??;
+    let events = collect_events(event_rx);
+    let error = result.expect_err("retry budget must exhaust");
+    assert_eq!(
+        error.kind,
+        EmbeddedErrorKind::ProviderUnavailable,
+        "error: {error:?}; events: {events:#?}"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EmbeddedEvent::RetryScheduled {
+            attempt: 1,
+            max_retries: 2,
+            ..
+        }
+    )));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EmbeddedEvent::RetryFailed { error_type, .. } if error_type == "api"
+        )),
+        "events: {events:#?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rate_limit_retry_budget_emits_exhausted_state() -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept()?;
+            let _ = read_request(&mut stream)?;
+            stream.write_all(rate_limit_response().as_bytes())?;
+        }
+        Ok(())
+    });
+    let directory = tempfile::tempdir()?;
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let (request, event_sink) = event_request(directory.path(), "rate-limit-exhausted", event_tx);
+    let result = execute(
+        EmbeddedConfig {
+            timeout: Duration::from_secs(10),
+            max_transport_retries: 2,
+            ..test_config(address)
+        },
+        request,
+    )
+    .await;
+    event_sink.flush();
+    server.join().map_err(|_| "server thread panicked")??;
+    assert_eq!(
+        result.expect_err("rate-limit budget must exhaust").kind,
+        EmbeddedErrorKind::RateLimited
+    );
+    let events = collect_events(event_rx);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        EmbeddedEvent::RetryScheduled {
+            attempt: 1,
+            max_retries: 2,
+            ..
+        }
+    )));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EmbeddedEvent::RetryExhausted {
+                attempts: 2,
+                is_rate_limited: true,
+                ..
+            }
+        )),
+        "events: {events:#?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_retryable_auth_failure_emits_failed_without_scheduling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        let _ = read_request(&mut stream)?;
+        let body = serde_json::json!({
+            "error": {
+                "message": format!("local-test-secret {}", "x".repeat(2_500)),
+                "type": "authentication_error",
+                "code": "invalid_api_key"
+            }
+        })
+        .to_string();
+        stream.write_all(json_status_response("401 Unauthorized", &body).as_bytes())?;
+        Ok(())
+    });
+    let directory = tempfile::tempdir()?;
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let (request, event_sink) = event_request(directory.path(), "retry-failed", event_tx);
+    let result = execute(
+        EmbeddedConfig {
+            max_transport_retries: 3,
+            ..test_config(address)
+        },
+        request,
+    )
+    .await;
+    event_sink.flush();
+    server.join().map_err(|_| "server thread panicked")??;
+    assert_eq!(
+        result
+            .expect_err("authentication must fail immediately")
+            .kind,
+        EmbeddedErrorKind::Authentication
+    );
+    let events = collect_events(event_rx);
+    let auth_message = events.iter().find_map(|event| match event {
+        EmbeddedEvent::RetryFailed {
+            error_type,
+            message,
+        } if error_type == "auth" => Some(message),
+        _ => None,
+    });
+    let auth_message = auth_message.expect("auth RetryFailed event");
+    assert!(!auth_message.contains("local-test-secret"));
+    assert!(auth_message.contains("[REDACTED]"));
+    assert!(auth_message.chars().count() <= 2_000);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, EmbeddedEvent::RetryScheduled { .. }))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doom_loop_budget_one_resamples_once_and_accepts_clean_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = MockInferenceServer::start().await?;
+    server.enqueue_response(
+        "/v1/responses",
+        ScriptedResponse::sse(responses_api_doom_loop_terminal_only_events(
+            &["tail_repetition:8@thinking"],
+            "loop loop loop",
+            "poisoned answer",
+            "test-model",
+        )),
+    );
+    server.enqueue_response(
+        "/v1/responses",
+        ScriptedResponse::sse(responses_api_reasoning_and_text_events(
+            "fresh thought",
+            "clean answer",
+            "test-model",
+        )),
+    );
+    let directory = tempfile::tempdir()?;
+
+    let result = execute(
+        EmbeddedConfig {
+            api_backend: EmbeddedApiBackend::Responses,
+            api_base_url: server.url(),
+            max_transport_retries: 0,
+            max_doom_loop_retries: 1,
+            ..test_config("127.0.0.1:1".parse()?)
+        },
+        test_request(
+            directory.path(),
+            "doom-loop-budget-one",
+            Arc::new(AtomicBool::new(false)),
+        ),
+    )
+    .await?;
+
+    assert_eq!(
+        responses_request_count(&server),
+        2,
+        "result: {result:#?}; requests: {:#?}",
+        server.requests()
+    );
+    assert!(result.output.contains("clean answer"), "result: {result:#?}");
+    assert!(!result.output.contains("poisoned answer"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn doom_loop_budget_zero_accepts_original_response_without_resampling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let server = MockInferenceServer::start().await?;
+    server.enqueue_response(
+        "/v1/responses",
+        ScriptedResponse::sse(responses_api_doom_loop_terminal_only_events(
+            &["tail_repetition:8@thinking"],
+            "loop loop loop",
+            "original answer",
+            "test-model",
+        )),
+    );
+    let directory = tempfile::tempdir()?;
+
+    let result = execute(
+        EmbeddedConfig {
+            api_backend: EmbeddedApiBackend::Responses,
+            api_base_url: server.url(),
+            max_transport_retries: 0,
+            max_doom_loop_retries: 0,
+            ..test_config("127.0.0.1:1".parse()?)
+        },
+        test_request(
+            directory.path(),
+            "doom-loop-budget-zero",
+            Arc::new(AtomicBool::new(false)),
+        ),
+    )
+    .await?;
+
+    assert_eq!(responses_request_count(&server), 1);
+    assert!(
+        result.output.contains("original answer"),
+        "result: {result:#?}"
     );
     Ok(())
 }

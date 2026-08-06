@@ -98,6 +98,10 @@ export type EngineFailureKind =
   | "NetworkError"
   | "Timeout"
   | "ProcessCrash"
+  | "ToolRejected"
+  | "ProtocolError"
+  | "MaxTurnsExceeded"
+  | "RuntimeError"
   | "TaskExecutionError";
 
 export type AcceptanceStatus = "Satisfied" | "Unsatisfied" | "Unknown" | "Contradictory" | "AcceptedDeviation";
@@ -658,6 +662,9 @@ export interface ExistingProjectBaseline {
   approved_at?: string;
   already_constitution_path: string;
   already_constitution_summary: string;
+  readme_full: string;
+  manifest_details: [string, string][];
+  source_abstracts: [string, string][];
 }
 
 // ========== 三项检查结果 ==========
@@ -755,6 +762,7 @@ export interface PlanDraft {
   constitution_part1_draft: string;
   generation_revision: number;
   data_revision_at_generation: number;
+  workload_profile_fingerprint: string;
   self_check_result: string;
   generated_at: string;
   /** @deprecated 使用 draft_status 代替 */
@@ -954,7 +962,37 @@ export interface MidStage {
 }
 
 export type StageMode = "Quick" | "Professional";
-export type ProjectMode = "Quick" | "Professional";
+
+export type WorkloadScale = "Micro" | "Small" | "Standard" | "System";
+export type WorkloadCheckDepth = "Lean" | "Standard" | "Strict";
+
+export interface WorkloadSignals {
+  has_frontend: boolean;
+  has_backend: boolean;
+  has_persistence: boolean;
+  has_auth_or_roles: boolean;
+  external_integration_count: number;
+  independent_domain_count: number;
+  deliverable_count: number;
+  high_risk: boolean;
+}
+
+export interface WorkloadProfile {
+  signals: WorkloadSignals;
+  scale: WorkloadScale;
+  use_mid_stage_layer: boolean;
+  max_milestones: number;
+  max_mid_stages: number;
+  max_subtasks: number;
+  max_split_depth: number;
+  check_depth: WorkloadCheckDepth;
+  max_executor_turns: number;
+  max_transport_retries: number;
+  max_doom_loop_retries: number;
+  evidence: string[];
+  discussion_revision: number;
+  fingerprint: string;
+}
 
 // ========== 需求质检相关 ==========
 
@@ -994,6 +1032,15 @@ export interface Milestone {
   dependencies: string[];
   expected_output: string;
   acceptance_criteria: string[];
+  plan_check_result?: StagePlanCheckResult;
+  plan_approved_at?: string;
+  plan_revision: number;
+  plan_draft_revision: number;
+  plan_generated_at?: string;
+  plan_regeneration_count: number;
+  last_plan_failure_fingerprint: string;
+  last_plan_issue_count: number;
+  plan_no_progress_count: number;
 }
 
 export interface ChatMessage {
@@ -1037,7 +1084,7 @@ export interface Project {
   status?: ProjectStatus;
   entry_kind: ProjectEntryKind;
   workflow_state: WorkflowState;
-  mode: ProjectMode;
+  workload_profile?: WorkloadProfile;
   execution_profile: ExecutionProfile;
   current_milestone_id: string;
   current_mid_stage_id: string;
@@ -1152,6 +1199,9 @@ export interface TaskContract {
   parent_task_id?: string;
   depth: number;
   node_type: TaskNodeType;
+  workload_scale: WorkloadScale;
+  workload_profile_fingerprint: string;
+  max_split_depth: number;
   title: string;
   goal: string;
   allowed_file_paths: string[];
@@ -1168,15 +1218,26 @@ export interface TaskContract {
     expected_files: string[];
     expected_identifiers: string[];
     completion_facts: string[];
+    expected_artifacts: string[];
+    related_symbols: string[];
+    read_file_paths: string[];
+    write_file_paths: string[];
   };
   budget: {
     level: string;
     estimated_model_calls: number;
     estimated_input_tokens: number;
     estimated_output_tokens: number;
+    max_executor_turns: number;
+    max_transport_retries: number;
+    max_doom_loop_retries: number;
   };
   recommended_executor: string;
   plan_source: string;
+  split_basis: string;
+  estimated_complexity_reduction: number;
+  independently_verifiable: boolean;
+  future_parallel_safe: boolean;
   compiled_at: string;
   fingerprint: string;
 }
@@ -1641,6 +1702,7 @@ export interface MilestoneTagNode {
   milestone_version: string;
   milestone_status: string;
   mid_stages: MidStageTagNode[];
+  subtasks: SubtaskTagNode[];
 }
 
 export interface MidStageTagNode {

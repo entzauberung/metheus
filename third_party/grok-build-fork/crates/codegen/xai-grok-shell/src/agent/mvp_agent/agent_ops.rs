@@ -34,6 +34,11 @@ impl MvpAgent {
         cfg.endpoints.models_list_url = None;
         cfg.endpoints.deployment_key = None;
         cfg.cli_agent_overrides.max_turns = Some(max_turns);
+        if let Some(policy) = sampling_config.doom_loop_recovery {
+            cfg.doom_loop_recovery.enabled = Some(true);
+            cfg.doom_loop_recovery.max_threshold = Some(policy.max_threshold);
+            cfg.doom_loop_recovery.max_retries = Some(policy.max_retries);
+        }
         let auth_manager = Arc::new(AuthManager::new(auth_root, GrokComConfig::default()));
         let models_manager = crate::agent::models::ModelsManager::new(
             None,
@@ -3534,12 +3539,15 @@ impl MvpAgent {
             )
             
         };
-        let model_max_retries = self
-            .models_manager
-            .models()
-            .values()
-            .find(|entry| entry.info.model == sampling_config.model)
-            .and_then(|entry| entry.info.max_retries);
+        let model_max_retries = if metheus_embedded {
+            sampling_config.max_retries
+        } else {
+            self.models_manager
+                .models()
+                .values()
+                .find(|entry| entry.info.model == sampling_config.model)
+                .and_then(|entry| entry.info.max_retries)
+        };
         let origin_client = self.origin_client_info_from_meta(init.meta.as_ref());
         let web_search_sampling_config = if metheus_embedded { None } else { self.prepare_web_search_sampling_config() };
         let image_gen_config = if metheus_embedded { Default::default() } else { self.prepare_image_gen_config() };

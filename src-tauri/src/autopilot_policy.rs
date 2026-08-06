@@ -311,20 +311,11 @@ pub(crate) fn mid_stage_planning_action(project: &project::Project) -> PlanningA
 }
 
 pub(crate) fn plan_planning_action(project: &project::Project) -> PlanningAction {
-    let Some(mid_stage) = project
-        .milestones
-        .iter()
-        .find(|milestone| milestone.id == project.current_milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter()
-                .find(|mid_stage| mid_stage.id == project.current_mid_stage_id)
-        })
-    else {
-        return PlanningAction::Stop("当前中阶段不存在。".to_string());
+    let scope = match crate::plan_scope::PlanScope::resolve(project) {
+        Ok(scope) => scope,
+        Err(error) => return PlanningAction::Stop(error),
     };
-    let Some(check) = mid_stage.plan_check_result.as_ref() else {
+    let Some(check) = scope.plan_check_result(project) else {
         return PlanningAction::CheckPlan;
     };
     let blocking_count = blocking_plan_issue_count(check);
@@ -339,13 +330,13 @@ pub(crate) fn plan_planning_action(project: &project::Project) -> PlanningAction
         .cloned()
         .collect::<Vec<_>>()
         .join("；");
-    if mid_stage.plan_regeneration_count >= MAX_PLANNING_REGENERATIONS {
+    if scope.plan_regeneration_count(project) >= MAX_PLANNING_REGENERATIONS {
         return PlanningAction::Stop(format!(
             "执行计划自动重生成已达到两次上限。具体硬阻断：{}",
             blockers
         ));
     }
-    if mid_stage.plan_no_progress_count >= MAX_PLAN_NO_PROGRESS {
+    if scope.plan_no_progress_count(project) >= MAX_PLAN_NO_PROGRESS {
         return PlanningAction::Stop(format!(
             "执行计划连续两次没有减少硬阻断。具体硬阻断：{}",
             blockers
@@ -459,20 +450,22 @@ pub(crate) fn decide_next_step(
         .as_ref()
         .filter(|session| session.active && session.status.eq_ignore_ascii_case("executing"))
     {
+        let session_task_matches = crate::task_tree::locate_task(proj, &session.subtask_id)
+            .ok()
+            .flatten()
+            .is_some_and(|address| {
+                address.milestone_id == session.milestone_id
+                    && address.mid_stage_id == session.mid_stage_id
+                    && crate::task_tree::find_task(proj, &session.subtask_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|subtask| subtask.status == project::SubtaskStatus::Executing)
+            });
         let session_matches_workflow = proj.workflow_state.current_step
             == project::WorkflowStep::Execution
             && session.milestone_id == proj.current_milestone_id
             && session.mid_stage_id == proj.current_mid_stage_id
-            && proj.milestones.iter().any(|milestone| {
-                milestone.id == session.milestone_id
-                    && milestone.mid_stages.iter().any(|mid| {
-                        mid.id == session.mid_stage_id
-                            && mid.subtasks.iter().any(|subtask| {
-                                subtask.id == session.subtask_id
-                                    && subtask.status == project::SubtaskStatus::Executing
-                            })
-                    })
-            });
+            && session_task_matches;
         if session_matches_workflow {
             return waiting(format!(
                 "小阶段「{}」正在执行，等待当前执行完成",
@@ -511,6 +504,47 @@ pub(crate) fn decide_next_step(
 
     use project::WorkflowStep::*;
     match step {
+        MilestoneSelection if target.mode == project::StageMode::Quick => {
+            match crate::workflow_resolution::resolve_direct_milestone_step(target) {
+                Ok(project::WorkflowStep::PlanGeneration) => transition(
+                    project_name,
+                    "PlanGeneration",
+                    "autopilot: Quick 大阶段直接生成执行计划",
+                    "进入大阶段直挂计划生成",
+                ),
+                Ok(project::WorkflowStep::PlanCheck) => transition(
+                    project_name,
+                    "PlanCheck",
+                    "autopilot: 恢复 Quick 大阶段计划检查",
+                    "恢复大阶段直挂计划检查",
+                ),
+                Ok(project::WorkflowStep::PlanApproving) => transition(
+                    project_name,
+                    "PlanApproving",
+                    "autopilot: 恢复 Quick 大阶段计划批准",
+                    "恢复大阶段直挂计划批准",
+                ),
+                Ok(project::WorkflowStep::Execution) => transition(
+                    project_name,
+                    "Execution",
+                    "autopilot: 恢复 Quick 大阶段执行",
+                    "恢复大阶段直挂任务执行",
+                ),
+                Ok(project::WorkflowStep::MilestoneReview) => transition(
+                    project_name,
+                    "MilestoneReview",
+                    "autopilot: Quick 大阶段任务均已完成",
+                    "进入大阶段审阅",
+                ),
+                Ok(step) => permanent_block(
+                    format!("Quick 大阶段解析到不支持的步骤：{:?}", step),
+                    project::AutopilotRecoveryAction::WaitHumanDecision,
+                ),
+                Err(reason) => {
+                    permanent_block(reason, project::AutopilotRecoveryAction::WaitHumanDecision)
+                }
+            }
+        }
         MilestoneSelection => match crate::workflow_resolution::resolve_mid_stage_route(target) {
             crate::workflow_resolution::MidStageRoute::NeedsInitialGeneration => transition(
                 project_name,
@@ -641,22 +675,21 @@ pub(crate) fn decide_next_step(
                 "计划硬阻断为空，进入批准阶段",
             ),
             PlanningAction::RegeneratePlan => {
-                let Some(mid) = target
-                    .mid_stages
-                    .iter()
-                    .find(|mid| mid.id == proj.current_mid_stage_id)
-                else {
-                    return permanent_block(
-                        "当前中阶段不存在。",
-                        project::AutopilotRecoveryAction::WaitHumanDecision,
-                    );
+                let scope = match crate::plan_scope::PlanScope::resolve(proj) {
+                    Ok(scope) => scope,
+                    Err(error) => {
+                        return permanent_block(
+                            error,
+                            project::AutopilotRecoveryAction::WaitHumanDecision,
+                        );
+                    }
                 };
                 next_step(
                     "regenerate_execution_plan",
                     serde_json::json!({
                         "projectName": project_name,
                         "expectedDataRevision": proj.workflow_state.data_revision,
-                        "expectedPlanDraftRevision": mid.plan_draft_revision,
+                        "expectedPlanDraftRevision": scope.plan_draft_revision(proj),
                         "feedback": "",
                         "source": "check_failed",
                     }),
@@ -704,11 +737,7 @@ fn decide_execution(
     target: &project::Milestone,
     facts: &AutopilotPolicyFacts,
 ) -> AutopilotDecision {
-    let current = target
-        .mid_stages
-        .iter()
-        .find(|mid| mid.id == proj.current_mid_stage_id);
-    let Some(current) = current else {
+    if target.mode == project::StageMode::Professional && proj.current_mid_stage_id.is_empty() {
         if let Some(next) = target
             .mid_stages
             .iter()
@@ -730,25 +759,33 @@ fn decide_execution(
         decision.kind = AutopilotDecisionKind::MilestoneComplete;
         decision.next.at_milestone_boundary = true;
         return decision;
+    }
+    let scope = match crate::plan_scope::PlanScope::resolve(proj) {
+        Ok(scope) => scope,
+        Err(error) => {
+            return permanent_block(error, project::AutopilotRecoveryAction::WaitHumanDecision);
+        }
     };
+    let tasks = scope.subtasks(proj);
+    let target_title = scope
+        .mid_stage(proj)
+        .map(|stage| stage.title.as_str())
+        .unwrap_or(target.title.as_str());
 
-    let has_awaiting = current
-        .subtasks
+    let has_awaiting = tasks
         .iter()
         .any(|item| item.status == project::SubtaskStatus::AwaitingConfirmation);
-    let has_pending = current
-        .subtasks
+    let has_pending = tasks
         .iter()
         .any(|item| item.status == project::SubtaskStatus::Pending);
-    let has_rejected = current
-        .subtasks
+    let has_rejected = tasks
         .iter()
         .any(|item| item.status == project::SubtaskStatus::Rejected);
     if has_rejected && !has_awaiting && !has_pending {
         return permanent_block(
             format!(
-                "中阶段「{}」存在已驳回的小阶段，需要人工决定是否重试或重新生成执行计划",
-                current.title
+                "计划目标「{}」存在已驳回的小阶段，需要人工决定是否重试或重新生成执行计划",
+                target_title
             ),
             project::AutopilotRecoveryAction::WaitHumanDecision,
         );
@@ -803,27 +840,29 @@ fn decide_execution(
         );
     }
 
-    if let Some(next) = target
-        .mid_stages
-        .iter()
-        .filter(|mid| mid.id != current.id)
-        .find(|mid| mid.status != project::MidStageStatus::Completed)
-    {
-        return next_step(
-            "select_mid_stage",
-            serde_json::json!({ "projectName": project_name, "midStageId": next.id }),
-            format!(
-                "中阶段「{}」已完成，切换到下一中阶段：{}",
-                current.title, next.title
-            ),
-            project::AutopilotCommandResultKind::ProjectState,
-        );
+    if let Some(current) = scope.mid_stage(proj) {
+        if let Some(next) = target
+            .mid_stages
+            .iter()
+            .filter(|mid| mid.id != current.id)
+            .find(|mid| mid.status != project::MidStageStatus::Completed)
+        {
+            return next_step(
+                "select_mid_stage",
+                serde_json::json!({ "projectName": project_name, "midStageId": next.id }),
+                format!(
+                    "中阶段「{}」已完成，切换到下一中阶段：{}",
+                    current.title, next.title
+                ),
+                project::AutopilotCommandResultKind::ProjectState,
+            );
+        }
     }
     let mut decision = transition(
         project_name,
         "MilestoneReview",
-        "autopilot: 所有中阶段完成，进入大阶段审阅",
-        "所有中阶段已完成，进入大阶段审阅",
+        "autopilot: 当前大阶段的全部计划任务完成，进入大阶段审阅",
+        "当前大阶段任务已完成，进入大阶段审阅",
     );
     decision.kind = AutopilotDecisionKind::MilestoneComplete;
     decision.next.at_milestone_boundary = true;

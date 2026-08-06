@@ -1,7 +1,5 @@
-use crate::project::Subtask;
+use crate::project::{Subtask, WorkloadProfile};
 use crate::task_contract::{TaskBudgetSummary, TaskComplexity, TaskRiskLevel};
-
-pub const MAX_DEFAULT_SPLIT_DEPTH: u32 = 8;
 
 pub fn complexity_score(subtask: &Subtask) -> u32 {
     let files = (subtask.allowed_file_paths.len() + subtask.new_file_paths.len()) as u32;
@@ -45,7 +43,11 @@ pub fn estimate_risk(subtask: &Subtask, complexity: TaskComplexity) -> TaskRiskL
     }
 }
 
-pub fn estimate_budget(subtask: &Subtask, complexity: TaskComplexity) -> TaskBudgetSummary {
+pub fn estimate_budget(
+    subtask: &Subtask,
+    complexity: TaskComplexity,
+    workload: &WorkloadProfile,
+) -> TaskBudgetSummary {
     let (level, calls, input, output): (&str, u32, u64, u64) = match complexity {
         TaskComplexity::Small => ("small", 1, 1_500, 800),
         TaskComplexity::Medium => ("medium", 2, 3_000, 1_600),
@@ -60,6 +62,9 @@ pub fn estimate_budget(subtask: &Subtask, complexity: TaskComplexity) -> TaskBud
         },
         estimated_input_tokens: input,
         estimated_output_tokens: output,
+        max_executor_turns: workload.max_executor_turns,
+        max_transport_retries: workload.max_transport_retries,
+        max_doom_loop_retries: workload.max_doom_loop_retries,
     }
 }
 
@@ -81,6 +86,11 @@ mod tests {
         task.allowed_file_paths = (0..8).map(|i| format!("src/{i}.rs")).collect();
         task.acceptance_criteria = (0..5).map(|i| format!("criterion {i}")).collect();
         assert_eq!(estimate_complexity(&task), TaskComplexity::Large);
-        assert_eq!(estimate_budget(&task, TaskComplexity::Large).level, "large");
+        let workload = crate::workload_policy::test_profile(crate::project::WorkloadScale::System);
+        let budget = estimate_budget(&task, TaskComplexity::Large, &workload);
+        assert_eq!(budget.level, "large");
+        assert_eq!(budget.max_executor_turns, 32);
+        assert_eq!(budget.max_transport_retries, 3);
+        assert_eq!(budget.max_doom_loop_retries, 2);
     }
 }

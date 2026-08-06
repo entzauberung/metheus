@@ -1,11 +1,10 @@
 use std::fmt;
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 const TEXT_AGGREGATION_WINDOW: Duration = Duration::from_millis(150);
 const MAX_AGGREGATED_TEXT_BYTES: usize = 4 * 1024;
-const EVENT_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrokBuildRuntimeEvent {
@@ -22,6 +21,24 @@ pub enum GrokBuildRuntimeEvent {
         name: String,
         summary: String,
     },
+    ToolFailed {
+        name: String,
+        summary: String,
+    },
+    RetryScheduled {
+        attempt: u32,
+        max_retries: u32,
+        reason: String,
+    },
+    RetryExhausted {
+        attempts: u32,
+        reason: String,
+        is_rate_limited: bool,
+    },
+    RetryFailed {
+        error_type: String,
+        message: String,
+    },
     TokenUsage {
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -34,54 +51,46 @@ pub enum GrokBuildRuntimeEvent {
 }
 
 #[derive(Clone)]
-pub struct RuntimeEventSink(Arc<dyn Fn(GrokBuildRuntimeEvent) + Send + Sync>);
+pub struct RuntimeEventSink {
+    sender: std::sync::mpsc::Sender<RuntimeEventDispatch>,
+}
+
+enum RuntimeEventDispatch {
+    Event(GrokBuildRuntimeEvent),
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
 
 impl RuntimeEventSink {
     pub fn new(callback: impl Fn(GrokBuildRuntimeEvent) + Send + Sync + 'static) -> Self {
         let callback: Arc<dyn Fn(GrokBuildRuntimeEvent) + Send + Sync> = Arc::new(callback);
-        let (sender, receiver) = std::sync::mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
+        let (sender, receiver) = std::sync::mpsc::channel();
         let worker_callback = Arc::clone(&callback);
-        let worker = std::thread::Builder::new()
+        let _ = std::thread::Builder::new()
             .name("metheus-grok-event-bridge".to_string())
             .spawn(move || run_event_worker(receiver, worker_callback));
-        match worker {
-            Ok(_) => {
-                let fallback_callback = Arc::clone(&callback);
-                Self(Arc::new(move |event| {
-                    send_without_loss(&sender, fallback_callback.as_ref(), event)
-                }))
-            }
-            // Thread creation failure must not abort execution. Delivery remains synchronous;
-            // only aggregation is unavailable in this rare degraded path.
-            Err(_) => Self(callback),
-        }
+        Self { sender }
     }
 
     pub(crate) fn emit(&self, event: GrokBuildRuntimeEvent) {
-        (self.0)(event);
+        // An unbounded channel keeps producers non-blocking. If the worker has terminated,
+        // discard the event instead of running host code on the SessionActor path.
+        let _ = self.sender.send(RuntimeEventDispatch::Event(event));
     }
-}
 
-fn send_without_loss(
-    sender: &SyncSender<GrokBuildRuntimeEvent>,
-    fallback_callback: &(dyn Fn(GrokBuildRuntimeEvent) + Send + Sync),
-    event: GrokBuildRuntimeEvent,
-) {
-    match sender.try_send(event) {
-        Ok(()) => {}
-        Err(TrySendError::Disconnected(event)) => fallback_callback(event),
-        Err(TrySendError::Full(event)) => {
-            // Backpressure is preferable to dropping execution evidence. The worker flushes
-            // text at bounded size/time boundaries before accepting more events.
-            if let Err(error) = sender.send(event) {
-                fallback_callback(error.0);
-            }
+    pub(crate) fn flush(&self) {
+        let (completed, receiver) = std::sync::mpsc::sync_channel(0);
+        if self
+            .sender
+            .send(RuntimeEventDispatch::Flush(completed))
+            .is_ok()
+        {
+            let _ = receiver.recv();
         }
     }
 }
 
 fn run_event_worker(
-    receiver: Receiver<GrokBuildRuntimeEvent>,
+    receiver: Receiver<RuntimeEventDispatch>,
     callback: Arc<dyn Fn(GrokBuildRuntimeEvent) + Send + Sync>,
 ) {
     let mut text_buffer = String::new();
@@ -94,7 +103,7 @@ fn run_event_worker(
             None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         match received {
-            Ok(GrokBuildRuntimeEvent::ModelText { text }) => {
+            Ok(RuntimeEventDispatch::Event(GrokBuildRuntimeEvent::ModelText { text })) => {
                 text_buffer.push_str(&text);
                 if text_buffer.contains('\n') || text_buffer.len() >= MAX_AGGREGATED_TEXT_BYTES {
                     flush_text(&mut text_buffer, callback.as_ref());
@@ -105,10 +114,15 @@ fn run_event_worker(
                     flush_deadline = Some(Instant::now() + TEXT_AGGREGATION_WINDOW);
                 }
             }
-            Ok(event) => {
+            Ok(RuntimeEventDispatch::Event(event)) => {
                 flush_text(&mut text_buffer, callback.as_ref());
                 flush_deadline = None;
                 callback(event);
+            }
+            Ok(RuntimeEventDispatch::Flush(completed)) => {
+                flush_text(&mut text_buffer, callback.as_ref());
+                flush_deadline = None;
+                let _ = completed.send(());
             }
             Err(RecvTimeoutError::Timeout) => {
                 flush_text(&mut text_buffer, callback.as_ref());
@@ -196,6 +210,43 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_grok_contract_retry_and_tool_failure_preserve_order() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sink = RuntimeEventSink::new(move |event| {
+            sender.send(event).unwrap();
+        });
+        sink.emit(GrokBuildRuntimeEvent::ModelText {
+            text: "partial".into(),
+        });
+        sink.emit(GrokBuildRuntimeEvent::ToolFailed {
+            name: "search_replace".into(),
+            summary: "failed".into(),
+        });
+        sink.emit(GrokBuildRuntimeEvent::RetryScheduled {
+            attempt: 1,
+            max_retries: 2,
+            reason: "service unavailable".into(),
+        });
+        sink.flush();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            GrokBuildRuntimeEvent::ModelText { text } if text == "partial"
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            GrokBuildRuntimeEvent::ToolFailed { name, .. } if name == "search_replace"
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            GrokBuildRuntimeEvent::RetryScheduled {
+                attempt: 1,
+                max_retries: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn runtime_fix_text_window_flushes_without_a_newline() {
         let (sender, receiver) = std::sync::mpsc::channel();
         let sink = RuntimeEventSink::new(move |event| {
@@ -210,6 +261,26 @@ mod tests {
             receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
             GrokBuildRuntimeEvent::ModelText {
                 text: "partial sentence".into()
+            }
+        );
+    }
+
+    #[test]
+    fn adaptive_grok_contract_flush_delivers_pending_text() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sink = RuntimeEventSink::new(move |event| {
+            sender.send(event).unwrap();
+        });
+        sink.emit(GrokBuildRuntimeEvent::ModelText {
+            text: "pending".into(),
+        });
+
+        sink.flush();
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            GrokBuildRuntimeEvent::ModelText {
+                text: "pending".into()
             }
         );
     }

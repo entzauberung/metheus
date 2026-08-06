@@ -742,7 +742,8 @@ mod tests {
     fn task_request_includes_contract_anchors() {
         let mut task = project::Subtask::default();
         task.related_symbols = vec!["renderGroups".into()];
-        let mut contract = crate::task_contract::compile_subtask(&task, None, 0);
+        let workload = crate::workload_policy::test_profile(project::WorkloadScale::Standard);
+        let mut contract = crate::task_contract::compile_subtask(&task, None, 0, &workload);
         contract.artifacts.expected_identifiers = vec!["saveBookmarks".into()];
         contract.artifacts.expected_files = vec!["index.html".into()];
         task.contract_snapshot = Some(contract);

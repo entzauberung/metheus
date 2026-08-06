@@ -361,10 +361,12 @@ pub(crate) async fn apply_task_control_action(
                     .ok_or_else(|| format!("任务节点不存在：{}", task_id))?;
                 let task = crate::task_tree::find_task(&latest, &task_id)?
                     .ok_or_else(|| format!("任务节点不存在：{}", task_id))?;
+                let workload = crate::workload_policy::current_profile(&latest)?;
                 let contract = crate::task_compiler::compile(
                     task,
                     address.ancestor_task_ids.last().map(String::as_str),
                     address.depth,
+                    workload,
                 )
                 .contract;
                 let action_id = format!("{}-{}", base_action_id, kind.as_str());
@@ -561,6 +563,7 @@ fn action_result(
 }
 
 pub(crate) fn split_task(project: &mut project::Project, task_id: &str) -> Result<(), String> {
+    let workload = crate::workload_policy::current_profile(project)?.clone();
     let address = crate::task_tree::locate_task(project, task_id)?
         .ok_or_else(|| format!("任务节点不存在：{}", task_id))?;
     let parent_task_id = address.ancestor_task_ids.last().cloned();
@@ -579,7 +582,8 @@ pub(crate) fn split_task(project: &mut project::Project, task_id: &str) -> Resul
         if !task.child_tasks.is_empty() {
             false
         } else {
-            let compiled = crate::task_compiler::compile(task, parent_task_id.as_deref(), depth);
+            let compiled =
+                crate::task_compiler::compile(task, parent_task_id.as_deref(), depth, &workload);
             if compiled.decision.kind != crate::task_compiler::TaskCompileDecisionKind::SplitFurther
             {
                 return Err(compiled.decision.reason);
@@ -588,7 +592,8 @@ pub(crate) fn split_task(project: &mut project::Project, task_id: &str) -> Resul
                 .split_plan
                 .as_ref()
                 .ok_or_else(|| "任务编译器未返回安全拆分计划".to_string())?;
-            let children = crate::task_compiler::materialize_child_tasks(task, depth, plan)?;
+            let children =
+                crate::task_compiler::materialize_child_tasks(task, depth, plan, &workload)?;
             if children.len() > crate::task_compiler::MAX_SPLIT_LEAVES {
                 return Err(format!(
                     "拆分结果包含 {} 个叶子，超过单次拆分上限 {}",
@@ -608,6 +613,7 @@ pub(crate) fn split_task(project: &mut project::Project, task_id: &str) -> Resul
 }
 
 pub(crate) fn recompile_task(project: &mut project::Project, task_id: &str) -> Result<(), String> {
+    let workload = crate::workload_policy::current_profile(project)?.clone();
     let address = crate::task_tree::locate_task(project, task_id)?
         .ok_or_else(|| format!("任务节点不存在：{}", task_id))?;
     let task = crate::task_tree::find_task_mut(project, task_id)?
@@ -625,6 +631,7 @@ pub(crate) fn recompile_task(project: &mut project::Project, task_id: &str) -> R
             task,
             address.ancestor_task_ids.last().map(String::as_str),
             address.depth,
+            &workload,
         )
         .contract,
     );
@@ -751,6 +758,9 @@ mod tests {
 
     fn project_with_task() -> project::Project {
         let mut project = project::Project::new("task-control-test");
+        project.workload_profile = Some(crate::workload_policy::test_profile(
+            project::WorkloadScale::Standard,
+        ));
         project.milestones.push(project::Milestone {
             id: "m".to_string(),
             version: "v0.1".to_string(),
@@ -805,6 +815,7 @@ mod tests {
             dependencies: Vec::new(),
             expected_output: String::new(),
             acceptance_criteria: Vec::new(),
+            ..Default::default()
         });
         project.current_milestone_id = "m".to_string();
         project
@@ -898,11 +909,13 @@ mod tests {
     }
 
     #[test]
-    fn split_and_recompile_preserve_parent_context_and_contract_fingerprint() {
+    fn child_depth_boundary_and_recompile_preserve_parent_contract() {
         let mut project = project_with_task();
         let mut nested = project.milestones[0].subtasks.remove(0);
         nested.id = "nested".to_string();
-        let expected = crate::task_compiler::compile(&nested, Some("parent"), 1).contract;
+        let workload = project.workload_profile.as_ref().unwrap().clone();
+        let expected =
+            crate::task_compiler::compile(&nested, Some("parent"), 1, &workload).contract;
         project.milestones[0].subtasks.push(project::Subtask {
             id: "parent".to_string(),
             title: "Parent".to_string(),
@@ -910,17 +923,9 @@ mod tests {
             ..Default::default()
         });
 
-        split_task(&mut project, "nested").unwrap();
-        let split_contract = crate::task_tree::find_task(&project, "nested")
-            .unwrap()
-            .unwrap()
-            .contract_snapshot
-            .as_ref()
-            .unwrap()
-            .clone();
-        assert_eq!(split_contract.parent_task_id.as_deref(), Some("parent"));
-        assert_eq!(split_contract.depth, 1);
-        assert_eq!(split_contract.fingerprint, expected.fingerprint);
+        let error =
+            split_task(&mut project, "nested").expect_err("Standard 画像只允许一层 ChildTask");
+        assert!(error.contains("拆分深度上限 1"));
 
         recompile_task(&mut project, "nested").unwrap();
         let recompiled = crate::task_tree::find_task(&project, "nested")
@@ -931,7 +936,7 @@ mod tests {
             .unwrap();
         assert_eq!(recompiled.parent_task_id.as_deref(), Some("parent"));
         assert_eq!(recompiled.depth, 1);
-        assert_eq!(recompiled.fingerprint, split_contract.fingerprint);
+        assert_eq!(recompiled.fingerprint, expected.fingerprint);
     }
 
     #[test]
@@ -993,8 +998,9 @@ mod tests {
                 ..Default::default()
             },
         ];
+        let workload = project.workload_profile.as_ref().unwrap().clone();
         let task = &mut project.milestones[0].subtasks[0];
-        let mut contract = crate::task_contract::compile_subtask(task, None, 0);
+        let mut contract = crate::task_contract::compile_subtask(task, None, 0, &workload);
         contract.verification_modes[3] = crate::validator_contract::VerificationMode::HumanReview;
         crate::task_contract::refresh_fingerprint(&mut contract);
         task.contract_snapshot = Some(contract);

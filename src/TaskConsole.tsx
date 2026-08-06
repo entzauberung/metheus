@@ -349,7 +349,25 @@ export default function TaskConsole({
                     <code className="tag-tree-version">{ms.milestone_version}</code>
                     <StatusBadgeInline status={ms.milestone_status} />
                   </summary>
-                  {ms.mid_stages.length > 0 ? (
+                  {ms.subtasks.length > 0 ? (
+                    <div className="tag-tree-children">
+                      {ms.subtasks.map((st) => (
+                        <div key={st.subtask_id} className={`tag-tree-subtask status-${st.subtask_status.toLowerCase()}`}>
+                          <CheckCircle2 size={12} className={`tag-tree-icon tag-tree-icon-${st.subtask_status.toLowerCase()}`} />
+                          <span className="tag-tree-subtask-index">#{st.subtask_index}</span>
+                          <span className="tag-tree-subtask-title">{st.subtask_title}</span>
+                          {st.subtask_tag ? (
+                            <code className="tag-tree-tag-badge tag-tree-tag-sub" title={st.subtask_tag}>
+                              {ms.milestone_version} · 任务 {st.subtask_index}
+                            </code>
+                          ) : (
+                            <span className="tag-tree-no-tag">—</span>
+                          )}
+                          <span className="tag-tree-subtask-status-text">{st.subtask_status}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : ms.mid_stages.length > 0 ? (
                     <div className="tag-tree-children">
                       {ms.mid_stages.map((mid) => (
                         <details key={mid.mid_stage_id} className={`tag-tree-midstage status-${mid.mid_stage_status.toLowerCase()}`}>

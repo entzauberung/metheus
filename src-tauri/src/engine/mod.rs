@@ -19,7 +19,9 @@ pub(crate) use contract::{
     EngineAuthenticationResult, EngineError, EngineHealth, EngineRuntimeSelfTestResult,
     ExecutionRequest,
 };
-pub(crate) use failure_classifier::{blocks_code_recovery, classify_process_failure};
+pub(crate) use failure_classifier::{
+    blocks_code_recovery, classify_process_failure, requires_human_recovery,
+};
 pub(crate) use service::{
     check_engine_health, execute, prepare_engine, validate_profile, verify_engine_authentication,
     PreparedEngine,

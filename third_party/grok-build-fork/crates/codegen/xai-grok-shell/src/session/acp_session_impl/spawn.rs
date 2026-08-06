@@ -1182,7 +1182,11 @@ pub(crate) async fn spawn_session_actor(
             skeptic_pool,
         }
     };
-    let doom_loop_recovery = effective_config.resolve_doom_loop_recovery();
+    let doom_loop_recovery = if metheus_embedded {
+        sampling_config.doom_loop_recovery
+    } else {
+        effective_config.resolve_doom_loop_recovery()
+    };
     let session = Arc::new_cyclic(|weak: &std::sync::Weak<SessionActor>| SessionActor {
         session_info: session_info.clone(),
         auth_method_id,

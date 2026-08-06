@@ -1,13 +1,29 @@
+use crate::plan_scope::PlanScope;
 use crate::project;
-use crate::workflow_resolution::{has_plan_execution_facts, resolve_selected_mid_stage_step};
+use crate::workflow_resolution::resolve_selected_mid_stage_step;
 
 // ===================================================================
 // V1 Console 命令：大阶段草稿 → 检查 → 批准 → 选择
-// 这些命令替代旧的 generate_milestones（前端传参）路径。
+// 所有阶段生成统一从后端持久化事实读取输入。
 // ===================================================================
 
 const MILESTONE_REGEN_SOURCE_CHECK_FAILED: &str = "check_failed";
 const MILESTONE_REGEN_SOURCE_APPROVAL_REJECTED: &str = "approval_rejected";
+
+fn validate_generated_count(layer: &str, actual: usize, limit: u32) -> Result<(), String> {
+    if limit == 0 {
+        return Err(format!("当前工作负载画像不允许生成{layer}"));
+    }
+    if actual == 0 {
+        return Err(format!("AI 返回的{layer}列表为空；至少需要 1 个"));
+    }
+    if actual > limit as usize {
+        return Err(format!(
+            "{layer}数量超出工作负载画像上限：实际 {actual}，上限 {limit}"
+        ));
+    }
+    Ok(())
+}
 
 fn model_context(
     project: &project::Project,
@@ -248,6 +264,7 @@ async fn generate_milestone_candidates(
     proj: &project::Project,
     regeneration_feedback: Option<&str>,
 ) -> Result<Vec<project::Milestone>, String> {
+    let workload = crate::workload_policy::current_profile(proj)?;
     if proj.version_plan.trim().is_empty() {
         return Err("没有正式项目方案，无法生成大阶段。请先批准方案。".to_string());
     }
@@ -305,9 +322,22 @@ async fn generate_milestone_candidates(
         feedback_section,
     );
 
+    let stage_mode = if workload.use_mid_stage_layer {
+        project::StageMode::Professional
+    } else {
+        project::StageMode::Quick
+    };
+    let topology = if workload.use_mid_stage_layer {
+        "每个大阶段后续通过中阶段承载执行计划"
+    } else {
+        "每个大阶段后续直接承载执行计划"
+    };
     let system_prompt = format!(
-        "{}\n\n当前项目模式：Professional。输出的每个大阶段应包含 mid_stages 字段（空列表）和 subtasks 字段（空列表）。",
-        crate::prompts::MILESTONE_GENERATION_PROMPT
+        "{}\n\n{}\n必须生成 1..={} 个大阶段；{}。模型输出不得包含 mid_stages 或 subtasks 的预生成内容。",
+        crate::prompts::MILESTONE_GENERATION_PROMPT,
+        crate::workload_policy::render_planning_constraints(workload),
+        workload.max_milestones,
+        topology,
     );
     // Inject context: working constitution, approved plan, discussion, Already constitution
     let context_injection = crate::constitution_context::build_context_injection(&proj);
@@ -335,9 +365,7 @@ async fn generate_milestone_candidates(
         crate::json_utils::parse_json_with_retry_with_context(&content, context)
             .await
             .map_err(|error| format!("解析大阶段 JSON 失败：{}", error))?;
-    if raw_milestones.is_empty() {
-        return Err("AI 返回的大阶段列表为空，请重新生成。".to_string());
-    }
+    validate_generated_count("大阶段", raw_milestones.len(), workload.max_milestones)?;
 
     let milestones = raw_milestones
         .iter()
@@ -351,7 +379,7 @@ async fn generate_milestone_candidates(
                 description: required_string(raw, "description", &entity)?,
                 tech_stack: required_string(raw, "tech_stack", &entity)?,
                 status: project::MilestoneStatus::Pending,
-                mode: project::StageMode::Professional,
+                mode: stage_mode.clone(),
                 mid_stages: Vec::new(),
                 subtasks: Vec::new(),
                 qa_result: None,
@@ -365,6 +393,7 @@ async fn generate_milestone_candidates(
                 dependencies: optional_string_array(raw, "dependencies", &entity)?,
                 expected_output: required_string(raw, "expected_output", &entity)?,
                 acceptance_criteria: required_string_array(raw, "acceptance_criteria", &entity)?,
+                ..Default::default()
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -758,6 +787,9 @@ pub(crate) async fn select_milestone(
         project::WorkflowStep::MidStageCheck,
         project::WorkflowStep::MidStageApproval,
         project::WorkflowStep::MidStageSelection,
+        project::WorkflowStep::PlanGeneration,
+        project::WorkflowStep::PlanCheck,
+        project::WorkflowStep::PlanApproving,
     ];
     if !valid_steps.contains(&proj.workflow_state.current_step) {
         return Err(format!(
@@ -767,13 +799,27 @@ pub(crate) async fn select_milestone(
     }
 
     // 2. 验证 milestone_id 存在于正式 milestones 中
-    let milestone_exists = proj.milestones.iter().any(|m| m.id == milestone_id);
-    if !milestone_exists {
-        return Err(format!("大阶段 {} 不在正式大阶段列表中", milestone_id));
+    let workload = crate::workload_policy::current_profile(&proj)?;
+    let milestone = proj
+        .milestones
+        .iter()
+        .find(|milestone| milestone.id == milestone_id)
+        .ok_or_else(|| format!("大阶段 {} 不在正式大阶段列表中", milestone_id))?;
+    let expected_mode = if workload.use_mid_stage_layer {
+        project::StageMode::Professional
+    } else {
+        project::StageMode::Quick
+    };
+    if milestone.mode != expected_mode {
+        return Err(format!(
+            "大阶段拓扑与工作负载画像矛盾：画像要求 {:?}，当前为 {:?}",
+            expected_mode, milestone.mode
+        ));
     }
 
     // 3. 持久化选择
     proj.current_milestone_id = milestone_id.clone();
+    proj.current_mid_stage_id.clear();
     proj.workflow_state.data_revision += 1;
 
     crate::save_and_reload_project(&proj)
@@ -788,6 +834,10 @@ async fn generate_mid_stage_candidates(
     milestone_id: &str,
     regeneration_feedback: Option<&str>,
 ) -> Result<Vec<project::MidStage>, String> {
+    let workload = crate::workload_policy::current_profile(proj)?;
+    if !workload.use_mid_stage_layer {
+        return Err("当前工作负载画像使用大阶段直挂计划，禁止生成中阶段。".to_string());
+    }
     let milestone = proj
         .milestones
         .iter()
@@ -802,8 +852,16 @@ async fn generate_mid_stage_candidates(
     let context_injection = crate::constitution_context::build_context_injection(proj);
     let context = format!(
         "{}{}大阶段：{} ({})\n目标：{}\n范围：{}\n预期输出：{}\n验收标准：{}\n技术栈：{}\n\n项目方案：\n{}{}",
-        if context_injection.is_empty() { String::new() } else { format!("{}\n\n", context_injection) },
-        if context_injection.is_empty() { String::new() } else { "---\n\n".to_string() },
+        if context_injection.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n\n", context_injection)
+        },
+        if context_injection.is_empty() {
+            String::new()
+        } else {
+            "---\n\n".to_string()
+        },
         milestone.title,
         milestone.version,
         milestone.goal,
@@ -818,20 +876,21 @@ async fn generate_mid_stage_candidates(
         proj,
         crate::cost_ledger::ModelCallPurpose::MidStageGeneration,
     );
-    let response = crate::api::call_deepseek_api_json_with_context(
+    let prompt = format!(
+        "{}\n\n{}\n必须生成 1..={} 个中阶段。",
         crate::prompts::MID_STAGE_GENERATION_PROMPT,
-        &context,
-        call_context.clone(),
-    )
-    .await
-    .map_err(|error| format!("中阶段生成 AI 调用失败：{}", error))?;
+        crate::workload_policy::render_planning_constraints(workload),
+        workload.max_mid_stages,
+    );
+    let response =
+        crate::api::call_deepseek_api_json_with_context(&prompt, &context, call_context.clone())
+            .await
+            .map_err(|error| format!("中阶段生成 AI 调用失败：{}", error))?;
     let raw: Vec<serde_json::Value> =
         crate::json_utils::parse_json_with_retry_with_context(&response.content, call_context)
             .await
             .map_err(|error| format!("解析中阶段 JSON 失败：{}", error))?;
-    if raw.is_empty() {
-        return Err("AI 返回的中阶段列表为空，请重新生成。".to_string());
-    }
+    validate_generated_count("中阶段", raw.len(), workload.max_mid_stages)?;
 
     let stages = raw
         .iter()
@@ -1299,7 +1358,7 @@ pub(crate) async fn select_mid_stage(
         ));
     }
 
-    let milestone_id = &proj.current_milestone_id;
+    let milestone_id = proj.current_milestone_id.clone();
     if milestone_id.is_empty() {
         return Err("请先选择一个大阶段。".to_string());
     }
@@ -1307,8 +1366,12 @@ pub(crate) async fn select_mid_stage(
     let ms = proj
         .milestones
         .iter()
-        .find(|m| m.id == *milestone_id)
+        .find(|m| m.id == milestone_id)
         .ok_or("大阶段不存在。".to_string())?;
+    let workload = crate::workload_policy::current_profile(&proj)?;
+    if !workload.use_mid_stage_layer || ms.mode != project::StageMode::Professional {
+        return Err("当前工作负载画像不允许选择中阶段。".to_string());
+    }
 
     let mid = ms
         .mid_stages
@@ -1316,12 +1379,18 @@ pub(crate) async fn select_mid_stage(
         .find(|m| m.id == mid_stage_id)
         .ok_or("中阶段不在当前大阶段中。".to_string())?;
 
-    proj.current_mid_stage_id = mid_stage_id.clone();
-
     let next_step = resolve_selected_mid_stage_step(ms, mid)?;
-
     let now = chrono::Utc::now().to_rfc3339();
-    proj.workflow_state.current_step = next_step;
+    proj.current_mid_stage_id = mid_stage_id;
+    if next_step == project::WorkflowStep::MilestoneReview {
+        crate::workflow_resolution::apply_milestone_review_boundary(
+            &mut proj,
+            &milestone_id,
+            &now,
+        )?;
+    } else {
+        proj.workflow_state.current_step = next_step;
+    }
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = now;
 
@@ -1345,11 +1414,43 @@ pub(crate) async fn continue_current_milestone(
         .iter()
         .find(|milestone| milestone.id == proj.current_milestone_id)
         .ok_or_else(|| "请先选择有效的大阶段。".to_string())?;
-    let route = crate::workflow_resolution::resolve_mid_stage_route(milestone);
-    let changed = crate::workflow_resolution::apply_mid_stage_route(&mut proj, &route)?;
+    let workload = crate::workload_policy::current_profile(&proj)?;
+    let expected_mode = if workload.use_mid_stage_layer {
+        project::StageMode::Professional
+    } else {
+        project::StageMode::Quick
+    };
+    if milestone.mode != expected_mode {
+        return Err(format!(
+            "大阶段拓扑与工作负载画像矛盾：画像要求 {:?}，当前为 {:?}",
+            expected_mode, milestone.mode
+        ));
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let changed = if milestone.mode == project::StageMode::Quick {
+        let next_step = crate::workflow_resolution::resolve_direct_milestone_step(milestone)?;
+        if next_step == project::WorkflowStep::MilestoneReview {
+            let milestone_id = proj.current_milestone_id.clone();
+            crate::workflow_resolution::apply_milestone_review_boundary(
+                &mut proj,
+                &milestone_id,
+                &now,
+            )?;
+            true
+        } else {
+            let changed = proj.workflow_state.current_step != next_step
+                || !proj.current_mid_stage_id.is_empty();
+            proj.current_mid_stage_id.clear();
+            proj.workflow_state.current_step = next_step;
+            changed
+        }
+    } else {
+        let route = crate::workflow_resolution::resolve_mid_stage_route(milestone);
+        crate::workflow_resolution::apply_mid_stage_route(&mut proj, &route, &now)?
+    };
     if changed {
         proj.workflow_state.data_revision += 1;
-        proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+        proj.workflow_state.last_transition_at = now;
         return crate::save_and_reload_project(&proj);
     }
     Ok(proj)
@@ -1372,22 +1473,54 @@ fn plan_check_feedback(result: &project::StagePlanCheckResult) -> String {
     .join("\n")
 }
 
+fn plan_check_tracking(
+    scope: PlanScope,
+    proj: &project::Project,
+    result: &project::StagePlanCheckResult,
+) -> (String, u32, u32) {
+    if result.passed {
+        return (String::new(), 0, 0);
+    }
+    let fingerprint = crate::autopilot_policy::plan_failure_fingerprint(result);
+    let issue_count = crate::autopilot_policy::blocking_plan_issue_count(result);
+    let repeated = !scope.last_plan_failure_fingerprint(proj).is_empty()
+        && scope.last_plan_failure_fingerprint(proj) == fingerprint;
+    let did_not_improve = issue_count > 0
+        && scope.last_plan_issue_count(proj) > 0
+        && issue_count >= scope.last_plan_issue_count(proj);
+    let no_progress_count = if repeated || did_not_improve {
+        scope.plan_no_progress_count(proj).saturating_add(1)
+    } else {
+        scope.plan_no_progress_count(proj)
+    };
+    (fingerprint, issue_count, no_progress_count)
+}
+
 async fn generate_execution_plan_tasks(
     proj: &project::Project,
-    milestone_id: &str,
-    mid_stage_id: &str,
     regeneration_feedback: Option<&str>,
 ) -> Result<Vec<project::Subtask>, String> {
-    let milestone = proj
-        .milestones
-        .iter()
-        .find(|milestone| milestone.id == milestone_id)
-        .ok_or_else(|| "大阶段不存在。".to_string())?;
-    let mid_stage = milestone
-        .mid_stages
-        .iter()
-        .find(|mid_stage| mid_stage.id == mid_stage_id)
-        .ok_or_else(|| "中阶段不存在。".to_string())?;
+    let workload = crate::workload_policy::current_profile(proj)?;
+    let max_subtasks = workload.max_subtasks;
+    let scope = PlanScope::resolve(proj)?;
+    let milestone = scope.milestone(proj);
+    let (target_kind, target_title, target_version, target_description, target_tech_focus) =
+        match scope.mid_stage(proj) {
+            Some(mid_stage) => (
+                "中阶段",
+                mid_stage.title.as_str(),
+                mid_stage.version.as_str(),
+                mid_stage.description.as_str(),
+                mid_stage.tech_focus.as_str(),
+            ),
+            None => (
+                "大阶段直挂计划",
+                milestone.title.as_str(),
+                milestone.version.as_str(),
+                milestone.description.as_str(),
+                milestone.tech_stack.as_str(),
+            ),
+        };
     let feedback_section = regeneration_feedback
         .map(str::trim)
         .filter(|feedback| !feedback.is_empty())
@@ -1397,24 +1530,27 @@ async fn generate_execution_plan_tasks(
     let context_injection = crate::constitution_context::build_context_injection(proj);
     let project_facts = crate::project_facts::planning_context(proj)?;
     let context = format!(
-        "{}中阶段：{} ({})\n描述：{}\n技术重点：{}\n\n所属大阶段：{} — {}\n\
+        "{}计划目标（{}）：{} ({})\n描述：{}\n技术重点：{}\n\n所属大阶段：{} — {}\n\
          项目方案摘要（仅相关部分）：\n{}\n\n项目路径：{}\n\
          当前项目事实（压缩扫描，不含完整文件）：\n{}\n\n\
-         完整文件由执行器在运行时按 evidence_files 精确读取。{}",
+         完整文件由执行器在运行时按 evidence_files 精确读取。\n\n{}\n必须生成 1..={} 个小阶段。{}",
         if context_injection.is_empty() {
             String::new()
         } else {
             format!("{}\n\n---\n\n", context_injection)
         },
-        mid_stage.title,
-        mid_stage.version,
-        mid_stage.description,
-        mid_stage.tech_focus,
+        target_kind,
+        target_title,
+        target_version,
+        target_description,
+        target_tech_focus,
         milestone.title,
         milestone.goal,
         proj.version_plan.chars().take(1000).collect::<String>(),
         proj.project_path,
         project_facts,
+        crate::workload_policy::render_planning_constraints(workload),
+        max_subtasks,
         feedback_section,
     );
     let call_context = model_context(
@@ -1429,7 +1565,13 @@ async fn generate_execution_plan_tasks(
     .await
     .map_err(|error| format!("执行计划生成 AI 调用失败：{}", error))?;
     let mut repair_call_id = None;
-    let mut tasks = match parse_execution_plan_tasks(&response.content, call_context.clone()).await
+    let mut tasks = match parse_execution_plan_tasks(
+        &response.content,
+        call_context.clone(),
+        max_subtasks,
+        workload,
+    )
+    .await
     {
         Ok(tasks) => tasks,
         Err(validation_error) => {
@@ -1448,14 +1590,19 @@ async fn generate_execution_plan_tasks(
             .await
             .map_err(|error| format!("执行计划修订 AI 调用失败：{}", error))?;
             repair_call_id = Some(repaired.metadata.call_id.clone());
-            parse_execution_plan_tasks(&repaired.content, repair_context_metadata)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "执行计划修订后仍不满足契约：{}（首次错误：{}）",
-                        error, validation_error
-                    )
-                })?
+            parse_execution_plan_tasks(
+                &repaired.content,
+                repair_context_metadata,
+                max_subtasks,
+                workload,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "执行计划修订后仍不满足契约：{}（首次错误：{}）",
+                    error, validation_error
+                )
+            })?
         }
     };
     let accepted_deviations = crate::project_facts::accepted_deviations(proj);
@@ -1486,14 +1633,14 @@ async fn generate_execution_plan_tasks(
 async fn parse_execution_plan_tasks(
     reply: &str,
     context: crate::cost_ledger::ModelCallContext,
+    max_subtasks: u32,
+    workload: &project::WorkloadProfile,
 ) -> Result<Vec<project::Subtask>, String> {
     let raw: Vec<serde_json::Value> =
         crate::json_utils::parse_json_with_retry_with_context(reply, context)
             .await
             .map_err(|error| format!("解析执行计划 JSON 失败：{}", error))?;
-    if raw.is_empty() {
-        return Err("AI 返回的执行计划为空，请重新生成。".to_string());
-    }
+    validate_generated_count("小阶段", raw.len(), max_subtasks)?;
 
     let dependency_orders = raw
         .iter()
@@ -1598,7 +1745,7 @@ async fn parse_execution_plan_tasks(
             .collect::<Result<Vec<_>, _>>()?;
     }
     for task in &mut tasks {
-        crate::plan_contract::hydrate_subtask_contract(task);
+        crate::plan_contract::hydrate_subtask_contract(task, workload);
     }
     crate::plan_contract::validate_subtasks(&tasks)?;
     Ok(tasks)
@@ -1677,13 +1824,10 @@ pub(crate) async fn generate_execution_plan(
     }
     let milestone_id = initial.current_milestone_id.clone();
     let mid_stage_id = initial.current_mid_stage_id.clone();
-    if milestone_id.is_empty() || mid_stage_id.is_empty() {
-        return Err("请先选择大阶段和中阶段。".to_string());
-    }
+    let initial_scope = PlanScope::resolve(&initial)?;
     let initial_revision = initial.workflow_state.data_revision;
     let initial_plan = initial.version_plan.clone();
-    let subtasks =
-        generate_execution_plan_tasks(&initial, &milestone_id, &mid_stage_id, None).await?;
+    let subtasks = generate_execution_plan_tasks(&initial, None).await?;
     let mut proj = crate::load_project(&project_name)?;
     if proj.workflow_state.current_step != project::WorkflowStep::PlanGeneration
         || proj.workflow_state.data_revision != initial_revision
@@ -1693,28 +1837,11 @@ pub(crate) async fn generate_execution_plan(
     {
         return Err("生成期间项目事实已变化，未写入执行计划。请同步后重试。".to_string());
     }
-    let ms = proj
-        .milestones
-        .iter_mut()
-        .find(|m| m.id == milestone_id)
-        .ok_or("大阶段不存在。".to_string())?;
-    let mid = ms
-        .mid_stages
-        .iter_mut()
-        .find(|m| m.id == mid_stage_id)
-        .ok_or("中阶段不存在。".to_string())?;
-    if has_plan_execution_facts(mid) {
-        return Err("当前中阶段已有执行事实，禁止覆盖执行计划。".to_string());
+    let scope = PlanScope::resolve(&proj)?;
+    if scope.kind() != initial_scope.kind() || scope.has_execution_facts(&proj) {
+        return Err("当前计划目标已有执行事实或拓扑已变化，禁止覆盖执行计划。".to_string());
     }
-    mid.subtasks = subtasks;
-    mid.plan_check_result = None;
-    mid.plan_approved_at = None;
-    mid.plan_revision = 0;
-    mid.plan_draft_revision += 1;
-    mid.plan_generated_at = Some(chrono::Utc::now().to_rfc3339());
-    mid.last_plan_failure_fingerprint.clear();
-    mid.last_plan_issue_count = 0;
-    mid.plan_no_progress_count = 0;
+    scope.set_generated_plan(&mut proj, subtasks, chrono::Utc::now().to_rfc3339(), 0, 0);
 
     proj.workflow_state.current_step = project::WorkflowStep::PlanCheck;
     proj.workflow_state.data_revision += 1;
@@ -1748,28 +1875,18 @@ pub(crate) async fn regenerate_execution_plan(
     }
     let milestone_id = initial.current_milestone_id.clone();
     let mid_stage_id = initial.current_mid_stage_id.clone();
-    let milestone = initial
-        .milestones
-        .iter()
-        .find(|milestone| milestone.id == milestone_id)
-        .ok_or_else(|| "当前大阶段不存在。".to_string())?;
-    let mid_stage = milestone
-        .mid_stages
-        .iter()
-        .find(|mid_stage| mid_stage.id == mid_stage_id)
-        .ok_or_else(|| "当前中阶段不存在。".to_string())?;
-    if mid_stage.plan_draft_revision != expected_plan_draft_revision {
+    let initial_scope = PlanScope::resolve(&initial)?;
+    if initial_scope.plan_draft_revision(&initial) != expected_plan_draft_revision {
         return Err("执行计划草稿修订已变化，请同步后重试。".to_string());
     }
-    if has_plan_execution_facts(mid_stage) {
+    if initial_scope.has_execution_facts(&initial) {
         return Err(
             "执行计划已有执行进度或稳定标签，禁止直接重新生成；请使用回退流程。".to_string(),
         );
     }
     let effective_feedback = if feedback.trim().is_empty() {
-        mid_stage
-            .plan_check_result
-            .as_ref()
+        initial_scope
+            .plan_check_result(&initial)
             .map(plan_check_feedback)
             .filter(|text| !text.is_empty())
             .ok_or_else(|| "请提供执行计划重新生成反馈。".to_string())?
@@ -1777,14 +1894,9 @@ pub(crate) async fn regenerate_execution_plan(
         feedback.trim().to_string()
     };
     let initial_plan = initial.version_plan.clone();
-    let old_regeneration_count = mid_stage.plan_regeneration_count;
-    let subtasks = generate_execution_plan_tasks(
-        &initial,
-        &milestone_id,
-        &mid_stage_id,
-        Some(&effective_feedback),
-    )
-    .await?;
+    let old_regeneration_count = initial_scope.plan_regeneration_count(&initial);
+    let old_no_progress_count = initial_scope.plan_no_progress_count(&initial);
+    let subtasks = generate_execution_plan_tasks(&initial, Some(&effective_feedback)).await?;
 
     let mut latest = crate::load_project(&project_name)?;
     if latest.workflow_state.data_revision != expected_data_revision
@@ -1795,30 +1907,22 @@ pub(crate) async fn regenerate_execution_plan(
     {
         return Err("生成期间项目选择或正式方案已变化，未覆盖原执行计划。".to_string());
     }
-    let latest_milestone = latest
-        .milestones
-        .iter_mut()
-        .find(|milestone| milestone.id == milestone_id)
-        .ok_or_else(|| "生成期间当前大阶段已不存在。".to_string())?;
-    let latest_mid_stage = latest_milestone
-        .mid_stages
-        .iter_mut()
-        .find(|mid_stage| mid_stage.id == mid_stage_id)
-        .ok_or_else(|| "生成期间当前中阶段已不存在。".to_string())?;
-    if latest_mid_stage.plan_draft_revision != expected_plan_draft_revision
-        || has_plan_execution_facts(latest_mid_stage)
+    let latest_scope = PlanScope::resolve(&latest)?;
+    if latest_scope.kind() != initial_scope.kind()
+        || latest_scope.plan_draft_revision(&latest) != expected_plan_draft_revision
+        || latest_scope.has_execution_facts(&latest)
     {
         return Err("生成期间执行计划或执行事实已变化，未覆盖原计划。".to_string());
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    latest_mid_stage.subtasks = subtasks;
-    latest_mid_stage.plan_check_result = None;
-    latest_mid_stage.plan_approved_at = None;
-    latest_mid_stage.plan_revision = 0;
-    latest_mid_stage.plan_draft_revision += 1;
-    latest_mid_stage.plan_generated_at = Some(now.clone());
-    latest_mid_stage.plan_regeneration_count = old_regeneration_count + 1;
+    latest_scope.set_generated_plan(
+        &mut latest,
+        subtasks,
+        now.clone(),
+        old_regeneration_count.saturating_add(1),
+        old_no_progress_count,
+    );
     latest.workflow_state.current_step = project::WorkflowStep::PlanCheck;
     if let Some(autopilot) = latest.workflow_state.autopilot_state.as_mut() {
         if autopilot.recovery_action == project::AutopilotRecoveryAction::RegenerateExecutionPlan {
@@ -1846,32 +1950,15 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
         ));
     }
 
-    let milestone_id = &proj.current_milestone_id;
-    let mid_stage_id = &proj.current_mid_stage_id;
+    let max_subtasks = crate::workload_policy::current_profile(&proj)?.max_subtasks;
+    let milestone_id = proj.current_milestone_id.clone();
+    let mid_stage_id = proj.current_mid_stage_id.clone();
+    let scope = PlanScope::resolve(&proj)?;
+    let plan_draft_revision = scope.plan_draft_revision(&proj);
 
-    let ms = proj
-        .milestones
-        .iter()
-        .find(|m| m.id == *milestone_id)
-        .ok_or("大阶段不存在。")?;
-    let mid = ms
-        .mid_stages
-        .iter()
-        .find(|m| m.id == *mid_stage_id)
-        .ok_or("中阶段不存在。")?;
-
-    let deterministic = crate::plan_deterministic_checks::check_execution_plan(&mid.subtasks);
+    let deterministic =
+        crate::plan_deterministic_checks::check_execution_plan(scope.subtasks(&proj), max_subtasks);
     if !deterministic.is_empty() {
-        let ms = proj
-            .milestones
-            .iter_mut()
-            .find(|m| m.id == *milestone_id)
-            .ok_or("大阶段不存在。")?;
-        let mid = ms
-            .mid_stages
-            .iter_mut()
-            .find(|m| m.id == *mid_stage_id)
-            .ok_or("中阶段不存在。")?;
         let result = project::StagePlanCheckResult {
             passed: false,
             omissions: deterministic.omissions,
@@ -1880,22 +1967,27 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
             suggestions: vec!["修复以上结构硬阻断后再运行语义检查。".to_string()],
             checked_at: chrono::Utc::now().to_rfc3339(),
         };
-        mid.last_plan_failure_fingerprint =
-            crate::autopilot_policy::plan_failure_fingerprint(&result);
-        mid.last_plan_issue_count = crate::autopilot_policy::blocking_plan_issue_count(&result);
-        mid.plan_check_result = Some(result);
+        let (fingerprint, issue_count, no_progress_count) =
+            plan_check_tracking(scope, &proj, &result);
+        scope.set_plan_check_result(
+            &mut proj,
+            result,
+            fingerprint,
+            issue_count,
+            no_progress_count,
+        );
         proj.workflow_state.data_revision += 1;
         proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
         return crate::save_and_reload_project(&proj);
     }
 
-    let order_by_id = mid
-        .subtasks
+    let order_by_id = scope
+        .subtasks(&proj)
         .iter()
         .map(|task| (task.id.as_str(), task.order))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let plan_text = mid
-        .subtasks
+    let plan_text = scope
+        .subtasks(&proj)
         .iter()
         .enumerate()
         .map(|(i, st)| {
@@ -1924,14 +2016,31 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
         .join("\n");
 
     let project_facts = crate::project_facts::planning_context(&proj)?;
+    let milestone = scope.milestone(&proj);
+    let (target_kind, target_title, target_description, target_tech_focus) =
+        match scope.mid_stage(&proj) {
+            Some(mid_stage) => (
+                "中阶段",
+                mid_stage.title.as_str(),
+                mid_stage.description.as_str(),
+                mid_stage.tech_focus.as_str(),
+            ),
+            None => (
+                "大阶段直挂计划",
+                milestone.title.as_str(),
+                milestone.description.as_str(),
+                milestone.tech_stack.as_str(),
+            ),
+        };
 
     let context = format!(
-        "中阶段：{} — {}\n技术重点：{}\n\n当前项目事实（与计划生成使用相同的压缩扫描）：\n{}\n\n执行计划（{} 个小阶段）：\n{}",
-        mid.title,
-        mid.description,
-        mid.tech_focus,
+        "计划目标（{}）：{} — {}\n技术重点：{}\n\n当前项目事实（与计划生成使用相同的压缩扫描）：\n{}\n\n执行计划（{} 个小阶段）：\n{}",
+        target_kind,
+        target_title,
+        target_description,
+        target_tech_focus,
         project_facts,
-        mid.subtasks.len(),
+        scope.subtasks(&proj).len(),
         plan_text
     );
 
@@ -1959,39 +2068,27 @@ pub(crate) async fn check_stage_plan(project_name: String) -> Result<project::Pr
     let passed = result.passed;
 
     let mut proj = crate::load_project(&project_name)?;
-    if proj.workflow_state.current_step != project::WorkflowStep::PlanCheck {
-        return Err("当前项目已不在计划检查步骤。".to_string());
+    if proj.workflow_state.current_step != project::WorkflowStep::PlanCheck
+        || proj.current_milestone_id != milestone_id
+        || proj.current_mid_stage_id != mid_stage_id
+    {
+        return Err("当前项目已不在原计划检查目标。".to_string());
     }
-
-    let ms = proj
-        .milestones
-        .iter_mut()
-        .find(|m| m.id == *milestone_id)
-        .ok_or("大阶段不存在。")?;
-    let mid = ms
-        .mid_stages
-        .iter_mut()
-        .find(|m| m.id == *mid_stage_id)
-        .ok_or("中阶段不存在。")?;
-    if passed {
-        mid.last_plan_failure_fingerprint.clear();
-        mid.last_plan_issue_count = 0;
-        mid.plan_no_progress_count = 0;
-    } else {
-        let fingerprint = crate::autopilot_policy::plan_failure_fingerprint(&result);
-        let issue_count = crate::autopilot_policy::blocking_plan_issue_count(&result);
-        let repeated = !mid.last_plan_failure_fingerprint.is_empty()
-            && mid.last_plan_failure_fingerprint == fingerprint;
-        let did_not_improve = issue_count > 0
-            && mid.last_plan_issue_count > 0
-            && issue_count >= mid.last_plan_issue_count;
-        if repeated || did_not_improve {
-            mid.plan_no_progress_count = mid.plan_no_progress_count.saturating_add(1);
-        }
-        mid.last_plan_failure_fingerprint = fingerprint;
-        mid.last_plan_issue_count = issue_count;
+    let latest_scope = PlanScope::resolve(&proj)?;
+    if latest_scope.kind() != scope.kind()
+        || latest_scope.plan_draft_revision(&proj) != plan_draft_revision
+    {
+        return Err("计划检查期间计划目标或草稿修订已变化，未写入检查结果。".to_string());
     }
-    mid.plan_check_result = Some(result);
+    let (fingerprint, issue_count, no_progress_count) =
+        plan_check_tracking(latest_scope, &proj, &result);
+    latest_scope.set_plan_check_result(
+        &mut proj,
+        result,
+        fingerprint,
+        issue_count,
+        no_progress_count,
+    );
 
     proj.workflow_state.current_step = if passed {
         project::WorkflowStep::PlanApproving
@@ -2026,46 +2123,22 @@ pub(crate) async fn approve_stage_plan(project_name: String) -> Result<project::
         ));
     }
 
-    let milestone_id = &proj.current_milestone_id;
-    let mid_stage_id = &proj.current_mid_stage_id;
-
-    if let Some(check) = proj
-        .milestones
-        .iter_mut()
-        .find(|milestone| milestone.id == *milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter_mut()
-                .find(|mid_stage| mid_stage.id == *mid_stage_id)
-        })
-        .and_then(|mid_stage| mid_stage.plan_check_result.as_mut())
-    {
+    let scope = PlanScope::resolve(&proj)?;
+    if let Some(check) = scope.plan_check_result_mut(&mut proj) {
         *check = crate::autopilot_policy::normalize_plan_check_result(check.clone());
     }
 
-    let ms = proj
-        .milestones
-        .iter()
-        .find(|m| m.id == *milestone_id)
-        .ok_or("大阶段不存在。")?;
-    let mid = ms
-        .mid_stages
-        .iter()
-        .find(|m| m.id == *mid_stage_id)
-        .ok_or("中阶段不存在。")?;
-
     // Verify check passed
-    match &mid.plan_check_result {
+    match scope.plan_check_result(&proj) {
         Some(r) if r.passed => {}
         Some(_) => return Err("执行计划检查未通过，无法批准。".to_string()),
         None => return Err("执行计划尚未检查，请先运行检查。".to_string()),
     }
 
-    if mid.subtasks.is_empty() {
+    if scope.subtasks(&proj).is_empty() {
         return Err("执行计划为空，无法批准。".to_string());
     }
-    crate::plan_contract::validate_subtasks(&mid.subtasks)
+    crate::plan_contract::validate_subtasks(scope.subtasks(&proj))
         .map_err(|error| format!("执行计划契约无效，无法批准：{}", error))?;
 
     let workspace = crate::pipeline::get_execution_workspace_status_inner(&proj.project_path)?;
@@ -2075,11 +2148,11 @@ pub(crate) async fn approve_stage_plan(project_name: String) -> Result<project::
             workspace.status_message
         ));
     }
-    crate::plan_contract::validate_subtasks_in_project(&mid.subtasks, &proj.project_path)
+    crate::plan_contract::validate_subtasks_in_project(scope.subtasks(&proj), &proj.project_path)
         .map_err(|error| format!("执行计划契约无效，无法批准：{}", error))?;
 
     // Idempotency: if already approved, ensure disk consistency
-    if mid.plan_approved_at.is_some() && mid.plan_revision > 0 {
+    if scope.plan_approved_at(&proj).is_some() && scope.plan_revision(&proj) > 0 {
         if proj.workflow_state.current_step == project::WorkflowStep::PlanApproving {
             // Repair stale step: migrate to Execution
             proj.workflow_state.current_step = project::WorkflowStep::Execution;
@@ -2094,19 +2167,7 @@ pub(crate) async fn approve_stage_plan(project_name: String) -> Result<project::
     let now = chrono::Utc::now().to_rfc3339();
     let plan_rev = proj.workflow_state.data_revision + 1;
 
-    // Write approval metadata
-    let ms = proj
-        .milestones
-        .iter_mut()
-        .find(|m| m.id == *milestone_id)
-        .ok_or("大阶段不存在。")?;
-    let mid = ms
-        .mid_stages
-        .iter_mut()
-        .find(|m| m.id == *mid_stage_id)
-        .ok_or("中阶段不存在。")?;
-    mid.plan_approved_at = Some(now);
-    mid.plan_revision = plan_rev;
+    scope.approve_plan(&mut proj, now, plan_rev);
 
     // Transition to Execution — plan is now frozen, ready for execution
     proj.workflow_state.current_step = project::WorkflowStep::Execution;
@@ -2127,51 +2188,23 @@ pub(crate) async fn enter_milestone_review(
 ) -> Result<project::Project, String> {
     let mut proj = crate::load_project(&project_name)?;
 
+    if !matches!(
+        proj.workflow_state.current_step,
+        project::WorkflowStep::Execution
+            | project::WorkflowStep::MilestoneSelection
+            | project::WorkflowStep::Discussion
+    ) {
+        return Err(format!(
+            "当前步骤 {:?} 不能直接进入 MilestoneReview。",
+            proj.workflow_state.current_step
+        ));
+    }
+
     let milestone_id = proj.current_milestone_id.clone();
-    if milestone_id.is_empty() {
-        return Err("未选择大阶段。".to_string());
-    }
-
-    let milestone_title = {
-        let ms = proj
-            .milestones
-            .iter_mut()
-            .find(|m| m.id == milestone_id)
-            .ok_or("大阶段不存在。".to_string())?;
-
-        if ms.mid_stages.is_empty() {
-            return Err("当前大阶段没有中阶段。".to_string());
-        }
-        let all_complete = ms
-            .mid_stages
-            .iter()
-            .all(|m| m.status == project::MidStageStatus::Completed);
-        if !all_complete {
-            return Err("大阶段尚有未完成的中阶段，无法进入审阅。".to_string());
-        }
-
-        ms.status = project::MilestoneStatus::Completed;
-        ms.review_status = Some("pending_review".to_string());
-        ms.review_conclusion = None;
-        ms.title.clone()
-    };
-
-    proj.workflow_state.current_step = project::WorkflowStep::MilestoneReview;
-    proj.workflow_state.review_node_id = milestone_id.clone();
-    if proj.workflow_state.autopilot_active {
-        let autopilot = proj
-            .workflow_state
-            .autopilot_state
-            .get_or_insert_with(project::AutopilotState::default);
-        autopilot.active = true;
-        autopilot.target_milestone_id = milestone_id.clone();
-        autopilot.run_status = project::AutopilotRunStatus::WaitingMilestoneReview;
-        autopilot.last_action = format!("到达大阶段边界：{}，等待人工 A/B/C", milestone_title);
-        autopilot.last_action_at = chrono::Utc::now().to_rfc3339();
-        autopilot.error_message.clear();
-    }
-    proj.workflow_state.data_revision += 1;
-    proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+    let now = chrono::Utc::now().to_rfc3339();
+    crate::workflow_resolution::apply_milestone_review_boundary(&mut proj, &milestone_id, &now)?;
+    proj.workflow_state.data_revision = proj.workflow_state.data_revision.saturating_add(1);
+    proj.workflow_state.last_transition_at = now;
 
     crate::save_and_reload_project(&proj)
 }
@@ -2553,6 +2586,7 @@ pub(crate) async fn generate_future_milestone_draft(
     project_name: String,
 ) -> Result<project::Project, String> {
     let proj = crate::load_project(&project_name)?;
+    let workload = crate::workload_policy::current_profile(&proj)?;
 
     if proj.workflow_state.discussion_scope != project::DiscussionScope::AdjustFuture {
         return Err("当前不在 AdjustFuture 讨论范围。".to_string());
@@ -2586,6 +2620,16 @@ pub(crate) async fn generate_future_milestone_draft(
         .map(|m| format!("- {} ({})", m.title, m.version))
         .collect();
     let retained_ids: Vec<String> = completed.iter().map(|m| m.id.clone()).collect();
+    let remaining_milestone_limit = workload
+        .max_milestones
+        .saturating_sub(retained_ids.len() as u32);
+    if remaining_milestone_limit == 0 {
+        return Err(format!(
+            "当前画像最多允许 {} 个大阶段，已保留 {} 个，无法再生成未来大阶段。",
+            workload.max_milestones,
+            retained_ids.len()
+        ));
+    }
     let discussion = source_thread
         .messages
         .iter()
@@ -2595,11 +2639,13 @@ pub(crate) async fn generate_future_milestone_draft(
 
     let context = format!(
         "项目方案：{}\n\n当前项目事实：\n{}\n\n已完成大阶段：\n{}\n\n讨论反馈：\n{}\n\n\
-         只生成上述已完成大阶段之后的后续大阶段。已完成大阶段必须完全保留。",
+         只生成上述已完成大阶段之后的后续大阶段。已完成大阶段必须完全保留。\n\n{}\n必须生成 1..={} 个后续大阶段。",
         proj.version_plan,
         future_planning_fact_summary(&proj, &retained_ids)?,
         completed_titles.join("\n"),
         discussion,
+        crate::workload_policy::render_planning_constraints(workload),
+        remaining_milestone_limit,
     );
 
     let call_context = model_context(
@@ -2619,9 +2665,7 @@ pub(crate) async fn generate_future_milestone_draft(
             .await
             .map_err(|e| format!("解析失败：{}", e))?;
 
-    if raw.is_empty() {
-        return Err("AI 返回的后续大阶段为空。".to_string());
-    }
+    validate_generated_count("后续大阶段", raw.len(), remaining_milestone_limit)?;
     let mut new_milestones: Vec<project::Milestone> = Vec::new();
     for r in &raw {
         new_milestones.push(project::Milestone {
@@ -2631,7 +2675,11 @@ pub(crate) async fn generate_future_milestone_draft(
             description: r["description"].as_str().unwrap_or("").to_string(),
             tech_stack: r["tech_stack"].as_str().unwrap_or("").to_string(),
             status: project::MilestoneStatus::Pending,
-            mode: project::StageMode::Professional,
+            mode: if workload.use_mid_stage_layer {
+                project::StageMode::Professional
+            } else {
+                project::StageMode::Quick
+            },
             mid_stages: vec![],
             subtasks: vec![],
             qa_result: None,
@@ -2645,6 +2693,7 @@ pub(crate) async fn generate_future_milestone_draft(
             dependencies: arr_str(&r["dependencies"]),
             expected_output: r["expected_output"].as_str().unwrap_or("").to_string(),
             acceptance_criteria: arr_str(&r["acceptance_criteria"]),
+            ..Default::default()
         });
     }
 
@@ -2950,623 +2999,6 @@ fn parse_version(v: &str) -> (u32, u32) {
     }
 }
 
-// ===================================================================
-// 旧命令（保留兼容，新路径不使用）
-// ===================================================================
-
-#[tauri::command]
-#[allow(dead_code)]
-pub(crate) async fn generate_milestones(
-    version_plan: String,
-    mode: String,
-) -> Result<Vec<project::Milestone>, String> {
-    //拼好提示词
-    //2. 构造 system prompt （产品经理角色 + 模式信息）
-    let system_prompt = format!(
-        "{}\n\n当前项目模式：{}。\
-         如果是专业模式，输出的每个大阶段应包含 mid_stages 字段（空列表）；\
-         如果是快速模式，输出的每个大阶段应包含 subtasks 字段（空列表）。\
-         每个大阶段的 version 字段格式为 v0.1、v0.2 等。\
-         你只输出 JSON 数组，不要输出其他文字，不要包含 markdown 代码块标记。\
-         每个大阶段包含：version（字符串）, title（字符串）, description（字符串）, tech_stack（字符串）。",
-        crate::prompts::PM_PROMPT, mode
-    );
-    let user_message = format!("请根据以下版本方案拆解为3-5个大阶段：\n{}", version_plan);
-    let content =
-        crate::api::call_deepseek_api_inner(&system_prompt, &user_message, false, 0.5).await?;
-    //（上面的文字）JSON数组转化为Rust数组,json改动替换
-    let raw_milestones: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&content)
-        .await
-        .map_err(|e| format!("解析大阶段 JSON 失败：{}", e))?;
-    //创建一个空的、可变的、专门用来存放 project::Milestone 结构体的数组，变量名叫 milestones
-    let mut milestones: Vec<project::Milestone> = Vec::new();
-    //把这个数组里面的每个对象，转化为Rust里Milestone结构体（补上id,状态...）
-    for raw in raw_milestones {
-        milestones.push(project::Milestone {
-            id: uuid::Uuid::new_v4().to_string(),
-            version: raw["version"].as_str().unwrap_or("v0.0").to_string(),
-            title: raw["title"].as_str().unwrap_or("未命名").to_string(),
-            description: raw["description"].as_str().unwrap_or("").to_string(),
-            tech_stack: raw["tech_stack"].as_str().unwrap_or("").to_string(),
-            status: project::MilestoneStatus::Pending,
-            mode: if mode == "Quick" {
-                project::StageMode::Quick
-            } else {
-                project::StageMode::Professional
-            },
-            mid_stages: vec![],
-            subtasks: vec![],
-            qa_result: None,
-            git_commit_hash: "".to_string(),
-            decomposition_check: None,
-            review_status: None,
-            review_conclusion: None,
-            approved_at: None,
-            goal: String::new(),
-            scope: String::new(),
-            dependencies: vec![],
-            expected_output: String::new(),
-            acceptance_criteria: vec![],
-        });
-    }
-
-    // === 质检逻辑：对比版本方案检查大阶段列表是否对齐 ===
-    // 步骤 1：将 milestones 序列化为 JSON 字符串
-    let milestones_json = match serde_json::to_string(&milestones) {
-        Ok(json) => json,
-        Err(e) => {
-            eprintln!(
-                "[generate_milestones] 大阶段 JSON 序列化失败：{}，跳过质检",
-                e
-            );
-            return Ok(milestones);
-        }
-    };
-
-    // 步骤 2：构造质检请求的 user_message
-    let qa_user_message = format!(
-        "【原始需求（版本方案）】\n{}\n\n【当前产出（大阶段列表）】\n{}",
-        version_plan, milestones_json
-    );
-
-    // 步骤 3：调用 DeepSeek Flash 执行质检（纯文本模式，低 temperature）
-    let qa_response = match crate::api::call_deepseek_api_inner(
-        crate::prompts::QA_CHECK_PROMPT,
-        &qa_user_message,
-        false,
-        0.1,
-    )
-    .await
-    {
-        Ok(reply) => reply,
-        Err(e) => {
-            eprintln!("[generate_milestones] 质检 API 调用失败：{}，跳过质检", e);
-            return Ok(milestones);
-        }
-    };
-
-    // 步骤 4：使用 parse_json_with_retry 解析 AI 返回的 QAResult JSON
-    let qa_result = match crate::json_utils::parse_json_with_contract::<project::QAResult>(
-        &qa_response,
-        &crate::json_utils::QA_RESULT_JSON_CONTRACT,
-    )
-    .await
-    {
-        Ok(mut result) => {
-            result.checked_at = chrono::Utc::now().to_rfc3339();
-            result
-        }
-        Err(e) => {
-            eprintln!(
-                "[generate_milestones] 质检 JSON 解析失败：{}，默认判定为不通过",
-                e
-            );
-            project::QAResult {
-                passed: false,
-                reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案".to_string(),
-                details: vec![],
-                attention_points: vec![],
-                checked_at: chrono::Utc::now().to_rfc3339(),
-                warnings: vec![format!("质检 JSON 解析失败：{}", e)],
-            }
-        }
-    };
-
-    // 步骤 5：将 QAResult 写入每个 Milestone
-    for milestone in &mut milestones {
-        milestone.qa_result = Some(qa_result.clone());
-    }
-
-    Ok(milestones)
-}
-
-///根据质检驳回的反馈，重新让产品经理拆解大阶段
-///与 generate_milestones 的区别：user_message 中包含驳回原因，引导 AI 修正
-#[tauri::command]
-#[allow(dead_code)]
-pub(crate) async fn regenerate_milestones_with_feedback(
-    version_plan: String,
-    mode: String,
-    feedback: String,
-) -> Result<Vec<project::Milestone>, String> {
-    // 2. 构造 system prompt （产品经理角色 + 模式信息）
-    let system_prompt = format!(
-        "{}\n\n当前项目模式：{}。\
-         如果是专业模式，输出的每个大阶段应包含 mid_stages 字段（空列表）；\
-         如果是快速模式，输出的每个大阶段应包含 subtasks 字段（空列表）。\
-         每个大阶段的 version 字段格式为 v0.1、v0.2 等。\
-         你只输出 JSON 数组，不要输出其他文字，不要包含 markdown 代码块标记。\
-         每个大阶段包含：version（字符串）, title（字符串）, description（字符串）, tech_stack（字符串）。",
-        crate::prompts::PM_PROMPT, mode
-    );
-    let user_message = format!(
-        "上次拆解被需求质检驳回，原因：\n{}\n\n请根据此反馈，重新根据以下版本方案拆解为3-5个大阶段：\n{}",
-        feedback, version_plan
-    );
-    let content =
-        crate::api::call_deepseek_api_inner(&system_prompt, &user_message, false, 0.5).await?;
-    // 5. 解析 JSON 数组
-    let raw_milestones: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&content)
-        .await
-        .map_err(|e| format!("解析大阶段 JSON 失败：{}", e))?;
-    // 6. 构造 Milestone 结构体
-    let mut milestones: Vec<project::Milestone> = Vec::new();
-    for raw in raw_milestones {
-        milestones.push(project::Milestone {
-            id: uuid::Uuid::new_v4().to_string(),
-            version: raw["version"].as_str().unwrap_or("v0.0").to_string(),
-            title: raw["title"].as_str().unwrap_or("未命名").to_string(),
-            description: raw["description"].as_str().unwrap_or("").to_string(),
-            tech_stack: raw["tech_stack"].as_str().unwrap_or("").to_string(),
-            status: project::MilestoneStatus::Pending,
-            mode: if mode == "Quick" {
-                project::StageMode::Quick
-            } else {
-                project::StageMode::Professional
-            },
-            mid_stages: vec![],
-            subtasks: vec![],
-            qa_result: None,
-            git_commit_hash: "".to_string(),
-            decomposition_check: None,
-            review_status: None,
-            review_conclusion: None,
-            approved_at: None,
-            goal: String::new(),
-            scope: String::new(),
-            dependencies: vec![],
-            expected_output: String::new(),
-            acceptance_criteria: vec![],
-        });
-    }
-
-    // === 质检逻辑：对比版本方案检查大阶段列表是否对齐 ===
-    // 步骤 7.1：将 milestones 序列化为 JSON 字符串
-    let milestones_json = match serde_json::to_string(&milestones) {
-        Ok(json) => json,
-        Err(e) => {
-            eprintln!(
-                "[regenerate_milestones_with_feedback] 大阶段 JSON 序列化失败：{}，跳过质检",
-                e
-            );
-            return Ok(milestones);
-        }
-    };
-
-    // 步骤 7.2：构造质检请求的 user_message
-    let qa_user_message = format!(
-        "【原始需求（版本方案）】\n{}\n\n【当前产出（大阶段列表）】\n{}",
-        version_plan, milestones_json
-    );
-
-    // 步骤 7.3：调用 DeepSeek Flash 执行质检（纯文本模式，低 temperature）
-    let qa_response = match crate::api::call_deepseek_api_inner(
-        crate::prompts::QA_CHECK_PROMPT,
-        &qa_user_message,
-        false,
-        0.1,
-    )
-    .await
-    {
-        Ok(reply) => reply,
-        Err(e) => {
-            eprintln!(
-                "[regenerate_milestones_with_feedback] 质检 API 调用失败：{}，跳过质检",
-                e
-            );
-            return Ok(milestones);
-        }
-    };
-
-    // 步骤 7.4：使用 parse_json_with_retry 解析 AI 返回的 QAResult JSON
-    let qa_result = match crate::json_utils::parse_json_with_contract::<project::QAResult>(
-        &qa_response,
-        &crate::json_utils::QA_RESULT_JSON_CONTRACT,
-    )
-    .await
-    {
-        Ok(mut result) => {
-            result.checked_at = chrono::Utc::now().to_rfc3339();
-            result
-        }
-        Err(e) => {
-            eprintln!(
-                "[regenerate_milestones_with_feedback] 质检 JSON 解析失败：{}，默认判定为不通过",
-                e
-            );
-            project::QAResult {
-                passed: false,
-                reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案".to_string(),
-                details: vec![],
-                attention_points: vec![],
-                checked_at: chrono::Utc::now().to_rfc3339(),
-                warnings: vec![format!("质检 JSON 解析失败：{}", e)],
-            }
-        }
-    };
-
-    // 步骤 7.5：将 QAResult 写入每个 Milestone
-    for milestone in &mut milestones {
-        milestone.qa_result = Some(qa_result.clone());
-    }
-
-    Ok(milestones)
-}
-
-///中阶段控制
-#[tauri::command]
-#[allow(dead_code)]
-pub(crate) async fn generate_mid_stages(
-    _milestone_id: String,
-    milestone_title: String,
-    milestone_description: String,
-    version_plan: String,
-    mode: String,
-    attention_points: Vec<String>,
-) -> Result<Vec<project::MidStage>, String> {
-    // 2. 构造 system prompt
-    let mut system_prompt = format!(
-        "{}\n\n当前项目模式：{}。请根据版本方案，将大阶段拆解为 3-6 个中阶段。\
-         每个中阶段是一个垂直切片。",
-        crate::prompts::DOMAIN_LEAD_PROMPT,
-        mode
-    );
-    // 注入 attention_points（若不为空）
-    if !attention_points.is_empty() {
-        system_prompt.push_str("\n【需求关注点】\n该大阶段在需求对齐检查中确认了以下要点，请在拆分中阶段时确保覆盖：\n");
-        for point in &attention_points {
-            system_prompt.push_str(&format!("- {}\n", point));
-        }
-    }
-    let user_message = format!(
-        "请根据版本方案，为大阶段「{} - {}」拆解中阶段：\n{}",
-        milestone_title, milestone_description, version_plan
-    );
-    let content =
-        crate::api::call_deepseek_api_inner(&system_prompt, &user_message, false, 0.5).await?;
-    // 5. 解析 JSON,json 解析改动
-    let raw_mid_stages: Vec<serde_json::Value> = crate::json_utils::parse_json_with_retry(&content)
-        .await
-        .map_err(|e| format!("解析中阶段 JSON 失败：{}", e))?;
-    // 6. 转换成 MidStage 结构体
-    let mut mid_stages: Vec<project::MidStage> = Vec::new();
-    for (i, raw) in raw_mid_stages.iter().enumerate() {
-        mid_stages.push(project::MidStage {
-            id: uuid::Uuid::new_v4().to_string(),
-            version: raw["version"].as_str().unwrap_or("v0.0.0").to_string(),
-            title: raw["title"].as_str().unwrap_or("未命名").to_string(),
-            description: raw["description"].as_str().unwrap_or("").to_string(),
-            tech_focus: raw["tech_focus"].as_str().unwrap_or("").to_string(),
-            order: Some((i + 1) as i32),
-            status: project::MidStageStatus::Pending,
-            subtasks: vec![],
-            test_report: "".to_string(),
-            domain: None,
-            test_log: None,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            completed_at: None,
-            approved_at: None,
-            git_tag: String::new(),
-            plan_check_result: None,
-            plan_approved_at: None,
-            plan_revision: 0,
-            plan_draft_revision: 0,
-            plan_generated_at: None,
-            plan_regeneration_count: 0,
-            last_plan_failure_fingerprint: String::new(),
-            last_plan_issue_count: 0,
-            plan_no_progress_count: 0,
-        });
-    }
-    Ok(mid_stages)
-}
-
-// src-tauri/src/lib.rs
-
-/// 在保留已完成大阶段的前提下，根据用户反馈重新生成后续大阶段
-///
-/// 与 generate_milestones（首次全量生成）的区别：
-/// - 只生成 after_milestone_id 之后的大阶段，不修改已完成的
-/// - 接受用户反馈作为修正方向
-/// - 将已完成大阶段的摘要作为上下文传给 AI
-///
-/// 1. 加载项目，定位 after_milestone_id 作为分割点
-/// 2. 构造包含已完成摘要和用户反馈的 AI 请求
-/// 3. 调用 AI 生成后续大阶段
-/// 4. QA 质检 → 不通过则返回错误，不修改 project.json
-/// 5. 填充 UUID / 时间戳，拼接新旧 milestones，持久化
-#[tauri::command]
-#[allow(dead_code)]
-pub(crate) async fn regenerate_milestones_from_point(
-    project_name: String,
-    after_milestone_id: String,
-    version_plan: String,
-    mode: String,
-    feedback: String,
-    completed_summary: String,
-) -> Result<String, String> {
-    // 1. 加载项目
-    let mut project = crate::load_project(&project_name)?;
-
-    // 2. 定位分割点：找到 after_milestone_id 的索引
-    let split_idx = if after_milestone_id.is_empty() {
-        // 没有已完成的大阶段 → 退化为全量生成
-        None
-    } else {
-        let mut found: Option<usize> = None;
-        for (i, m) in project.milestones.iter().enumerate() {
-            if m.id == after_milestone_id {
-                found = Some(i);
-                break;
-            }
-        }
-        match found {
-            Some(idx) => Some(idx),
-            None => return Err(format!("未找到指定的大阶段: {}", after_milestone_id)),
-        }
-    };
-
-    // 3. 收集已完成大阶段的上下文信息
-    let completed_milestones: Vec<&project::Milestone> = match split_idx {
-        Some(idx) => project.milestones[..=idx].iter().collect(),
-        None => vec![],
-    };
-
-    let completed_titles: Vec<String> = completed_milestones
-        .iter()
-        .map(|m| format!("- {} ({})", m.title, m.version))
-        .collect();
-    let completed_titles_str = if completed_titles.is_empty() {
-        "（暂无已完成的大阶段）".to_string()
-    } else {
-        completed_titles.join("\n")
-    };
-
-    let next_version_hint = if let Some(last) = completed_milestones.last() {
-        format!(
-            "\n\n已有大阶段的最后一个版本是 {}，新生成的大阶段版本号应从 {} 之后开始。",
-            last.version, last.version
-        )
-    } else {
-        String::new()
-    };
-
-    // 4. 构造 AI 请求
-    let system_prompt = crate::prompts::REGENERATE_MILESTONES_PROMPT.to_string();
-
-    let user_message = format!(
-        "版本方案：\n{}\n\n项目模式：{}\n\n已完成大阶段摘要：\n{}\n\n已完成大阶段列表：\n{}{}\n\n用户反馈：\n{}\n\n请根据以上信息，生成后续的大阶段（milestones）JSON 数组。",
-        version_plan,
-        mode,
-        completed_summary,
-        completed_titles_str,
-        next_version_hint,
-        if feedback.is_empty() { "（用户未提供额外反馈）" } else { &feedback }
-    );
-
-    let call_context = model_context(
-        &project,
-        crate::cost_ledger::ModelCallPurpose::MilestoneGeneration,
-    );
-    let response = crate::api::call_deepseek_api_inner_with_context(
-        &system_prompt,
-        &user_message,
-        false,
-        0.5,
-        call_context.clone(),
-    )
-    .await?;
-    let content = response.content;
-
-    // 8. 解析 AI 返回的 JSON 数组
-    let raw_milestones: Vec<serde_json::Value> =
-        crate::json_utils::parse_json_with_retry_with_context(&content, call_context)
-            .await
-            .map_err(|e| format!("解析大阶段 JSON 失败：{}", e))?;
-    mark_model_output(
-        &project_name,
-        &response.metadata.call_id,
-        crate::cost_ledger::ModelCallOutcome {
-            produced_plan: true,
-            ..Default::default()
-        },
-    );
-
-    // 9. 构造新的 Milestone 结构体
-    let mut new_milestones: Vec<project::Milestone> = Vec::new();
-    for raw in raw_milestones {
-        new_milestones.push(project::Milestone {
-            id: uuid::Uuid::new_v4().to_string(),
-            version: raw["version"].as_str().unwrap_or("v0.0").to_string(),
-            title: raw["title"].as_str().unwrap_or("未命名").to_string(),
-            description: raw["description"].as_str().unwrap_or("").to_string(),
-            tech_stack: raw["tech_stack"].as_str().unwrap_or("").to_string(),
-            status: project::MilestoneStatus::Pending,
-            mode: if mode == "Quick" {
-                project::StageMode::Quick
-            } else {
-                project::StageMode::Professional
-            },
-            mid_stages: vec![],
-            subtasks: vec![],
-            qa_result: None,
-            git_commit_hash: String::new(),
-            decomposition_check: None,
-            review_status: None,
-            review_conclusion: None,
-            approved_at: None,
-            goal: String::new(),
-            scope: String::new(),
-            dependencies: vec![],
-            expected_output: String::new(),
-            acceptance_criteria: vec![],
-        });
-    }
-
-    // 10. QA 质检
-    if !new_milestones.is_empty() {
-        let milestones_json = match serde_json::to_string(&new_milestones) {
-            Ok(json) => json,
-            Err(e) => {
-                eprintln!(
-                    "[regenerate_milestones_from_point] 大阶段 JSON 序列化失败：{}，跳过质检",
-                    e
-                );
-                // 序列化失败不阻塞流程，跳过质检
-                let merged = merge_milestones(completed_milestones, new_milestones);
-                project.milestones = merged;
-                let project = crate::save_and_reload_project(&project)?;
-                let json_str = serde_json::to_string_pretty(&project)
-                    .map_err(|e| format!("序列化项目文件失败: {}", e))?;
-                return Ok(json_str);
-            }
-        };
-
-        let qa_user_message = format!(
-            "【原始需求（版本方案）】\n{}\n\n【当前产出（大阶段列表）】\n{}",
-            version_plan, milestones_json
-        );
-
-        let qa_context = model_context(
-            &project,
-            crate::cost_ledger::ModelCallPurpose::MilestoneCheck,
-        );
-        let qa_response = match crate::api::call_deepseek_api_inner_with_context(
-            crate::prompts::QA_CHECK_PROMPT,
-            &qa_user_message,
-            false,
-            0.1,
-            qa_context.clone(),
-        )
-        .await
-        {
-            Ok(response) => {
-                mark_model_output(
-                    &project_name,
-                    &response.metadata.call_id,
-                    crate::cost_ledger::ModelCallOutcome {
-                        produced_evidence: true,
-                        ..Default::default()
-                    },
-                );
-                response.content
-            }
-            Err(e) => {
-                eprintln!(
-                    "[regenerate_milestones_from_point] 质检 API 调用失败：{}，跳过质检",
-                    e
-                );
-                let merged = merge_milestones(completed_milestones, new_milestones);
-                project.milestones = merged;
-                let project = crate::save_and_reload_project(&project)?;
-                let json_str = serde_json::to_string_pretty(&project)
-                    .map_err(|e| format!("序列化项目文件失败: {}", e))?;
-                return Ok(json_str);
-            }
-        };
-
-        let qa_result = match crate::json_utils::parse_json_with_contract_and_context::<
-            project::QAResult,
-        >(
-            &qa_response,
-            &crate::json_utils::QA_RESULT_JSON_CONTRACT,
-            qa_context,
-        )
-        .await
-        {
-            Ok(mut result) => {
-                result.checked_at = chrono::Utc::now().to_rfc3339();
-                result
-            }
-            Err(e) => {
-                eprintln!(
-                    "[regenerate_milestones_from_point] 质检 JSON 解析失败：{}，默认判定为不通过",
-                    e
-                );
-                project::QAResult {
-                    passed: false,
-                    reason: "质检结果解析失败，请人工审查大阶段列表是否对齐版本方案".to_string(),
-                    details: vec![],
-                    attention_points: vec![],
-                    checked_at: chrono::Utc::now().to_rfc3339(),
-                    warnings: vec![format!("质检 JSON 解析失败：{}", e)],
-                }
-            }
-        };
-
-        // 质检不通过 → 返回错误，不修改 project.json
-        if !qa_result.passed {
-            return Err(format!(
-                "质检不通过：{}\n\n详细偏差：\n{}",
-                qa_result.reason,
-                qa_result
-                    .details
-                    .iter()
-                    .map(|d| format!(
-                        "- [{}] {}（相关需求：{}）",
-                        d.issue_type, d.description, d.related_requirement
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ));
-        }
-
-        // 质检通过 → 写入每个新 milestone
-        for milestone in &mut new_milestones {
-            milestone.qa_result = Some(qa_result.clone());
-        }
-    }
-
-    // 11. 拼接：保留已完成 + 新生成的
-    let merged = merge_milestones(completed_milestones, new_milestones);
-    project.milestones = merged;
-
-    // 12. 持久化
-    let project = crate::save_and_reload_project(&project)?;
-
-    // 13. 返回完整 Project JSON
-    let json_str =
-        serde_json::to_string_pretty(&project).map_err(|e| format!("序列化项目文件失败: {}", e))?;
-
-    Ok(json_str)
-}
-
-/// 将已完成的大阶段和新生成的大阶段拼接为一个列表
-#[allow(dead_code)]
-fn merge_milestones(
-    completed: Vec<&project::Milestone>,
-    new: Vec<project::Milestone>,
-) -> Vec<project::Milestone> {
-    let mut result: Vec<project::Milestone> = Vec::new();
-    for m in completed {
-        result.push(m.clone());
-    }
-    for m in new {
-        result.push(m);
-    }
-    result
-}
-
 /// 大阶段完成后的 AI 自然语言总结
 ///
 /// 基于大阶段的执行统计数据（中阶段完成情况、测试通过率、Git 标签等），
@@ -3768,7 +3200,11 @@ mod tests {
             version: "v0.1.1".to_string(),
             order: Some(1),
             status: project::MidStageStatus::Completed,
-            subtasks: vec![],
+            subtasks: vec![project::Subtask {
+                id: "subtask-1".to_string(),
+                status: project::SubtaskStatus::Passed,
+                ..Default::default()
+            }],
             domain: None,
             test_log: None,
             created_at: String::new(),
@@ -3788,6 +3224,24 @@ mod tests {
             last_plan_issue_count: 0,
             plan_no_progress_count: 0,
         }
+    }
+
+    fn professional_workload_profile() -> project::WorkloadProfile {
+        crate::workload_policy::classify(
+            project::WorkloadSignals {
+                has_frontend: true,
+                has_backend: true,
+                has_persistence: false,
+                has_auth_or_roles: false,
+                external_integration_count: 0,
+                independent_domain_count: 3,
+                deliverable_count: 3,
+                high_risk: false,
+            },
+            None,
+            0,
+        )
+        .expect("professional test profile")
     }
 
     fn test_milestone(
@@ -3816,11 +3270,13 @@ mod tests {
             dependencies: vec![],
             expected_output: String::new(),
             acceptance_criteria: vec![],
+            ..Default::default()
         }
     }
 
     fn review_project(project_name: &str, with_next: bool) -> project::Project {
         let mut proj = project::Project::new(project_name);
+        proj.workload_profile = Some(professional_workload_profile());
         proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
         proj.workflow_state.current_step = project::WorkflowStep::MilestoneReview;
         proj.workflow_state.review_node_id = "milestone-1".to_string();
@@ -3852,6 +3308,47 @@ mod tests {
                 project::MilestoneStatus::Pending,
             ));
         }
+        proj
+    }
+
+    fn quick_completed_review_project(project_name: &str) -> project::Project {
+        let mut proj = project::Project::new(project_name);
+        proj.workload_profile = Some(crate::workload_policy::test_profile(
+            project::WorkloadScale::Small,
+        ));
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
+        proj.workflow_state.data_revision = 6;
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::Running,
+            ..Default::default()
+        });
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.milestones.push(project::Milestone {
+            id: "milestone-1".to_string(),
+            title: "Quick completed".to_string(),
+            status: project::MilestoneStatus::Completed,
+            mode: project::StageMode::Quick,
+            subtasks: [
+                project::SubtaskStatus::Passed,
+                project::SubtaskStatus::AcceptedDeviation,
+                project::SubtaskStatus::Skipped,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, status)| project::Subtask {
+                id: format!("quick-task-{}", index + 1),
+                status,
+                ..Default::default()
+            })
+            .collect(),
+            review_status: Some("approved".to_string()),
+            review_conclusion: Some("A".to_string()),
+            ..Default::default()
+        });
         proj
     }
 
@@ -3965,6 +3462,7 @@ mod tests {
         let project_name = unique_project_name("existing-mid-stage-e2e");
         let _guard = ProjectDataGuard::new(&project_name)?;
         let mut proj = project::Project::new(&project_name);
+        proj.workload_profile = Some(professional_workload_profile());
         proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
         proj.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
         proj.current_milestone_id = "milestone-1".to_string();
@@ -3997,6 +3495,101 @@ mod tests {
             continued.milestones[0].mid_stages[0].status,
             project::MidStageStatus::Completed
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adaptive_execution_contract_continue_quick_completed_builds_review_boundary(
+    ) -> Result<(), String> {
+        let project_name = unique_project_name("continue-quick-review");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = quick_completed_review_project(&project_name);
+        let before_revision = proj.workflow_state.data_revision;
+        crate::save_project(&proj)?;
+
+        let updated = continue_current_milestone(project_name).await?;
+        assert_eq!(
+            updated.workflow_state.current_step,
+            project::WorkflowStep::MilestoneReview
+        );
+        assert_eq!(updated.workflow_state.review_node_id, "milestone-1");
+        assert_eq!(
+            updated.milestones[0].review_status.as_deref(),
+            Some("pending_review")
+        );
+        assert!(updated.milestones[0].review_conclusion.is_none());
+        assert_eq!(updated.workflow_state.data_revision, before_revision + 1);
+        assert_eq!(
+            updated
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .ok_or("Quick Review 缺少 autopilot 边界".to_string())?
+                .run_status,
+            project::AutopilotRunStatus::WaitingMilestoneReview
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adaptive_execution_contract_continue_professional_completed_builds_review_boundary(
+    ) -> Result<(), String> {
+        let project_name = unique_project_name("continue-professional-review");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = review_project(&project_name, false);
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
+        proj.workflow_state.data_revision = 7;
+        proj.milestones[0].review_status = Some("needs_fix".to_string());
+        proj.milestones[0].review_conclusion = Some("B".to_string());
+        if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+            autopilot.run_status = project::AutopilotRunStatus::Running;
+        }
+        crate::save_project(&proj)?;
+
+        let updated = continue_current_milestone(project_name).await?;
+        assert_eq!(updated.workflow_state.data_revision, 8);
+        assert_eq!(
+            updated.workflow_state.current_step,
+            project::WorkflowStep::MilestoneReview
+        );
+        assert_eq!(updated.workflow_state.review_node_id, "milestone-1");
+        assert_eq!(
+            updated.milestones[0].review_status.as_deref(),
+            Some("pending_review")
+        );
+        assert!(updated.milestones[0].review_conclusion.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adaptive_execution_contract_select_last_completed_mid_stage_builds_review_boundary(
+    ) -> Result<(), String> {
+        let project_name = unique_project_name("select-final-mid-review");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = review_project(&project_name, false);
+        proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
+        proj.workflow_state.data_revision = 11;
+        proj.milestones[0].review_status = Some("approved".to_string());
+        proj.milestones[0].review_conclusion = Some("A".to_string());
+        let mut final_stage = completed_mid_stage();
+        final_stage.id = "mid-2".to_string();
+        final_stage.subtasks[0].id = "subtask-2".to_string();
+        proj.milestones[0].mid_stages.push(final_stage);
+        crate::save_project(&proj)?;
+
+        let updated = select_mid_stage(project_name, "mid-2".to_string()).await?;
+        assert_eq!(updated.workflow_state.data_revision, 12);
+        assert_eq!(updated.current_mid_stage_id, "mid-2");
+        assert_eq!(
+            updated.workflow_state.current_step,
+            project::WorkflowStep::MilestoneReview
+        );
+        assert_eq!(updated.workflow_state.review_node_id, "milestone-1");
+        assert_eq!(
+            updated.milestones[0].review_status.as_deref(),
+            Some("pending_review")
+        );
+        assert!(updated.milestones[0].review_conclusion.is_none());
         Ok(())
     }
 
@@ -4244,6 +3837,8 @@ mod tests {
         let tasks = parse_execution_plan_tasks(
             &execution_plan_json(serde_json::json!([1])),
             crate::cost_ledger::ModelCallContext::default(),
+            8,
+            &crate::workload_policy::test_profile(project::WorkloadScale::System),
         )
         .await?;
         assert_eq!(tasks[1].depends_on, vec![tasks[0].id.clone()]);
@@ -4256,9 +3851,36 @@ mod tests {
         let result = parse_execution_plan_tasks(
             &execution_plan_json(serde_json::json!([2])),
             crate::cost_ledger::ModelCallContext::default(),
+            8,
+            &crate::workload_policy::test_profile(project::WorkloadScale::System),
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn execution_plan_rejects_profile_count_overflow() {
+        let result = parse_execution_plan_tasks(
+            &execution_plan_json(serde_json::json!([1])),
+            crate::cost_ledger::ModelCallContext::default(),
+            1,
+            &crate::workload_policy::test_profile(project::WorkloadScale::Micro),
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .contains("小阶段数量超出工作负载画像上限：实际 2，上限 1"));
+    }
+
+    #[test]
+    fn adaptive_execution_contract_generation_count_is_profile_bounded() {
+        assert!(validate_generated_count("大阶段", 1, 1).is_ok());
+        assert!(validate_generated_count("大阶段", 0, 3)
+            .unwrap_err()
+            .contains("至少需要 1 个"));
+        assert!(validate_generated_count("大阶段", 4, 3)
+            .unwrap_err()
+            .contains("实际 4，上限 3"));
     }
 
     #[test]
@@ -4328,7 +3950,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entering_review_persists_milestone_and_autopilot_boundary() -> Result<(), String> {
+    async fn adaptive_execution_contract_entering_review_persists_single_boundary(
+    ) -> Result<(), String> {
         let project_name = unique_project_name("enter-review");
         let _guard = ProjectDataGuard::new(&project_name)?;
         let mut proj = review_project(&project_name, false);
@@ -4338,6 +3961,7 @@ mod tests {
             autopilot.run_status = project::AutopilotRunStatus::Running;
         }
         crate::save_project(&proj)?;
+        let before_revision = proj.workflow_state.data_revision;
 
         let updated = enter_milestone_review(project_name).await?;
         assert_eq!(
@@ -4361,6 +3985,87 @@ mod tests {
                 .run_status,
             project::AutopilotRunStatus::WaitingMilestoneReview
         );
+        assert_eq!(updated.workflow_state.data_revision, before_revision + 1);
+        assert_eq!(
+            updated.workflow_state.last_transition_at,
+            updated
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .ok_or("自动驾驶状态缺失".to_string())?
+                .last_action_at
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adaptive_execution_contract_entering_review_rejects_illegal_source_without_save(
+    ) -> Result<(), String> {
+        let project_name = unique_project_name("enter-review-illegal-source");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = review_project(&project_name, false);
+        proj.workflow_state.current_step = project::WorkflowStep::PlanGeneration;
+        proj.workflow_state.data_revision = 9;
+        proj.milestones[0].status = project::MilestoneStatus::InProgress;
+        proj.milestones[0].review_status = Some("approved".to_string());
+        crate::save_project(&proj)?;
+
+        let error = enter_milestone_review(project_name.clone())
+            .await
+            .expect_err("illegal source must fail");
+        assert!(error.contains("不能直接进入"));
+        let persisted = crate::load_project(&project_name)?;
+        assert_eq!(persisted.workflow_state.data_revision, 9);
+        assert_eq!(
+            persisted.workflow_state.current_step,
+            project::WorkflowStep::PlanGeneration
+        );
+        assert_eq!(
+            persisted.milestones[0].status,
+            project::MilestoneStatus::InProgress
+        );
+        assert_eq!(
+            persisted.milestones[0].review_status.as_deref(),
+            Some("approved")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adaptive_execution_contract_discussion_reentry_resets_review_and_preserves_thread(
+    ) -> Result<(), String> {
+        let project_name = unique_project_name("enter-review-discussion");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = review_project(&project_name, false);
+        proj.workflow_state.current_step = project::WorkflowStep::Discussion;
+        proj.workflow_state.data_revision = 4;
+        proj.milestones[0].review_status = Some("needs_fix".to_string());
+        proj.milestones[0].review_conclusion = Some("B".to_string());
+        proj.discussion_threads.push(project::DiscussionThread {
+            id: "review-thread".to_string(),
+            title: "审阅讨论".to_string(),
+            node_id: "milestone-1".to_string(),
+            milestone_id: "milestone-1".to_string(),
+            scope: project::DiscussionScope::FixPast,
+            ..Default::default()
+        });
+        crate::save_project(&proj)?;
+
+        let updated = enter_milestone_review(project_name).await?;
+        assert_eq!(updated.workflow_state.data_revision, 5);
+        assert_eq!(
+            updated.workflow_state.current_step,
+            project::WorkflowStep::MilestoneReview
+        );
+        assert_eq!(
+            updated.milestones[0].review_status.as_deref(),
+            Some("pending_review")
+        );
+        assert!(updated.milestones[0].review_conclusion.is_none());
+        assert!(updated
+            .discussion_threads
+            .iter()
+            .any(|thread| thread.id == "review-thread"));
         Ok(())
     }
 
@@ -4467,6 +4172,136 @@ mod tests {
             let duplicate = approve_milestone_outcome_state(project_name, branch.to_string()).await;
             assert!(duplicate.is_err());
         }
+        Ok(())
+    }
+
+    async fn assert_branch_discussion_reenters_complete_review(
+        branch: &str,
+        scope: project::DiscussionScope,
+    ) -> Result<(), String> {
+        let project_name = unique_project_name(&format!("review-{}-reentry", branch));
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut seeded = review_project(&project_name, false);
+        crate::pipeline::write_execution_history_with_source(
+            &mut seeded,
+            "info",
+            project::ExecutionEventType::SystemAdvance,
+            project::OperationSource::System,
+            "审阅前历史事件".to_string(),
+            Some("milestone-1"),
+            None,
+            None,
+        );
+        crate::save_project(&seeded)?;
+
+        let branched =
+            approve_milestone_outcome_state(project_name.clone(), branch.to_string()).await?;
+        assert_eq!(branched.workflow_state.discussion_scope, scope);
+        let thread_id = branched
+            .active_discussion_thread()
+            .ok_or("B/C 分支活动线程缺失".to_string())?
+            .id
+            .clone();
+        let discussion = crate::commands::workflow::transition_workflow(
+            project_name.clone(),
+            "Discussion".to_string(),
+            format!("test: {} 分支继续讨论", branch),
+        )
+        .await?;
+        assert_eq!(
+            discussion.workflow_state.current_step,
+            project::WorkflowStep::Discussion
+        );
+        let before_review_revision = discussion.workflow_state.data_revision;
+
+        let reviewed = crate::commands::workflow::transition_workflow(
+            project_name,
+            "MilestoneReview".to_string(),
+            format!("test: {} 分支重返审阅", branch),
+        )
+        .await?;
+        assert_eq!(
+            reviewed.workflow_state.current_step,
+            project::WorkflowStep::MilestoneReview
+        );
+        assert_eq!(
+            reviewed.workflow_state.top_level_phase,
+            project::TopLevelPhase::Console
+        );
+        assert_eq!(
+            reviewed.workflow_state.data_revision,
+            before_review_revision + 1
+        );
+        assert_eq!(reviewed.workflow_state.review_node_id, "milestone-1");
+        assert_eq!(
+            reviewed.milestones[0].review_status.as_deref(),
+            Some("pending_review")
+        );
+        assert!(reviewed.milestones[0].review_conclusion.is_none());
+        assert!(reviewed
+            .discussion_threads
+            .iter()
+            .any(|thread| thread.id == thread_id));
+        assert!(reviewed
+            .execution_history
+            .iter()
+            .any(|entry| entry.text == "审阅前历史事件"));
+        assert_eq!(
+            reviewed
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .ok_or("重返 Review 缺少 autopilot 边界".to_string())?
+                .run_status,
+            project::AutopilotRunStatus::WaitingMilestoneReview
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adaptive_execution_contract_branch_b_discussion_reenters_complete_review(
+    ) -> Result<(), String> {
+        assert_branch_discussion_reenters_complete_review("B", project::DiscussionScope::FixPast)
+            .await
+    }
+
+    #[tokio::test]
+    async fn adaptive_execution_contract_branch_c_discussion_reenters_complete_review(
+    ) -> Result<(), String> {
+        assert_branch_discussion_reenters_complete_review(
+            "C",
+            project::DiscussionScope::AdjustFuture,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn adaptive_execution_contract_plain_discussion_without_milestone_rejects_review(
+    ) -> Result<(), String> {
+        let project_name = unique_project_name("plain-discussion-review");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = project::Project::new(&project_name);
+        proj.workload_profile = Some(crate::workload_policy::test_profile(
+            project::WorkloadScale::Small,
+        ));
+        proj.workflow_state.current_step = project::WorkflowStep::Discussion;
+        proj.workflow_state.data_revision = 5;
+        crate::save_project(&proj)?;
+
+        let error = crate::commands::workflow::transition_workflow(
+            project_name.clone(),
+            "MilestoneReview".to_string(),
+            "test: 普通讨论不得旁路进入审阅".to_string(),
+        )
+        .await
+        .expect_err("missing milestone facts must block Review");
+        assert!(error.contains("未选择大阶段"));
+        let persisted = crate::load_project(&project_name)?;
+        assert_eq!(persisted.workflow_state.data_revision, 5);
+        assert_eq!(
+            persisted.workflow_state.current_step,
+            project::WorkflowStep::Discussion
+        );
         Ok(())
     }
 }

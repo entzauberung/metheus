@@ -141,7 +141,7 @@ pub(crate) async fn execute(
         _ => {
             return Err(EngineError::InvalidConfiguration(
                 "执行模式与引擎组合无效".to_string(),
-            ))
+            ));
         }
     };
     let display_name = spec.display_name;

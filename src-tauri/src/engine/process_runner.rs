@@ -162,7 +162,7 @@ async fn terminate_child(
             Ok(None) | Err(_) => {
                 return Err(EngineError::ProcessFailed(format!(
                     "{context}时终止 {display_name} 失败：{kill_error}"
-                )))
+                )));
             }
         }
     }

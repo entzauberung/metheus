@@ -88,7 +88,13 @@ fn cache_self_test(settings: &AppSettings, api_key: &str, result: EngineRuntimeS
     }
 }
 
-fn adapter_config(settings: &BuiltInGrokBuildSettings, api_key: &str) -> GrokBuildExecutionConfig {
+fn adapter_config(
+    settings: &BuiltInGrokBuildSettings,
+    api_key: &str,
+    max_turns: u32,
+    max_transport_retries: u32,
+    max_doom_loop_retries: u32,
+) -> GrokBuildExecutionConfig {
     GrokBuildExecutionConfig {
         api_backend: match settings.api_backend {
             GrokBuildApiBackend::ChatCompletions => {
@@ -101,7 +107,9 @@ fn adapter_config(settings: &BuiltInGrokBuildSettings, api_key: &str) -> GrokBui
         model: settings.model.clone(),
         api_key: api_key.to_string(),
         timeout_secs: settings.timeout_secs,
-        max_turns: settings.max_turns,
+        max_turns,
+        max_transport_retries,
+        max_doom_loop_retries,
     }
 }
 
@@ -194,7 +202,7 @@ pub(crate) async fn test_runtime() -> EngineRuntimeSelfTestResult {
                 source_revision,
                 verified_at,
                 message,
-            }
+            };
         }
     };
     let settings = AppSettings {
@@ -205,6 +213,9 @@ pub(crate) async fn test_runtime() -> EngineRuntimeSelfTestResult {
     let result = metheus_grok_engine::run_runtime_self_test(adapter_config(
         &snapshot.settings,
         &snapshot.api_key,
+        snapshot.settings.max_turns,
+        2,
+        0,
     ))
     .await;
     let result = match result {
@@ -239,12 +250,15 @@ pub(super) async fn test_model_connection() -> ConnectionTestResult {
                 latency_ms: elapsed_millis(started),
                 error_kind: Some(ModelConnectionErrorKind::MissingSecret),
                 message,
-            }
+            };
         }
     };
     let result = metheus_grok_engine::test_model_connection(adapter_config(
         &snapshot.settings,
         &snapshot.api_key,
+        snapshot.settings.max_turns,
+        0,
+        0,
     ))
     .await;
     ConnectionTestResult {
@@ -291,13 +305,80 @@ fn map_failure_kind(kind: GrokBuildRuntimeErrorKind) -> EngineFailureKind {
         GrokBuildRuntimeErrorKind::Network => EngineFailureKind::NetworkError,
         GrokBuildRuntimeErrorKind::ProviderUnavailable => EngineFailureKind::ProviderUnavailable,
         GrokBuildRuntimeErrorKind::Timeout => EngineFailureKind::Timeout,
-        GrokBuildRuntimeErrorKind::InvalidConfiguration
-        | GrokBuildRuntimeErrorKind::ToolRejected
-        | GrokBuildRuntimeErrorKind::ToolFailed
-        | GrokBuildRuntimeErrorKind::Protocol
-        | GrokBuildRuntimeErrorKind::MaxTurns
-        | GrokBuildRuntimeErrorKind::Runtime
-        | GrokBuildRuntimeErrorKind::Cancelled => EngineFailureKind::TaskExecutionError,
+        GrokBuildRuntimeErrorKind::ToolRejected => EngineFailureKind::ToolRejected,
+        GrokBuildRuntimeErrorKind::Protocol => EngineFailureKind::ProtocolError,
+        GrokBuildRuntimeErrorKind::MaxTurns => EngineFailureKind::MaxTurnsExceeded,
+        GrokBuildRuntimeErrorKind::InvalidConfiguration | GrokBuildRuntimeErrorKind::Runtime => {
+            EngineFailureKind::RuntimeError
+        }
+        GrokBuildRuntimeErrorKind::ToolFailed | GrokBuildRuntimeErrorKind::Cancelled => {
+            EngineFailureKind::TaskExecutionError
+        }
+    }
+}
+
+fn runtime_event_log(event: GrokBuildRuntimeEvent) -> (&'static str, String) {
+    match event {
+        GrokBuildRuntimeEvent::Started { source_revision } => {
+            let short_revision = source_revision.get(..8).unwrap_or(&source_revision);
+            (
+                "info",
+                format!("[Grok Build 内置] 运行时启动 · 源码 {short_revision}"),
+            )
+        }
+        GrokBuildRuntimeEvent::ModelText { text } => ("info", format!("[Grok Build 内置] {text}")),
+        GrokBuildRuntimeEvent::ToolStarted { name } => {
+            ("info", format!("[Grok Build 内置] 调用工具 {name}"))
+        }
+        GrokBuildRuntimeEvent::ToolCompleted { name, .. } => {
+            ("info", format!("[Grok Build 内置] 工具 {name} 已完成"))
+        }
+        GrokBuildRuntimeEvent::ToolFailed { name, .. } => {
+            ("error", format!("[Grok Build 内置] 工具 {name} 执行失败"))
+        }
+        GrokBuildRuntimeEvent::RetryScheduled {
+            attempt,
+            max_retries,
+            reason,
+        } => (
+            "warn",
+            format!("[Grok Build 内置] 正在重试 {attempt}/{max_retries} · {reason}"),
+        ),
+        GrokBuildRuntimeEvent::RetryExhausted {
+            attempts,
+            reason,
+            is_rate_limited,
+        } => (
+            "error",
+            format!(
+                "[Grok Build 内置] 重试已耗尽 · {attempts} 次{} · {reason}",
+                if is_rate_limited { " · 限流" } else { "" }
+            ),
+        ),
+        GrokBuildRuntimeEvent::RetryFailed {
+            error_type,
+            message,
+        } => (
+            "error",
+            format!("[Grok Build 内置] 不可重试错误 · {error_type} · {message}"),
+        ),
+        GrokBuildRuntimeEvent::TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        } => (
+            "info",
+            format!(
+                "[Grok Build 内置] Token · 输入 {prompt_tokens} · 输出 {completion_tokens} · 总计 {total_tokens}"
+            ),
+        ),
+        GrokBuildRuntimeEvent::Completed {
+            turns,
+            files_written,
+        } => (
+            "info",
+            format!("[Grok Build 内置] 完成 · {turns} 轮 · 写入 {files_written} 个授权文件"),
+        ),
     }
 }
 
@@ -314,41 +395,11 @@ fn event_sink(
             if pipeline.execution_id != execution_id || pipeline.status != PipelineStatus::Running {
                 return;
             }
-            let text = match event {
-                GrokBuildRuntimeEvent::Started { source_revision } => {
-                    let short_revision = source_revision.get(..8).unwrap_or(&source_revision);
-                    format!(
-                        "[Grok Build 内置] 运行时启动 · 源码 {}",
-                        short_revision
-                    )
-                }
-                GrokBuildRuntimeEvent::ModelText { text } => {
-                    format!("[Grok Build 内置] {text}")
-                }
-                GrokBuildRuntimeEvent::ToolStarted { name } => {
-                    format!("[Grok Build 内置] 调用工具 {name}")
-                }
-                GrokBuildRuntimeEvent::ToolCompleted { name, .. } => {
-                    format!("[Grok Build 内置] 工具 {name} 已完成")
-                }
-                GrokBuildRuntimeEvent::TokenUsage {
-                    prompt_tokens,
-                    completion_tokens,
-                    total_tokens,
-                } => format!(
-                    "[Grok Build 内置] Token · 输入 {prompt_tokens} · 输出 {completion_tokens} · 总计 {total_tokens}"
-                ),
-                GrokBuildRuntimeEvent::Completed {
-                    turns,
-                    files_written,
-                } => {
-                    format!("[Grok Build 内置] 完成 · {turns} 轮 · 写入 {files_written} 个授权文件")
-                }
-            };
+            let (level, text) = runtime_event_log(event);
             if text.trim().is_empty() {
                 return;
             }
-            append_runtime_log(pipeline, "info", text);
+            append_runtime_log(pipeline, level, text);
             pipeline.project_name.clone()
         };
         if !project_name.is_empty() {
@@ -396,7 +447,16 @@ pub(super) async fn execute(
         event_sink: Some(event_sink(state, request.execution_id.clone())),
     };
     let result = metheus_grok_engine::execute(
-        adapter_config(&app_settings.built_in_grok_build, api_key),
+        adapter_config(
+            &app_settings.built_in_grok_build,
+            api_key,
+            app_settings
+                .built_in_grok_build
+                .max_turns
+                .min(request.task_budget.max_executor_turns),
+            request.task_budget.max_transport_retries,
+            request.task_budget.max_doom_loop_retries,
+        ),
         adapter_request,
     )
     .await;
@@ -440,9 +500,6 @@ pub(super) async fn execute(
             Err(EngineError::Cancelled)
         }
         Err(error) if error.kind == GrokBuildRuntimeErrorKind::Timeout => Err(EngineError::Timeout),
-        Err(error) if error.kind == GrokBuildRuntimeErrorKind::InvalidConfiguration => Err(
-            EngineError::InvalidConfiguration(error.message().to_string()),
-        ),
         Err(error) => {
             let message = error.message().to_string();
             Ok(ExecutionResult {
@@ -500,5 +557,106 @@ mod tests {
         changed = settings.clone();
         changed.built_in_grok_build.max_turns += 1;
         assert!(base != SelfTestCacheIdentity::new(&changed, "first-secret"));
+    }
+
+    #[test]
+    fn adaptive_grok_contract_task_budget_never_exceeds_user_setting() {
+        let mut settings = BuiltInGrokBuildSettings::default();
+        settings.max_turns = 12;
+        assert_eq!(adapter_config(&settings, "secret", 4, 1, 0).max_turns, 4);
+        assert_eq!(
+            adapter_config(&settings, "secret", settings.max_turns.min(32), 3, 2).max_turns,
+            12
+        );
+        let mapped = adapter_config(&settings, "secret", 8, 3, 2);
+        assert_eq!(mapped.max_transport_retries, 3);
+        assert_eq!(mapped.max_doom_loop_retries, 2);
+    }
+
+    #[test]
+    fn adaptive_grok_contract_events_use_failure_aware_log_levels() {
+        let (level, text) = runtime_event_log(GrokBuildRuntimeEvent::ToolFailed {
+            name: "search_replace".into(),
+            summary: "rejected".into(),
+        });
+        assert_eq!(level, "error");
+        assert!(text.contains("执行失败"));
+        assert!(!text.contains("已完成"));
+
+        let (level, text) = runtime_event_log(GrokBuildRuntimeEvent::RetryScheduled {
+            attempt: 1,
+            max_retries: 3,
+            reason: "service unavailable".into(),
+        });
+        assert_eq!(level, "warn");
+        assert!(text.contains("1/3"));
+
+        let (level, _) = runtime_event_log(GrokBuildRuntimeEvent::RetryExhausted {
+            attempts: 4,
+            reason: "service unavailable".into(),
+            is_rate_limited: false,
+        });
+        assert_eq!(level, "error");
+    }
+
+    #[test]
+    fn adaptive_grok_contract_errors_map_without_text_inference() {
+        let cases = [
+            (
+                GrokBuildRuntimeErrorKind::Authentication,
+                EngineFailureKind::AuthenticationError,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::QuotaExceeded,
+                EngineFailureKind::QuotaExceeded,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::RateLimited,
+                EngineFailureKind::RateLimited,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::ProviderUnavailable,
+                EngineFailureKind::ProviderUnavailable,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::Network,
+                EngineFailureKind::NetworkError,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::Timeout,
+                EngineFailureKind::Timeout,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::ToolRejected,
+                EngineFailureKind::ToolRejected,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::Protocol,
+                EngineFailureKind::ProtocolError,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::MaxTurns,
+                EngineFailureKind::MaxTurnsExceeded,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::InvalidConfiguration,
+                EngineFailureKind::RuntimeError,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::Runtime,
+                EngineFailureKind::RuntimeError,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::ToolFailed,
+                EngineFailureKind::TaskExecutionError,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::Cancelled,
+                EngineFailureKind::TaskExecutionError,
+            ),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(map_failure_kind(source), expected);
+        }
     }
 }

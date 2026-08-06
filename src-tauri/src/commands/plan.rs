@@ -1,7 +1,7 @@
 use crate::project;
 
 /// 校验三项检查全部通过且未过期，返回具体错误说明。
-fn validate_preflight_checks(proj: &project::Project) -> Result<(), String> {
+fn validate_preflight_checks(proj: &project::Project) -> Result<&project::WorkloadProfile, String> {
     let check_types = [
         ("goal_completeness", "目标完整性检查"),
         ("reality_consistency", "现实一致性检查"),
@@ -19,11 +19,25 @@ fn validate_preflight_checks(proj: &project::Project) -> Result<(), String> {
             return Err(format!("检查「{}」未通过，无法继续操作", label));
         }
 
-        if result.stale || result.discussion_revision < proj.discussion_revision {
+        if result.stale || result.discussion_revision != proj.discussion_revision {
             return Err(format!("检查「{}」已过期（讨论已更新），请重新检查", label));
         }
     }
 
+    crate::workload_policy::current_profile(proj)
+}
+
+fn validate_plan_profile_binding(
+    proj: &project::Project,
+    draft: &project::PlanDraft,
+) -> Result<(), String> {
+    let profile = crate::workload_policy::current_profile(proj)?;
+    if draft.workload_profile_fingerprint != profile.fingerprint {
+        return Err(format!(
+            "方案草稿绑定的工作负载画像已变化（草稿 {}，当前 {}），请重新完成三项检查并生成方案。",
+            draft.workload_profile_fingerprint, profile.fingerprint
+        ));
+    }
     Ok(())
 }
 
@@ -96,7 +110,7 @@ pub(crate) async fn generate_version_plan(
     }
 
     // === 4. 强制校验三项检查 ===
-    validate_preflight_checks(&proj)?;
+    let snapshot_workload_fingerprint = validate_preflight_checks(&proj)?.fingerprint.clone();
 
     // === 4.5. 保存事实快照（AI 返回后校验未变化） ===
     let snapshot_step = proj.workflow_state.current_step.clone();
@@ -183,7 +197,12 @@ pub(crate) async fn generate_version_plan(
     }
 
     // 重新校验三项检查仍然有效
-    validate_preflight_checks(&current_proj)?;
+    let current_profile = validate_preflight_checks(&current_proj)?;
+    if current_profile.fingerprint != snapshot_workload_fingerprint {
+        return Err(
+            "工作负载画像在方案生成期间发生变化，请重新完成三项检查并生成方案。".to_string(),
+        );
+    }
 
     // === AI 输出完整性校验 ===
     // 检查是否有宪法分隔标记
@@ -237,6 +256,7 @@ pub(crate) async fn generate_version_plan(
         constitution_part1_draft: constitution_draft,
         generation_revision: current_proj.discussion_revision,
         data_revision_at_generation: current_proj.workflow_state.data_revision,
+        workload_profile_fingerprint: current_profile.fingerprint.clone(),
         self_check_result: "".to_string(),
         generated_at: chrono::Utc::now().to_rfc3339(),
         approved: false,
@@ -294,6 +314,7 @@ pub(crate) async fn approve_version_plan(
         .plan_draft
         .as_ref()
         .ok_or("没有可批准的方案草稿，请先生成方案".to_string())?;
+    validate_plan_profile_binding(&proj, draft)?;
 
     // === 3. 验证 draft_id 匹配 ===
     if draft.draft_id != draft_id {
@@ -496,6 +517,7 @@ pub(crate) async fn reject_version_plan(
     // Clear preflight results (they're now stale)
     // Don't clear version_plan — it was never set for a Pending draft
     proj.preflight_results.clear();
+    proj.workload_profile = None;
 
     // Return to discussion
     proj.workflow_state.current_step = project::WorkflowStep::Discussion;
@@ -531,6 +553,7 @@ pub(crate) async fn enter_console(project_name: String) -> Result<project::Proje
         .plan_draft
         .as_ref()
         .ok_or("没有方案草稿，无法进入控制台。请先生成并批准方案。".to_string())?;
+    validate_plan_profile_binding(&proj, draft)?;
 
     // === 4. 验证草稿已批准 ===
     if draft.draft_status != project::DraftStatus::Approved {
@@ -569,4 +592,80 @@ pub(crate) async fn enter_console(project_name: String) -> Result<project::Proje
     proj.workflow_state.data_revision += 1;
 
     crate::save_and_reload_project(&proj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn checked_project() -> project::Project {
+        let mut project = project::Project::new("plan-profile-binding");
+        project.discussion_revision = 3;
+        project.workload_profile = Some(
+            crate::workload_policy::classify(
+                project::WorkloadSignals {
+                    has_frontend: true,
+                    has_backend: false,
+                    has_persistence: false,
+                    has_auth_or_roles: false,
+                    external_integration_count: 0,
+                    independent_domain_count: 1,
+                    deliverable_count: 2,
+                    high_risk: false,
+                },
+                None,
+                project.discussion_revision,
+            )
+            .unwrap(),
+        );
+        for check_type in [
+            "goal_completeness",
+            "reality_consistency",
+            "task_executability",
+        ] {
+            project
+                .preflight_results
+                .push(project::PreflightCheckResult {
+                    check_type: check_type.to_string(),
+                    passed: true,
+                    summary: "ok".to_string(),
+                    issues: vec![],
+                    suggestions: vec![],
+                    discussion_revision: project.discussion_revision,
+                    checked_at: String::new(),
+                    stale: false,
+                    expired_at: None,
+                });
+        }
+        project
+    }
+
+    #[test]
+    fn adaptive_execution_contract_plan_requires_fresh_profile() {
+        let mut project = checked_project();
+        assert!(validate_preflight_checks(&project).is_ok());
+        project.workload_profile = None;
+        assert!(validate_preflight_checks(&project)
+            .unwrap_err()
+            .contains("画像缺失"));
+    }
+
+    #[test]
+    fn adaptive_execution_contract_approval_rejects_changed_profile() {
+        let project = checked_project();
+        let mut draft = project::PlanDraft {
+            workload_profile_fingerprint: project
+                .workload_profile
+                .as_ref()
+                .unwrap()
+                .fingerprint
+                .clone(),
+            ..Default::default()
+        };
+        assert!(validate_plan_profile_binding(&project, &draft).is_ok());
+        draft.workload_profile_fingerprint = "sha256:changed".to_string();
+        assert!(validate_plan_profile_binding(&project, &draft)
+            .unwrap_err()
+            .contains("画像已变化"));
+    }
 }

@@ -308,10 +308,13 @@ impl CostLedger {
 
 impl ModelCallContext {
     pub fn for_project(project: &crate::project::Project, purpose: ModelCallPurpose) -> Self {
+        let stage_id = crate::plan_scope::PlanScope::resolve(project)
+            .map(|scope| scope.target_id(project).to_string())
+            .unwrap_or_default();
         Self {
             project_name: project.name.clone(),
             milestone_id: project.current_milestone_id.clone(),
-            stage_id: project.current_mid_stage_id.clone(),
+            stage_id,
             task_id: crate::task_tree::select_current_leaf(project)
                 .ok()
                 .flatten()
@@ -755,6 +758,38 @@ pub fn summarize(calls: &[ModelCallRecord]) -> TokenCostSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quick_plan_uses_milestone_identity_for_stage_costs() {
+        let mut project = crate::project::Project::new("quick-cost");
+        project.workload_profile = Some(
+            crate::workload_policy::classify(
+                crate::project::WorkloadSignals {
+                    has_frontend: true,
+                    has_backend: false,
+                    has_persistence: false,
+                    has_auth_or_roles: false,
+                    external_integration_count: 0,
+                    independent_domain_count: 1,
+                    deliverable_count: 2,
+                    high_risk: false,
+                },
+                None,
+                0,
+            )
+            .unwrap(),
+        );
+        project.current_milestone_id = "milestone-1".to_string();
+        project.milestones.push(crate::project::Milestone {
+            id: "milestone-1".to_string(),
+            mode: crate::project::StageMode::Quick,
+            ..Default::default()
+        });
+
+        let context = ModelCallContext::for_project(&project, ModelCallPurpose::Execution);
+        assert_eq!(context.milestone_id, "milestone-1");
+        assert_eq!(context.stage_id, "milestone-1");
+    }
 
     #[test]
     fn missing_provider_usage_remains_unknown() {

@@ -737,6 +737,7 @@ fn invalidate_discussion_derivatives(project: &mut project::Project) {
             result.expired_at = Some(now.clone());
         }
     }
+    project.workload_profile = None;
     if project
         .plan_draft
         .as_ref()
@@ -1079,6 +1080,46 @@ mod tests {
             .expect("expired draft remains visible");
         assert!(draft.expired);
         assert!(draft.expiration_reason.is_some());
+    }
+
+    #[test]
+    fn first_discussion_change_clears_the_workload_profile() {
+        let mut project = project::Project::new("workload-expiration");
+        project.workload_profile = Some(
+            crate::workload_policy::classify(
+                project::WorkloadSignals {
+                    has_frontend: true,
+                    has_backend: false,
+                    has_persistence: false,
+                    has_auth_or_roles: false,
+                    external_integration_count: 0,
+                    independent_domain_count: 1,
+                    deliverable_count: 1,
+                    high_risk: false,
+                },
+                None,
+                project.discussion_revision,
+            )
+            .unwrap(),
+        );
+        project
+            .preflight_results
+            .push(project::PreflightCheckResult {
+                check_type: "goal_completeness".to_string(),
+                passed: true,
+                summary: "ok".to_string(),
+                issues: vec![],
+                suggestions: vec![],
+                discussion_revision: project.discussion_revision,
+                checked_at: String::new(),
+                stale: false,
+                expired_at: None,
+            });
+
+        invalidate_discussion_derivatives(&mut project);
+
+        assert!(project.workload_profile.is_none());
+        assert!(project.preflight_results[0].stale);
     }
 
     #[test]

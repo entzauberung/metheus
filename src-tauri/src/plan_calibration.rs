@@ -62,21 +62,11 @@ pub(crate) async fn calibrate_next_subtask(project: &mut project::Project) -> Re
     let milestone_id = project.current_milestone_id.clone();
     let mid_stage_id = project.current_mid_stage_id.clone();
     let accepted_deviations = crate::project_facts::accepted_deviations(project);
-    let task = project
-        .milestones
+    let scope = crate::plan_scope::PlanScope::resolve(project)?;
+    let task = scope
+        .subtasks(project)
         .iter()
-        .find(|milestone| milestone.id == milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter()
-                .find(|mid| mid.id == mid_stage_id)
-        })
-        .and_then(|mid| {
-            mid.subtasks
-                .iter()
-                .find(|task| task.status == project::SubtaskStatus::Pending)
-        })
+        .find(|task| task.status == project::SubtaskStatus::Pending)
         .cloned()
         .ok_or_else(|| "没有待校准的小阶段。".to_string())?;
     let paths = crate::project_facts::snapshot_paths(&task);
@@ -87,17 +77,10 @@ pub(crate) async fn calibrate_next_subtask(project: &mut project::Project) -> Re
         &task.required_identifiers,
     )?;
     if task.fact_snapshot.is_none() {
-        let item = project
-            .milestones
+        let item = scope
+            .subtasks_mut(project)
             .iter_mut()
-            .find(|milestone| milestone.id == milestone_id)
-            .and_then(|milestone| {
-                milestone
-                    .mid_stages
-                    .iter_mut()
-                    .find(|mid| mid.id == mid_stage_id)
-            })
-            .and_then(|mid| mid.subtasks.iter_mut().find(|item| item.id == task.id))
+            .find(|item| item.id == task.id)
             .ok_or_else(|| "扫描期间下一任务已变化。".to_string())?;
         item.fact_snapshot = Some(current);
         project.workflow_state.data_revision =
@@ -136,17 +119,11 @@ pub(crate) async fn calibrate_next_subtask(project: &mut project::Project) -> Re
         return Err("计划补丁缺少实现指引、背景、证据文件或依赖说明。".to_string());
     }
 
-    let item = project
-        .milestones
+    let workload = crate::workload_policy::current_profile(project)?.clone();
+    let item = scope
+        .subtasks_mut(project)
         .iter_mut()
-        .find(|milestone| milestone.id == milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter_mut()
-                .find(|mid| mid.id == mid_stage_id)
-        })
-        .and_then(|mid| mid.subtasks.iter_mut().find(|item| item.id == task.id))
+        .find(|item| item.id == task.id)
         .ok_or_else(|| "校准期间下一任务已变化。".to_string())?;
     item.execution_prompt = patch.implementation_guidance.trim().to_string();
     item.context_summary = patch.context_summary.trim().to_string();
@@ -154,7 +131,7 @@ pub(crate) async fn calibrate_next_subtask(project: &mut project::Project) -> Re
     item.dependency_notes = patch.dependency_notes.trim().to_string();
     item.fact_snapshot = Some(current);
     item.plan_patch_revision = item.plan_patch_revision.saturating_add(1);
-    crate::plan_contract::hydrate_subtask_contract(item);
+    crate::plan_contract::hydrate_subtask_contract(item, &workload);
     if immutable_contract(item)? != contract_before {
         return Err("计划补丁改变了不可变任务契约，已拒绝。".to_string());
     }
@@ -213,21 +190,11 @@ pub(crate) async fn calibrate_next_subtask_with_pipeline(
         .autopilot_state
         .as_ref()
         .map(|state| (state.active, state.run_status.clone()));
-    let initial_task = initial
-        .milestones
+    let initial_scope = crate::plan_scope::PlanScope::resolve(&initial)?;
+    let initial_task = initial_scope
+        .subtasks(&initial)
         .iter()
-        .find(|milestone| milestone.id == initial_milestone)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter()
-                .find(|mid| mid.id == initial_mid_stage)
-        })
-        .and_then(|mid| {
-            mid.subtasks
-                .iter()
-                .find(|task| task.status == project::SubtaskStatus::Pending)
-        })
+        .find(|task| task.status == project::SubtaskStatus::Pending)
         .ok_or_else(|| "没有待校准的小阶段。".to_string())?;
     let initial_task_id = initial_task.id.clone();
     let initial_facts = crate::project_facts::capture_with_identifiers(
@@ -256,21 +223,14 @@ pub(crate) async fn calibrate_next_subtask_with_pipeline(
         return Err("滚动校准期间项目状态已变化，已丢弃旧计划补丁。".to_string());
     }
 
-    let latest_task = latest
-        .milestones
+    let latest_scope = crate::plan_scope::PlanScope::resolve(&latest)?;
+    if latest_scope.kind() != initial_scope.kind() {
+        return Err("滚动校准期间计划目标拓扑已变化，已丢弃旧计划补丁。".to_string());
+    }
+    let latest_task = latest_scope
+        .subtasks(&latest)
         .iter()
-        .find(|milestone| milestone.id == initial_milestone)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter()
-                .find(|mid| mid.id == initial_mid_stage)
-        })
-        .and_then(|mid| {
-            mid.subtasks
-                .iter()
-                .find(|task| task.status == project::SubtaskStatus::Pending)
-        })
+        .find(|task| task.status == project::SubtaskStatus::Pending)
         .ok_or_else(|| "滚动校准提交时待处理任务已变化。".to_string())?;
     if latest_task.id != initial_task_id {
         return Err("滚动校准期间下一任务已变化，已丢弃旧计划补丁。".to_string());

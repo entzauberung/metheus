@@ -109,14 +109,14 @@ pub fn evaluate(
                 format!("控制动作 {} 正在执行，请等待完成", lease.action_id),
                 Vec::new(),
                 String::new(),
-            )
+            );
         }
         crate::control_action_executor::ControlActionOccupancy::Stale { reason, .. } => {
             return denied(
                 format!("陈旧控制动作锁尚未由后端清理：{}", reason),
                 Vec::new(),
                 String::new(),
-            )
+            );
         }
     }
 
@@ -127,7 +127,7 @@ pub fn evaluate(
                 format!("任务节点不存在：{}", task_id),
                 Vec::new(),
                 String::new(),
-            )
+            );
         }
         Err(error) => return denied(error, Vec::new(), String::new()),
     };
@@ -421,6 +421,7 @@ mod tests {
             dependencies: Vec::new(),
             expected_output: String::new(),
             acceptance_criteria: Vec::new(),
+            ..Default::default()
         });
         project
     }

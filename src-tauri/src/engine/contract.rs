@@ -10,6 +10,7 @@ pub(crate) struct ExecutionRequest {
     pub authorized_paths: Vec<String>,
     pub subtask_id: String,
     pub execution_id: String,
+    pub task_budget: crate::task_contract::TaskBudgetSummary,
 }
 
 #[derive(Debug)]

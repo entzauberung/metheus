@@ -803,6 +803,18 @@ pub(crate) async fn get_git_tags_summary(
             milestone_title: milestone.title.clone(),
             milestone_version: milestone.version.clone(),
             milestone_status: format!("{:?}", milestone.status),
+            subtasks: milestone
+                .subtasks
+                .iter()
+                .enumerate()
+                .map(|(index, subtask)| project::SubtaskTagNode {
+                    subtask_id: subtask.id.clone(),
+                    subtask_title: subtask.title.clone(),
+                    subtask_index: (index + 1) as u32,
+                    subtask_tag: subtask.auto_tag.clone().unwrap_or_default(),
+                    subtask_status: format!("{:?}", subtask.status),
+                })
+                .collect(),
             mid_stages: milestone
                 .mid_stages
                 .iter()
@@ -879,6 +891,14 @@ pub(crate) fn save_tag_to_mid_stage(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn quick_subtask_v2_tag_uses_stable_empty_mid_stage_identity() {
+        assert_eq!(
+            subtask_v2_tag("milestone-a", "", "subtask-a", "transaction-a"),
+            "metheus/v2/subtask/milestone-a/empty/subtask-a/transaction-a"
+        );
+    }
 
     struct TempRepo(PathBuf);
 

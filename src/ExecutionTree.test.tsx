@@ -45,6 +45,23 @@ function treeProject(currentTaskId = ""): Project {
   } as unknown as Project;
 }
 
+function quickTreeProject(): Project {
+  return {
+    current_milestone_id: "milestone-quick",
+    current_mid_stage_id: "",
+    workflow_state: { current_step: "Execution" },
+    milestones: [{
+      id: "milestone-quick",
+      title: "静态网页",
+      version: "v0.1",
+      mode: "Quick",
+      status: "InProgress",
+      subtasks: [task("direct-task")],
+      mid_stages: [],
+    }],
+  } as unknown as Project;
+}
+
 describe("ExecutionTree recursive subtasks", () => {
   let host: HTMLDivElement;
   let root: Root;
@@ -118,5 +135,14 @@ describe("ExecutionTree recursive subtasks", () => {
 
     expect(host.textContent).toContain("任务 level-4");
     expect(host.querySelector("[aria-current='true']")?.textContent).toContain("任务 level-4");
+  });
+
+  it("renders a Quick milestone with direct tasks and no synthetic mid-stage", () => {
+    render(quickTreeProject());
+
+    expect(host.textContent).toContain("静态网页");
+    expect(host.textContent).toContain("任务 direct-task");
+    expect(host.querySelectorAll(".tree-mid-stage")).toHaveLength(0);
+    expect(host.querySelectorAll(".tree-subtask-select")).toHaveLength(1);
   });
 });

@@ -26,7 +26,13 @@ pub(crate) fn from_engine_failure(
         project::EngineFailureKind::NetworkError => project::AutopilotFailureKind::Network,
         project::EngineFailureKind::Timeout => project::AutopilotFailureKind::Timeout,
         project::EngineFailureKind::ProcessCrash => project::AutopilotFailureKind::ProcessCrash,
-        project::EngineFailureKind::TaskExecutionError => project::AutopilotFailureKind::Permanent,
+        project::EngineFailureKind::ToolRejected
+        | project::EngineFailureKind::ProtocolError
+        | project::EngineFailureKind::MaxTurnsExceeded
+        | project::EngineFailureKind::RuntimeError
+        | project::EngineFailureKind::TaskExecutionError => {
+            project::AutopilotFailureKind::Permanent
+        }
     }
 }
 
@@ -96,5 +102,19 @@ mod tests {
         assert!(!is_transient(&classify_message("401 Unauthorized")));
         assert!(!is_transient(&classify_message("quota exceeded")));
         assert!(is_transient(&classify_message("429 rate limit")));
+    }
+
+    #[test]
+    fn adaptive_execution_contract_runtime_errors_are_human_boundaries() {
+        for kind in [
+            project::EngineFailureKind::ToolRejected,
+            project::EngineFailureKind::ProtocolError,
+            project::EngineFailureKind::MaxTurnsExceeded,
+            project::EngineFailureKind::RuntimeError,
+        ] {
+            let failure = from_engine_failure(&kind);
+            assert_eq!(failure, project::AutopilotFailureKind::Permanent);
+            assert!(!is_transient(&failure));
+        }
     }
 }

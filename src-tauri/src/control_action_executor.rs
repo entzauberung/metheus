@@ -84,7 +84,7 @@ pub(crate) fn classify_control_action_occupancy(
             return ControlActionOccupancy::Stale {
                 lease: Some(lease.clone()),
                 reason: "控制锁心跳时间无效".to_string(),
-            }
+            };
         }
     };
     let started = match chrono::DateTime::parse_from_rfc3339(&lease.started_at) {
@@ -93,7 +93,7 @@ pub(crate) fn classify_control_action_occupancy(
             return ControlActionOccupancy::Stale {
                 lease: Some(lease.clone()),
                 reason: "控制锁开始时间无效".to_string(),
-            }
+            };
         }
     };
     if now.signed_duration_since(heartbeat).num_seconds() > CONTROL_ACTION_STALE_AFTER_SECS {
@@ -709,10 +709,12 @@ fn validate_request(
         }
     }
     if !request.contract_fingerprint.is_empty() {
+        let workload = crate::workload_policy::current_profile(project)?;
         let contract = crate::task_compiler::compile(
             task,
             address.ancestor_task_ids.last().map(String::as_str),
             address.depth,
+            workload,
         )
         .contract;
         if contract.fingerprint != request.contract_fingerprint {
@@ -873,19 +875,40 @@ async fn dispatch(
         }
         ControlActionKind::AcceptDeviation => {
             let mut project = claimed_project;
-            crate::commands::task_control::accept_deviation(
+            let claimed_lease = project.task_control.active_action_lease.take();
+            let claimed_action_id = std::mem::take(&mut project.task_control.active_action_id);
+            let claimed_action_kind = std::mem::take(&mut project.task_control.active_action_kind);
+            let claimed_action_task_id =
+                std::mem::take(&mut project.task_control.active_action_task_id);
+            let accepted = crate::commands::task_control::accept_deviation(
                 &mut project,
                 &request.task_id,
                 &request.criterion_indexes,
                 &request.reason,
-            )?;
+            );
+            project.task_control.active_action_lease = claimed_lease;
+            project.task_control.active_action_id = claimed_action_id;
+            project.task_control.active_action_kind = claimed_action_kind;
+            project.task_control.active_action_task_id = claimed_action_task_id;
+            accepted?;
+            let mut stage_reconciled = false;
             if crate::task_tree::find_task(&project, &request.task_id)?
                 .is_some_and(|task| crate::task_tree::is_terminal(&task.status))
             {
                 crate::task_aggregation::aggregate_ancestors(&mut project, &request.task_id)?;
+                let address = crate::task_tree::locate_task(&project, &request.task_id)?
+                    .ok_or_else(|| format!("任务节点不存在：{}", request.task_id))?;
+                stage_reconciled = crate::pipeline::reconcile_terminal_stage(
+                    &mut project,
+                    &address.milestone_id,
+                    &address.mid_stage_id,
+                )?
+                .0;
             }
-            project.workflow_state.data_revision =
-                project.workflow_state.data_revision.saturating_add(1);
+            if !stage_reconciled {
+                project.workflow_state.data_revision =
+                    project.workflow_state.data_revision.saturating_add(1);
+            }
             crate::save_project_if_revision(
                 &project,
                 claimed_project_revision,
@@ -992,7 +1015,15 @@ fn validate_claimed_dispatch(
     let mut revalidated = request.clone();
     revalidated.expected_project_revision = Some(claimed_project_revision);
     revalidated.expected_tree_revision = Some(claimed_tree_revision);
-    validate_request(project, &revalidated)
+    // The exact claimed lease was verified above. Re-run business authorization on a
+    // read-only copy without that same lease so a human terminal action does not reject
+    // itself as concurrent occupancy; foreign or replaced leases never reach this point.
+    let mut business_view = project.clone();
+    business_view.task_control.active_action_lease = None;
+    business_view.task_control.active_action_id.clear();
+    business_view.task_control.active_action_kind.clear();
+    business_view.task_control.active_action_task_id.clear();
+    validate_request(&business_view, &revalidated)
 }
 
 fn run_local_validation(project_name: &str, request: &ControlActionRequest) -> Result<(), String> {
@@ -1219,7 +1250,9 @@ async fn run_targeted_validation(
         Some(crate::cost_ledger::ModelCallContext {
             project_name: project.name.clone(),
             milestone_id: project.current_milestone_id.clone(),
-            stage_id: project.current_mid_stage_id.clone(),
+            stage_id: crate::plan_scope::PlanScope::resolve(&project)
+                .map(|scope| scope.target_id(&project).to_string())
+                .unwrap_or_default(),
             task_id: task.id.clone(),
             purpose: Some(crate::cost_ledger::ModelCallPurpose::EvidenceSupplement),
             decision_id: request.decision_id.clone(),
@@ -1447,9 +1480,36 @@ fn control_fingerprint(project: &project::Project, task_id: &str) -> Result<Stri
 mod tests {
     use super::*;
     use crate::project::{Milestone, MilestoneStatus, StageMode, Subtask};
+    use std::path::PathBuf;
+
+    struct ControlProjectGuard {
+        data_path: PathBuf,
+        lock_path: PathBuf,
+    }
+
+    impl ControlProjectGuard {
+        fn new(project_name: &str) -> Result<Self, String> {
+            let data_path = crate::project_data_path(project_name)?;
+            let lock_path = data_path.with_extension("control-action.lock");
+            Ok(Self {
+                data_path,
+                lock_path,
+            })
+        }
+    }
+
+    impl Drop for ControlProjectGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.data_path);
+            let _ = std::fs::remove_file(&self.lock_path);
+        }
+    }
 
     fn project_with_task(status: project::SubtaskStatus) -> project::Project {
         let mut project = project::Project::new("executor");
+        project.workload_profile = Some(crate::workload_policy::test_profile(
+            project::WorkloadScale::Small,
+        ));
         project.milestones.push(Milestone {
             id: "m".to_string(),
             version: "v0.1".to_string(),
@@ -1476,9 +1536,246 @@ mod tests {
             dependencies: Vec::new(),
             expected_output: String::new(),
             acceptance_criteria: Vec::new(),
+            ..Default::default()
         });
         project.current_milestone_id = "m".to_string();
         project
+    }
+
+    fn prepare_deviation_task(task: &mut Subtask) {
+        task.status = project::SubtaskStatus::AwaitingConfirmation;
+        task.execution_result = Some(project::ExecutionResult {
+            success: true,
+            output: "execution completed".to_string(),
+            ..Default::default()
+        });
+        task.acceptance_ledger = vec![project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            criterion: "criterion".to_string(),
+            status: project::AcceptanceStatus::Unknown,
+            ..Default::default()
+        }];
+    }
+
+    fn mid_stage(
+        id: &str,
+        status: project::MidStageStatus,
+        subtasks: Vec<Subtask>,
+    ) -> project::MidStage {
+        project::MidStage {
+            id: id.to_string(),
+            title: id.to_string(),
+            version: "v0.1.1".to_string(),
+            order: None,
+            status,
+            subtasks,
+            domain: None,
+            test_log: None,
+            created_at: String::new(),
+            description: String::new(),
+            tech_focus: String::new(),
+            test_report: String::new(),
+            completed_at: None,
+            approved_at: None,
+            git_tag: String::new(),
+            plan_check_result: None,
+            plan_approved_at: None,
+            plan_revision: 0,
+            plan_draft_revision: 0,
+            plan_generated_at: None,
+            plan_regeneration_count: 0,
+            last_plan_failure_fingerprint: String::new(),
+            last_plan_issue_count: 0,
+            plan_no_progress_count: 0,
+        }
+    }
+
+    async fn execute_deviation(project_name: &str) -> Result<ControlActionExecutionResult, String> {
+        let persisted = crate::load_project(project_name)?;
+        execute(
+            Arc::new(Mutex::new(None)),
+            project_name.to_string(),
+            ControlActionRequest {
+                action_id: format!("accept-deviation-{}", uuid::Uuid::new_v4()),
+                action: ControlActionKind::AcceptDeviation,
+                task_id: "task".to_string(),
+                expected_project_revision: Some(persisted.workflow_state.data_revision),
+                expected_tree_revision: Some(persisted.task_control.tree_revision),
+                criterion_indexes: vec![1],
+                reason: "已核实成功执行，接受当前范围化偏差".to_string(),
+                source: project::OperationSource::User,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn adaptive_execution_contract_accept_deviation_quick_reconciles_once_to_review(
+    ) -> Result<(), String> {
+        let project_name = format!("accept-quick-{}", uuid::Uuid::new_v4());
+        let _guard = ControlProjectGuard::new(&project_name)?;
+        let mut project = project_with_task(project::SubtaskStatus::AwaitingConfirmation);
+        project.name = project_name.clone();
+        project.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        project.workflow_state.current_step = project::WorkflowStep::Execution;
+        project.workflow_state.autopilot_active = true;
+        project.workflow_state.autopilot_state = Some(project::AutopilotState::default());
+        prepare_deviation_task(&mut project.milestones[0].subtasks[0]);
+        crate::save_project(&project)?;
+        let before = crate::load_project(&project_name)?;
+
+        let result = execute_deviation(&project_name).await?;
+        let completed = crate::load_project(&project_name)?;
+        assert_eq!(
+            completed.milestones[0].subtasks[0].status,
+            project::SubtaskStatus::AcceptedDeviation
+        );
+        assert_eq!(
+            completed.milestones[0].status,
+            project::MilestoneStatus::Completed
+        );
+        assert_eq!(
+            completed.milestones[0].review_status.as_deref(),
+            Some("pending_review")
+        );
+        assert_eq!(
+            completed.workflow_state.current_step,
+            project::WorkflowStep::MilestoneReview
+        );
+        assert_eq!(completed.workflow_state.review_node_id, "m");
+        assert_eq!(
+            completed
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .unwrap()
+                .run_status,
+            project::AutopilotRunStatus::WaitingMilestoneReview
+        );
+        assert_eq!(
+            completed.workflow_state.data_revision,
+            before.workflow_state.data_revision + 3
+        );
+        assert_eq!(
+            completed.task_control.tree_revision,
+            before.task_control.tree_revision
+        );
+        assert!(completed.task_control.active_action_lease.is_none());
+        assert_eq!(
+            result.project_revision,
+            completed.workflow_state.data_revision
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adaptive_execution_contract_accept_deviation_professional_advances_to_next_stage(
+    ) -> Result<(), String> {
+        let project_name = format!("accept-professional-{}", uuid::Uuid::new_v4());
+        let _guard = ControlProjectGuard::new(&project_name)?;
+        let mut project = project_with_task(project::SubtaskStatus::AwaitingConfirmation);
+        project.name = project_name.clone();
+        project.workload_profile = Some(crate::workload_policy::test_profile(
+            project::WorkloadScale::System,
+        ));
+        project.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        project.workflow_state.current_step = project::WorkflowStep::Execution;
+        project.current_mid_stage_id = "mid-1".to_string();
+        let mut current = mid_stage(
+            "mid-1",
+            project::MidStageStatus::InProgress,
+            std::mem::take(&mut project.milestones[0].subtasks),
+        );
+        prepare_deviation_task(&mut current.subtasks[0]);
+        let next = mid_stage(
+            "mid-2",
+            project::MidStageStatus::Ready,
+            vec![Subtask {
+                id: "next-task".to_string(),
+                acceptance_criteria: vec!["next criterion".to_string()],
+                ..Default::default()
+            }],
+        );
+        project.milestones[0].mode = project::StageMode::Professional;
+        project.milestones[0].mid_stages = vec![current, next];
+        crate::save_project(&project)?;
+        let before = crate::load_project(&project_name)?;
+
+        execute_deviation(&project_name).await?;
+        let completed = crate::load_project(&project_name)?;
+        assert_eq!(
+            completed.milestones[0].mid_stages[0].status,
+            project::MidStageStatus::Completed
+        );
+        assert_eq!(
+            completed.workflow_state.current_step,
+            project::WorkflowStep::MidStageSelection
+        );
+        assert!(completed.current_mid_stage_id.is_empty());
+        assert_eq!(
+            completed.milestones[0].status,
+            project::MilestoneStatus::InProgress
+        );
+        assert_eq!(
+            completed.workflow_state.data_revision,
+            before.workflow_state.data_revision + 3
+        );
+        assert_eq!(
+            completed.task_control.tree_revision,
+            before.task_control.tree_revision
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adaptive_execution_contract_accept_deviation_professional_last_stage_reaches_review(
+    ) -> Result<(), String> {
+        let project_name = format!("accept-professional-last-{}", uuid::Uuid::new_v4());
+        let _guard = ControlProjectGuard::new(&project_name)?;
+        let mut project = project_with_task(project::SubtaskStatus::AwaitingConfirmation);
+        project.name = project_name.clone();
+        project.workload_profile = Some(crate::workload_policy::test_profile(
+            project::WorkloadScale::System,
+        ));
+        project.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        project.workflow_state.current_step = project::WorkflowStep::Execution;
+        project.current_mid_stage_id = "mid-1".to_string();
+        let mut current = mid_stage(
+            "mid-1",
+            project::MidStageStatus::InProgress,
+            std::mem::take(&mut project.milestones[0].subtasks),
+        );
+        prepare_deviation_task(&mut current.subtasks[0]);
+        project.milestones[0].mode = project::StageMode::Professional;
+        project.milestones[0].mid_stages = vec![current];
+        crate::save_project(&project)?;
+        let before = crate::load_project(&project_name)?;
+
+        execute_deviation(&project_name).await?;
+        let completed = crate::load_project(&project_name)?;
+        assert_eq!(
+            completed.milestones[0].mid_stages[0].status,
+            project::MidStageStatus::Completed
+        );
+        assert_eq!(
+            completed.milestones[0].status,
+            project::MilestoneStatus::Completed
+        );
+        assert_eq!(
+            completed.workflow_state.current_step,
+            project::WorkflowStep::MilestoneReview
+        );
+        assert_eq!(completed.workflow_state.review_node_id, "m");
+        assert_eq!(
+            completed.workflow_state.data_revision,
+            before.workflow_state.data_revision + 3
+        );
+        assert_eq!(
+            completed.task_control.tree_revision,
+            before.task_control.tree_revision
+        );
+        Ok(())
     }
 
     #[test]
@@ -1926,6 +2223,7 @@ mod tests {
     #[test]
     fn human_review_action_accepts_only_human_review_criteria() {
         let mut project = project_with_task(project::SubtaskStatus::AwaitingConfirmation);
+        let workload = project.workload_profile.as_ref().unwrap().clone();
         let task = &mut project.milestones[0].subtasks[0];
         task.acceptance_criteria = vec![
             "用户可以完成结账".to_string(),
@@ -1941,7 +2239,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        let mut contract = crate::task_contract::compile_subtask(task, None, 0);
+        let mut contract = crate::task_contract::compile_subtask(task, None, 0, &workload);
         contract.verification_modes = vec![
             crate::validator_contract::VerificationMode::SemanticReview,
             crate::validator_contract::VerificationMode::HumanReview,

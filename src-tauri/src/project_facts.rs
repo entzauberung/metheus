@@ -505,21 +505,11 @@ pub(crate) fn has_drift(
 pub(crate) fn next_task_needs_scan_or_calibration(
     project: &project::Project,
 ) -> Result<bool, String> {
-    let task = project
-        .milestones
+    let scope = crate::plan_scope::PlanScope::resolve(project)?;
+    let task = scope
+        .subtasks(project)
         .iter()
-        .find(|milestone| milestone.id == project.current_milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter()
-                .find(|mid| mid.id == project.current_mid_stage_id)
-        })
-        .and_then(|mid| {
-            mid.subtasks
-                .iter()
-                .find(|task| task.status == project::SubtaskStatus::Pending)
-        })
+        .find(|task| task.status == project::SubtaskStatus::Pending)
         .ok_or_else(|| "没有待扫描的小阶段。".to_string())?;
     let Some(previous) = task.fact_snapshot.as_ref() else {
         return Ok(true);
@@ -612,6 +602,7 @@ mod tests {
             dependencies: vec![],
             expected_output: String::new(),
             acceptance_criteria: vec![],
+            ..Default::default()
         }
     }
 
@@ -750,7 +741,10 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("metheus-fact-context-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
-        let content = format!("{}\n<script>function tailAction() {{ localStorage.tail_key = 'x'; document.querySelector('#tail').addEventListener('click', tailAction); }}</script>", "\n".repeat(400));
+        let content = format!(
+            "{}\n<script>function tailAction() {{ localStorage.tail_key = 'x'; document.querySelector('#tail').addEventListener('click', tailAction); }}</script>",
+            "\n".repeat(400)
+        );
         std::fs::write(root.join("index.html"), content).unwrap();
         let facts = capture_with_identifiers(
             &root.to_string_lossy(),

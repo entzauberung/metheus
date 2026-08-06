@@ -315,6 +315,7 @@ mod tests {
             dependencies: Vec::new(),
             expected_output: String::new(),
             acceptance_criteria: Vec::new(),
+            ..Default::default()
         });
         project
     }

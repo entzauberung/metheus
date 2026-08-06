@@ -21,6 +21,7 @@
     "verify:runtime-sync-ux": "./scripts/verify-runtime-sync-ux.sh",
     "verify:phase1-closeout": "./scripts/verify-phase1-closeout.sh",
     "verify:phase1-runtime-contract": "./scripts/verify-phase1-runtime-contract.sh",
+    "verify:adaptive-execution-closeout": "./scripts/verify-adaptive-execution-closeout.sh",
     "verify:phase1": "npm run verify:task-control-closeout && npm run build",
     "verify:grok-check": "./scripts/verify-grok-check.sh",
     "preview": "vite preview",

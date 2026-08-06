@@ -28,6 +28,7 @@ import {
 } from "./taskTreePolicy";
 import type { ExecutionWorkspaceStatus, PipelineState, Project, RecoveryPresentation } from "./types";
 import { getWorkspaceAction } from "./workspacePolicy";
+import { resolvePlanTarget } from "./planTargetPolicy";
 
 // ============================================================
 // V1 执行面板：单小阶段执行 + 人工确认
@@ -52,11 +53,9 @@ export default function V1ExecutionPanel({
   const [showReject, setShowReject] = useState(false);
   const busy = externalBusy || localBusy;
 
-  const ms = project.milestones.find(m => m.id === project.current_milestone_id);
-  const mid = ms?.mid_stages.find(m => m.id === project.current_mid_stage_id);
-  const planApproved = mid?.plan_approved_at != null && (mid?.plan_revision ?? 0) > 0;
-
-  const activeTasks = mid ? mid.subtasks : (ms?.subtasks ?? []);
+  const planTarget = resolvePlanTarget(project);
+  const planApproved = planTarget?.planApprovedAt != null && planTarget.planRevision > 0;
+  const activeTasks = planTarget?.subtasks ?? [];
   const sessionTask = findProjectSubtaskById(project, project.execution_session?.subtask_id ?? "");
   const sessionLeaf = sessionTask && isSubtaskLeaf(sessionTask) ? sessionTask : null;
   const nextSubtask = sessionLeaf
@@ -333,7 +332,10 @@ export default function V1ExecutionPanel({
       {/* All done — workflow should have auto-advanced; this is a safety net */}
       {!recoveryBlocked && !isAwaiting && planApproved && workspaceReady && !nextSubtask && (
         <div style={{ marginBottom: "20px" }}>
-          <FeedbackBanner type="success" message="当前中阶段所有小阶段已执行完成。" />
+          <FeedbackBanner
+            type="success"
+            message={`${planTarget?.kind === "Milestone" ? "当前大阶段" : "当前中阶段"}所有小阶段已执行完成。`}
+          />
           <p style={{ color: "#656d76", fontSize: "13px", marginTop: "12px" }}>
             如果页面未自动跳转，请手动同步项目状态。
           </p>

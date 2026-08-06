@@ -83,6 +83,8 @@
 - **稳定性原则（2026-07-15 固化）**：不再保留任何"执行前重新生成提示词 / 固定管线自动重拆"的路径；执行端只执行用户或 autopilot 已确认的既定计划（`execution_prompt`），杜绝 AI 歧义。
 - **确定性验证优先原则（2026-08-02 固化）**：路径、字段、依赖、环、顺序、重复和其他可由本地规则判定的事实，必须先由确定性检查裁决，禁止交给 AI 反复挑刺。AI 只补充本地规则不能可靠判断的语义、设计和体验结论；验证深度按变更风险、证据缺口和影响范围伸缩，不使用固定长度流水线代替风险判断。
 - **自适应执行原则（2026-08-03 固化）**：任务的检查深度、验证方式和执行步骤按任务复杂度和风险自适应决定。简单任务可一步执行并通过本地确定性验证；高风险任务才需要多轮计划检查和 AI 语义审查。
+- **工作负载画像原则（2026-08-06 固化）**：项目在首项检查中形成后端确定性计算的 `Micro / Small / Standard / System` 工作负载画像；画像是执行拓扑、各层数量上限、检查深度和执行预算的唯一事实源。项目体量、单任务复杂度与风险分别计算；小范围高风险工作保持浅层，只提高验证强度。画像缺失或讨论修订不匹配时必须明确阻断，禁止默认解释为任一规模。
+- **Grok Build 受控借用边界（2026-08-06 固化）**：业务模块不得直接引用 `metheus_grok_engine`；唯一进程内链路为 `engine/builtin.rs -> metheus-grok-engine -> metheus_embedded -> SessionActor/sampler`。只复用受控 facade 暴露的执行、重试、Doom Loop、事件与类型化错误能力，不得借此开放 Shell、terminal fallback、网页工具、MCP、插件、技能、记忆、Hook 或子代理。
 - **检查结论分级原则（2026-08-02 固化）**：检查结果必须区分硬阻断与建议项。缺失必需产物、越权、契约不满足、不可执行和依赖错误属于硬阻断；优化方向、“可考虑”、可选增强和非必需 criteria 只能属于建议。只有硬阻断可以使检查不通过、触发重生成或进入人工停止，建议不得改变 `passed`。
 - **Git 确认事务原则（2026-07-25 固化）**：小阶段与中阶段 V2 标签由大阶段、中阶段、小阶段实体 ID 和稳定确认事务 ID 组成；版本、标题和序号只用于展示。提交、标签和项目收口分阶段持久化，重试复用同一事务和提交。Git 确认受阻必须保留代码与质量结果，不得依据工作区脏状态误分类为执行失败或恢复基线。
 - **不可变标签审计原则（2026-07-25 固化）**：V1/V2 标签均不得删除、覆盖或移动；标签树和回滚使用项目保存的实际标签，回退只调整工作树与项目引用。
@@ -1573,3 +1575,44 @@ Phase 30、Phase 31 记录的独立任务控制标签页是当时已经完成并
 - 实际运行 `npm run verify:grok-check`：资源预检通过；Grok 使用 `.build/grok-full`、单任务、`builtin-grok` 的库目标 `cargo check`，Cargo 报告耗时 1 分 34 秒并通过，仅报告 21 条未使用代码告警。未执行最终链接、Tauri 构建或真实模型请求。
 - 实际运行桌面资源资格预检，结果为 `DESKTOP_SMOKE_ELIGIBLE=no`：仅有的 `src-tauri/target/debug/metheus` 是非 Core 候选，缺少同时匹配当前源码指纹、关闭默认特性和时间戳的构建证据。本轮未启动桌面程序或触发重建；因此不宣称真实桌面无需 Reload 体验、强退恢复或发布级稳定性已完成验收。
 - 本轮未运行无过滤 Rust 全量测试/构建、Clippy、Tauri dev/build 或打包、Grok 完整构建、真实模型与付费 CLI；未新增依赖、未修改清单或锁文件。本轮执行未调用 `git commit`、`git push`、`git tag`，也未调用暂存、取消暂存或其他修改 Git index 的命令。
+
+---
+
+## 39. Phase: 自适应执行闭环与 Grok 受控执行单元（2026-08-06）
+
+### 39.1 工作负载、拓扑与检查原则
+
+- 项目体量由首项目标完整性检查同一次模型调用提供的结构化范围事实与 Half Project 确定性基线共同分类；模型不得直接决定规模。画像必须绑定讨论修订与稳定指纹，缺失或过期时明确阻断，不得默认为任一规模。
+- `contract_snapshot` 是可重建派生缓存，当前严格版本为 `task-contract-v2`：已知 `task-contract-v1` 只失效缓存，未知版本和损坏 v2 继续拒绝；缺失或过期画像的历史项目保持任务、验收和执行事实可加载，但合同编译、SerialTakeover 与 autopilot 明确阻断，直到重新完成目标完整性检查。
+- 四档固定矩阵为：`Micro` 使用 Milestone 1 / MidStage 0 / Subtask 1 / split 0 / `Lean` / executor turns 4；`Small` 为 1 / 0 / 3 / 0 / `Lean` / 8；`Standard` 为 3 / 3 / 6 / 1 / `Standard` / 16；`System` 为 5 / 5 / 8 / 1 / `Strict` / 32。transport retry 预算依次为 0 / 1 / 2 / 3，Doom Loop retry 预算依次为 0 / 0 / 1 / 2。
+- 正式执行拓扑只有 `Milestone -> Subtask` 与 `Milestone -> MidStage -> Subtask` 两种；`Standard/System` 只允许在非原子 Subtask 下增加一层 ChildTask，32 层仅作为损坏防护。高风险只把检查深度提高为 `Strict`，不得据此增加阶段或 split 深度。
+- 三项检查的目标完整性、现实一致性和任务可执行性维度及顺序全部保留；`Lean/Standard/Strict` 只改变证据深度与阻断门槛。建议项不得使检查失败，System 的跨端、数据库、权限、外部集成与依赖顺序必须给出严格证据。
+- 阶段与任务数量同时受 Prompt 和本地确定性上限约束；每层允许只生成一个实体，零个或超过画像上限均在 AI 语义检查前失败。
+- 首次进入或从 Discussion 重返 `MilestoneReview` 的所有生产路径统一调用同步、无 I/O 且不自行修改 revision 的 `apply_milestone_review_boundary`：该函数校验有效画像、Quick/Professional 拓扑和全部任务终态，并一次建立 Milestone `Completed`、`review_status=pending_review`、`review_conclusion=None`、正确 `review_node_id`、`current_step=MilestoneReview` 与 active autopilot 的 `WaitingMilestoneReview`。正式命令、select/continue、pipeline 终态收敛、AcceptDeviation、Skip、workflow migration 和启动对账均复用该边界；Discussion B/C 重返保留讨论线程与历史事件。持久化调用者只增加一次 `data_revision` 并只写一次 `last_transition_at`，AcceptDeviation 继续保留 CAS 与动作租约检查。
+
+### 39.2 执行预算、Grok 边界与错误恢复
+
+- 任务合同冻结 scale、split 深度和 `max_executor_turns`、`max_transport_retries`、`max_doom_loop_retries`；Pipeline 将同一预算复制到执行请求，内置执行器轮数取任务预算与用户设置上限的较小值，插件不得拼装未支持的参数。
+- 模型连接 adapter 由单一 `retry_policy(config)` 驱动，`SamplerConfig.max_retries` 与 `RetryPolicy.max_retries` 都严格读取 `max_transport_retries`；零预算不重试，非零预算不被内部默认值改写。
+- Grok 只能经 `engine/builtin.rs -> metheus-grok-engine -> metheus_embedded -> SessionActor/sampler` 使用。受控 fork 修订为 `metheus.3`，复用上游 sampler 重试、错误分类、退避与 `DoomLoopRecoveryPolicy`，不扩大 Shell、terminal、网页、MCP、plugin、skill、memory、hook 或 subagent 工具面。
+- Embedded 会话继承 facade 已冻结的 Doom policy，重采样时只丢弃当前未接受尝试的聚合输出，不复制上游检测或恢复算法；Responses fake-SSE 证明 transport retry 为 0 时，Doom 预算 1 恰好发出两次请求并只返回 clean response，预算 0 恰好发出一次请求并保留原响应。
+- `ToolCompleted` 与 `ToolFailed` 分流；只转发 `x.ai/session_notification` 的结构化 retry 状态。结构化事件到达前刷新文本缓存，事件桥不阻塞 SessionActor，诊断经过脱敏和限长。
+- `ToolRejected`、`ProtocolError`、`MaxTurnsExceeded` 与 `RuntimeError` 进入人工边界且禁止自动代码修复；网络、服务不可用、限流与超时继续沿用有限恢复。Core 决策 API 保持独立，不由 Grok sampler 替换。
+
+### 39.3 2026-08-06 历史分轨验收事实（已由 39.4 取代）
+
+- 本次最终封板以 `/usr/bin/time -p` 记录墙钟，按顺序实际运行 `npm run verify:adaptive-execution-closeout` 并退出 0：静态边界、pristine 基线、PATCHSET、`metheus.3` revision、资源预检与 `git diff --check` 通过；`.build/core`、两任务、`--no-default-features` 下 `adaptive_execution_contract` 40 项通过、457 项过滤（Cargo 0.70 秒、测试 0.27 秒），6 个前端文件 22 项通过（Vitest 2.57 秒），`.build/grok-full`、单任务下 `adaptive_grok_contract` 7 项通过（BuiltIn 3、engine 4，Cargo 3 分 46 秒）；整条命令墙钟 238.16 秒。
+- 随后实际运行 `npm run verify:phase1-runtime-contract` 并退出 0：Rust 15 项通过、482 项过滤（Cargo 1.46 秒、测试 0.05 秒），19 个前端文件 115 项通过（Vitest 3.60 秒），超时策略与设置活动租约接线审计通过；整条命令墙钟 11.53 秒。
+- 实际运行 `npm run verify:grok-check` 并退出 0；`.build/grok-full`、`CARGO_BUILD_JOBS=1` 的单任务 `cargo check` 报告 1 分 31 秒，仅有 25 条未使用代码告警，整条命令墙钟 91.79 秒。随后以同一 target/jobs 运行 fork `metheus_embedded_runtime`，11 项本地 fake-SSE 测试全部通过（Cargo 2 分 26 秒、测试 2.54 秒、墙钟 149.35 秒）；最后 `git diff --check` 与 `git diff --cached --check` 均退出 0。
+- 本次未运行桌面 smoke、Tauri dev/build、发布构建、无过滤 Rust 全量测试、Clippy、真实模型或付费请求；未启用 MCP、subagent、plugin、skills、terminal 或其他禁用工具面，也未执行 Git 提交、暂存、标签、清理或推送。因此本记录证明自适应执行的 Core、前端契约与 Grok 受控边界，不宣称真实桌面或真实模型长链路已经验收。
+
+### 39.4 2026-08-06 Review 旁路修复后复验
+
+- 39.3 的封板发生在全部 `MilestoneReview` 旁路清除之前，现由本节结果取代。当前 Review 事实只由 `apply_milestone_review_boundary` 写入；正式进入命令、select/continue 路由、Passed/AcceptedDeviation/Skipped 的 pipeline 收敛、workflow closure migration、启动对账及 Discussion B/C 重返均可追溯到该共享边界。迁移与启动对账通过 `Result` 传播缺失或过期画像错误，不保存 `MilestoneReview` 与未完成状态并存的半状态；每次持久化转换仍只增加一次 revision。
+- 使用 `/usr/bin/time -p` 实际运行 `npm run verify:adaptive-execution-closeout` 并退出 0：Core `adaptive_execution_contract` 60 项通过、455 项过滤（Cargo 0.35 秒、测试 0.20 秒），6 个前端文件 22 项通过（Vitest 1.38 秒），Grok `adaptive_grok_contract` 7 项通过（BuiltIn 3、engine 4，Cargo 3 分 45 秒）；整条命令墙钟 232.46 秒，静态边界、pristine 基线、PATCHSET、`metheus.3` revision、资源预检和 diff 门禁均通过，仅报告 25 条未使用代码告警。
+- 随后实际运行 `npm run verify:phase1-runtime-contract` 并退出 0：Rust 15 项通过、500 项过滤（Cargo 1.62 秒、测试 0.12 秒），19 个前端文件 115 项通过（Vitest 2.75 秒），整条命令墙钟 10.81 秒。`npm run verify:grok-check` 也退出 0（Cargo 1 分 29 秒、墙钟 89.51 秒，仅有 25 条未使用代码告警）；同一 `.build/grok-full`、`CARGO_BUILD_JOBS=1` 轨道的 fork `metheus_embedded_runtime` 11 项全部通过（Cargo 2 分 05 秒、测试 2.39 秒、墙钟 128.11 秒）。最后 `git diff --check` 与 `git diff --cached --check` 均退出 0，Git index 为空。
+- 本次未运行桌面 smoke、桌面资源资格复核、Tauri dev/build、发布构建、无过滤 Rust 全量测试、Clippy、真实模型或付费请求，也未执行提交、暂存、标签、清理或推送。Grok 受控工具集合仍严格为 `read_file/search_replace/list_dir/grep`；本记录不宣称真实桌面、真实模型长链路或发布级资源稳定性已经验收。
+- 2026-08-07 增加 Review 唯一写入静态门禁：专项脚本遍历 `src-tauri/src/**/*.rs`，只扫描每个文件首个 `#[cfg(test)]` 之前的生产部分，并以跨行空白归一化匹配要求 `current_step = project::WorkflowStep::MilestoneReview` 恰好出现一次、位于 `workflow_resolution.rs`，同时确认 `apply_milestone_review_boundary` 存在；违规时列出文件和行号并退出 1。Shell 语法检查、生产调用链只读审计和实际专项执行均通过，未发现 select、continue、通用 transition、migration、startup 或 pipeline 新旁路。
+- 2026-08-07 最终复验前以 `git status --short`、`git diff --cached --name-status` 和 `git diff --name-only` 交叉核实：Git index 为空，不存在 staged `ONSTITUTION.md` 或其他 staged 路径；`CONSTITUTION.md` 等现有交付文件均为未暂存修改，WO-015 修改的 `scripts/verify-adaptive-execution-closeout.sh` 是开工前即存在且继续保持未跟踪的文件，没有执行暂存、取消暂存、恢复或清理。
+- 2026-08-07 按顺序实际运行最终四轨并全部退出 0。`npm run verify:adaptive-execution-closeout` 的 Review 唯一写入门禁、静态边界、资源预检与 diff 门禁通过；Core 60 项通过、455 项过滤（Cargo 0.37 秒、测试 0.27 秒、18 条 unused-code 告警），6 个前端文件 22 项通过（Vitest 1.41 秒），Grok 7 项通过（BuiltIn 3、engine 4，Cargo 3 分 39 秒；lib 报告 25 条告警，test 目标报告 14 条且其中 11 条重复），整条命令墙钟 229.23 秒。`npm run verify:phase1-runtime-contract` 为 Rust 15 项通过、500 项过滤（Cargo 1.25 秒、测试 0.14 秒、18 条告警），19 个前端文件 115 项通过（Vitest 3.40 秒），墙钟 11.05 秒；`npm run verify:grok-check` 为 Cargo 1 分 28 秒、墙钟 88.58 秒、25 条告警；fork `metheus_embedded_runtime` 为 11 项通过（Cargo 2 分 09 秒、测试 2.24 秒、墙钟 131.52 秒）。随后 `git diff --check`（0.03 秒）与 `git diff --cached --check`（0.00 秒）均通过。
+- 2026-08-07 本轮仍未运行桌面 smoke、Tauri dev/build、发布构建、无过滤 Rust 全量测试、Clippy、真实模型或付费请求，也未执行 Git 提交、暂存、标签、清理或推送；上述自动化结果不替代真实桌面与真实模型长链路验收。

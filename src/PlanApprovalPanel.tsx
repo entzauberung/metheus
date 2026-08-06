@@ -45,6 +45,54 @@ export function PlanApprovalPanel({
   const isPending = draft.draft_status === "Pending";
   const isApproved = draft.draft_status === "Approved";
   const busy = isSubmitting;
+  const workloadProfile = project.workload_profile;
+  const workloadBindingValid = Boolean(
+    workloadProfile
+    && workloadProfile.discussion_revision === project.discussion_revision
+    && workloadProfile.fingerprint === draft.workload_profile_fingerprint,
+  );
+  const workloadProfileCard = workloadProfile ? (
+    <div
+      data-workload-profile={workloadProfile.scale}
+      style={{
+        border: `1px solid ${workloadBindingValid ? "#0969da" : "#cf222e"}`,
+        borderRadius: "8px",
+        padding: "14px",
+        marginBottom: "16px",
+        background: workloadBindingValid ? "#ddf4ff" : "#fff1f0",
+        fontSize: "13px",
+      }}
+    >
+      <strong>工作负载画像：{workloadProfile.scale}</strong>
+      <div style={{ marginTop: "6px" }}>
+        层级策略：{workloadProfile.use_mid_stage_layer
+          ? "Milestone → MidStage → Subtask"
+          : "Milestone → Subtask"}
+        ；检查深度：{workloadProfile.check_depth}
+      </div>
+      <div style={{ marginTop: "4px" }}>
+        数量上限：Milestone {workloadProfile.max_milestones}，
+        MidStage {workloadProfile.max_mid_stages}，Subtask {workloadProfile.max_subtasks}
+      </div>
+      <ul style={{ margin: "8px 0 0", paddingLeft: "20px" }}>
+        {workloadProfile.evidence.map((item, index) => (
+          <li key={`${index}-${item}`}>{item}</li>
+        ))}
+      </ul>
+      {!workloadBindingValid && (
+        <p style={{ color: "#cf222e", margin: "8px 0 0" }}>
+          当前画像已过期或与草稿指纹不一致，请重新完成目标完整性检查并生成方案。
+        </p>
+      )}
+    </div>
+  ) : (
+    <div
+      data-workload-profile="missing"
+      style={{ border: "1px solid #cf222e", borderRadius: "8px", padding: "14px", marginBottom: "16px", background: "#fff1f0", color: "#cf222e" }}
+    >
+      工作负载画像缺失，请重新完成目标完整性检查；当前草稿不能批准。
+    </div>
+  );
 
   // === 草稿待审批视图 ===
   if (isPending) {
@@ -76,6 +124,8 @@ export function PlanApprovalPanel({
           </p>
         </div>
 
+        {workloadProfileCard}
+
         {/* 方案内容 */}
         <div style={{
           border: "1px solid #d0d7de", borderRadius: "8px", padding: "16px",
@@ -104,7 +154,7 @@ export function PlanApprovalPanel({
         <div style={{ display: "flex", gap: "12px", justifyContent: "center" }}>
           <ActionButton
             onClick={() => setShowApproveConfirm(true)}
-            disabled={busy}
+            disabled={busy || !workloadBindingValid}
             variant="primary"
           >
             {busy ? "批准中..." : "批准项目方案"}
@@ -139,6 +189,7 @@ export function PlanApprovalPanel({
                 onApprove(draft.draft_id, draft.generation_revision);
               },
               variant: "primary",
+              disabled: !workloadBindingValid,
             },
           ]}
         >
@@ -217,6 +268,8 @@ export function PlanApprovalPanel({
           </p>
         </div>
 
+        {workloadProfileCard}
+
         {/* 方案摘要 */}
         <div style={{
           border: "1px solid #d0d7de", borderRadius: "8px", padding: "16px",
@@ -231,7 +284,7 @@ export function PlanApprovalPanel({
         <div style={{ textAlign: "center" }}>
           <ActionButton
             onClick={onEnterConsole}
-            disabled={busy}
+            disabled={busy || !workloadBindingValid}
             variant="primary"
           >
             {busy ? "进入中..." : "进入控制台"}

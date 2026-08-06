@@ -174,13 +174,17 @@ pub fn should_stop_no_progress(count: u32) -> bool {
 mod tests {
     use super::*;
 
+    fn workload() -> crate::project::WorkloadProfile {
+        crate::workload_policy::test_profile(crate::project::WorkloadScale::Standard)
+    }
+
     fn compiled_task() -> (Subtask, TaskCompileResult) {
         let mut task = Subtask::default();
         task.id = "t".into();
         task.allowed_file_paths = vec!["index.html".into()];
         task.acceptance_criteria = vec!["DOM 存在 `board` id 节点".into()];
         task.status = SubtaskStatus::AwaitingConfirmation;
-        let compiled = crate::task_compiler::compile(&task, None, 0);
+        let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
         (task, compiled)
     }
 
@@ -197,7 +201,7 @@ mod tests {
         task.id = "automated".into();
         task.acceptance_criteria = vec!["cargo test 测试通过".into()];
         task.status = SubtaskStatus::AwaitingConfirmation;
-        let compiled = crate::task_compiler::compile(&task, None, 0);
+        let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
         task.contract_snapshot = Some(compiled.contract.clone());
         let decision = decide_next_action(&task, &compiled, "facts", false);
         assert_eq!(decision.action.kind, ControlActionKind::AutomatedValidate);
@@ -209,7 +213,7 @@ mod tests {
         task.id = "human".into();
         task.acceptance_criteria = vec!["操作员确认真实桌面行为".into()];
         task.status = SubtaskStatus::AwaitingConfirmation;
-        let compiled = crate::task_compiler::compile(&task, None, 0);
+        let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
         let mut contract = compiled.contract.clone();
         contract.verification_modes =
             vec![crate::validator_contract::VerificationMode::HumanReview];
@@ -230,7 +234,7 @@ mod tests {
     fn executing_waits_and_satisfied_awaiting_task_confirms() {
         let (mut task, _) = compiled_task();
         task.status = SubtaskStatus::Executing;
-        let compiled = crate::task_compiler::compile(&task, None, 0);
+        let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
         assert_eq!(
             decide_next_action(&task, &compiled, "facts-1", false)
                 .action
@@ -245,7 +249,7 @@ mod tests {
             status: AcceptanceStatus::Satisfied,
             ..Default::default()
         }];
-        let compiled = crate::task_compiler::compile(&task, None, 0);
+        let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
         assert_eq!(
             decide_next_action(&task, &compiled, "facts-1", false)
                 .action

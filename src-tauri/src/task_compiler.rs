@@ -1,5 +1,5 @@
-use crate::project::Subtask;
-use crate::task_complexity::{complexity_score, MAX_DEFAULT_SPLIT_DEPTH};
+use crate::project::{Subtask, WorkloadProfile};
+use crate::task_complexity::complexity_score;
 use crate::task_contract::{compile_subtask, TaskComplexity, TaskContract};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -55,8 +55,13 @@ pub struct TaskCompileResult {
     pub split_plan: Option<TaskSplitPlan>,
 }
 
-pub fn compile(subtask: &Subtask, parent_task_id: Option<&str>, depth: u32) -> TaskCompileResult {
-    let mut contract = compile_subtask(subtask, parent_task_id, depth);
+pub fn compile(
+    subtask: &Subtask,
+    parent_task_id: Option<&str>,
+    depth: u32,
+    workload: &WorkloadProfile,
+) -> TaskCompileResult {
+    let mut contract = compile_subtask(subtask, parent_task_id, depth, workload);
     let score = complexity_score(subtask);
     let atomic = is_atomic(subtask, contract.complexity);
     let split_plan = (!atomic).then(|| build_split_plan(subtask)).flatten();
@@ -64,40 +69,43 @@ pub fn compile(subtask: &Subtask, parent_task_id: Option<&str>, depth: u32) -> T
         contract.estimated_complexity_reduction = plan.estimated_complexity_reduction;
         crate::task_contract::refresh_fingerprint(&mut contract);
     }
-    let decision = if depth >= MAX_DEFAULT_SPLIT_DEPTH {
+    let decision = if atomic {
         TaskCompileDecision {
-            kind: TaskCompileDecisionKind::HumanBoundary,
-            reason: "已达到默认拆分深度，需要人工确认叶子任务边界".to_string(),
-            max_depth: depth,
+            kind: TaskCompileDecisionKind::DirectExecute,
+            reason: "任务范围、目标和验收项可独立执行与验证".to_string(),
+            max_depth: workload.max_split_depth,
             child_count_hint: 0,
         }
-    } else if !atomic {
+    } else if depth >= workload.max_split_depth {
+        TaskCompileDecision {
+            kind: TaskCompileDecisionKind::HumanBoundary,
+            reason: format!(
+                "非原子任务已达到 {:?} 工作负载的拆分深度上限 {}，需要人工确认或重新规划",
+                workload.scale, workload.max_split_depth
+            ),
+            max_depth: workload.max_split_depth,
+            child_count_hint: 0,
+        }
+    } else {
         match split_plan.as_ref() {
             Some(plan) if plan.safe => TaskCompileDecision {
                 kind: TaskCompileDecisionKind::SplitFurther,
                 reason: plan.reason.clone(),
-                max_depth: MAX_DEFAULT_SPLIT_DEPTH,
+                max_depth: workload.max_split_depth,
                 child_count_hint: plan.groups.len() as u32,
             },
             Some(plan) if plan.groups.len() > MAX_SPLIT_LEAVES => TaskCompileDecision {
                 kind: TaskCompileDecisionKind::HumanBoundary,
                 reason: plan.reason.clone(),
-                max_depth: MAX_DEFAULT_SPLIT_DEPTH,
+                max_depth: workload.max_split_depth,
                 child_count_hint: 0,
             },
             _ => TaskCompileDecision {
                 kind: TaskCompileDecisionKind::DirectExecute,
                 reason: "无法确定多个独立产物边界，保守保持单一执行单元".to_string(),
-                max_depth: MAX_DEFAULT_SPLIT_DEPTH,
+                max_depth: workload.max_split_depth,
                 child_count_hint: 0,
             },
-        }
-    } else {
-        TaskCompileDecision {
-            kind: TaskCompileDecisionKind::DirectExecute,
-            reason: "任务范围、目标和验收项可独立执行与验证".to_string(),
-            max_depth: MAX_DEFAULT_SPLIT_DEPTH,
-            child_count_hint: 0,
         }
     };
     TaskCompileResult {
@@ -216,6 +224,7 @@ pub fn materialize_child_tasks(
     parent: &Subtask,
     parent_depth: u32,
     plan: &TaskSplitPlan,
+    workload: &WorkloadProfile,
 ) -> Result<Vec<Subtask>, String> {
     if plan.groups.len() > MAX_SPLIT_LEAVES {
         return Err(format!(
@@ -294,11 +303,12 @@ pub fn materialize_child_tasks(
             parent_criterion_indexes: group.criterion_indexes.clone(),
             ..Default::default()
         };
-        crate::plan_contract::hydrate_subtask_contract(&mut child);
+        crate::plan_contract::hydrate_subtask_contract(&mut child, workload);
         child.contract_snapshot = Some(compile_subtask(
             &child,
             Some(&parent.id),
             parent_depth.saturating_add(1),
+            workload,
         ));
         children.push(child);
     }
@@ -442,6 +452,10 @@ fn child_title(parent: &Subtask, group: &TaskSplitGroup, index: usize) -> String
 mod tests {
     use super::*;
 
+    fn standard_profile() -> WorkloadProfile {
+        crate::workload_policy::test_profile(crate::project::WorkloadScale::Standard)
+    }
+
     #[test]
     fn simple_task_uses_short_path() {
         let mut task = Subtask::default();
@@ -449,7 +463,7 @@ mod tests {
         task.allowed_file_paths = vec!["index.html".into()];
         task.acceptance_criteria = vec!["DOM element exists".into()];
         assert_eq!(
-            compile(&task, None, 0).decision.kind,
+            compile(&task, None, 0, &standard_profile()).decision.kind,
             TaskCompileDecisionKind::DirectExecute
         );
     }
@@ -465,7 +479,7 @@ mod tests {
             "`load_data` is defined in src/b.rs".into(),
             "`load_data` reports errors".into(),
         ];
-        let compiled = compile(&task, None, 0);
+        let compiled = compile(&task, None, 0, &standard_profile());
         assert_eq!(
             compiled.decision.kind,
             TaskCompileDecisionKind::SplitFurther
@@ -483,7 +497,7 @@ mod tests {
         task.allowed_file_paths = (0..6).map(|i| format!("src/{i}.rs")).collect();
         task.acceptance_criteria = (0..4).map(|i| format!("generic criterion {i}")).collect();
         assert_eq!(
-            compile(&task, None, 0).decision.kind,
+            compile(&task, None, 0, &standard_profile()).decision.kind,
             TaskCompileDecisionKind::DirectExecute
         );
     }
@@ -508,7 +522,7 @@ mod tests {
             "0".into(),
         ];
 
-        let compiled = compile(&task, None, 0);
+        let compiled = compile(&task, None, 0, &standard_profile());
         assert_eq!(
             compiled.decision.kind,
             TaskCompileDecisionKind::DirectExecute
@@ -525,7 +539,7 @@ mod tests {
             .map(|index| format!("src/{index}.rs independently passes its check"))
             .collect();
 
-        let compiled = compile(&task, None, 0);
+        let compiled = compile(&task, None, 0, &standard_profile());
         assert_eq!(
             compiled.decision.kind,
             TaskCompileDecisionKind::HumanBoundary
@@ -533,7 +547,7 @@ mod tests {
         let plan = compiled.split_plan.expect("应保留超限诊断计划");
         assert_eq!(plan.groups.len(), 5);
         assert!(!plan.safe);
-        assert!(materialize_child_tasks(&task, 0, &plan).is_err());
+        assert!(materialize_child_tasks(&task, 0, &plan, &standard_profile()).is_err());
     }
 
     #[test]
@@ -549,7 +563,7 @@ mod tests {
             "`validate_data` in src/b.rs exists".into(),
         ];
         let plan = build_split_plan(&task).unwrap();
-        let children = materialize_child_tasks(&task, 0, &plan).unwrap();
+        let children = materialize_child_tasks(&task, 0, &plan, &standard_profile()).unwrap();
         assert!((2..=MAX_SPLIT_LEAVES).contains(&children.len()));
         assert!(children.iter().all(|child| child.depends_on.is_empty()));
         assert!(children.iter().all(|child| {
@@ -560,5 +574,52 @@ mod tests {
         assert!(children
             .iter()
             .all(|child| child.acceptance_criteria.len() < task.acceptance_criteria.len()));
+    }
+
+    #[test]
+    fn adaptive_execution_contract_small_non_atomic_stops_without_split() {
+        let mut task = Subtask::default();
+        task.id = "bounded".into();
+        task.allowed_file_paths = vec!["src/a.rs".into(), "src/b.rs".into()];
+        task.acceptance_criteria = vec![
+            "src/a.rs independently passes".into(),
+            "src/b.rs independently passes".into(),
+            "both artifacts are delivered".into(),
+            "integration behavior is verified".into(),
+        ];
+        for scale in [
+            crate::project::WorkloadScale::Micro,
+            crate::project::WorkloadScale::Small,
+        ] {
+            let workload = crate::workload_policy::test_profile(scale);
+            let compiled = compile(&task, None, 0, &workload);
+            assert_eq!(
+                compiled.decision.kind,
+                TaskCompileDecisionKind::HumanBoundary
+            );
+            assert_eq!(compiled.decision.max_depth, 0);
+        }
+    }
+
+    #[test]
+    fn adaptive_execution_contract_system_allows_one_child_layer() {
+        let workload = crate::workload_policy::test_profile(crate::project::WorkloadScale::System);
+        let mut task = Subtask::default();
+        task.id = "system-task".into();
+        task.allowed_file_paths = vec!["src/a.rs".into(), "src/b.rs".into()];
+        task.acceptance_criteria = vec![
+            "src/a.rs independently passes".into(),
+            "src/b.rs independently passes".into(),
+            "both artifacts are delivered".into(),
+            "integration behavior is verified".into(),
+        ];
+        assert_eq!(
+            compile(&task, None, 0, &workload).decision.kind,
+            TaskCompileDecisionKind::SplitFurther
+        );
+        assert_eq!(
+            compile(&task, Some("parent"), 1, &workload).decision.kind,
+            TaskCompileDecisionKind::HumanBoundary
+        );
     }
 }

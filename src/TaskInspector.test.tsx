@@ -195,6 +195,52 @@ describe("TaskInspector", () => {
     expect(revalidate?.disabled).toBe(true);
   });
 
+  it("shows the frozen workload and executor budgets from the backend contract", () => {
+    const selected = node("selected");
+    selected.contract = {
+      workload_scale: "Small",
+      max_split_depth: 0,
+      budget: {
+        level: "small",
+        estimated_model_calls: 1,
+        max_executor_turns: 8,
+        max_transport_retries: 1,
+        max_doom_loop_retries: 0,
+      },
+      allowed_file_paths: ["index.html"],
+      acceptance_criteria: ["页面可用"],
+      stop_rules: ["越界时停止"],
+      fingerprint: "sha256:contract",
+      title: "静态页面",
+      goal: "交付页面",
+      complexity: "Small",
+      risk: "Low",
+      depth: 0,
+    } as unknown as NonNullable<TaskTreeNodeView["contract"]>;
+    act(() => {
+      root.render(
+        <TaskInspector
+          project={project()}
+          snapshot={snapshot("selected")}
+          selectedNode={selected}
+          selectedTaskId="selected"
+          busy={false}
+          error=""
+          recoveryPresentation={null}
+          expectedEventSequence={4}
+          detailsSyncing={false}
+          onClose={vi.fn()}
+          onRefresh={vi.fn()}
+          onAction={vi.fn()}
+          onChangeMode={vi.fn()}
+        />,
+      );
+    });
+    expect(host.textContent).toContain("工作负载 Small · 最大拆分深度 0");
+    expect(host.textContent).toContain("最多 8 执行轮");
+    expect(host.textContent).toContain("transport 1 · Doom Loop 0");
+  });
+
   it("shows test status and exact evidence lines on the acceptance page", () => {
     render();
     const acceptanceTab = host.querySelector('[role="tab"][title="验收与证据"]');

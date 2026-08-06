@@ -47,11 +47,21 @@ fn dependency_cycle(adjacency: &[Vec<usize>]) -> bool {
     (0..adjacency.len()).any(|index| visit(index, adjacency, &mut states))
 }
 
-pub(crate) fn check_execution_plan(subtasks: &[project::Subtask]) -> PlanDeterministicIssues {
+pub(crate) fn check_execution_plan(
+    subtasks: &[project::Subtask],
+    max_subtasks: u32,
+) -> PlanDeterministicIssues {
     let mut issues = PlanDeterministicIssues::default();
     if subtasks.is_empty() {
         issues.omissions.push("执行计划为空".to_string());
         return issues;
+    }
+    if subtasks.len() > max_subtasks as usize {
+        issues.not_executable.push(format!(
+            "小阶段数量超出工作负载画像上限：实际 {}，上限 {}",
+            subtasks.len(),
+            max_subtasks
+        ));
     }
 
     let mut indexes_by_id = BTreeMap::new();
@@ -155,7 +165,7 @@ mod tests {
         let first = task("one", 1, "建立配置读取");
         let mut second = task("two", 2, "接入配置界面");
         second.depends_on = vec![first.id.clone()];
-        assert!(check_execution_plan(&[first, second]).is_empty());
+        assert!(check_execution_plan(&[first, second], 6).is_empty());
     }
 
     #[test]
@@ -168,7 +178,7 @@ mod tests {
         second.acceptance_criteria.clear();
         second.depends_on = vec!["one".to_string()];
 
-        let issues = check_execution_plan(&[first, second]);
+        let issues = check_execution_plan(&[first, second], 6);
         assert!(!issues.omissions.is_empty());
         assert!(!issues.out_of_scope.is_empty());
         assert!(issues
@@ -179,5 +189,14 @@ mod tests {
             .not_executable
             .iter()
             .any(|issue| issue.contains("存在环")));
+    }
+
+    #[test]
+    fn task_count_over_profile_limit_is_blocking() {
+        let issues = check_execution_plan(&[task("one", 1, "one"), task("two", 2, "two")], 1);
+        assert!(issues
+            .not_executable
+            .iter()
+            .any(|issue| issue.contains("实际 2，上限 1")));
     }
 }

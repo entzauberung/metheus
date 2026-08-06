@@ -69,6 +69,20 @@ pub(crate) fn blocks_code_recovery(kind: &EngineFailureKind) -> bool {
             | EngineFailureKind::NetworkError
             | EngineFailureKind::Timeout
             | EngineFailureKind::ProcessCrash
+            | EngineFailureKind::ToolRejected
+            | EngineFailureKind::ProtocolError
+            | EngineFailureKind::MaxTurnsExceeded
+            | EngineFailureKind::RuntimeError
+    )
+}
+
+pub(crate) fn requires_human_recovery(kind: &EngineFailureKind) -> bool {
+    matches!(
+        kind,
+        EngineFailureKind::ToolRejected
+            | EngineFailureKind::ProtocolError
+            | EngineFailureKind::MaxTurnsExceeded
+            | EngineFailureKind::RuntimeError
     )
 }
 
@@ -98,5 +112,21 @@ mod tests {
             classify_process_failure(Some(1), "", "503 Service Unavailable"),
             EngineFailureKind::ProviderUnavailable
         );
+    }
+
+    #[test]
+    fn adaptive_execution_contract_runtime_errors_block_code_recovery() {
+        for kind in [
+            EngineFailureKind::ToolRejected,
+            EngineFailureKind::ProtocolError,
+            EngineFailureKind::MaxTurnsExceeded,
+            EngineFailureKind::RuntimeError,
+        ] {
+            assert!(blocks_code_recovery(&kind), "{kind:?}");
+            assert!(requires_human_recovery(&kind), "{kind:?}");
+        }
+        assert!(!blocks_code_recovery(
+            &EngineFailureKind::TaskExecutionError
+        ));
     }
 }

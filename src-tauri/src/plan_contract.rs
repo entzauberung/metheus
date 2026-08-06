@@ -85,7 +85,10 @@ fn validate_execution_prompt_contract(
     Ok(())
 }
 
-pub(crate) fn hydrate_subtask_contract(subtask: &mut project::Subtask) {
+pub(crate) fn hydrate_subtask_contract(
+    subtask: &mut project::Subtask,
+    workload: &project::WorkloadProfile,
+) {
     subtask.acceptance_criteria_meta = crate::provability::normalize_metadata(
         &subtask.acceptance_criteria,
         &subtask.acceptance_criteria_meta,
@@ -113,7 +116,9 @@ pub(crate) fn hydrate_subtask_contract(subtask: &mut project::Subtask) {
                 | project::SubtaskStatus::Skipped
         )
     {
-        subtask.contract_snapshot = Some(crate::task_contract::compile_subtask(subtask, None, 0));
+        subtask.contract_snapshot = Some(crate::task_contract::compile_subtask(
+            subtask, None, 0, workload,
+        ));
     }
 }
 
@@ -388,7 +393,8 @@ mod tests {
         assert!(validate_subtasks(&[task.clone()]).is_ok());
 
         task.execution_prompt = "在 src/main.ts 实现 getSearchEngines 和默认引擎切换".to_string();
-        hydrate_subtask_contract(&mut task);
+        let workload = crate::workload_policy::test_profile(project::WorkloadScale::Standard);
+        hydrate_subtask_contract(&mut task, &workload);
         assert!(validate_subtasks(&[task.clone()]).is_ok());
         let compiled = crate::plan_compiler::compile_execution_prompt(&task);
         for identifier in ["getEngines", "setDefault", "isDefault", "Date.now"] {

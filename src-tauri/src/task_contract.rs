@@ -1,9 +1,11 @@
 use crate::project;
 use crate::validator_contract::VerificationMode;
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const TASK_CONTRACT_VERSION: &str = "task-contract-v1";
+pub const TASK_CONTRACT_VERSION: &str = "task-contract-v2";
+const LEGACY_TASK_CONTRACT_VERSION: &str = "task-contract-v1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TaskNodeType {
@@ -58,6 +60,9 @@ pub struct TaskBudgetSummary {
     pub estimated_input_tokens: u64,
     #[serde(default)]
     pub estimated_output_tokens: u64,
+    pub max_executor_turns: u32,
+    pub max_transport_retries: u32,
+    pub max_doom_loop_retries: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +72,9 @@ pub struct TaskContract {
     pub parent_task_id: Option<String>,
     pub depth: u32,
     pub node_type: TaskNodeType,
+    pub workload_scale: project::WorkloadScale,
+    pub workload_profile_fingerprint: String,
+    pub max_split_depth: u32,
     pub title: String,
     pub goal: String,
     #[serde(default)]
@@ -103,10 +111,38 @@ pub struct TaskContract {
     pub fingerprint: String,
 }
 
+/// `contract_snapshot` is a rebuildable cache, but the surrounding task is not.
+/// Only the known v1 cache may be discarded during project deserialization. Current
+/// and unknown versions stay strict so damaged data cannot be silently accepted.
+pub fn deserialize_contract_snapshot<'de, D>(
+    deserializer: D,
+) -> Result<Option<TaskContract>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let version = value
+        .get("version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| D::Error::custom("任务合同快照缺少字符串 version 字段"))?;
+    match version {
+        LEGACY_TASK_CONTRACT_VERSION => Ok(None),
+        TASK_CONTRACT_VERSION => serde_json::from_value(value)
+            .map(Some)
+            .map_err(|error| D::Error::custom(format!("任务合同 v2 快照损坏：{error}"))),
+        other => Err(D::Error::custom(format!(
+            "不支持的任务合同快照版本：{other}"
+        ))),
+    }
+}
+
 pub fn compile_subtask(
     subtask: &project::Subtask,
     parent_task_id: Option<&str>,
     depth: u32,
+    workload: &project::WorkloadProfile,
 ) -> TaskContract {
     let acceptance_criteria_meta = crate::provability::normalize_metadata(
         &subtask.acceptance_criteria,
@@ -145,13 +181,16 @@ pub fn compile_subtask(
     };
     let complexity = crate::task_complexity::estimate_complexity(subtask);
     let risk = crate::task_complexity::estimate_risk(subtask, complexity);
-    let budget = crate::task_complexity::estimate_budget(subtask, complexity);
+    let budget = crate::task_complexity::estimate_budget(subtask, complexity, workload);
     let mut contract = TaskContract {
         version: TASK_CONTRACT_VERSION.to_string(),
         task_id: subtask.id.clone(),
         parent_task_id: parent_task_id.map(str::to_string),
         depth,
         node_type: TaskNodeType::Subtask,
+        workload_scale: workload.scale,
+        workload_profile_fingerprint: workload.fingerprint.clone(),
+        max_split_depth: workload.max_split_depth,
         title: subtask.title.clone(),
         goal: if subtask.goal.trim().is_empty() {
             subtask.prompt.clone()
@@ -205,16 +244,80 @@ pub fn contract_is_stable(left: &TaskContract, right: &TaskContract) -> bool {
 mod tests {
     use super::*;
 
+    fn task_with_facts() -> project::Subtask {
+        project::Subtask {
+            id: "task-1".into(),
+            title: "Small change".into(),
+            goal: "Update one file".into(),
+            allowed_file_paths: vec!["src/lib.rs".into()],
+            acceptance_criteria: vec!["file exists".into()],
+            confirmation_notes: Some("keep this human decision".into()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn contract_fingerprint_is_comparable() {
-        let mut task = project::Subtask::default();
-        task.id = "task-1".into();
-        task.title = "Small change".into();
-        task.goal = "Update one file".into();
-        task.allowed_file_paths = vec!["src/lib.rs".into()];
-        task.acceptance_criteria = vec!["file exists".into()];
-        let first = compile_subtask(&task, None, 0);
-        let second = compile_subtask(&task, None, 0);
+        let task = task_with_facts();
+        let workload = crate::workload_policy::test_profile(project::WorkloadScale::Micro);
+        let first = compile_subtask(&task, None, 0, &workload);
+        let second = compile_subtask(&task, None, 0, &workload);
         assert!(contract_is_stable(&first, &second));
+        assert_eq!(first.workload_scale, project::WorkloadScale::Micro);
+        assert_eq!(first.max_split_depth, 0);
+        assert_eq!(first.budget.max_executor_turns, 4);
+    }
+
+    #[test]
+    fn adaptive_execution_contract_known_v1_snapshot_is_invalidated_without_task_loss() {
+        let task = task_with_facts();
+        let mut value = serde_json::to_value(&task).unwrap();
+        value["contract_snapshot"] = serde_json::json!({
+            "version": "task-contract-v1",
+            "task_id": "task-1"
+        });
+
+        let restored: project::Subtask = serde_json::from_value(value).unwrap();
+        assert!(restored.contract_snapshot.is_none());
+        assert_eq!(restored.id, task.id);
+        assert_eq!(restored.status, task.status);
+        assert_eq!(restored.acceptance_criteria, task.acceptance_criteria);
+        assert_eq!(restored.confirmation_notes, task.confirmation_notes);
+    }
+
+    #[test]
+    fn adaptive_execution_contract_v2_snapshot_roundtrips_strictly() {
+        let mut task = task_with_facts();
+        let workload = crate::workload_policy::test_profile(project::WorkloadScale::Micro);
+        task.contract_snapshot = Some(compile_subtask(&task, None, 0, &workload));
+
+        let encoded = serde_json::to_string(&task).unwrap();
+        let restored: project::Subtask = serde_json::from_str(&encoded).unwrap();
+        let contract = restored.contract_snapshot.unwrap();
+        assert_eq!(contract.version, "task-contract-v2");
+        assert_eq!(contract.workload_profile_fingerprint, workload.fingerprint);
+    }
+
+    #[test]
+    fn adaptive_execution_contract_unknown_snapshot_version_is_rejected() {
+        let mut value = serde_json::to_value(task_with_facts()).unwrap();
+        value["contract_snapshot"] = serde_json::json!({
+            "version": "task-contract-v999",
+            "task_id": "task-1"
+        });
+
+        let error = serde_json::from_value::<project::Subtask>(value).unwrap_err();
+        assert!(error.to_string().contains("不支持的任务合同快照版本"));
+    }
+
+    #[test]
+    fn adaptive_execution_contract_damaged_v2_snapshot_is_rejected() {
+        let mut value = serde_json::to_value(task_with_facts()).unwrap();
+        value["contract_snapshot"] = serde_json::json!({
+            "version": "task-contract-v2",
+            "task_id": "task-1"
+        });
+
+        assert!(serde_json::from_value::<project::Subtask>(value).is_err());
     }
 }

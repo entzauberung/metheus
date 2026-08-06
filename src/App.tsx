@@ -59,6 +59,7 @@ import {
   terminalSyncDelay,
   type TerminalSyncPhase,
 } from "./executionSyncPolicy";
+import { resolvePlanTarget } from "./planTargetPolicy";
 
 const WORKFLOW_STEPS = new Set<WorkflowStep>([
   "WaitingEntry", "ExistingAnalysis", "BaselineApproval", "Discussion", "ThreeChecks",
@@ -718,27 +719,39 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project, viewMode.phase]);
 
-  // 大阶段完成检测：当所有中阶段执行完成后，自动插入总结消息
+  // 大阶段完成检测：按大阶段自己的正式拓扑判断完成事实。
   useEffect(() => {
-    if (!project || project.mode === "Quick") return;
+    if (!project) return;
     for (const ms of project.milestones) {
       if (isMilestoneFullyCompleted(ms) && !completedMilestonesRef.current.has(ms.id)) {
-        // 收集统计数据
+        const isDirect = ms.mode === "Quick";
         const midStages = ms.mid_stages || [];
-        const totalCount = midStages.length;
-        const completedCount = midStages.filter(m => m.status === "Completed").length;
-        const failedCount = midStages.filter(m => m.status === "Rejected").length;
+        const directSubtasks = ms.subtasks || [];
+        const totalCount = isDirect ? directSubtasks.length : midStages.length;
+        const completedCount = isDirect
+          ? directSubtasks.filter(task => isTerminalSubtask(task.status)).length
+          : midStages.filter(mid => mid.status === "Completed").length;
+        const failedCount = isDirect
+          ? directSubtasks.filter(task => task.status === "Rejected").length
+          : midStages.filter(mid => mid.status === "Rejected").length;
         // 收集 Git tag
         const tags: string[] = [];
-        for (const mid of midStages) {
-          if (mid.git_tag) tags.push(mid.git_tag);
+        if (isDirect) {
+          for (const task of directSubtasks) {
+            if (task.auto_tag) tags.push(task.auto_tag);
+          }
+        } else {
+          for (const mid of midStages) {
+            if (mid.git_tag) tags.push(mid.git_tag);
+          }
         }
         const tagsLine = tags.length > 0 ? tags.join("、") : "无";
         // 统计子任务测试通过率
         let totalSubtasks = 0;
         let passedSubtasks = 0;
-        for (const mid of midStages) {
-          for (const st of (mid.subtasks || [])) {
+        const taskGroups = isDirect ? [directSubtasks] : midStages.map(mid => mid.subtasks || []);
+        for (const tasks of taskGroups) {
+          for (const st of tasks) {
             totalSubtasks++;
             if (st.test_result?.passed) passedSubtasks++;
           }
@@ -749,13 +762,13 @@ function App() {
 
 | 项目 | 数据 |
 |------|------|
-| 中阶段总数 | ${totalCount} |
+| ${isDirect ? "小阶段总数" : "中阶段总数"} | ${totalCount} |
 | 已完成 | ${completedCount} |
 | 失败 | ${failedCount} |
 | 子任务测试通过率 | ${passRate} |
 | Git 标签 | ${tagsLine} |
 
-所有中阶段已执行完成，请审阅后决定下一步。`;
+${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请审阅后决定下一步。`;
 
         const summaryMsg: ChatMessage = {
           id: crypto.randomUUID(),
@@ -1114,10 +1127,17 @@ function App() {
     }
   }, [project, isDecisionSubmitting]);
 
-  // 判断一个大阶段的所有中阶段是否都已执行完成
+  const isTerminalSubtask = (status: Milestone["subtasks"][number]["status"]): boolean =>
+    status === "Passed" || status === "AcceptedDeviation" || status === "Skipped";
+
+  // 判断一个大阶段在自身拓扑中的执行容器是否全部完成。
   const isMilestoneFullyCompleted = (milestone: Milestone): boolean => {
-    if (!milestone.mid_stages || milestone.mid_stages.length === 0) return false;
-    return milestone.mid_stages.every(m => m.status === "Completed");
+    if (milestone.mode === "Quick") {
+      return milestone.subtasks.length > 0
+        && milestone.subtasks.every(task => isTerminalSubtask(task.status));
+    }
+    return milestone.mid_stages.length > 0
+      && milestone.mid_stages.every(mid => mid.status === "Completed");
   };
 
   // === V1 暂停：In Stop ===
@@ -1429,16 +1449,15 @@ function App() {
   const handleRegenerateInvalidPlan = async () => {
     if (!project || !beginConsoleAction("regenerate_invalid_plan")) return;
     try {
-      const milestone = project.milestones.find(item => item.id === project.current_milestone_id);
-      const midStage = milestone?.mid_stages.find(item => item.id === project.current_mid_stage_id);
-      if (!midStage) throw new Error("当前中阶段不存在。");
+      const planTarget = resolvePlanTarget(project);
+      if (!planTarget) throw new Error("当前计划目标不存在或拓扑不一致。");
       const source = project.workflow_state.current_step === "PlanApproving"
         ? "approval_rejected"
         : "check_failed";
       await invokeRuntimeMutation("regenerate_execution_plan_runtime", {
         projectName: project.name,
         expectedDataRevision: project.workflow_state.data_revision,
-        expectedPlanDraftRevision: midStage.plan_draft_revision,
+        expectedPlanDraftRevision: planTarget.planDraftRevision,
         feedback: "补全并校正每个小阶段的精确文件范围。",
         source,
       });

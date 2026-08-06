@@ -205,9 +205,10 @@ fn inspect_task_capabilities(
     tasks: &[crate::project::Subtask],
     parent_id: Option<&str>,
     depth: u32,
+    workload: &crate::project::WorkloadProfile,
 ) -> Result<(), String> {
     for task in tasks {
-        let compiled = crate::task_compiler::compile(task, parent_id, depth);
+        let compiled = crate::task_compiler::compile(task, parent_id, depth, workload);
         if compiled.contract.fingerprint.trim().is_empty() {
             return Err(format!("任务 {} 无法生成稳定合同指纹", task.id));
         }
@@ -219,7 +220,12 @@ fn inspect_task_capabilities(
                 ));
             }
         }
-        inspect_task_capabilities(&task.child_tasks, Some(&task.id), depth.saturating_add(1))?;
+        inspect_task_capabilities(
+            &task.child_tasks,
+            Some(&task.id),
+            depth.saturating_add(1),
+            workload,
+        )?;
     }
     Ok(())
 }
@@ -227,10 +233,24 @@ fn inspect_task_capabilities(
 pub fn inspect_serial_takeover_capability(project: &Project) -> Result<(), String> {
     crate::task_tree::validate_project_tree(project)
         .map_err(|reason| format!("任务树不可用：{}", reason))?;
+    let has_tasks = project.milestones.iter().any(|milestone| {
+        !milestone.subtasks.is_empty()
+            || milestone
+                .mid_stages
+                .iter()
+                .any(|stage| !stage.subtasks.is_empty())
+    });
+    let workload = has_tasks
+        .then(|| crate::workload_policy::current_profile(project))
+        .transpose()?;
     for milestone in &project.milestones {
-        inspect_task_capabilities(&milestone.subtasks, None, 0)?;
+        if let Some(workload) = workload {
+            inspect_task_capabilities(&milestone.subtasks, None, 0, workload)?;
+        }
         for stage in &milestone.mid_stages {
-            inspect_task_capabilities(&stage.subtasks, None, 0)?;
+            if let Some(workload) = workload {
+                inspect_task_capabilities(&stage.subtasks, None, 0, workload)?;
+            }
         }
     }
     crate::control_action_executor::ensure_serial_takeover_actions_available()?;
@@ -402,11 +422,39 @@ pub fn hydrate_project(project: &mut Project) -> Result<(), String> {
         }
         .to_string();
     }
+    let has_tasks = project.milestones.iter().any(|milestone| {
+        !milestone.subtasks.is_empty()
+            || milestone
+                .mid_stages
+                .iter()
+                .any(|stage| !stage.subtasks.is_empty())
+    });
+    // A missing or stale workload profile blocks task-control operations, not project
+    // loading. The capability refresh below records that explicit business boundary.
+    let workload = if has_tasks {
+        crate::workload_policy::current_profile(project)
+            .ok()
+            .cloned()
+    } else {
+        None
+    };
     let mut has_dynamic_tasks = false;
     for milestone in &mut project.milestones {
-        hydrate_task_contracts(&mut milestone.subtasks, None, 0, &mut has_dynamic_tasks)?;
+        hydrate_task_contracts(
+            &mut milestone.subtasks,
+            None,
+            0,
+            workload.as_ref(),
+            &mut has_dynamic_tasks,
+        )?;
         for stage in &mut milestone.mid_stages {
-            hydrate_task_contracts(&mut stage.subtasks, None, 0, &mut has_dynamic_tasks)?;
+            hydrate_task_contracts(
+                &mut stage.subtasks,
+                None,
+                0,
+                workload.as_ref(),
+                &mut has_dynamic_tasks,
+            )?;
         }
     }
     if has_dynamic_tasks && project.task_control.tree_revision == 0 {
@@ -427,6 +475,7 @@ fn hydrate_task_contracts(
     tasks: &mut [crate::project::Subtask],
     parent_id: Option<&str>,
     depth: u32,
+    workload: Option<&crate::project::WorkloadProfile>,
     has_dynamic_tasks: &mut bool,
 ) -> Result<(), String> {
     if depth > crate::task_tree::MAX_TASK_TREE_DEPTH {
@@ -436,10 +485,15 @@ fn hydrate_task_contracts(
         ));
     }
     for task in tasks {
-        if task.contract_snapshot.is_none() {
-            task.contract_snapshot = Some(crate::task_contract::compile_subtask(
-                task, parent_id, depth,
-            ));
+        if let Some(workload) = workload {
+            let candidate = crate::task_contract::compile_subtask(task, parent_id, depth, workload);
+            let must_refresh = task.contract_snapshot.as_ref().map_or(true, |current| {
+                current.version != crate::task_contract::TASK_CONTRACT_VERSION
+                    || !crate::task_contract::contract_is_stable(current, &candidate)
+            });
+            if must_refresh {
+                task.contract_snapshot = Some(candidate);
+            }
         }
         if !task.child_tasks.is_empty() {
             *has_dynamic_tasks = true;
@@ -449,6 +503,7 @@ fn hydrate_task_contracts(
             &mut task.child_tasks,
             Some(&task_id),
             depth.saturating_add(1),
+            workload,
             has_dynamic_tasks,
         )?;
     }
@@ -584,11 +639,38 @@ pub fn mode_label(mode: TaskControlMode) -> &'static str {
 mod tests {
     use super::*;
 
+    fn task(id: &str) -> crate::project::Subtask {
+        crate::project::Subtask {
+            id: id.to_string(),
+            title: format!("Task {id}"),
+            goal: format!("Complete {id}"),
+            acceptance_criteria: vec!["cargo test 测试通过".to_string()],
+            ..Default::default()
+        }
+    }
+
+    fn project_with_tasks(tasks: Vec<crate::project::Subtask>) -> Project {
+        let mut project = Project::new("contract-hydration");
+        project.current_milestone_id = "m".to_string();
+        project.milestones.push(crate::project::Milestone {
+            id: "m".to_string(),
+            title: "Milestone".to_string(),
+            status: crate::project::MilestoneStatus::InProgress,
+            mode: crate::project::StageMode::Quick,
+            subtasks: tasks,
+            ..Default::default()
+        });
+        project
+    }
+
     fn project_with_parent_session(
         parent_status: crate::project::SubtaskStatus,
         session_status: &str,
     ) -> Project {
         let mut project = Project::new("legacy-dynamic-tree");
+        project.workload_profile = Some(crate::workload_policy::test_profile(
+            crate::project::WorkloadScale::System,
+        ));
         project.current_milestone_id = "m".to_string();
         let parent = crate::project::Subtask {
             id: "parent".to_string(),
@@ -629,6 +711,7 @@ mod tests {
             dependencies: Vec::new(),
             expected_output: String::new(),
             acceptance_criteria: Vec::new(),
+            ..Default::default()
         });
         project.execution_session = Some(crate::project::ExecutionSession {
             active: true,
@@ -711,6 +794,100 @@ mod tests {
         project.task_control.mode = TaskControlMode::SerialTakeover;
         hydrate_project(&mut project).unwrap();
         assert_eq!(project.task_control.mode, TaskControlMode::SerialTakeover);
+    }
+
+    #[test]
+    fn adaptive_execution_contract_missing_profile_keeps_tasks_loadable_but_unavailable() {
+        let mut project = project_with_tasks(vec![task("missing-profile")]);
+        project.workload_profile = None;
+
+        hydrate_project(&mut project).unwrap();
+
+        let restored = &project.milestones[0].subtasks[0];
+        assert_eq!(restored.id, "missing-profile");
+        assert!(restored.contract_snapshot.is_none());
+        assert_eq!(
+            project.task_control.takeover_capability_status,
+            TakeoverCapabilityStatus::Unavailable
+        );
+        assert!(project
+            .task_control
+            .takeover_unavailable_reason
+            .contains("目标完整性检查"));
+    }
+
+    #[test]
+    fn adaptive_execution_contract_stale_profile_keeps_tasks_loadable_without_recompile() {
+        let mut project = project_with_tasks(vec![task("stale-profile")]);
+        project.workload_profile = Some(crate::workload_policy::test_profile(
+            crate::project::WorkloadScale::Small,
+        ));
+        project.discussion_revision = 1;
+
+        hydrate_project(&mut project).unwrap();
+
+        assert!(project.milestones[0].subtasks[0]
+            .contract_snapshot
+            .is_none());
+        assert_eq!(
+            project.task_control.takeover_capability_status,
+            TakeoverCapabilityStatus::Unavailable
+        );
+        assert!(project
+            .task_control
+            .takeover_unavailable_reason
+            .contains("重新完成目标完整性检查"));
+    }
+
+    #[test]
+    fn adaptive_execution_contract_valid_profile_refreshes_unstable_snapshot() {
+        let profile = crate::workload_policy::test_profile(crate::project::WorkloadScale::Small);
+        let mut changed_task = task("changed-task");
+        let mut stale = crate::task_contract::compile_subtask(&changed_task, None, 0, &profile);
+        stale.workload_profile_fingerprint = "sha256:stale".to_string();
+        crate::task_contract::refresh_fingerprint(&mut stale);
+        changed_task.contract_snapshot = Some(stale);
+        let mut project = project_with_tasks(vec![changed_task]);
+        project.workload_profile = Some(profile.clone());
+
+        hydrate_project(&mut project).unwrap();
+
+        let contract = project.milestones[0].subtasks[0]
+            .contract_snapshot
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            contract.version,
+            crate::task_contract::TASK_CONTRACT_VERSION
+        );
+        assert_eq!(contract.workload_profile_fingerprint, profile.fingerprint);
+    }
+
+    #[test]
+    fn adaptive_execution_contract_child_tasks_refresh_recursively() {
+        let profile = crate::workload_policy::test_profile(crate::project::WorkloadScale::System);
+        let mut parent = task("parent-refresh");
+        let mut child = task("child-refresh");
+        let mut stale_child =
+            crate::task_contract::compile_subtask(&child, Some(&parent.id), 1, &profile);
+        stale_child.parent_task_id = None;
+        crate::task_contract::refresh_fingerprint(&mut stale_child);
+        child.contract_snapshot = Some(stale_child);
+        parent.child_tasks = vec![child];
+        let mut project = project_with_tasks(vec![parent]);
+        project.workload_profile = Some(profile);
+
+        hydrate_project(&mut project).unwrap();
+
+        let parent = &project.milestones[0].subtasks[0];
+        assert!(parent.contract_snapshot.is_some());
+        let child_contract = parent.child_tasks[0].contract_snapshot.as_ref().unwrap();
+        assert_eq!(
+            child_contract.parent_task_id.as_deref(),
+            Some("parent-refresh")
+        );
+        assert_eq!(child_contract.depth, 1);
+        assert_eq!(project.task_control.tree_revision, 1);
     }
 
     #[test]

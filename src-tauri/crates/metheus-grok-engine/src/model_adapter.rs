@@ -17,6 +17,13 @@ pub struct GrokBuildConnectionTestResult {
     pub message: String,
 }
 
+pub(crate) fn retry_policy(config: &GrokBuildExecutionConfig) -> RetryPolicy {
+    RetryPolicy {
+        max_retries: config.max_transport_retries,
+        rate_limit_retry_threshold: 1,
+    }
+}
+
 pub(crate) fn sampling_config(config: &GrokBuildExecutionConfig) -> SamplerConfig {
     SamplerConfig {
         api_key: Some(config.api_key.clone()),
@@ -34,7 +41,7 @@ pub(crate) fn sampling_config(config: &GrokBuildExecutionConfig) -> SamplerConfi
         } else {
             AuthScheme::Bearer
         },
-        max_retries: Some(1),
+        max_retries: Some(config.max_transport_retries),
         stream_tool_calls: false,
         idle_timeout_secs: Some(config.timeout_secs),
         origin_client: Some(xai_grok_sampler::OriginClientInfo {
@@ -54,10 +61,7 @@ pub(crate) async fn sample(
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
     let sampler = SamplerActor::spawn(
         sampling_config(config),
-        RetryPolicy {
-            max_retries: 1,
-            rate_limit_retry_threshold: 1,
-        },
+        retry_policy(config),
         event_tx,
     );
     sampler
@@ -132,6 +136,8 @@ mod tests {
             api_key: "test-secret".to_string(),
             timeout_secs: 30,
             max_turns: 4,
+            max_transport_retries: 0,
+            max_doom_loop_retries: 0,
         }
     }
 
@@ -151,5 +157,24 @@ mod tests {
             let sampler = sampling_config(&config(backend));
             assert!(matches!(sampler.auth_scheme, AuthScheme::Bearer));
         }
+    }
+
+    #[test]
+    fn adaptive_grok_contract_zero_transport_budget_disables_sampler_retries() {
+        let config = config(GrokBuildApiBackend::Responses);
+
+        assert_eq!(sampling_config(&config).max_retries, Some(0));
+        assert_eq!(retry_policy(&config).max_retries, 0);
+        assert_eq!(retry_policy(&config).rate_limit_retry_threshold, 1);
+    }
+
+    #[test]
+    fn adaptive_grok_contract_nonzero_transport_budget_reaches_sampler_config() {
+        let mut config = config(GrokBuildApiBackend::Responses);
+        config.max_transport_retries = 3;
+
+        assert_eq!(sampling_config(&config).max_retries, Some(3));
+        assert_eq!(retry_policy(&config).max_retries, 3);
+        assert_eq!(retry_policy(&config).rate_limit_retry_threshold, 1);
     }
 }

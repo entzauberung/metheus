@@ -166,7 +166,9 @@ pub(crate) fn write_execution_history_with_source(
         source,
         text,
         milestone_id: milestone_id.map(|s| s.to_string()),
-        mid_stage_id: mid_stage_id.map(|s| s.to_string()),
+        mid_stage_id: mid_stage_id
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
         subtask_id: subtask_id.map(|s| s.to_string()),
         criterion_index: None,
         decision_id: None,
@@ -409,26 +411,13 @@ pub(crate) async fn execute_task_with_source(
 
     let milestone_id = proj.current_milestone_id.clone();
     let mid_stage_id = proj.current_mid_stage_id.clone();
-    if milestone_id.is_empty() || mid_stage_id.is_empty() {
-        return Err("请先选择大阶段和中阶段。".to_string());
-    }
-
-    let ms = proj
-        .milestones
-        .iter()
-        .find(|m| m.id == milestone_id)
-        .ok_or("大阶段不存在。")?;
-    let mid = ms
-        .mid_stages
-        .iter()
-        .find(|m| m.id == mid_stage_id)
-        .ok_or("中阶段不存在。")?;
+    let scope = crate::plan_scope::PlanScope::resolve(&proj)?;
 
     // Verify plan is approved
-    if mid.plan_approved_at.is_none() || mid.plan_revision == 0 {
+    if scope.plan_approved_at(&proj).is_none() || scope.plan_revision(&proj) == 0 {
         return Err("执行计划尚未批准，请先在 Console 中批准执行计划。".to_string());
     }
-    crate::plan_contract::validate_subtasks(&mid.subtasks)
+    crate::plan_contract::validate_subtasks(scope.subtasks(&proj))
         .map_err(|error| format!("执行计划契约无效：{}", error))?;
 
     // Verify Git workspace is ready
@@ -436,7 +425,7 @@ pub(crate) async fn execute_task_with_source(
     if !ws.ready {
         return Err(ws.status_message);
     }
-    crate::plan_contract::validate_subtasks_in_project(&mid.subtasks, &project_path)
+    crate::plan_contract::validate_subtasks_in_project(scope.subtasks(&proj), &project_path)
         .map_err(|error| format!("执行计划契约无效：{}", error))?;
 
     let prepared_engine = crate::engine::prepare_engine(&proj.execution_profile).await?;
@@ -484,7 +473,7 @@ pub(crate) async fn execute_task_with_source(
     if selected_address.milestone_id != milestone_id
         || selected_address.mid_stage_id != mid_stage_id
     {
-        return Err("目标叶子任务不属于当前大阶段和中阶段".to_string());
+        return Err("目标叶子任务不属于当前计划目标".to_string());
     }
     if !selected_address.dependencies_satisfied {
         return Err(format!(
@@ -523,7 +512,8 @@ pub(crate) async fn execute_task_with_source(
         crate::plan_compiler::compile_execution_prompt_with_learning(subtask, &learning);
 
     let total = leaves.len();
-    let plan_revision = mid.plan_revision;
+    let plan_revision = scope.plan_revision(&proj);
+    let workload = crate::workload_policy::current_profile(&proj)?;
     let compiled_contract = crate::task_compiler::compile(
         subtask,
         selected_address
@@ -531,8 +521,10 @@ pub(crate) async fn execute_task_with_source(
             .last()
             .map(String::as_str),
         selected_address.depth,
+        workload,
     )
     .contract;
+    let task_budget = compiled_contract.budget.clone();
     let execution_id = format!(
         "execution-{}-{}",
         std::process::id(),
@@ -708,6 +700,7 @@ pub(crate) async fn execute_task_with_source(
             total,
             execution_id,
             execution_profile,
+            task_budget,
             prepared_engine,
             background_pipeline_state.clone(),
             operation_source,
@@ -762,6 +755,7 @@ async fn execute_current_subtask_background(
     total: usize,
     execution_id: String,
     execution_profile: project::ExecutionProfile,
+    task_budget: crate::task_contract::TaskBudgetSummary,
     prepared_engine: crate::engine::PreparedEngine,
     pipeline_state: std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
     operation_source: project::OperationSource,
@@ -781,15 +775,21 @@ async fn execute_current_subtask_background(
             authorized_paths: authorized_paths.clone(),
             subtask_id: subtask_id.clone(),
             execution_id: execution_id.clone(),
+            task_budget,
         },
         pipeline_state.clone(),
     )
     .await;
     let execution_elapsed_ms = execution_timer.elapsed().as_millis() as u64;
+    let cost_stage_id = if mid_stage_id.is_empty() {
+        milestone_id.clone()
+    } else {
+        mid_stage_id.clone()
+    };
     let execution_context = crate::cost_ledger::ModelCallContext {
         project_name: project_name.clone(),
         milestone_id: milestone_id.clone(),
-        stage_id: mid_stage_id.clone(),
+        stage_id: cost_stage_id.clone(),
         task_id: subtask_id.clone(),
         purpose: Some(crate::cost_ledger::ModelCallPurpose::Execution),
         ..Default::default()
@@ -925,7 +925,7 @@ async fn execute_current_subtask_background(
         Some(crate::cost_ledger::ModelCallContext {
             project_name: project_name.clone(),
             milestone_id: milestone_id.clone(),
-            stage_id: mid_stage_id.clone(),
+            stage_id: cost_stage_id,
             task_id: subtask_id.clone(),
             purpose: Some(crate::cost_ledger::ModelCallPurpose::Review),
             ..Default::default()
@@ -1003,10 +1003,14 @@ async fn execute_current_subtask_background(
             "执行目标已变成父任务，拒绝旧结果写回",
         ));
     }
+    let workload = crate::workload_policy::current_profile(&proj).map_err(|error| {
+        BackgroundExecutionFailure::new(project::RecoveryErrorKind::StateConflict, error)
+    })?;
     let current_contract = crate::task_compiler::compile(
         current_task,
         current_address.ancestor_task_ids.last().map(String::as_str),
         current_address.depth,
+        workload,
     )
     .contract;
     if !session.contract_fingerprint.is_empty()
@@ -1230,6 +1234,10 @@ async fn finalize_background_execution_failure(
         .engine_failure_kind
         .as_ref()
         .is_some_and(crate::engine::blocks_code_recovery);
+    let engine_boundary = failure
+        .engine_failure_kind
+        .as_ref()
+        .map(crate::recovery::engine_block_boundary);
     let baseline = proj
         .execution_session
         .as_ref()
@@ -1263,7 +1271,10 @@ async fn finalize_background_execution_failure(
     crate::recovery::begin_execution_recovery(
         &mut proj,
         if engine_blocked {
-            project::RecoveryErrorKind::EngineBlocked
+            engine_boundary
+                .as_ref()
+                .map(|(error_kind, _)| error_kind.clone())
+                .unwrap_or(project::RecoveryErrorKind::EngineBlocked)
         } else {
             failure.kind.clone()
         },
@@ -1272,8 +1283,8 @@ async fn finalize_background_execution_failure(
     );
     if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
         recovery.engine_failure_kind = failure.engine_failure_kind.clone();
-        if recovery.error_kind == project::RecoveryErrorKind::EngineBlocked {
-            recovery.phase = project::RecoveryPhase::WaitingEngine;
+        if let Some((_, phase)) = engine_boundary.as_ref() {
+            recovery.phase = phase.clone();
         }
     }
     if engine_blocked {
@@ -1394,10 +1405,12 @@ fn validate_subtask_quality_gate_with_session_statuses(
     if !subtask.child_tasks.is_empty() {
         return Err("执行会话指向父任务，不能进入质量确认。".to_string());
     }
+    let workload = crate::workload_policy::current_profile(proj)?;
     let contract = crate::task_compiler::compile(
         subtask,
         address.ancestor_task_ids.last().map(String::as_str),
         address.depth,
+        workload,
     )
     .contract;
     if !session.contract_fingerprint.is_empty()
@@ -1460,15 +1473,6 @@ fn validate_subtask_quality_gate_with_session_statuses(
     Ok(())
 }
 
-fn is_terminal_subtask(status: &project::SubtaskStatus) -> bool {
-    matches!(
-        status,
-        project::SubtaskStatus::Passed
-            | project::SubtaskStatus::AcceptedDeviation
-            | project::SubtaskStatus::Skipped
-    )
-}
-
 /// Reconcile stage state after any terminal task outcome. Passing, accepting a
 /// deviation, and dependency-approved skipping must advance through the same
 /// state transition instead of leaving a completed stage marked InProgress.
@@ -1476,30 +1480,88 @@ pub(crate) fn reconcile_terminal_stage(
     proj: &mut project::Project,
     milestone_id: &str,
     mid_stage_id: &str,
-) -> (bool, bool) {
+) -> Result<(bool, bool), String> {
     let now = chrono::Utc::now().to_rfc3339();
-    let mid_completed = proj
+    if mid_stage_id.is_empty() {
+        let milestone_completed = proj
+            .milestones
+            .iter()
+            .find(|milestone| milestone.id == milestone_id)
+            .is_some_and(|milestone| {
+                milestone.mode == project::StageMode::Quick
+                    && milestone.mid_stages.is_empty()
+                    && !milestone.subtasks.is_empty()
+                    && milestone.subtasks.iter().all(|subtask| {
+                        crate::workflow_resolution::is_terminal_subtask(&subtask.status)
+                    })
+            });
+        if !milestone_completed {
+            return Ok((false, false));
+        }
+        crate::workflow_resolution::apply_milestone_review_boundary(proj, milestone_id, &now)?;
+        proj.workflow_state.data_revision = proj.workflow_state.data_revision.saturating_add(1);
+        proj.workflow_state.last_transition_at = now;
+        return Ok((true, true));
+    }
+    let mid_completed =
+        proj.milestones
+            .iter()
+            .find(|milestone| milestone.id == milestone_id)
+            .and_then(|milestone| {
+                milestone
+                    .mid_stages
+                    .iter()
+                    .find(|mid_stage| mid_stage.id == mid_stage_id)
+            })
+            .is_some_and(|mid_stage| {
+                !mid_stage.subtasks.is_empty()
+                    && mid_stage.subtasks.iter().all(|subtask| {
+                        crate::workflow_resolution::is_terminal_subtask(&subtask.status)
+                    })
+            });
+    if !mid_completed {
+        return Ok((false, false));
+    }
+
+    let milestone_completed = proj
         .milestones
         .iter()
         .find(|milestone| milestone.id == milestone_id)
-        .and_then(|milestone| {
-            milestone
-                .mid_stages
-                .iter()
-                .find(|mid_stage| mid_stage.id == mid_stage_id)
-        })
-        .is_some_and(|mid_stage| {
-            !mid_stage.subtasks.is_empty()
-                && mid_stage
-                    .subtasks
-                    .iter()
-                    .all(|subtask| is_terminal_subtask(&subtask.status))
+        .is_some_and(|milestone| {
+            !milestone.mid_stages.is_empty()
+                && milestone.mid_stages.iter().all(|mid_stage| {
+                    mid_stage.id == mid_stage_id
+                        || mid_stage.status == project::MidStageStatus::Completed
+                })
         });
-    if !mid_completed {
-        return (false, false);
+    if milestone_completed {
+        let mut candidate = proj.clone();
+        let mid_stage = candidate
+            .milestones
+            .iter_mut()
+            .find(|milestone| milestone.id == milestone_id)
+            .and_then(|milestone| {
+                milestone
+                    .mid_stages
+                    .iter_mut()
+                    .find(|mid_stage| mid_stage.id == mid_stage_id)
+            })
+            .ok_or_else(|| format!("中阶段不存在：{}", mid_stage_id))?;
+        mid_stage.status = project::MidStageStatus::Completed;
+        mid_stage.completed_at = Some(now.clone());
+        crate::workflow_resolution::apply_milestone_review_boundary(
+            &mut candidate,
+            milestone_id,
+            &now,
+        )?;
+        candidate.workflow_state.data_revision =
+            candidate.workflow_state.data_revision.saturating_add(1);
+        candidate.workflow_state.last_transition_at = now;
+        *proj = candidate;
+        return Ok((true, true));
     }
 
-    if let Some(mid_stage) = proj
+    let mid_stage = proj
         .milestones
         .iter_mut()
         .find(|milestone| milestone.id == milestone_id)
@@ -1509,58 +1571,14 @@ pub(crate) fn reconcile_terminal_stage(
                 .iter_mut()
                 .find(|mid_stage| mid_stage.id == mid_stage_id)
         })
-    {
-        mid_stage.status = project::MidStageStatus::Completed;
-        mid_stage.completed_at = Some(now.clone());
-    }
-    let milestone_completed = proj
-        .milestones
-        .iter()
-        .find(|milestone| milestone.id == milestone_id)
-        .is_some_and(|milestone| {
-            !milestone.mid_stages.is_empty()
-                && milestone
-                    .mid_stages
-                    .iter()
-                    .all(|mid_stage| mid_stage.status == project::MidStageStatus::Completed)
-        });
-    if milestone_completed {
-        if let Some(milestone) = proj
-            .milestones
-            .iter_mut()
-            .find(|milestone| milestone.id == milestone_id)
-        {
-            milestone.status = project::MilestoneStatus::Completed;
-            milestone.review_status = Some("pending_review".to_string());
-            milestone.review_conclusion = None;
-        }
-        proj.workflow_state.current_step = project::WorkflowStep::MilestoneReview;
-        proj.workflow_state.review_node_id = milestone_id.to_string();
-        if proj.workflow_state.autopilot_active {
-            let milestone_title = proj
-                .milestones
-                .iter()
-                .find(|milestone| milestone.id == milestone_id)
-                .map(|milestone| milestone.title.clone())
-                .unwrap_or_else(|| milestone_id.to_string());
-            let autopilot = proj
-                .workflow_state
-                .autopilot_state
-                .get_or_insert_with(project::AutopilotState::default);
-            autopilot.active = true;
-            autopilot.target_milestone_id = milestone_id.to_string();
-            autopilot.run_status = project::AutopilotRunStatus::WaitingMilestoneReview;
-            autopilot.last_action = format!("到达大阶段边界：{}，等待人工 A/B/C", milestone_title);
-            autopilot.last_action_at = now.clone();
-            autopilot.error_message.clear();
-        }
-    } else {
-        proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
-        proj.current_mid_stage_id.clear();
-    }
+        .ok_or_else(|| format!("中阶段不存在：{}", mid_stage_id))?;
+    mid_stage.status = project::MidStageStatus::Completed;
+    mid_stage.completed_at = Some(now.clone());
+    proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
+    proj.current_mid_stage_id.clear();
     proj.workflow_state.data_revision = proj.workflow_state.data_revision.saturating_add(1);
     proj.workflow_state.last_transition_at = now;
-    (true, milestone_completed)
+    Ok((true, false))
 }
 
 /// 执行器失败时修正磁盘任务、会话、流水线和自动驾驶状态
@@ -1826,10 +1844,10 @@ pub(crate) async fn confirm_subtask_result_with_source(
         .as_ref()
         .map(|session| (session.milestone_id.clone(), session.mid_stage_id.clone()))
         .ok_or_else(|| "没有活跃的执行会话。".to_string())?;
-    if milestone_id.is_empty() || mid_stage_id.is_empty() {
+    if milestone_id.is_empty() {
         release_confirmation_claim(&mut proj, "awaiting_confirmation");
         let _ = crate::save_project(&proj);
-        return Err("请先选择大阶段和中阶段。".to_string());
+        return Err("执行会话缺少大阶段身份。".to_string());
     }
 
     // 质量门禁：在创建 Git 标签之前校验执行/测试/证据完整性
@@ -1866,18 +1884,16 @@ pub(crate) async fn confirm_subtask_result_with_source(
     }
 
     let precheck = (|| {
-        let ms = proj
-            .milestones
-            .iter()
-            .find(|m| m.id == milestone_id)
-            .ok_or_else(|| "大阶段不存在。".to_string())?;
-        let mid = ms
-            .mid_stages
-            .iter()
-            .find(|m| m.id == mid_stage_id)
-            .ok_or_else(|| "中阶段不存在。".to_string())?;
-        let milestone_title = ms.title.clone();
-        let mid_version = mid.version.clone();
+        let scope = crate::plan_scope::PlanScope::resolve(&proj)?;
+        if proj.current_milestone_id != milestone_id || proj.current_mid_stage_id != mid_stage_id {
+            return Err("执行会话与当前计划目标不一致。".to_string());
+        }
+        let milestone = scope.milestone(&proj);
+        let milestone_title = milestone.title.clone();
+        let plan_target_version = scope
+            .mid_stage(&proj)
+            .map(|stage| stage.version.clone())
+            .unwrap_or_else(|| milestone.version.clone());
         let session = proj
             .execution_session
             .as_ref()
@@ -1896,7 +1912,7 @@ pub(crate) async fn confirm_subtask_result_with_source(
         )?;
         Ok::<_, String>((
             milestone_title,
-            mid_version,
+            plan_target_version,
             subtask_idx,
             subtask_id,
             subtask_title,
@@ -1904,15 +1920,21 @@ pub(crate) async fn confirm_subtask_result_with_source(
         ))
     })();
 
-    let (milestone_title, mid_version, subtask_idx, subtask_id, subtask_title, authorized_paths) =
-        match precheck {
-            Ok(v) => v,
-            Err(msg) => {
-                release_confirmation_claim(&mut proj, "awaiting_confirmation");
-                let _ = crate::save_project(&proj);
-                return Err(msg);
-            }
-        };
+    let (
+        milestone_title,
+        plan_target_version,
+        subtask_idx,
+        subtask_id,
+        subtask_title,
+        authorized_paths,
+    ) = match precheck {
+        Ok(v) => v,
+        Err(msg) => {
+            release_confirmation_claim(&mut proj, "awaiting_confirmation");
+            let _ = crate::save_project(&proj);
+            return Err(msg);
+        }
+    };
 
     let (transaction_id, mut confirmation_phase, mut confirmation_commit, candidate_tag) = proj
         .execution_session
@@ -1990,7 +2012,11 @@ pub(crate) async fn confirm_subtask_result_with_source(
                             crate::cost_ledger::ModelCallContext {
                                 project_name: project_name.clone(),
                                 milestone_id: milestone_id.clone(),
-                                stage_id: mid_stage_id.clone(),
+                                stage_id: if mid_stage_id.is_empty() {
+                                    milestone_id.clone()
+                                } else {
+                                    mid_stage_id.clone()
+                                },
                                 task_id: subtask_id.clone(),
                                 purpose: Some(
                                     crate::cost_ledger::ModelCallPurpose::ConstitutionSummary,
@@ -2070,7 +2096,7 @@ pub(crate) async fn confirm_subtask_result_with_source(
             subtask_id.clone(),
             transaction_id.clone(),
             (subtask_idx + 1) as u32,
-            mid_version.clone(),
+            plan_target_version.clone(),
             subtask_title.clone(),
             authorized_paths.clone(),
             generated_file.take(),
@@ -2299,26 +2325,28 @@ pub(crate) async fn confirm_subtask_result_with_source(
         .and_then(|ms| ms.mid_stages.iter().find(|m| m.id == mid_stage_id))
         .map(|mid| mid.title.clone())
         .unwrap_or_default();
-    let mid_version_for_node_tag = mid_version.clone();
+    let mid_version_for_node_tag = plan_target_version.clone();
     let mid_stage_id_for_node_tag = mid_stage_id.clone();
 
     let (all_subtasks_passed, milestone_completed) =
-        reconcile_terminal_stage(&mut proj, &milestone_id, &mid_stage_id);
+        reconcile_terminal_stage(&mut proj, &milestone_id, &mid_stage_id)?;
 
     if all_subtasks_passed {
-        write_execution_history_with_source(
-            &mut proj,
-            "success",
-            project::ExecutionEventType::MidStageComplete,
-            operation_source,
-            format!(
-                "✅ 中阶段完成：{} (v{})",
-                mid_title_for_node_tag, mid_version_for_node_tag
-            ),
-            Some(&milestone_id),
-            Some(&mid_stage_id),
-            None,
-        );
+        if !mid_stage_id.is_empty() {
+            write_execution_history_with_source(
+                &mut proj,
+                "success",
+                project::ExecutionEventType::MidStageComplete,
+                operation_source,
+                format!(
+                    "✅ 中阶段完成：{} (v{})",
+                    mid_title_for_node_tag, mid_version_for_node_tag
+                ),
+                Some(&milestone_id),
+                Some(&mid_stage_id),
+                None,
+            );
+        }
         if milestone_completed {
             write_execution_history_with_source(
                 &mut proj,
@@ -2427,7 +2455,7 @@ pub(crate) async fn confirm_subtask_result_with_source(
     };
 
     // === 中阶段节点 Git 标签（项目状态已持久化，标签为补充元数据） ===
-    if all_subtasks_passed {
+    if all_subtasks_passed && !mid_stage_id_for_node_tag.is_empty() {
         match crate::git_ops::git_save_node(
             project_path.clone(),
             milestone_id.clone(),
@@ -2633,10 +2661,9 @@ pub(crate) async fn retry_current_subtask(
         .execution_session
         .as_ref()
         .map(|session| session.mid_stage_id.clone())
-        .filter(|id| !id.is_empty())
         .unwrap_or_else(|| proj.current_mid_stage_id.clone());
-    if milestone_id.is_empty() || mid_stage_id.is_empty() {
-        return Err("请先选择大阶段和中阶段。".to_string());
+    if milestone_id.is_empty() {
+        return Err("当前恢复目标缺少大阶段身份。".to_string());
     }
 
     // 可由会话状态直接定位可恢复任务，不得依赖 retry_count > 0
@@ -4474,6 +4501,7 @@ pub fn apply_execution_reconciliation(
         ExecutionReconciliation::SessionLost => {
             // Process died — mark session as lost and reset the stuck subtask
             let now = chrono::Utc::now().to_rfc3339();
+            let mut lost_task_id = None;
             if let Some(ref mut session) = proj.execution_session {
                 // 已是 session_lost 时不重复清空证据
                 if session.status != "session_lost" {
@@ -4485,31 +4513,23 @@ pub fn apply_execution_reconciliation(
                     }
                     session.state_entered_at = now.clone();
                 }
-                // Reset the Executing/Awaiting subtask to Pending
-                if let Some(ms) = proj
-                    .milestones
-                    .iter_mut()
-                    .find(|m| m.id == session.milestone_id)
-                {
-                    if let Some(mid) = ms
-                        .mid_stages
-                        .iter_mut()
-                        .find(|m| m.id == session.mid_stage_id)
+                lost_task_id = Some(session.subtask_id.clone());
+            }
+            // Task identity, not container shape, is authoritative for both direct and
+            // mid-stage plans (including a split child leaf).
+            if let Some(task_id) = lost_task_id {
+                if let Ok(Some(task)) = crate::task_tree::find_task_mut(proj, &task_id) {
+                    if task.status == project::SubtaskStatus::Executing
+                        || (task.status == project::SubtaskStatus::AwaitingConfirmation
+                            && task
+                                .execution_result
+                                .as_ref()
+                                .map(|result| !result.success)
+                                .unwrap_or(false))
                     {
-                        for st in &mut mid.subtasks {
-                            if st.status == project::SubtaskStatus::Executing
-                                || (st.status == project::SubtaskStatus::AwaitingConfirmation
-                                    && st
-                                        .execution_result
-                                        .as_ref()
-                                        .map(|r| !r.success)
-                                        .unwrap_or(false))
-                            {
-                                st.status = project::SubtaskStatus::Pending;
-                                st.execution_result = None;
-                                st.test_result = None;
-                            }
-                        }
+                        task.status = project::SubtaskStatus::Pending;
+                        task.execution_result = None;
+                        task.test_result = None;
                     }
                 }
             }
@@ -4574,8 +4594,8 @@ pub fn apply_execution_reconciliation(
         ExecutionReconciliation::SessionInvalid => {
             proj.execution_session = None;
             if proj.workflow_state.current_step == project::WorkflowStep::Execution {
-                // No valid session in Execution step → go back
-                proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
+                proj.workflow_state.current_step =
+                    crate::workflow_resolution::execution_recovery_selection_step(proj);
                 proj.workflow_state.data_revision += 1;
                 proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
             }
@@ -4588,7 +4608,8 @@ pub fn apply_execution_reconciliation(
             if proj.workflow_state.current_step == project::WorkflowStep::Execution
                 || proj.workflow_state.current_step == project::WorkflowStep::PauseDecision
             {
-                proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
+                proj.workflow_state.current_step =
+                    crate::workflow_resolution::execution_recovery_selection_step(proj);
                 proj.workflow_state.data_revision += 1;
                 proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
             }
@@ -4793,9 +4814,15 @@ pub(crate) async fn reconcile_on_startup(
     let guard = state.pipeline_state.lock().await;
     let (result, should_start_autopilot, should_start_managed) =
         crate::mutate_project_for_control(&project_name, |proj| {
+            let persisted_revision = proj.workflow_state.data_revision;
             let mut modified = reconcile_loaded_project_under_pipeline_lock(proj, guard.as_ref());
             crate::commands::workflow::reconcile_autopilot_in_migration(proj);
-            modified |= crate::commands::workflow::reconcile_workflow_closure_state(proj);
+            let closure_changed =
+                crate::commands::workflow::reconcile_workflow_closure_state(proj)?;
+            if closure_changed {
+                proj.workflow_state.data_revision = persisted_revision.saturating_add(1);
+            }
+            modified |= closure_changed;
             let should_start_autopilot = crate::autopilot_runtime::reconcile_startup_job(proj);
             let should_start_managed = crate::managed_runtime::reconcile_startup_job(proj);
             modified |= proj.workflow_state.autopilot_state.is_some();
@@ -5280,6 +5307,7 @@ mod tests {
             dependencies: vec![],
             expected_output: String::new(),
             acceptance_criteria: vec![],
+            ..Default::default()
         }
     }
 
@@ -5332,6 +5360,23 @@ mod tests {
         session: Option<project::ExecutionSession>,
     ) -> project::Project {
         let mut proj = project::Project::new(project_name);
+        proj.workload_profile = Some(
+            crate::workload_policy::classify(
+                project::WorkloadSignals {
+                    has_frontend: true,
+                    has_backend: true,
+                    has_persistence: false,
+                    has_auth_or_roles: false,
+                    external_integration_count: 0,
+                    independent_domain_count: 3,
+                    deliverable_count: 3,
+                    high_risk: false,
+                },
+                None,
+                0,
+            )
+            .expect("professional execution profile"),
+        );
         proj.project_path = project_path.to_string_lossy().to_string();
         proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
         proj.workflow_state.current_step = project::WorkflowStep::Execution;
@@ -5339,6 +5384,51 @@ mod tests {
         proj.current_mid_stage_id = "mid-1".to_string();
         proj.milestones = vec![test_milestone(subtask_status)];
         proj.execution_session = session;
+        proj
+    }
+
+    fn quick_execution_project(
+        subtask_status: project::SubtaskStatus,
+        session_status: Option<&str>,
+    ) -> project::Project {
+        let mut proj = project::Project::new("quick-execution");
+        proj.workload_profile = Some(
+            crate::workload_policy::classify(
+                project::WorkloadSignals {
+                    has_frontend: true,
+                    has_backend: false,
+                    has_persistence: false,
+                    has_auth_or_roles: false,
+                    external_integration_count: 0,
+                    independent_domain_count: 1,
+                    deliverable_count: 2,
+                    high_risk: false,
+                },
+                None,
+                0,
+            )
+            .expect("quick execution profile"),
+        );
+        proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id.clear();
+        proj.milestones = vec![project::Milestone {
+            id: "milestone-1".to_string(),
+            version: "v0.1".to_string(),
+            title: "Quick".to_string(),
+            status: project::MilestoneStatus::InProgress,
+            mode: project::StageMode::Quick,
+            subtasks: vec![test_subtask(subtask_status)],
+            plan_approved_at: Some("2026-08-01T00:00:00Z".to_string()),
+            plan_revision: 1,
+            ..Default::default()
+        }];
+        proj.execution_session = session_status.map(|status| {
+            let mut session = execution_session(status, "quick-execution-1", "abc123");
+            session.mid_stage_id.clear();
+            session
+        });
         proj
     }
 
@@ -7100,7 +7190,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_last_task_completes_stage_and_milestone() {
+    fn adaptive_execution_contract_skipped_last_task_completes_stage_and_milestone() {
         let mut proj = execution_project(
             "skip-terminal",
             Path::new(""),
@@ -7110,7 +7200,8 @@ mod tests {
         proj.workflow_state.autopilot_active = true;
         proj.workflow_state.autopilot_state = Some(project::AutopilotState::default());
         let (mid_completed, milestone_completed) =
-            reconcile_terminal_stage(&mut proj, "milestone-1", "mid-1");
+            reconcile_terminal_stage(&mut proj, "milestone-1", "mid-1")
+                .expect("terminal stage reconciliation");
         assert!(mid_completed);
         assert!(milestone_completed);
         assert_eq!(
@@ -7125,6 +7216,156 @@ mod tests {
             proj.workflow_state.current_step,
             project::WorkflowStep::MilestoneReview
         );
+    }
+
+    #[test]
+    fn adaptive_execution_contract_terminal_reconcile_propagates_profile_error_atomically() {
+        let mut proj = execution_project(
+            "terminal-profile-error",
+            Path::new(""),
+            project::SubtaskStatus::Passed,
+            None,
+        );
+        proj.workload_profile = None;
+        proj.workflow_state.data_revision = 7;
+
+        let error = reconcile_terminal_stage(&mut proj, "milestone-1", "mid-1")
+            .expect_err("missing profile must block Review convergence");
+        assert!(error.contains("画像缺失"));
+        assert_eq!(proj.workflow_state.data_revision, 7);
+        assert_eq!(
+            proj.workflow_state.current_step,
+            project::WorkflowStep::Execution
+        );
+        assert_eq!(
+            proj.milestones[0].mid_stages[0].status,
+            project::MidStageStatus::InProgress
+        );
+        assert_eq!(
+            proj.milestones[0].status,
+            project::MilestoneStatus::InProgress
+        );
+    }
+
+    #[test]
+    fn adaptive_execution_contract_startup_closure_builds_complete_quick_review_boundary() {
+        let mut proj = quick_execution_project(project::SubtaskStatus::Passed, None);
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
+        proj.workflow_state.data_revision = 12;
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState::default());
+        proj.milestones[0].status = project::MilestoneStatus::Completed;
+        proj.milestones[0].review_status = Some("approved".to_string());
+        proj.milestones[0].review_conclusion = Some("A".to_string());
+
+        assert!(
+            crate::commands::workflow::reconcile_workflow_closure_state(&mut proj)
+                .expect("startup workflow closure")
+        );
+        assert_eq!(proj.workflow_state.data_revision, 13);
+        assert_eq!(
+            proj.workflow_state.current_step,
+            project::WorkflowStep::MilestoneReview
+        );
+        assert_eq!(proj.workflow_state.review_node_id, "milestone-1");
+        assert_eq!(
+            proj.milestones[0].review_status.as_deref(),
+            Some("pending_review")
+        );
+        assert!(proj.milestones[0].review_conclusion.is_none());
+        assert_eq!(
+            proj.workflow_state
+                .autopilot_state
+                .as_ref()
+                .expect("startup autopilot boundary")
+                .run_status,
+            project::AutopilotRunStatus::WaitingMilestoneReview
+        );
+    }
+
+    #[test]
+    fn adaptive_execution_contract_startup_closure_profile_error_is_atomic() {
+        let mut proj = quick_execution_project(project::SubtaskStatus::Skipped, None);
+        proj.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
+        proj.workflow_state.data_revision = 14;
+        proj.workload_profile = None;
+        proj.milestones[0].status = project::MilestoneStatus::Completed;
+        proj.milestones[0].review_status = Some("approved".to_string());
+
+        let error = crate::commands::workflow::reconcile_workflow_closure_state(&mut proj)
+            .expect_err("startup must propagate missing profile");
+        assert!(error.contains("画像缺失"));
+        assert_eq!(proj.workflow_state.data_revision, 14);
+        assert_eq!(
+            proj.workflow_state.current_step,
+            project::WorkflowStep::MilestoneSelection
+        );
+        assert!(proj.workflow_state.review_node_id.is_empty());
+        assert_eq!(
+            proj.milestones[0].review_status.as_deref(),
+            Some("approved")
+        );
+    }
+
+    #[test]
+    fn adaptive_execution_contract_quick_terminal_task_completes_milestone() {
+        let mut proj = project::Project::new("quick-terminal");
+        proj.workload_profile = Some(crate::workload_policy::test_profile(
+            project::WorkloadScale::Small,
+        ));
+        proj.current_milestone_id = "milestone-1".to_string();
+        proj.current_mid_stage_id.clear();
+        proj.workflow_state.current_step = project::WorkflowStep::Execution;
+        proj.milestones.push(project::Milestone {
+            id: "milestone-1".to_string(),
+            title: "Quick".to_string(),
+            status: project::MilestoneStatus::InProgress,
+            mode: project::StageMode::Quick,
+            subtasks: vec![test_subtask(project::SubtaskStatus::Skipped)],
+            ..Default::default()
+        });
+
+        let (target_completed, milestone_completed) =
+            reconcile_terminal_stage(&mut proj, "milestone-1", "")
+                .expect("terminal milestone reconciliation");
+        assert!(target_completed);
+        assert!(milestone_completed);
+        assert!(proj.milestones[0].mid_stages.is_empty());
+        assert_eq!(
+            proj.workflow_state.current_step,
+            project::WorkflowStep::MilestoneReview
+        );
+    }
+
+    #[test]
+    fn quick_refresh_recovery_resets_direct_task_and_uses_milestone_boundary() {
+        let mut lost =
+            quick_execution_project(project::SubtaskStatus::Executing, Some("executing"));
+        assert_eq!(
+            reconcile_execution_state(&lost, None),
+            ExecutionReconciliation::SessionLost
+        );
+        assert!(apply_execution_reconciliation(
+            &mut lost,
+            &ExecutionReconciliation::SessionLost
+        ));
+        assert_eq!(
+            lost.milestones[0].subtasks[0].status,
+            project::SubtaskStatus::Pending
+        );
+        assert!(lost.milestones[0].mid_stages.is_empty());
+
+        let mut invalid = quick_execution_project(project::SubtaskStatus::Pending, None);
+        invalid.execution_session = Some(project::ExecutionSession::default());
+        assert!(apply_execution_reconciliation(
+            &mut invalid,
+            &ExecutionReconciliation::SessionInvalid
+        ));
+        assert_eq!(
+            invalid.workflow_state.current_step,
+            project::WorkflowStep::MilestoneSelection
+        );
+        assert!(invalid.current_mid_stage_id.is_empty());
     }
 
     #[test]
@@ -7398,7 +7639,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_engine_block_restores_baseline_and_preserves_evidence() -> Result<(), String> {
+    async fn adaptive_execution_contract_engine_block_restores_baseline() -> Result<(), String> {
         let repo = TempGitRepo::new("initial-engine-block")?;
         let baseline = repo.head()?;
         std::fs::write(repo.path.join("tracked.txt"), "partial provider change\n")

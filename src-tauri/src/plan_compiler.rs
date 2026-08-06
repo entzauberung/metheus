@@ -40,15 +40,31 @@ pub(crate) fn compile_execution_prompt_with_learning(
 
     format!(
         "任务目标：\n{}\n\n计划背景：\n{}\n\n实现指引：\n{}\n\n当前代码事实：\n{}\n\n匹配的纠错经验（仅限当前文件/标识符）：\n{}\n\n必须先读取的证据文件：\n{}\n\n不可变验收标准：\n{}\n\n精确标识符（由系统附加，不得替换命名）：\n{}\n\n依赖说明：\n{}\n\n停止规则：\n{}",
-        if subtask.goal.trim().is_empty() { &subtask.title } else { &subtask.goal },
-        if subtask.context_summary.trim().is_empty() { "（无额外背景）" } else { &subtask.context_summary },
+        if subtask.goal.trim().is_empty() {
+            &subtask.title
+        } else {
+            &subtask.goal
+        },
+        if subtask.context_summary.trim().is_empty() {
+            "（无额外背景）"
+        } else {
+            &subtask.context_summary
+        },
         implementation,
         fact_context,
-        if matching_learning.trim().is_empty() { "（无）" } else { matching_learning },
+        if matching_learning.trim().is_empty() {
+            "（无）"
+        } else {
+            matching_learning
+        },
         list(&subtask.evidence_files, "（无）"),
         list(&subtask.acceptance_criteria, "（无）"),
         list(&subtask.required_identifiers, "（无）"),
-        if subtask.dependency_notes.trim().is_empty() { "（无显式依赖说明）" } else { &subtask.dependency_notes },
+        if subtask.dependency_notes.trim().is_empty() {
+            "（无显式依赖说明）"
+        } else {
+            &subtask.dependency_notes
+        },
         list(&subtask.stop_rules, "发现信息不足或范围外问题时停止"),
     )
 }

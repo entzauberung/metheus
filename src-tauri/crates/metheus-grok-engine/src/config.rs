@@ -22,6 +22,8 @@ pub struct GrokBuildExecutionConfig {
     pub api_key: String,
     pub timeout_secs: u64,
     pub max_turns: u32,
+    pub max_transport_retries: u32,
+    pub max_doom_loop_retries: u32,
 }
 
 impl fmt::Debug for GrokBuildExecutionConfig {
@@ -34,6 +36,8 @@ impl fmt::Debug for GrokBuildExecutionConfig {
             .field("api_key_configured", &!self.api_key.is_empty())
             .field("timeout_secs", &self.timeout_secs)
             .field("max_turns", &self.max_turns)
+            .field("max_transport_retries", &self.max_transport_retries)
+            .field("max_doom_loop_retries", &self.max_doom_loop_retries)
             .finish()
     }
 }

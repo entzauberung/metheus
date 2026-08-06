@@ -305,17 +305,7 @@ async fn recover_stopped_action(
             crate::pipeline::prepare_execution_workspace_inner(project.name.clone()).await?;
         }
         project::AutopilotRecoveryAction::RegenerateExecutionPlan => {
-            let mid = project
-                .milestones
-                .iter()
-                .find(|milestone| milestone.id == project.current_milestone_id)
-                .and_then(|milestone| {
-                    milestone
-                        .mid_stages
-                        .iter()
-                        .find(|mid| mid.id == project.current_mid_stage_id)
-                })
-                .ok_or("当前中阶段不存在。".to_string())?;
+            let scope = crate::plan_scope::PlanScope::resolve(project)?;
             let source =
                 if project.workflow_state.current_step == project::WorkflowStep::PlanApproving {
                     "approval_rejected"
@@ -325,7 +315,7 @@ async fn recover_stopped_action(
             milestone::regenerate_execution_plan(
                 project.name.clone(),
                 project.workflow_state.data_revision,
-                mid.plan_draft_revision,
+                scope.plan_draft_revision(project),
                 String::new(),
                 source.to_string(),
             )

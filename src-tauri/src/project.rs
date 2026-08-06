@@ -922,13 +922,55 @@ pub enum StageMode {
     ///专业模式：大阶段包含中阶段（三级）
     Professional,
 }
-///项目整体执行模式
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum ProjectMode {
-    ///快速模式
-    Quick,
-    ///专业模式
-    Professional,
+
+/// 由项目范围事实确定的工作负载规模。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WorkloadScale {
+    Micro,
+    Small,
+    Standard,
+    System,
+}
+
+/// 三项检查使用的证据与阻断深度。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WorkloadCheckDepth {
+    Lean,
+    Standard,
+    Strict,
+}
+
+/// 首项检查声明的结构化范围事实；模型不得直接决定 WorkloadScale。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadSignals {
+    pub has_frontend: bool,
+    pub has_backend: bool,
+    pub has_persistence: bool,
+    pub has_auth_or_roles: bool,
+    pub external_integration_count: u32,
+    pub independent_domain_count: u32,
+    pub deliverable_count: u32,
+    /// 风险是与规模独立的事实，只能提高检查强度。
+    pub high_risk: bool,
+}
+
+/// 后端确定性分类器生成的工作负载画像。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkloadProfile {
+    pub signals: WorkloadSignals,
+    pub scale: WorkloadScale,
+    pub use_mid_stage_layer: bool,
+    pub max_milestones: u32,
+    pub max_mid_stages: u32,
+    pub max_subtasks: u32,
+    pub max_split_depth: u32,
+    pub check_depth: WorkloadCheckDepth,
+    pub max_executor_turns: u32,
+    pub max_transport_retries: u32,
+    pub max_doom_loop_retries: u32,
+    pub evidence: Vec<String>,
+    pub discussion_revision: u64,
+    pub fingerprint: String,
 }
 
 /// 执行引擎的运行载体。插件模式表示由 Metheus 管理外部 CLI 进程。
@@ -991,11 +1033,6 @@ impl Default for ExecutionProfile {
     }
 }
 
-impl Default for ProjectMode {
-    fn default() -> Self {
-        ProjectMode::Professional
-    }
-}
 ///中阶段状态
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum MidStageStatus {
@@ -1095,7 +1132,10 @@ pub struct Subtask {
     #[serde(default)]
     pub dependency_notes: String,
     /// v0.0.4 compiled contract view. Legacy task fields remain authoritative.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::task_contract::deserialize_contract_snapshot"
+    )]
     pub contract_snapshot: Option<crate::task_contract::TaskContract>,
     /// Controller-created descendants. The legacy serial pipeline ignores this
     /// field until SerialTakeover explicitly selects a leaf.
@@ -1224,6 +1264,10 @@ pub enum EngineFailureKind {
     NetworkError,
     Timeout,
     ProcessCrash,
+    ToolRejected,
+    ProtocolError,
+    MaxTurnsExceeded,
+    RuntimeError,
     TaskExecutionError,
 }
 ///测试工程师的检查结果
@@ -1414,6 +1458,61 @@ pub struct Milestone {
     /// 验收方向
     #[serde(default)]
     pub acceptance_criteria: Vec<String>,
+    /// 直挂执行计划检查结果（Quick 拓扑使用）。
+    #[serde(default)]
+    pub plan_check_result: Option<StagePlanCheckResult>,
+    #[serde(default)]
+    pub plan_approved_at: Option<String>,
+    #[serde(default)]
+    pub plan_revision: u64,
+    #[serde(default)]
+    pub plan_draft_revision: u64,
+    #[serde(default)]
+    pub plan_generated_at: Option<String>,
+    #[serde(default)]
+    pub plan_regeneration_count: u32,
+    #[serde(default)]
+    pub last_plan_failure_fingerprint: String,
+    #[serde(default)]
+    pub last_plan_issue_count: u32,
+    #[serde(default)]
+    pub plan_no_progress_count: u32,
+}
+
+impl Default for Milestone {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            version: String::new(),
+            title: String::new(),
+            description: String::new(),
+            tech_stack: String::new(),
+            status: MilestoneStatus::Pending,
+            mode: StageMode::Quick,
+            mid_stages: Vec::new(),
+            subtasks: Vec::new(),
+            qa_result: None,
+            git_commit_hash: String::new(),
+            decomposition_check: None,
+            review_status: None,
+            review_conclusion: None,
+            approved_at: None,
+            goal: String::new(),
+            scope: String::new(),
+            dependencies: Vec::new(),
+            expected_output: String::new(),
+            acceptance_criteria: Vec::new(),
+            plan_check_result: None,
+            plan_approved_at: None,
+            plan_revision: 0,
+            plan_draft_revision: 0,
+            plan_generated_at: None,
+            plan_regeneration_count: 0,
+            last_plan_failure_fingerprint: String::new(),
+            last_plan_issue_count: 0,
+            plan_no_progress_count: 0,
+        }
+    }
 }
 ///单条聊天消息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1551,6 +1650,9 @@ pub struct PlanDraft {
     /// 生成时的项目数据修订号
     #[serde(default)]
     pub data_revision_at_generation: u64,
+    /// 生成方案时绑定的工作负载画像指纹。
+    #[serde(default)]
+    pub workload_profile_fingerprint: String,
     /// AI 自检结果或驳回反馈
     #[serde(default)]
     pub self_check_result: String,
@@ -1593,6 +1695,7 @@ impl Default for PlanDraft {
             constitution_part1_draft: String::new(),
             generation_revision: 0,
             data_revision_at_generation: 0,
+            workload_profile_fingerprint: String::new(),
             self_check_result: String::new(),
             generated_at: String::new(),
             approved: false,
@@ -1989,9 +2092,9 @@ pub struct Project {
     ///统一工作流状态 — 前端显示和按钮权限的唯一判断来源
     #[serde(default)]
     pub workflow_state: WorkflowState,
-    ///项目模式
+    /// 首项检查生成的工作负载画像；缺失时不得进入方案生成。
     #[serde(default)]
-    pub mode: ProjectMode,
+    pub workload_profile: Option<WorkloadProfile>,
     /// 项目后续执行默认使用的引擎；旧项目自动映射为 Claude Code。
     #[serde(default)]
     pub execution_profile: ExecutionProfile,
@@ -2088,7 +2191,7 @@ impl Project {
                 active_discussion_thread_id: initial_thread.id.clone(),
                 ..WorkflowState::default()
             },
-            mode: ProjectMode::Professional,
+            workload_profile: None,
             execution_profile: ExecutionProfile::default(),
             current_milestone_id: "".to_string(),
             current_mid_stage_id: "".to_string(),
@@ -2305,6 +2408,7 @@ pub struct MilestoneTagNode {
     pub milestone_version: String,
     pub milestone_status: String,
     pub mid_stages: Vec<MidStageTagNode>,
+    pub subtasks: Vec<SubtaskTagNode>,
 }
 
 /// 中阶段标签节点

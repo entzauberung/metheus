@@ -45,6 +45,37 @@ pub async fn execute(
                     summary: "completed".to_string(),
                 });
             }
+            EmbeddedEvent::ToolFailed(name) => {
+                sink.emit(GrokBuildRuntimeEvent::ToolFailed {
+                    name,
+                    summary: "failed".to_string(),
+                });
+            }
+            EmbeddedEvent::RetryScheduled {
+                attempt,
+                max_retries,
+                reason,
+            } => sink.emit(GrokBuildRuntimeEvent::RetryScheduled {
+                attempt,
+                max_retries,
+                reason,
+            }),
+            EmbeddedEvent::RetryExhausted {
+                attempts,
+                reason,
+                is_rate_limited,
+            } => sink.emit(GrokBuildRuntimeEvent::RetryExhausted {
+                attempts,
+                reason,
+                is_rate_limited,
+            }),
+            EmbeddedEvent::RetryFailed {
+                error_type,
+                message,
+            } => sink.emit(GrokBuildRuntimeEvent::RetryFailed {
+                error_type,
+                message,
+            }),
         })
     });
     let embedded_config = EmbeddedConfig {
@@ -58,7 +89,10 @@ pub async fn execute(
         api_key: config.api_key,
         timeout: Duration::from_secs(config.timeout_secs),
         max_turns: config.max_turns as usize,
+        max_transport_retries: config.max_transport_retries,
+        max_doom_loop_retries: config.max_doom_loop_retries,
     };
+    let embedded_event_sink = event_sink.clone();
     let embedded_request = EmbeddedRequest {
         project_root: request.project_path,
         authorized_write_paths: request.authorized_paths,
@@ -67,9 +101,19 @@ pub async fn execute(
         cancellation: request.cancellation,
         event_sink,
     };
-    let result = xai_grok_shell::metheus_embedded::execute(embedded_config, embedded_request)
-        .await
-        .map_err(map_embedded_error)?;
+    let result = xai_grok_shell::metheus_embedded::execute(embedded_config, embedded_request).await;
+    if let Some(event_sink) = embedded_event_sink {
+        event_sink.flush();
+    }
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            if let Some(event_sink) = request.event_sink.as_ref() {
+                event_sink.flush();
+            }
+            return Err(map_embedded_error(error));
+        }
+    };
     let token_usage = token_usage(result.prompt_tokens, result.completion_tokens);
     let result = GrokBuildExecutionResult {
         output: result.output,
@@ -95,6 +139,9 @@ pub async fn execute(
             files_written: result.files_written.len(),
         },
     );
+    if let Some(event_sink) = request.event_sink.as_ref() {
+        event_sink.flush();
+    }
     Ok(result)
 }
 

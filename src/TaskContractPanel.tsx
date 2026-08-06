@@ -11,7 +11,10 @@ export default function TaskContractPanel({ contract }: { contract?: TaskContrac
         <span><Gauge size={14} />复杂度 {contract.complexity}</span>
         <span><ShieldCheck size={14} />风险 {contract.risk}</span>
         <span><GitBranch size={14} />深度 {contract.depth}</span>
-        <span>预算 {contract.budget.level} · 预计 {contract.budget.estimated_model_calls} 次模型调用</span>
+        <span>工作负载 {contract.workload_scale} · 最大拆分深度 {contract.max_split_depth}</span>
+        <span>预算 {contract.budget.level} · 最多 {contract.budget.max_executor_turns} 执行轮</span>
+        <span>重试 transport {contract.budget.max_transport_retries} · Doom Loop {contract.budget.max_doom_loop_retries}</span>
+        <span>预计 {contract.budget.estimated_model_calls} 次模型调用</span>
       </div>
       <div className="task-control-section"><strong>允许路径</strong><code>{contract.allowed_file_paths.join("、") || "未声明"}</code></div>
       <div className="task-control-section"><strong>验收标准</strong><ul>{contract.acceptance_criteria.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul></div>

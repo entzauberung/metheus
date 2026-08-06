@@ -1273,7 +1273,7 @@ pub(crate) async fn test_model_connection(target: ModelConnectionTarget) -> Conn
                 latency_ms: elapsed_millis(started),
                 error_kind: Some(ModelConnectionErrorKind::MissingSecret),
                 message,
-            }
+            };
         }
     };
     let model = settings.model.clone();

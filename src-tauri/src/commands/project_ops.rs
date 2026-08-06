@@ -690,30 +690,23 @@ fn clean_stale_execution_session(proj: &mut project::Project) -> bool {
     // Check 1: session is active but refers to non-existent entities
     if session.active {
         // Find the referenced subtask
-        let subtask_exists = proj
-            .milestones
-            .iter()
-            .filter(|ms| ms.id == session.milestone_id)
-            .flat_map(|ms| ms.mid_stages.iter())
-            .filter(|mid| mid.id == session.mid_stage_id)
-            .flat_map(|mid| mid.subtasks.iter())
-            .any(|st| st.id == session.subtask_id);
+        let subtask_exists = crate::task_tree::locate_task(&proj, &session.subtask_id)
+            .ok()
+            .flatten()
+            .is_some_and(|address| {
+                address.milestone_id == session.milestone_id
+                    && address.mid_stage_id == session.mid_stage_id
+            });
 
         if !subtask_exists {
             // Referenced subtask no longer exists — stale session
             should_clean = true;
         } else if session.status == "executing" {
             // Check if subtask is still marked as Executing
-            let still_executing = proj
-                .milestones
-                .iter()
-                .filter(|ms| ms.id == session.milestone_id)
-                .flat_map(|ms| ms.mid_stages.iter())
-                .filter(|mid| mid.id == session.mid_stage_id)
-                .flat_map(|mid| mid.subtasks.iter())
-                .any(|st| {
-                    st.id == session.subtask_id && st.status == project::SubtaskStatus::Executing
-                });
+            let still_executing = crate::task_tree::find_task(&proj, &session.subtask_id)
+                .ok()
+                .flatten()
+                .is_some_and(|task| task.status == project::SubtaskStatus::Executing);
 
             if !still_executing {
                 // Session says executing but subtask doesn't — process died
@@ -725,7 +718,7 @@ fn clean_stale_execution_session(proj: &mut project::Project) -> bool {
         if !session.milestone_id.is_empty() && proj.current_milestone_id != session.milestone_id {
             should_clean = true;
         }
-        if !session.mid_stage_id.is_empty() && proj.current_mid_stage_id != session.mid_stage_id {
+        if proj.current_mid_stage_id != session.mid_stage_id {
             should_clean = true;
         }
     } else {
@@ -735,9 +728,10 @@ fn clean_stale_execution_session(proj: &mut project::Project) -> bool {
 
     if should_clean {
         proj.execution_session = None;
-        // If current step is Execution with stale session, go back to MidStageSelection
+        // Return to the selection boundary that belongs to the active topology.
         if proj.workflow_state.current_step == project::WorkflowStep::Execution {
-            proj.workflow_state.current_step = project::WorkflowStep::MidStageSelection;
+            proj.workflow_state.current_step =
+                crate::workflow_resolution::execution_recovery_selection_step(proj);
             proj.workflow_state.data_revision += 1;
             proj.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
         }

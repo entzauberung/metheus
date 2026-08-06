@@ -1,6 +1,6 @@
 # Metheus fork patch set
 
-Fork revision: `metheus.2`
+Fork revision: `metheus.3`
 
 The only supported embedded call chain is:
 
@@ -26,11 +26,11 @@ metheus-grok-engine
 | `crates/codegen/xai-grok-sampler/src/sampling_log.rs` | Remove credential prefixes from sampling request spans so sampler tracing cannot persist partial API keys |
 | `crates/codegen/xai-grok-shell/Cargo.toml` | Declare the opt-in `metheus-embedded` feature |
 | `crates/codegen/xai-grok-shell/src/lib.rs` | Export the feature-gated embedded facade |
-| `crates/codegen/xai-grok-shell/src/metheus_embedded.rs` | Build and drive the real upstream session actor with frozen Metheus config, bounded lifecycle, ACP policy client, and typed errors |
-| `crates/codegen/xai-grok-shell/tests/metheus_embedded_runtime.rs` | Exercise the embedded SessionActor through local fake SSE without compiling the shell unit-test harness |
+| `crates/codegen/xai-grok-shell/src/metheus_embedded.rs` | Build and drive the real upstream session actor with frozen Metheus config, budgeted sampler/Doom recovery, non-blocking structured events, bounded lifecycle, ACP policy client, and typed errors |
+| `crates/codegen/xai-grok-shell/tests/metheus_embedded_runtime.rs` | Exercise the embedded SessionActor, retry states, and failed-tool status through local fake SSE without compiling the shell unit-test harness |
 | `crates/codegen/xai-grok-shell/src/agent/config.rs` | Carry an explicit process-local embedded mode that cannot be loaded from Grok configuration |
 | `crates/codegen/xai-grok-shell/src/agent/mvp_agent/acp_agent.rs` | Keep ordinary ACP session constructors explicit about not using embedded mode |
-| `crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs` | Construct embedded `MvpAgent` sessions and disable host config, plugins, credentials, feedback, MCP, LSP, memory, hooks, and subagents |
+| `crates/codegen/xai-grok-shell/src/agent/mvp_agent/agent_ops.rs` | Construct embedded `MvpAgent` sessions, thread the frozen sampler/Doom budgets into `SessionActor`, and disable host config, plugins, credentials, feedback, MCP, LSP, memory, hooks, and subagents |
 | `crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs` | Thread embedded mode and file policy through session spawn options |
 | `crates/codegen/xai-grok-shell/src/agent/subagent/handle_request.rs` | Supply non-embedded defaults to the extended upstream spawn signature |
 | `crates/codegen/xai-grok-shell/src/session/acp_types.rs` | Add non-persisted embedded and frozen-auth startup hints |
@@ -54,7 +54,9 @@ baseline without first being added to this inventory with a security rationale.
 - `read_file` and `search_replace` are executed by the restricted ACP client.
 - `list_dir` and `grep` use the same canonical project policy; grep is Rust-only.
 - No Shell, terminal fallback, web tool, MCP, plugin, skill, memory, hook, or subagent is available.
-- Model, endpoint, backend, API key, timeout, and maximum turns come only from the Metheus execution snapshot.
+- Model, endpoint, backend, API key, timeout, maximum turns, transport retries, and Doom retries come only from the Metheus execution snapshot.
+- Doom-loop detection, retry classification, and backoff remain the upstream sampler implementation; Metheus only supplies bounded budgets and forwards `RetryState`.
+- The event bridge distinguishes completed and failed tools and exposes structured retry scheduling/exhaustion without forwarding reasoning content.
 - Embedded requests do not read Grok CLI model credentials or add URL-derived Grok authentication headers.
 - Cancellation, timeout, maximum turns, policy rejection, auth, quota, rate limit, network, protocol, and runtime failures remain typed across the adapter boundary.
 

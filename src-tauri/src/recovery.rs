@@ -1326,12 +1326,13 @@ async fn replan_current_subtask(
         .map_err(|error| format!("当前任务重规划协议失败：{}", error))?;
     let output = validate_replan_output(output)?;
     let contract_before = crate::plan_calibration::immutable_contract(subtask)?;
+    let workload = crate::workload_policy::current_profile(proj)?.clone();
     let mut contract_candidate = subtask.clone();
     contract_candidate.execution_prompt = output.implementation_guidance.trim().to_string();
     contract_candidate.context_summary = output.context_summary.trim().to_string();
     contract_candidate.evidence_files = output.evidence_files.clone();
     contract_candidate.dependency_notes = output.dependency_notes.trim().to_string();
-    crate::plan_contract::hydrate_subtask_contract(&mut contract_candidate);
+    crate::plan_contract::hydrate_subtask_contract(&mut contract_candidate, &workload);
     if crate::plan_calibration::immutable_contract(&contract_candidate)? != contract_before {
         return Err("当前任务计划补丁改变了不可变契约，已拒绝。".to_string());
     }
@@ -1775,6 +1776,20 @@ pub(crate) async fn run_error_recovery_with_pipeline(
 
     let mut proj = crate::load_project(&project_name)?;
     let (mut recovery, mut session, subtask) = current_recovery_context(&proj)?;
+    let workload = crate::workload_policy::current_profile(&proj)?;
+    let current_contract = crate::task_compiler::compile(
+        &subtask,
+        (!session.parent_task_id.is_empty()).then_some(session.parent_task_id.as_str()),
+        session.node_depth,
+        workload,
+    )
+    .contract;
+    if !session.contract_fingerprint.is_empty()
+        && session.contract_fingerprint != current_contract.fingerprint
+    {
+        return Err("恢复任务合同已变化，拒绝沿用旧执行会话。".to_string());
+    }
+    let task_budget = current_contract.budget;
     if recovery.phase == project::RecoveryPhase::WaitingEngine
         || recovery.error_kind == project::RecoveryErrorKind::EngineBlocked
     {
@@ -2171,6 +2186,7 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             authorized_paths: authorized_paths.clone(),
             subtask_id: session.subtask_id.clone(),
             execution_id: recovery_execution_id.clone(),
+            task_budget,
         },
         pipeline_state.clone(),
     )
@@ -2379,6 +2395,22 @@ pub(crate) async fn run_error_recovery_with_pipeline(
     .await
 }
 
+pub(crate) fn engine_block_boundary(
+    kind: &project::EngineFailureKind,
+) -> (project::RecoveryErrorKind, project::RecoveryPhase) {
+    if crate::engine::requires_human_recovery(kind) {
+        (
+            project::RecoveryErrorKind::HumanRequired,
+            project::RecoveryPhase::WaitingHuman,
+        )
+    } else {
+        (
+            project::RecoveryErrorKind::EngineBlocked,
+            project::RecoveryPhase::WaitingEngine,
+        )
+    }
+}
+
 fn handle_repair_engine_block(
     proj: &mut project::Project,
     session: &project::ExecutionSession,
@@ -2388,6 +2420,7 @@ fn handle_repair_engine_block(
     execution_result: Option<project::ExecutionResult>,
     pipeline_state: &mut Option<PipelineState>,
 ) -> Result<(), String> {
+    let (error_kind, phase) = engine_block_boundary(&engine_failure_kind);
     let baseline = proj
         .workflow_state
         .recovery_state
@@ -2416,9 +2449,9 @@ fn handle_repair_engine_block(
     };
     if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
         recovery.attempt = recovery.attempt.saturating_sub(1);
-        recovery.error_kind = project::RecoveryErrorKind::EngineBlocked;
+        recovery.error_kind = error_kind;
         recovery.engine_failure_kind = Some(engine_failure_kind);
-        recovery.phase = project::RecoveryPhase::WaitingEngine;
+        recovery.phase = phase;
         recovery.last_repair_summary = truncate_chars(&detail, 4_000);
         recovery.updated_at = chrono::Utc::now().to_rfc3339();
     }
@@ -3379,7 +3412,7 @@ pub(crate) async fn resolve_human_recovery(
                 &mut proj,
                 &session.milestone_id,
                 &session.mid_stage_id,
-            );
+            )?;
             if mid_completed {
                 pipeline::write_execution_history_with_source(
                     &mut proj,
@@ -3760,6 +3793,7 @@ mod tests {
             dependencies: Vec::new(),
             expected_output: String::new(),
             acceptance_criteria: Vec::new(),
+            ..Default::default()
         });
         proj.execution_session = Some(project::ExecutionSession {
             milestone_id: "m".to_string(),
@@ -3977,6 +4011,31 @@ mod tests {
         assert_eq!(recovery.attempt, 0);
         assert!(!recovery.replan_attempted);
         assert!(!recovery.replan_execution_attempted);
+    }
+
+    #[test]
+    fn adaptive_execution_contract_recovery_separates_human_and_network() {
+        for kind in [
+            project::EngineFailureKind::ToolRejected,
+            project::EngineFailureKind::ProtocolError,
+            project::EngineFailureKind::MaxTurnsExceeded,
+            project::EngineFailureKind::RuntimeError,
+        ] {
+            assert_eq!(
+                engine_block_boundary(&kind),
+                (
+                    project::RecoveryErrorKind::HumanRequired,
+                    project::RecoveryPhase::WaitingHuman,
+                )
+            );
+        }
+        assert_eq!(
+            engine_block_boundary(&project::EngineFailureKind::NetworkError),
+            (
+                project::RecoveryErrorKind::EngineBlocked,
+                project::RecoveryPhase::WaitingEngine,
+            )
+        );
     }
 
     #[test]

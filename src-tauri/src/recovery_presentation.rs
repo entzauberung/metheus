@@ -1256,7 +1256,7 @@ pub(crate) fn present_recovery(project: &Project) -> RecoveryPresentation {
         AutopilotRecoveryAction::None
         | AutopilotRecoveryAction::RestoreExecutionBaseline
         | AutopilotRecoveryAction::RunAutomaticRecovery => {
-            return RecoveryPresentation::none(project)
+            return RecoveryPresentation::none(project);
         }
     };
 

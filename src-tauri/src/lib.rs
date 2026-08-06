@@ -33,6 +33,7 @@ mod plan_calibration;
 mod plan_compiler;
 mod plan_contract;
 mod plan_deterministic_checks;
+mod plan_scope;
 mod project;
 mod project_facts;
 mod project_state_bus;
@@ -59,6 +60,7 @@ mod validator_contract;
 mod validator_registry;
 mod validators;
 mod workflow_resolution;
+mod workload_policy;
 use crate::pipeline::PipelineState;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -459,4 +461,56 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_execution_contract_loads_v1_snapshot_without_profile_and_preserves_task_facts() {
+        let path = std::env::temp_dir().join(format!(
+            "metheus-v1-contract-load-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut project = project::Project::new("legacy-contract-load");
+        project.workload_profile = None;
+        project.milestones.push(project::Milestone {
+            id: "m".to_string(),
+            title: "Legacy milestone".to_string(),
+            status: project::MilestoneStatus::InProgress,
+            mode: project::StageMode::Quick,
+            subtasks: vec![project::Subtask {
+                id: "legacy-task".to_string(),
+                title: "Legacy task".to_string(),
+                status: project::SubtaskStatus::AcceptedDeviation,
+                acceptance_criteria: vec!["保留历史验收内容".to_string()],
+                confirmation_notes: Some("保留人工决定".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let mut value = serde_json::to_value(project).unwrap();
+        value["milestones"][0]["subtasks"][0]["contract_snapshot"] = serde_json::json!({
+            "version": "task-contract-v1",
+            "task_id": "legacy-task"
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let loaded = load_project_from_path(&path);
+        let _ = fs::remove_file(&path);
+        let loaded = loaded.unwrap();
+        let task = &loaded.milestones[0].subtasks[0];
+        assert_eq!(task.status, project::SubtaskStatus::AcceptedDeviation);
+        assert_eq!(task.acceptance_criteria, vec!["保留历史验收内容"]);
+        assert_eq!(task.confirmation_notes.as_deref(), Some("保留人工决定"));
+        assert!(task.contract_snapshot.is_none());
+        assert_eq!(
+            loaded.task_control.takeover_capability_status,
+            crate::task_control::TakeoverCapabilityStatus::Unavailable
+        );
+        let error = crate::workload_policy::current_profile(&loaded).unwrap_err();
+        assert!(error.contains("目标完整性检查"));
+        assert!(error.contains("重新"));
+    }
 }

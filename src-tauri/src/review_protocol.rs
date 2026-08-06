@@ -360,7 +360,7 @@ fn normalize_conclusion(
                 path,
                 "Satisfied、Unsatisfied 或 EvidenceInsufficient",
                 &value,
-            ))
+            ));
         }
     };
     *normalized += u32::from(raw != canonical);

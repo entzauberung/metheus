@@ -256,6 +256,10 @@ fn verification_failure_message(kind: &EngineFailureKind) -> &'static str {
         EngineFailureKind::NetworkError => "网络错误",
         EngineFailureKind::Timeout => "验证超时",
         EngineFailureKind::ProcessCrash => "CLI 进程异常",
+        EngineFailureKind::ToolRejected => "工具权限被拒绝",
+        EngineFailureKind::ProtocolError => "执行协议错误",
+        EngineFailureKind::MaxTurnsExceeded => "执行轮数已耗尽",
+        EngineFailureKind::RuntimeError => "执行运行时错误",
         EngineFailureKind::TaskExecutionError => "验证请求失败",
     }
 }
@@ -313,7 +317,7 @@ pub(super) async fn check_engine_health_with_settings(
                 EngineHealthStatus::NotInstalled,
                 configured.is_none(),
                 message,
-            )
+            );
         }
     };
     let version = command_output(&path, &["--version"])
