@@ -20,10 +20,14 @@ if [[ "${VERIFY_SCOPE}" != "--static-only" ]]; then
   cd "${REPO_ROOT}"
   npx --no-install tsc --noEmit
   npx --no-install vitest run \
+    src/utils/invokeWithTimeout.test.ts \
+    src/engineHealthSync.test.ts \
     src/projectSyncPolicy.test.ts \
     src/hooks/useProjectStateSync.test.tsx \
     src/executionSyncPolicy.test.ts \
     src/hooks/useTaskControlWorkspace.test.tsx \
+    src/components/ApplicationSettings.test.tsx \
+    src/components/ExecutionEngineSelector.test.tsx \
     src/components/AutopilotControlBar.test.tsx \
     src/components/RecoveryDecisionDialog.test.tsx \
     src/RecoveryImpactDialog.test.tsx \
@@ -77,7 +81,7 @@ if rg -n '恢复前将先展示影响范围|后台重试进行中|最终状态�
   exit 1
 fi
 
-for scenario in {1..10}; do
+for scenario in {1..13}; do
   if ! rg -q "场景 ${scenario}：" docs/phase1-runtime-acceptance.md; then
     echo "运行时验收文档缺少场景 ${scenario}" >&2
     exit 1

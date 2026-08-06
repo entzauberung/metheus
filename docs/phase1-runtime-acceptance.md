@@ -1,6 +1,6 @@
 # Metheus v0.0.4 第一阶段运行时验收协议
 
-本协议只验证第一阶段正式默认启用与最终体验封板，不重建控制算法、同步总线或恢复主链。自动化轨道固定使用 `.build/core`、`--no-default-features` 和最多两个 Cargo 任务；禁止 Tauri dev/build、Grok Build、真实模型请求、无过滤 Rust 测试、依赖变更和 Git 写操作。
+本协议只验证第一阶段正式默认启用与最终体验封板，不重建控制算法、同步总线或恢复主链。Core 自动化轨道固定使用 `.build/core`、`--no-default-features` 和最多两个 Cargo 任务；Grok 专项只允许 `.build/grok-full`、单任务、`builtin-grok` 的库目标 `cargo check`。禁止 Tauri dev/build、Grok 完整构建、真实模型请求、无过滤 Rust 测试、依赖变更和 Git 写操作。
 
 ## 自动化契约场景
 
@@ -8,7 +8,7 @@
 |---|---|---|
 | 场景 1： | 新项目默认进入 `SerialTakeover`，缺字段旧项目仍为 `Legacy` | `task_control::tests::phase1_runtime_contract_new_projects_default_to_serial_without_migrating_legacy` |
 | 场景 2： | `Shadow` 只记录对照，不派发控制动作 | `commands::workflow::tests::phase1_runtime_contract_explicit_shadow_uses_legacy_and_only_audits` |
-| 场景 3： | `SerialTakeover` 派发 `execute_control_action` | `commands::workflow::tests::phase1_runtime_contract_serial_takeover_dispatches_control_action` |
+| 场景 3： | 验收文本先推断为 `SemanticReview`，`SerialTakeover` 再派发确定的 `TargetedValidate` 控制动作 | `commands::workflow::tests::phase1_runtime_contract_serial_takeover_dispatches_control_action` |
 | 场景 4： | 后端阻断经 Channel/统一快照出现，无需 Reload | `useProjectStateSync.test.tsx`、`AutopilotControlBar.test.tsx` |
 | 场景 5： | Channel 不可用时低频快照兜底保持状态可恢复 | `useProjectStateSync.test.tsx`、`SyncStatusIndicator.test.tsx` |
 | 场景 6： | 执行终态延迟时显示后台收尾同步状态 | `executionSyncPolicy.test.ts`、`SyncStatusIndicator.test.tsx` |
@@ -16,8 +16,11 @@
 | 场景 8： | 恢复完成后旧恢复状态立即清除 | `pipeline::tests::phase1_runtime_contract_successful_retest_clears_recovery_immediately`、`RecoveryNotice.test.tsx` |
 | 场景 9： | 叶子串行收口后父节点聚合，Git 确认事务不会触发重复执行 | `task_aggregation::tests::phase1_runtime_contract_two_leaf_closeout_aggregates_parent_and_advances`、`pipeline::tests::phase1_runtime_contract_git_confirmation_claim_reconciles_without_reexecution` |
 | 场景 10： | 显式确认回退到 `Shadow` 后旧任务流水线继续可用，且原因可审计 | `commands::workflow::tests::phase1_runtime_contract_explicit_shadow_uses_legacy_and_only_audits`、`taskControlPolicy.test.ts` |
+| 场景 11： | 有界 `_runtime` 命令按显式覆盖、完整命令、单层基础名和默认值解析，不再误落 30 秒 | `invokeWithTimeout.test.ts`、`verify-phase1-closeout.sh --static-only` |
+| 场景 12： | 决策与执行活动租约存续时阻断设置修改，终态释放后恢复修改且计数保持饱和 | 两项 settings Rust 单测验证阻断与释放算法；`verify-phase1-closeout.sh --static-only` 验证 `ActivityGuard::drop` 将当前 `kind` 接入 `release_activity` |
+| 场景 13： | Grok Build 内置自检返回后，所有匹配的已挂载健康消费者无需 Reload 即可刷新，旧响应不能覆盖新状态 | `engineHealthSync.test.ts`、`ApplicationSettings.test.tsx`、`ExecutionEngineSelector.test.tsx` |
 
-执行命令：`./scripts/verify-phase1-runtime-contract.sh`。只做静态契约核对时使用 `--static-only`。
+Core 执行命令：`npm run verify:phase1-runtime-contract`。只做静态契约核对时使用 `./scripts/verify-phase1-runtime-contract.sh --static-only`；Grok 特性边界使用 `npm run verify:grok-check`。
 
 ## 最终封板定向清单
 
@@ -59,6 +62,10 @@
 记录字段：二进制路径与时间戳、进程启动标识、动作标识、最后心跳、陈旧判定与清理原因、清理审计事件、Git 提交标识前后值、恢复按钮延迟、通知是否丢失、状态是否分裂、峰值内存/CPU、每步结果、未执行原因。
 
 ## 当前执行记录
+
+- 第一阶段运行期三项收口（2026-08-06）：实际运行 `npm run verify:phase1-runtime-contract`，命令退出状态为 0、总耗时约 8.7 秒；资源预检、Rust 格式、TypeScript 无输出检查、运行时命令注册/旧命令旁路/超时覆盖静态门禁及 `git diff --check` 通过。`.build/core`、`CARGO_BUILD_JOBS=2`、`--no-default-features` 下 15 项 `phase1_runtime_contract` Rust 测试通过、422 项过滤，仅报告 15 条既有未使用代码告警；19 个指定前端测试文件共 113 项通过。超时门禁动态审计 61 个命令：56 个基础策略、1 个精确策略、2 个显式超时例外和 2 个 Channel 例外，精确策略明确包含 `test_grok_build_runtime`。settings Rust 单测覆盖两类活动计数的阻断与释放算法，静态门禁覆盖 `ActivityGuard::drop` 到释放函数的接线；`workflow.rs` 同一测试先证明夹具为 `SemanticReview`，再证明派发 `TargetedValidate`；Grok 自检健康刷新与请求序号保护也已覆盖。该自动化证据不等同于真实网络请求成功、失败或取消的生命周期测试。
+- Grok 专项（2026-08-06）：实际运行 `npm run verify:grok-check`，命令退出状态为 0且资源预检通过；`.build/grok-full`、`CARGO_BUILD_JOBS=1`、`--no-default-features --features builtin-grok` 下单任务库目标 `cargo check` 通过，Cargo 报告耗时 1 分 34 秒，仅报告 21 条未使用代码告警；未执行最终链接、桌面构建或真实模型请求。
+- 桌面资格复核（2026-08-06）：实际运行 `./scripts/resource-preflight.sh desktop`，资源检查通过，但仅发现非 Core 候选 `src-tauri/target/debug/metheus`；没有同时满足 Core 路径、关闭默认特性的构建元数据、当前源码指纹和时间戳的桌面二进制，结果为 `DESKTOP_SMOKE_ELIGIBLE=no`。未启动候选程序，也未触发重建，因此本轮自动化只证明 Core/Grok 类型与前端契约，不宣称真实桌面自检刷新、强退恢复或发布级稳定性已经验收。
 
 - 验证可证明性收尾（2026-08-03）：已实现五档可证明性元数据、规划显式打标与本地保守校准、旧项目纯本地迁移、标签优先分拣、逐项人工确认入口、证据来源指纹熔断，以及按动作类型收紧的租约窗口。实际运行 `scripts/verify-provability-closeout.sh`：资源预检、Rust 格式、TypeScript、静态链路门禁与 `git diff --check` 通过；`.build/core`、最多两个 Cargo 任务、`--no-default-features` 下 14 项 Rust 定向测试通过（409 项过滤），任务检查器 8 项通过，仅有 14 条既有未使用代码告警。
 

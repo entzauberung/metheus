@@ -4,7 +4,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 /// 各 Tauri 命令的超时秒数映射表
-/// Key: invoke 命令名，Value: 超时秒数
+/// Key: 完整 invoke 命令名或 `_runtime` 包装命令的基础名，Value: 超时秒数
 /// 未在此表中的命令使用默认值 DEFAULT_TIMEOUT_SECS（30 秒）
 const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   // 聊天/讨论类 — 用户可感知，不宜过长
@@ -66,6 +66,7 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   scan_existing_project: 60,
   generate_existing_baseline: 120,
   approve_existing_baseline: 15,
+  update_execution_profile: 15,
 
   // V1 新增命令 - 三项检查
   run_preflight_check: 120,
@@ -96,7 +97,9 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   get_execution_workspace_status: 15,
   prepare_execution_workspace: 60,
   refresh_execution_workspace: 15,
+  retry_git_confirmation: 30,
   run_error_recovery: 1500,
+  acknowledge_execution_recovery: 30,
   resolve_human_recovery: 900,
   request_in_stop: 30,
   request_ed_stop: 15,
@@ -107,10 +110,12 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   // V1 新增命令 - 工作流
   transition_workflow: 15,
   migrate_project_workflow: 15,
+  reconcile_on_startup: 30,
   reconcile_managed_milestone_state: 15,
   wait_managed_flow_for_human: 15,
   pause_managed_flow: 15,
   resume_managed_flow: 15,
+  start_managed_flow: 15,
   stop_managed_flow: 15,
   toggle_autopilot: 15,
   autopilot_pause: 120,  // 可能涉及 In Stop kill 子进程
@@ -144,6 +149,41 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
 /// 未显式配置的命令超时秒数
 const DEFAULT_TIMEOUT_SECS = 30;
 
+export type InvokeTimeoutSource = "explicit" | "exact" | "runtime-base" | "default";
+
+export interface InvokeTimeoutResolution {
+  timeoutMs: number;
+  source: InvokeTimeoutSource;
+  usedDefault: boolean;
+}
+
+/**
+ * 按调用点覆盖、完整命令、单层 `_runtime` 基础名、默认值的顺序解析等待预算。
+ */
+export function resolveInvokeTimeout(
+  cmd: string,
+  explicitTimeoutMs?: number,
+): InvokeTimeoutResolution {
+  if (explicitTimeoutMs !== undefined) {
+    return { timeoutMs: explicitTimeoutMs, source: "explicit", usedDefault: false };
+  }
+
+  const exactTimeoutSecs = INVOKE_TIMEOUT_MAP[cmd];
+  if (exactTimeoutSecs !== undefined) {
+    return { timeoutMs: exactTimeoutSecs * 1000, source: "exact", usedDefault: false };
+  }
+
+  if (cmd.endsWith("_runtime")) {
+    const baseCommand = cmd.slice(0, -"_runtime".length);
+    const baseTimeoutSecs = INVOKE_TIMEOUT_MAP[baseCommand];
+    if (baseTimeoutSecs !== undefined) {
+      return { timeoutMs: baseTimeoutSecs * 1000, source: "runtime-base", usedDefault: false };
+    }
+  }
+
+  return { timeoutMs: DEFAULT_TIMEOUT_SECS * 1000, source: "default", usedDefault: true };
+}
+
 export class InvokeTimeoutError extends Error {
   readonly command: string;
   readonly timeoutMs: number;
@@ -176,10 +216,11 @@ export async function invokeWithTimeout<T>(
   args?: Record<string, unknown>,
   timeoutMs?: number,
 ): Promise<T> {
-  const timeout = timeoutMs ?? (INVOKE_TIMEOUT_MAP[cmd] ?? DEFAULT_TIMEOUT_SECS) * 1000;
+  const resolution = resolveInvokeTimeout(cmd, timeoutMs);
+  const timeout = resolution.timeoutMs;
 
   // 调试：记录未配置的命令
-  if (!INVOKE_TIMEOUT_MAP[cmd] && !timeoutMs) {
+  if (resolution.usedDefault) {
     console.warn(
       `[invokeWithTimeout] 命令 "${cmd}" 未在超时映射表中配置，使用默认值 ${DEFAULT_TIMEOUT_SECS}s`,
     );

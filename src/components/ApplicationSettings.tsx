@@ -23,6 +23,10 @@ import {
   Project,
   SecretPersistence,
 } from "../types";
+import {
+  BUILT_IN_GROK_BUILD_HEALTH_TARGET,
+  invalidateEngineHealth,
+} from "../engineHealthSync";
 import { invokeWithTimeout } from "../utils/invokeWithTimeout";
 import { IconButton } from "./IconButton";
 import { Modal } from "./Modal";
@@ -290,6 +294,7 @@ export function ApplicationSettings({ project, pipeline, className }: Props) {
         (saved.settings.built_in_grok_build.timeout_secs + 10) * 1000,
       );
       setRuntimeResult(result);
+      invalidateEngineHealth(BUILT_IN_GROK_BUILD_HEALTH_TARGET);
     } catch (testError) {
       setError(String(testError));
     } finally {

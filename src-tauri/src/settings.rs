@@ -350,6 +350,17 @@ pub(crate) struct ActivityGuard {
     kind: ActivityKind,
 }
 
+fn release_activity(state: &mut RuntimeState, kind: ActivityKind) {
+    match kind {
+        ActivityKind::DecisionRequest => {
+            state.active_decision_requests = state.active_decision_requests.saturating_sub(1)
+        }
+        ActivityKind::EngineOperation => {
+            state.active_engine_operations = state.active_engine_operations.saturating_sub(1)
+        }
+    }
+}
+
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
         let Some(store) = SETTINGS_STORE.get() else {
@@ -358,14 +369,7 @@ impl Drop for ActivityGuard {
         let Ok(mut state) = store.state.lock() else {
             return;
         };
-        match self.kind {
-            ActivityKind::DecisionRequest => {
-                state.active_decision_requests = state.active_decision_requests.saturating_sub(1)
-            }
-            ActivityKind::EngineOperation => {
-                state.active_engine_operations = state.active_engine_operations.saturating_sub(1)
-            }
-        }
+        release_activity(&mut state, self.kind);
     }
 }
 
@@ -1213,9 +1217,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn stale_revision_and_active_engine_lease_block_updates() {
-        let mut state = RuntimeState {
+    fn runtime_state_for_activity_tests() -> RuntimeState {
+        RuntimeState {
             settings: AppSettings::default(),
             secrets: RuntimeSecrets {
                 decision_model: None,
@@ -1225,11 +1228,51 @@ mod tests {
             preserve_corrupt_file: false,
             active_decision_requests: 0,
             active_engine_operations: 0,
-        };
-        assert!(ensure_update_allowed(&state, state.settings.revision.saturating_add(1)).is_err());
+        }
+    }
+
+    #[test]
+    fn phase1_runtime_contract_settings_updates_require_current_revision_and_no_active_leases() {
+        let mut state = runtime_state_for_activity_tests();
+        let current_revision = state.settings.revision;
+
+        assert!(ensure_update_allowed(&state, current_revision).is_ok());
+        assert!(ensure_update_allowed(&state, current_revision.saturating_add(1)).is_err());
+
+        state.active_decision_requests = 1;
+        assert!(ensure_update_allowed(&state, current_revision).is_err());
+        state.active_decision_requests = 0;
+
         state.active_engine_operations = 1;
-        assert!(ensure_update_allowed(&state, state.settings.revision).is_err());
+        assert!(ensure_update_allowed(&state, current_revision).is_err());
         state.active_engine_operations = 0;
-        assert!(ensure_update_allowed(&state, state.settings.revision).is_ok());
+        assert!(ensure_update_allowed(&state, current_revision).is_ok());
+    }
+
+    #[test]
+    fn phase1_runtime_contract_activity_release_is_independent_saturating_and_unblocks_updates() {
+        let mut state = runtime_state_for_activity_tests();
+        let current_revision = state.settings.revision;
+        state.active_decision_requests = 2;
+        state.active_engine_operations = 2;
+
+        release_activity(&mut state, ActivityKind::DecisionRequest);
+        assert_eq!(state.active_decision_requests, 1);
+        assert_eq!(state.active_engine_operations, 2);
+        assert!(ensure_update_allowed(&state, current_revision).is_err());
+
+        release_activity(&mut state, ActivityKind::DecisionRequest);
+        release_activity(&mut state, ActivityKind::EngineOperation);
+        assert_eq!(state.active_decision_requests, 0);
+        assert_eq!(state.active_engine_operations, 1);
+        assert!(ensure_update_allowed(&state, current_revision).is_err());
+
+        release_activity(&mut state, ActivityKind::EngineOperation);
+        assert!(ensure_update_allowed(&state, current_revision).is_ok());
+
+        release_activity(&mut state, ActivityKind::DecisionRequest);
+        release_activity(&mut state, ActivityKind::EngineOperation);
+        assert_eq!(state.active_decision_requests, 0);
+        assert_eq!(state.active_engine_operations, 0);
     }
 }

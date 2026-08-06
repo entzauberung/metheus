@@ -29,17 +29,46 @@ fi
 
 cd "${REPO_ROOT}"
 
-readonly RUNTIME_COMMAND_SOURCES=(
-  "src-tauri/src/commands/runtime_mutations.rs"
-  "src-tauri/src/commands/task_control.rs"
-  "src-tauri/src/commands/chat.rs"
+readonly RUNTIME_COMMAND_DIRECTORY="src-tauri/src/commands"
+readonly TIMEOUT_POLICY_SOURCE="src/utils/invokeWithTimeout.ts"
+readonly EXPLICIT_TIMEOUT_RUNTIME_COMMANDS=(
+  "apply_task_control_action_runtime"
+  "set_task_control_mode_runtime"
+)
+readonly STREAMING_CHANNEL_RUNTIME_COMMANDS=(
+  "chat_with_role_stream_runtime"
+  "regenerate_chat_reply_stream_runtime"
 )
 
+is_listed_runtime_command() {
+  local candidate="$1"
+  shift
+  local listed_command
+  for listed_command in "$@"; do
+    if [[ "${candidate}" == "${listed_command}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 mapfile -t RUNTIME_MUTATION_COMMANDS < <(
-  rg -o 'pub\(crate\) async fn [a-z0-9_]+_runtime' "${RUNTIME_COMMAND_SOURCES[@]}" \
+  rg --glob '*.rs' --no-filename -o \
+    'pub\(crate\) async fn [a-z0-9_]+_runtime' "${RUNTIME_COMMAND_DIRECTORY}" \
     | awk '{ print $NF }' \
     | sort -u
 )
+
+if [[ "${#RUNTIME_MUTATION_COMMANDS[@]}" -eq 0 ]]; then
+  echo "未能从 Rust 命令源提取运行时命令" >&2
+  exit 1
+fi
+
+base_policy_count=0
+exact_policy_count=0
+explicit_exception_count=0
+streaming_exception_count=0
+EXACT_POLICY_COMMANDS=()
 
 for runtime_command in "${RUNTIME_MUTATION_COMMANDS[@]}"; do
   if ! rg -q "::${runtime_command}," src-tauri/src/lib.rs; then
@@ -53,7 +82,84 @@ for runtime_command in "${RUNTIME_MUTATION_COMMANDS[@]}"; do
     echo "主前端不得直接调用旧状态变更命令：${base_command}" >&2
     exit 1
   fi
+
+  if is_listed_runtime_command "${runtime_command}" \
+      "${EXPLICIT_TIMEOUT_RUNTIME_COMMANDS[@]}"; then
+    explicit_exception_count=$((explicit_exception_count + 1))
+    continue
+  fi
+
+  if is_listed_runtime_command "${runtime_command}" \
+      "${STREAMING_CHANNEL_RUNTIME_COMMANDS[@]}"; then
+    streaming_exception_count=$((streaming_exception_count + 1))
+    continue
+  fi
+
+  if rg -q "^[[:space:]]{2}${runtime_command}:" "${TIMEOUT_POLICY_SOURCE}"; then
+    exact_policy_count=$((exact_policy_count + 1))
+    EXACT_POLICY_COMMANDS+=("${runtime_command}")
+    continue
+  fi
+
+  if rg -q "^[[:space:]]{2}${base_command}:" "${TIMEOUT_POLICY_SOURCE}"; then
+    base_policy_count=$((base_policy_count + 1))
+    continue
+  fi
+
+  echo "有界运行时命令缺少超时策略或已登记例外：${runtime_command}（基础命令 ${base_command}）" >&2
+  exit 1
 done
+
+for exception_command in \
+  "${EXPLICIT_TIMEOUT_RUNTIME_COMMANDS[@]}" \
+  "${STREAMING_CHANNEL_RUNTIME_COMMANDS[@]}"; do
+  if ! is_listed_runtime_command "${exception_command}" "${RUNTIME_MUTATION_COMMANDS[@]}"; then
+    echo "超时例外未对应已提取的 Rust 运行时命令：${exception_command}" >&2
+    exit 1
+  fi
+done
+
+if ! rg -U -q '(?s)"apply_task_control_action_runtime".{0,1200}\}, 900_000\);' \
+  src/hooks/useTaskControlWorkspace.ts; then
+  echo "任务控制动作必须保留 900_000 毫秒显式超时" >&2
+  exit 1
+fi
+
+if ! rg -U -q '(?s)"set_task_control_mode_runtime".{0,1200}\}, 15_000\);' \
+  src/hooks/useTaskControlWorkspace.ts; then
+  echo "任务控制模式切换必须保留 15_000 毫秒显式超时" >&2
+  exit 1
+fi
+
+for stream_command in "${STREAMING_CHANNEL_RUNTIME_COMMANDS[@]}"; do
+  if ! rg -q "\"${stream_command}\"" src/chatStreamController.ts; then
+    echo "流式运行时命令缺少 Channel 调用登记：${stream_command}" >&2
+    exit 1
+  fi
+done
+
+if ! rg -U -q '(?s)invokeStream\(command, args\).{0,240}return invoke<RuntimeMutationResult>\(command, args\);' \
+  src/chatStreamController.ts; then
+  echo "聊天流式运行时命令必须继续通过 Tauri Channel invoke 等待终态" >&2
+  exit 1
+fi
+
+if [[ "${#EXACT_POLICY_COMMANDS[@]}" -eq 0 ]]; then
+  exact_policy_summary="none"
+else
+  exact_policy_summary="$(IFS=,; echo "${EXACT_POLICY_COMMANDS[*]}")"
+fi
+
+echo "超时策略审计通过：runtime_commands=${#RUNTIME_MUTATION_COMMANDS[@]} base_policies=${base_policy_count} exact_policies=${exact_policy_count} explicit_exceptions=${explicit_exception_count} streaming_exceptions=${streaming_exception_count} exact_commands=${exact_policy_summary}"
+
+if ! rg -U -q \
+  '(?s)impl Drop for ActivityGuard\s*\{.{0,200}fn drop\(&mut self\).{0,400}SETTINGS_STORE\.get\(\).{0,400}store\.state\.lock\(\).{0,400}release_activity\(\s*&mut state,\s*self\.kind\s*\);' \
+  src-tauri/src/settings.rs; then
+  echo "设置活动租约必须保持 ActivityGuard::drop 到 release_activity(&mut state, self.kind) 的 RAII 接线" >&2
+  exit 1
+fi
+
+echo "设置活动租约 RAII 接线审计通过：ActivityGuard::drop -> release_activity(state, self.kind)"
 
 readonly FRONTEND_PROJECT_MUTATION_FILES=(
   src/App.tsx

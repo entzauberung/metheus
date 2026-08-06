@@ -3,6 +3,10 @@ import { Bot, CheckCircle2, CircleAlert, LoaderCircle, PlugZap } from "lucide-re
 import { invokeWithTimeout } from "../utils/invokeWithTimeout";
 import { EngineHealth, ExecutionProfile, ExecutionProvider } from "../types";
 import { PLUGIN_EXECUTION_PROVIDERS } from "../enginePolicy";
+import {
+  matchesEngineHealthTarget,
+  subscribeEngineHealthInvalidation,
+} from "../engineHealthSync";
 
 interface Props {
   value: ExecutionProfile;
@@ -38,36 +42,47 @@ export function ExecutionEngineSelector({ value, onChange, disabled = false, onH
   }, [health, checking, onHealthChange]);
 
   useEffect(() => {
-    const requestId = ++requestIdRef.current;
-    setChecking(true);
-    setHealth(null);
-    invokeWithTimeout<EngineHealth>("check_engine_health", { executionProfile: value })
-      .then((result) => {
-        if (requestIdRef.current === requestId) setHealth(result);
-      })
-      .catch(() => {
-        if (requestIdRef.current !== requestId) return;
-        setHealth({
-          runtime: value.runtime,
-          provider: value.provider,
-          status: "Unknown",
-          auth_state: "Unknown",
-          authentication: {
-            local_state: "Unknown",
-            online_state: "NotVerified",
-            method: "None",
-            message: "暂时无法检查认证状态",
-          },
-          supports_unattended: value.runtime === "Plugin",
-          configuration_valid: false,
-          capabilities: [],
-          runtime_self_test: "NotRun",
-          message: "暂时无法检查引擎状态",
+    const checkHealth = () => {
+      const requestId = ++requestIdRef.current;
+      setChecking(true);
+      setHealth(null);
+      invokeWithTimeout<EngineHealth>("check_engine_health", { executionProfile: value })
+        .then((result) => {
+          if (requestIdRef.current === requestId) setHealth(result);
+        })
+        .catch(() => {
+          if (requestIdRef.current !== requestId) return;
+          setHealth({
+            runtime: value.runtime,
+            provider: value.provider,
+            status: "Unknown",
+            auth_state: "Unknown",
+            authentication: {
+              local_state: "Unknown",
+              online_state: "NotVerified",
+              method: "None",
+              message: "暂时无法检查认证状态",
+            },
+            supports_unattended: value.runtime === "Plugin",
+            configuration_valid: false,
+            capabilities: [],
+            runtime_self_test: "NotRun",
+            message: "暂时无法检查引擎状态",
+          });
+        })
+        .finally(() => {
+          if (requestIdRef.current === requestId) setChecking(false);
         });
-      })
-      .finally(() => {
-        if (requestIdRef.current === requestId) setChecking(false);
-      });
+    };
+
+    checkHealth();
+    const unsubscribe = subscribeEngineHealthInvalidation((target) => {
+      if (matchesEngineHealthTarget(value, target)) checkHealth();
+    });
+    return () => {
+      requestIdRef.current += 1;
+      unsubscribe();
+    };
   }, [value.runtime, value.provider, value.permission_profile]);
 
   const selectProvider = (provider: ExecutionProvider) => {

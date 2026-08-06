@@ -3601,12 +3601,16 @@ mod tests {
         proj.current_mid_stage_id = "mid-1".to_string();
         proj.task_control.mode = crate::task_control::TaskControlMode::SerialTakeover;
         let mut task = test_subtask(project::SubtaskStatus::AwaitingConfirmation);
-        task.acceptance_criteria = vec!["复杂业务行为需要语义审查".to_string()];
+        task.acceptance_criteria = vec!["复杂业务流程需要语义审查".to_string()];
         task.acceptance_ledger = vec![project::AcceptanceLedgerItem {
             criterion_index: 1,
             criterion: task.acceptance_criteria[0].clone(),
             ..Default::default()
         }];
+        assert_eq!(
+            crate::provability::infer_provability(&task.acceptance_criteria[0]),
+            crate::provability::Provability::SemanticReview
+        );
         let mut mid = test_mid_stage(project::MidStageStatus::InProgress);
         mid.subtasks = vec![task];
         mid.plan_approved_at = Some("2026-07-28T00:00:00Z".to_string());
