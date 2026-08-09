@@ -168,7 +168,7 @@ pub(crate) async fn call_deepseek_api_inner_typed_with_context(
                 ended_at,
                 elapsed_ms,
                 usage: None,
-                failure_kind: format!("{:?}", error.kind),
+                failure_kind: error.failure_label(),
             };
             crate::cost_ledger::record_metadata_best_effort(&metadata);
             error.metadata = Some(metadata);
@@ -259,7 +259,7 @@ pub(crate) async fn call_deepseek_api_messages_typed_with_context(
                 ended_at,
                 elapsed_ms,
                 usage: None,
-                failure_kind: format!("{:?}", error.kind),
+                failure_kind: error.failure_label(),
             };
             crate::cost_ledger::record_metadata_best_effort(&metadata);
             error.metadata = Some(metadata);
@@ -431,7 +431,37 @@ where
 pub(crate) struct ApiRequestError {
     kind: ModelConnectionErrorKind,
     message: String,
+    phase: ApiRequestPhase,
     metadata: Option<ModelCallMetadata>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiRequestPhase {
+    Unspecified,
+    ConnectOrHeaders,
+    FirstBodyChunk,
+    BodyIdle,
+    BodyHardDeadline,
+    BodySize,
+    BodyRead,
+    HttpStatus,
+    Decode,
+}
+
+impl ApiRequestPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "Unspecified",
+            Self::ConnectOrHeaders => "ConnectOrHeaders",
+            Self::FirstBodyChunk => "FirstBodyChunk",
+            Self::BodyIdle => "BodyIdle",
+            Self::BodyHardDeadline => "BodyHardDeadline",
+            Self::BodySize => "BodySize",
+            Self::BodyRead => "BodyRead",
+            Self::HttpStatus => "HttpStatus",
+            Self::Decode => "Decode",
+        }
+    }
 }
 
 impl ApiRequestError {
@@ -439,8 +469,18 @@ impl ApiRequestError {
         Self {
             kind,
             message: message.into(),
+            phase: ApiRequestPhase::Unspecified,
             metadata: None,
         }
+    }
+
+    fn in_phase(mut self, phase: ApiRequestPhase) -> Self {
+        self.phase = phase;
+        self
+    }
+
+    fn failure_label(&self) -> String {
+        format!("{:?}:{}", self.kind, self.phase.as_str())
     }
 
     pub(crate) fn review_failure_kind(&self) -> crate::project::ReviewFailureKind {
@@ -516,8 +556,11 @@ async fn send_openai_compatible_with_usage(
         );
     }
 
+    let idle_timeout = std::time::Duration::from_secs(settings.timeout_secs);
+    let hard_timeout = ordinary_response_hard_timeout(settings.timeout_secs);
+    let request_started = tokio::time::Instant::now();
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(settings.timeout_secs))
+        .connect_timeout(idle_timeout)
         .build()
         .map_err(|error| {
             ApiRequestError::new(
@@ -535,15 +578,33 @@ async fn send_openai_compatible_with_usage(
         body["response_format"] = serde_json::json!({ "type": "json_object" });
     }
 
-    let response = client
-        .post(&settings.request_url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|error| classify_transport_error(error, settings.timeout_secs))?;
+    let response = tokio::time::timeout(
+        idle_timeout,
+        client
+            .post(&settings.request_url)
+            .bearer_auth(api_key)
+            .json(&body)
+            .send(),
+    )
+    .await
+    .map_err(|_| {
+        ApiRequestError::new(
+            ModelConnectionErrorKind::Timeout,
+            format!(
+                "OpenAI Compatible 连接或等待响应头超时（超过 {} 秒）",
+                settings.timeout_secs
+            ),
+        )
+        .in_phase(ApiRequestPhase::ConnectOrHeaders)
+    })?
+    .map_err(|error| {
+        classify_transport_error(error, settings.timeout_secs)
+            .in_phase(ApiRequestPhase::ConnectOrHeaders)
+    })?;
 
-    parse_response_with_usage(response, api_key, settings.timeout_secs).await
+    let remaining_hard_timeout = hard_timeout.saturating_sub(request_started.elapsed());
+    parse_response_with_usage_deadline(response, api_key, idle_timeout, remaining_hard_timeout)
+        .await
 }
 
 async fn send_openai_compatible_stream<F>(
@@ -584,8 +645,11 @@ where
         return Err(StreamResponseError::Cancelled);
     }
 
+    let idle_timeout = std::time::Duration::from_secs(settings.timeout_secs);
+    let hard_timeout = ordinary_response_hard_timeout(settings.timeout_secs);
+    let request_started = tokio::time::Instant::now();
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(settings.timeout_secs))
+        .connect_timeout(idle_timeout)
         .build()
         .map_err(|error| {
             StreamResponseError::Failed(
@@ -607,17 +671,39 @@ where
         .bearer_auth(api_key)
         .json(&body)
         .send();
+    let request = tokio::time::timeout(idle_timeout, request);
     tokio::pin!(request);
     let response = tokio::select! {
         result = &mut request => result
-            .map_err(|error| StreamResponseError::Failed(classify_transport_error(error, settings.timeout_secs).to_string()))?,
+            .map_err(|_| {
+                StreamResponseError::Failed(
+                    ApiRequestError::new(
+                        ModelConnectionErrorKind::Timeout,
+                        format!(
+                            "OpenAI Compatible 流式连接或等待响应头超时（超过 {} 秒）",
+                            settings.timeout_secs
+                        ),
+                    )
+                    .in_phase(ApiRequestPhase::ConnectOrHeaders)
+                    .to_string(),
+                )
+            })?
+            .map_err(|error| {
+                StreamResponseError::Failed(
+                    classify_transport_error(error, settings.timeout_secs)
+                        .in_phase(ApiRequestPhase::ConnectOrHeaders)
+                        .to_string(),
+                )
+            })?,
         _ = wait_for_cancellation(&cancellation) => return Err(StreamResponseError::Cancelled),
     };
 
+    let remaining_hard_timeout = hard_timeout.saturating_sub(request_started.elapsed());
     parse_stream_response_with_usage(
         response,
         api_key,
-        settings.timeout_secs,
+        idle_timeout,
+        remaining_hard_timeout,
         cancellation,
         on_delta,
     )
@@ -627,7 +713,8 @@ where
 async fn parse_stream_response_with_usage<F>(
     mut response: reqwest::Response,
     api_key: &str,
-    timeout_secs: u64,
+    idle_timeout: std::time::Duration,
+    hard_timeout: std::time::Duration,
     cancellation: Arc<AtomicBool>,
     mut on_delta: F,
 ) -> Result<ProviderResponse, StreamResponseError>
@@ -635,21 +722,37 @@ where
     F: FnMut(&str) -> Result<(), String>,
 {
     let status = response.status();
+    let hard_deadline = tokio::time::Instant::now() + hard_timeout;
     if !status.is_success() {
-        let read_body = response.text();
-        tokio::pin!(read_body);
-        let body = tokio::select! {
-            result = &mut read_body => result.map_err(|error| {
-                StreamResponseError::Failed(
-                    ApiRequestError::new(
-                        ModelConnectionErrorKind::Protocol,
-                        format!("接口返回 HTTP {status}，且错误正文读取失败：{error}"),
-                    )
-                    .to_string(),
-                )
-            })?,
-            _ = wait_for_cancellation(&cancellation) => return Err(StreamResponseError::Cancelled),
-        };
+        let mut body = Vec::new();
+        let mut received_chunk = false;
+        loop {
+            let read_chunk = next_response_chunk_with_deadlines(
+                &mut response,
+                idle_timeout,
+                hard_deadline,
+                received_chunk,
+                body.len(),
+            );
+            tokio::pin!(read_chunk);
+            let next_chunk = tokio::select! {
+                result = &mut read_chunk => result.map_err(|error| {
+                    StreamResponseError::Failed(error.to_string())
+                })?,
+                _ = wait_for_cancellation(&cancellation) => {
+                    return Err(StreamResponseError::Cancelled);
+                }
+            };
+            let Some(chunk) = next_chunk else {
+                break;
+            };
+            received_chunk = true;
+            if body.len().saturating_add(chunk.len()) > MAX_ORDINARY_RESPONSE_BYTES {
+                return Err(protocol_stream_error("错误响应正文超过长度限制"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let body = String::from_utf8_lossy(&body);
         let sanitized = sanitize_api_error(&body, api_key);
         return Err(StreamResponseError::Failed(
             classify_status_error(status, &sanitized).to_string(),
@@ -669,17 +772,29 @@ where
     let mut saw_reasoning = false;
     let mut stream_done = false;
     let mut saw_done = false;
+    let mut received_chunk = false;
+    let mut received_bytes = 0usize;
 
     while !stream_done {
+        let read_chunk = next_response_chunk_with_deadlines(
+            &mut response,
+            idle_timeout,
+            hard_deadline,
+            received_chunk,
+            received_bytes,
+        );
+        tokio::pin!(read_chunk);
         let next_chunk = tokio::select! {
-            result = response.chunk() => result.map_err(|error| {
-                StreamResponseError::Failed(classify_transport_error(error, timeout_secs).to_string())
+            result = &mut read_chunk => result.map_err(|error| {
+                StreamResponseError::Failed(error.to_string())
             })?,
             _ = wait_for_cancellation(&cancellation) => return Err(StreamResponseError::Cancelled),
         };
         let Some(chunk) = next_chunk else {
             break;
         };
+        received_chunk = true;
+        received_bytes = received_bytes.saturating_add(chunk.len());
 
         if is_event_stream {
             let events = parser.push(&chunk).map_err(StreamResponseError::Failed)?;
@@ -974,15 +1089,92 @@ fn extract_content_value(content: &serde_json::Value) -> Option<String> {
     )
 }
 
+async fn next_response_chunk_with_deadlines(
+    response: &mut reqwest::Response,
+    idle_timeout: std::time::Duration,
+    hard_deadline: tokio::time::Instant,
+    received_chunk: bool,
+    received_bytes: usize,
+) -> Result<Option<Vec<u8>>, ApiRequestError> {
+    let remaining = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(ApiRequestError::new(
+            ModelConnectionErrorKind::Timeout,
+            format!("读取 OpenAI Compatible 响应达到硬总时限（已读 {received_bytes} 字节）"),
+        )
+        .in_phase(ApiRequestPhase::BodyHardDeadline));
+    }
+    let wait = idle_timeout.min(remaining);
+    let chunk = match tokio::time::timeout(wait, response.chunk()).await {
+        Err(_) if remaining <= idle_timeout => {
+            return Err(ApiRequestError::new(
+                ModelConnectionErrorKind::Timeout,
+                format!("读取 OpenAI Compatible 响应达到硬总时限（已读 {received_bytes} 字节）"),
+            )
+            .in_phase(ApiRequestPhase::BodyHardDeadline));
+        }
+        Err(_) if !received_chunk => {
+            return Err(ApiRequestError::new(
+                ModelConnectionErrorKind::Timeout,
+                format!(
+                    "等待 OpenAI Compatible 首个正文分块超时（超过 {} 秒，已读 0 字节）",
+                    idle_timeout.as_secs_f64()
+                ),
+            )
+            .in_phase(ApiRequestPhase::FirstBodyChunk));
+        }
+        Err(_) => {
+            return Err(ApiRequestError::new(
+                ModelConnectionErrorKind::Timeout,
+                format!(
+                    "等待 OpenAI Compatible 后续正文分块超时（超过 {} 秒，已读 {received_bytes} 字节）",
+                    idle_timeout.as_secs_f64()
+                ),
+            )
+            .in_phase(ApiRequestPhase::BodyIdle));
+        }
+        Ok(result) => result,
+    };
+    match chunk {
+        Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+        Ok(None) => Ok(None),
+        Err(error) if error.is_timeout() => Err(ApiRequestError::new(
+            ModelConnectionErrorKind::Timeout,
+            format!("读取 OpenAI Compatible 响应正文超时（已读 {received_bytes} 字节）"),
+        )
+        .in_phase(if received_chunk {
+            ApiRequestPhase::BodyIdle
+        } else {
+            ApiRequestPhase::FirstBodyChunk
+        })),
+        Err(error) => {
+            let reason = if error.is_body() || error.is_decode() {
+                "响应正文未完整到达"
+            } else {
+                "连接在读取响应正文时中断"
+            };
+            Err(ApiRequestError::new(
+                ModelConnectionErrorKind::Network,
+                format!(
+                    "OpenAI Compatible 响应网络读取失败：{reason}（已读 {received_bytes} 字节）"
+                ),
+            )
+            .in_phase(ApiRequestPhase::BodyRead))
+        }
+    }
+}
+
 async fn parse_response_with_usage(
     response: reqwest::Response,
     api_key: &str,
     timeout_secs: u64,
 ) -> Result<ProviderResponse, ApiRequestError> {
-    parse_response_with_usage_timeout(
+    let idle_timeout = std::time::Duration::from_secs(timeout_secs);
+    parse_response_with_usage_deadline(
         response,
         api_key,
-        std::time::Duration::from_secs(timeout_secs),
+        idle_timeout,
+        ordinary_response_hard_timeout(timeout_secs),
     )
     .await
 }
@@ -992,48 +1184,69 @@ async fn parse_response_with_usage_timeout(
     api_key: &str,
     read_timeout: std::time::Duration,
 ) -> Result<ProviderResponse, ApiRequestError> {
+    parse_response_with_usage_deadline(
+        response,
+        api_key,
+        read_timeout,
+        read_timeout.saturating_mul(3),
+    )
+    .await
+}
+
+fn ordinary_response_hard_timeout(timeout_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(timeout_secs.saturating_mul(3).min(3_600))
+}
+
+async fn parse_response_with_usage_deadline(
+    mut response: reqwest::Response,
+    api_key: &str,
+    idle_timeout: std::time::Duration,
+    hard_timeout: std::time::Duration,
+) -> Result<ProviderResponse, ApiRequestError> {
     let status = response.status();
-    let response_bytes = match tokio::time::timeout(read_timeout, response.bytes()).await {
-        Err(_) => {
-            return Err(ApiRequestError::new(
-                ModelConnectionErrorKind::Timeout,
-                format!(
-                    "读取 OpenAI Compatible 响应超时（超过 {} 秒）",
-                    read_timeout.as_secs_f64()
-                ),
-            ));
+    let hard_deadline = tokio::time::Instant::now() + hard_timeout;
+    let mut response_bytes = Vec::new();
+    let mut received_chunk = false;
+    loop {
+        match next_response_chunk_with_deadlines(
+            &mut response,
+            idle_timeout,
+            hard_deadline,
+            received_chunk,
+            response_bytes.len(),
+        )
+        .await?
+        {
+            Some(bytes) => {
+                received_chunk = true;
+                if response_bytes.len().saturating_add(bytes.len()) > MAX_ORDINARY_RESPONSE_BYTES {
+                    return Err(ApiRequestError::new(
+                        ModelConnectionErrorKind::Protocol,
+                        format!(
+                            "OpenAI Compatible 响应正文超过 {} 字节上限",
+                            MAX_ORDINARY_RESPONSE_BYTES
+                        ),
+                    )
+                    .in_phase(ApiRequestPhase::BodySize));
+                }
+                response_bytes.extend_from_slice(&bytes);
+            }
+            None => break,
         }
-        Ok(Err(error)) if error.is_timeout() => {
-            return Err(ApiRequestError::new(
-                ModelConnectionErrorKind::Timeout,
-                "读取 OpenAI Compatible 响应超时",
-            ));
-        }
-        Ok(Err(error)) => {
-            let reason = if error.is_body() || error.is_decode() {
-                "响应正文未完整到达"
-            } else {
-                "连接在读取响应正文时中断"
-            };
-            return Err(ApiRequestError::new(
-                ModelConnectionErrorKind::Network,
-                format!("OpenAI Compatible 响应网络读取失败：{reason}"),
-            ));
-        }
-        Ok(Ok(bytes)) => bytes,
-    };
+    }
 
     if !status.is_success() {
         let body = String::from_utf8_lossy(&response_bytes);
         let sanitized = sanitize_api_error(&body, api_key);
-        return Err(classify_status_error(status, &sanitized));
+        return Err(classify_status_error(status, &sanitized).in_phase(ApiRequestPhase::HttpStatus));
     }
 
     if response_bytes.is_empty() {
         return Err(ApiRequestError::new(
             ModelConnectionErrorKind::Network,
             "OpenAI Compatible 响应正文为空，可能在正文到达前断开连接",
-        ));
+        )
+        .in_phase(ApiRequestPhase::BodyRead));
     }
 
     let response_text = String::from_utf8_lossy(&response_bytes);
@@ -1045,7 +1258,8 @@ async fn parse_response_with_usage_timeout(
             format!(
                 "OpenAI Compatible 服务返回了非 JSON 正文；响应前缀（已脱敏，最多 500 字节）：{diagnostic}"
             ),
-        ));
+        )
+        .in_phase(ApiRequestPhase::Decode));
     }
 
     let response_data: serde_json::Value = match serde_json::from_slice(&response_bytes) {
@@ -1057,7 +1271,8 @@ async fn parse_response_with_usage_timeout(
                 format!(
                     "OpenAI Compatible 响应在 JSON 完成前中断；响应前缀（已脱敏，最多 500 字节）：{diagnostic}"
                 ),
-            ));
+            )
+            .in_phase(ApiRequestPhase::Decode));
         }
         Err(initial_error) => {
             // 与上层 Schema 修复链共用同一确定性清洗入口；仅完整但形态错误的
@@ -1072,7 +1287,8 @@ async fn parse_response_with_usage_timeout(
                         format!(
                             "解析 OpenAI Compatible JSON 响应失败：{initial_error}；确定性清洗后仍失败：{cleaned_error}；响应前缀（已脱敏，最多 500 字节）：{diagnostic}"
                         ),
-                    ));
+                    )
+                    .in_phase(ApiRequestPhase::Decode));
                 }
             }
         }
@@ -1082,6 +1298,7 @@ async fn parse_response_with_usage_timeout(
             ModelConnectionErrorKind::Protocol,
             "OpenAI Compatible 响应缺少有效 choices[0].message.content",
         )
+        .in_phase(ApiRequestPhase::Decode)
     })?;
     Ok(ProviderResponse {
         content,
@@ -1257,6 +1474,9 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 
 pub(crate) async fn test_model_connection(target: ModelConnectionTarget) -> ConnectionTestResult {
     let started = std::time::Instant::now();
+    if target == ModelConnectionTarget::VisionModel {
+        return crate::vision_review::test_connection().await;
+    }
     if target == ModelConnectionTarget::BuiltInGrokBuild {
         return crate::engine::test_builtin_grok_model_connection().await;
     }
@@ -1410,6 +1630,53 @@ mod tests {
             socket.flush().await.map_err(|error| error.to_string())?;
             tokio::time::sleep(delay).await;
             let _ = socket.write_all(body.as_bytes()).await;
+            Ok(())
+        });
+        Ok((format!("http://{address}/custom/chat"), handle))
+    }
+
+    async fn chunked_response_body(
+        body: Vec<u8>,
+        chunk_sizes: Vec<usize>,
+        delay: std::time::Duration,
+    ) -> Result<(String, tokio::task::JoinHandle<Result<(), String>>), String> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .map_err(|error| error.to_string())?;
+        let address = listener.local_addr().map_err(|error| error.to_string())?;
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.map_err(|error| error.to_string())?;
+            let mut request = vec![0u8; 16 * 1024];
+            socket
+                .read(&mut request)
+                .await
+                .map_err(|error| error.to_string())?;
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut offset = 0usize;
+            for size in chunk_sizes {
+                let end = offset.saturating_add(size).min(body.len());
+                if end <= offset {
+                    continue;
+                }
+                if socket.write_all(&body[offset..end]).await.is_err() {
+                    return Ok(());
+                }
+                socket.flush().await.map_err(|error| error.to_string())?;
+                offset = end;
+                if offset < body.len() {
+                    tokio::time::sleep(delay).await;
+                }
+            }
+            if offset < body.len() {
+                let _ = socket.write_all(&body[offset..]).await;
+            }
             Ok(())
         });
         Ok((format!("http://{address}/custom/chat"), handle))
@@ -1609,8 +1876,94 @@ mod tests {
         .expect_err("正文读取超时必须失败");
 
         assert_eq!(error.kind, ModelConnectionErrorKind::Timeout);
-        assert!(error.message.contains("读取 OpenAI Compatible 响应超时"));
+        assert_eq!(error.phase, ApiRequestPhase::FirstBodyChunk);
+        assert!(error.message.contains("首个正文分块超时"));
         assert!(!error.message.contains("JSON"));
+        request.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_response_allows_continuous_chunks_longer_than_one_idle_window(
+    ) -> Result<(), String> {
+        let body = r#"{"choices":[{"message":{"content":"你好，持续响应"}}]}"#
+            .as_bytes()
+            .to_vec();
+        let (url, request) = chunked_response_body(
+            body,
+            vec![9, 10, 11, 12],
+            std::time::Duration::from_millis(35),
+        )
+        .await?;
+        let response = reqwest::Client::new()
+            .post(url)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let parsed = parse_response_with_usage_timeout(
+            response,
+            "secret",
+            std::time::Duration::from_millis(60),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert_eq!(parsed.content, "你好，持续响应");
+        request.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_response_enforces_hard_deadline_despite_continuous_chunks(
+    ) -> Result<(), String> {
+        let body = r#"{"choices":[{"message":{"content":"continuous but too long"}}]}"#
+            .as_bytes()
+            .to_vec();
+        let (url, request) = chunked_response_body(
+            body,
+            vec![5, 5, 5, 5, 5, 5, 5],
+            std::time::Duration::from_millis(25),
+        )
+        .await?;
+        let response = reqwest::Client::new()
+            .post(url)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let error = parse_response_with_usage_deadline(
+            response,
+            "secret",
+            std::time::Duration::from_millis(45),
+            std::time::Duration::from_millis(80),
+        )
+        .await
+        .expect_err("持续分块仍必须受硬总时限限制");
+        assert_eq!(error.kind, ModelConnectionErrorKind::Timeout);
+        assert_eq!(error.phase, ApiRequestPhase::BodyHardDeadline);
+        request.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ordinary_response_rejects_body_over_size_limit() -> Result<(), String> {
+        let body = vec![b'x'; MAX_ORDINARY_RESPONSE_BYTES + 1];
+        let body_len = body.len();
+        let (url, request) =
+            chunked_response_body(body, vec![body_len], std::time::Duration::from_millis(1))
+                .await?;
+        let response = reqwest::Client::new()
+            .post(url)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let error = parse_response_with_usage_timeout(
+            response,
+            "secret",
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .expect_err("超大正文必须立即失败");
+        assert_eq!(error.kind, ModelConnectionErrorKind::Protocol);
+        assert_eq!(error.phase, ApiRequestPhase::BodySize);
         request.await.map_err(|error| error.to_string())??;
         Ok(())
     }

@@ -37,7 +37,11 @@ export interface AutopilotControlBarProps {
   recoveryPresentation: RecoveryPresentation | null;
   executionStatus?: PipelineState | null;
   busy: boolean;
+  writeDisabled?: boolean;
+  writeDisabledReason?: string;
   onToggle: (active: boolean) => Promise<void>;
+  onPauseManagedFlow?: () => Promise<void>;
+  onResumeManagedFlow?: () => Promise<void>;
   onStopManagedFlow: () => Promise<void>;
   onPauseNow: () => Promise<void>;
   onPauseAfterCurrent: () => Promise<void>;
@@ -88,7 +92,11 @@ export function AutopilotControlBar({
   recoveryPresentation,
   executionStatus,
   busy,
+  writeDisabled = false,
+  writeDisabledReason = "",
   onToggle,
+  onPauseManagedFlow,
+  onResumeManagedFlow,
   onStopManagedFlow,
   onPauseNow,
   onPauseAfterCurrent,
@@ -168,8 +176,11 @@ export function AutopilotControlBar({
       return null;
     }
     const handler = recoveryHandler(action.capability);
-    const enabled = action.enabled && handler !== null;
+    const isSyncAction = action.capability === "SyncProject"
+      || action.capability === "ClearStaleControlLock";
+    const enabled = action.enabled && handler !== null && (!writeDisabled || isSyncAction);
     const disabledReason = action.disabled_reason
+      ?? (writeDisabled && !isSyncAction ? writeDisabledReason : undefined)
       ?? (!handler ? "当前界面未连接此恢复动作" : undefined);
     return (
       <button
@@ -287,9 +298,24 @@ export function AutopilotControlBar({
               <span className="ap-bar-error" title={presentation.detail}>{presentation.detail}</span>
             )}
           </div>
-          <button className="ap-bar-btn" disabled={busy} onClick={onStopManagedFlow}>
-            <Square size={14} /> 停止托管
-          </button>
+          <div className="ap-bar-right">
+            <button className="ap-bar-btn" disabled={busy} onClick={onSync}>
+              <RotateCcw size={14} /> 同步
+            </button>
+            {presentation.canPause && onPauseManagedFlow && (
+              <button className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onPauseManagedFlow}>
+                <Pause size={14} /> 暂停托管
+              </button>
+            )}
+            {presentation.canResume && onResumeManagedFlow && (
+              <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onResumeManagedFlow}>
+                <Play size={14} /> {presentation.resumeLabel}
+              </button>
+            )}
+            <button className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onStopManagedFlow}>
+              <Square size={14} /> 停止托管
+            </button>
+          </div>
         </div>
       );
     }
@@ -299,7 +325,8 @@ export function AutopilotControlBar({
         <span className="ap-bar-status"><Play size={16} /> {canActivate ? "自动驾驶未激活" : "请先完成大阶段批准"}</span>
         <button
           className="ap-bar-btn ap-bar-btn-primary"
-          disabled={busy || !canActivate}
+          disabled={busy || writeDisabled || !canActivate}
+          title={writeDisabled ? writeDisabledReason : undefined}
           onClick={() => { void onToggle(true); }}
         >
           <WandSparkles size={14} /> 激活自动驾驶
@@ -347,18 +374,18 @@ export function AutopilotControlBar({
         <button className="ap-bar-btn" disabled={busy} onClick={onSync}><RotateCcw size={14} /> 同步</button>
         {isExecuting && (
           <>
-            <button className="ap-bar-btn ap-bar-btn-danger" disabled={busy} onClick={onPauseNow}><Square size={14} /> 立即暂停</button>
-            <button className="ap-bar-btn" disabled={busy} onClick={onPauseAfterCurrent}><Pause size={14} /> 完成后暂停</button>
+            <button className="ap-bar-btn ap-bar-btn-danger" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onPauseNow}><Square size={14} /> 立即暂停</button>
+            <button className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onPauseAfterCurrent}><Pause size={14} /> 完成后暂停</button>
           </>
         )}
         {!isExecuting && runStatus === "Running" && (
-          <button className="ap-bar-btn" disabled={busy} onClick={onPauseNow}><Pause size={14} /> 暂停自动驾驶</button>
+          <button className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onPauseNow}><Pause size={14} /> 暂停自动驾驶</button>
         )}
         {!isExecuting && runStatus === "Paused" && (
-          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={onResume}><Play size={14} /> 恢复</button>
+          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onResume}><Play size={14} /> 恢复</button>
         )}
         {runStatus !== "Running" && (
-          <button className="ap-bar-btn" disabled={busy} onClick={() => { void onToggle(false); }}><Square size={14} /> 关闭</button>
+          <button className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={() => { void onToggle(false); }}><Square size={14} /> 关闭</button>
         )}
       </div>
     </div>

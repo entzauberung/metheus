@@ -23,7 +23,7 @@ describe("V1ExecutionPanel recovery responsibility", () => {
     host.remove();
   });
 
-  it("shows blocking facts but delegates the only recovery action to the top bar", () => {
+  it("keeps recovery details and actions out of the execution panel", () => {
     const project = {
       name: "blocked-project",
       milestones: [],
@@ -70,15 +70,12 @@ describe("V1ExecutionPanel recovery responsibility", () => {
           onExecute={noop}
           onConfirm={noop}
           onReject={noop}
-          onInStop={noop}
-          onEdStop={noop}
-          onSyncProject={noop}
         />,
       );
     });
 
-    expect(host.textContent).toContain("后台执行已阻断");
-    expect(host.textContent).toContain("页面顶部的唯一恢复入口");
+    expect(host.textContent).not.toContain("后台执行已阻断");
+    expect(host.textContent).not.toContain("页面顶部的唯一恢复入口");
     expect(host.textContent).not.toContain("预览并恢复执行基线");
     expect(host.querySelectorAll("button")).toHaveLength(0);
   });
@@ -134,9 +131,6 @@ describe("V1ExecutionPanel recovery responsibility", () => {
           onExecute={onExecute}
           onConfirm={noop}
           onReject={noop}
-          onInStop={noop}
-          onEdStop={noop}
-          onSyncProject={noop}
         />,
       );
     });

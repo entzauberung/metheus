@@ -13,12 +13,14 @@ pub(crate) fn update_app_settings(
     settings: AppSettingsInput,
     decision_secret_update: SecretMutation,
     built_in_grok_build_secret_update: SecretMutation,
+    vision_model_secret_update: SecretMutation,
 ) -> Result<AppSettingsView, String> {
     crate::settings::update_settings(
         expected_revision,
         settings,
         decision_secret_update,
         built_in_grok_build_secret_update,
+        vision_model_secret_update,
     )
 }
 

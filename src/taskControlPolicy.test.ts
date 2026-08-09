@@ -64,7 +64,15 @@ describe("task control presentation policy", () => {
     expect(acceptanceCounts([
       { criterion_index: 1, criterion: "a", status: "Unknown", evidence: "", evidence_references: [], confidence: 0, updated_at: "" },
       { criterion_index: 2, criterion: "b", status: "Unsatisfied", evidence: "", evidence_references: [], confidence: 0, updated_at: "" },
-    ])).toEqual({ Satisfied: 0, Unsatisfied: 1, Unknown: 1, Contradictory: 0, AcceptedDeviation: 0 });
+    ])).toEqual({
+      Satisfied: 0,
+      Unsatisfied: 1,
+      Unknown: 1,
+      Contradictory: 0,
+      AcceptedDeviation: 0,
+      AiProvisionallySatisfied: 0,
+      DeferredHumanReview: 0,
+    });
   });
 
   it("uses only backend capabilities to enable control commands", () => {

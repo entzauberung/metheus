@@ -590,6 +590,12 @@ impl SessionActor {
     /// the sampler actor is invalidated automatically by
     /// `update_config`.
     pub(crate) async fn prepare_sampler_for_turn(&self) {
+        if self.startup_hints.metheus_embedded {
+            // The sampler actor was seeded from the complete host-frozen config
+            // at spawn. Reconstructing it from serializable chat state would
+            // drop process-local hooks such as the response-usage observer.
+            return;
+        }
         self.refresh_token_if_expired().await;
         let mut sampler_config = self.reconstruct_full_config().await;
         sampler_config.idle_timeout_secs = Some(self.inference_idle_timeout.as_secs());

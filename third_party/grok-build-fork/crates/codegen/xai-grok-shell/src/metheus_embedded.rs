@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use xai_grok_tools::implementations::metheus_embedded::EMBEDDED_PATH_NOT_FOUND;
 use xai_grok_tools::implementations::metheus_embedded::EmbeddedFilePolicy;
 
-pub const FORK_REVISION: &str = "metheus.3";
+pub const FORK_REVISION: &str = "metheus.4";
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_EVENT_TEXT_CHARS: usize = 2_000;
 const TRUNCATION_SUFFIX: &str = "...[truncated]";
@@ -170,6 +170,7 @@ pub enum EmbeddedErrorKind {
     Cancelled,
     ToolRejected,
     Protocol,
+    OutputTruncated,
     MaxTurns,
     Runtime,
 }
@@ -178,6 +179,60 @@ pub enum EmbeddedErrorKind {
 pub struct EmbeddedError {
     pub kind: EmbeddedErrorKind,
     message: String,
+    pub turns: u32,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub files_written: Vec<String>,
+    pub output_summary: String,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EmbeddedUsageFacts {
+    turns: u32,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+impl EmbeddedUsageFacts {
+    fn from_prompt_usage(usage: &crate::extensions::notification::PromptUsage) -> Self {
+        Self {
+            turns: usage.num_turns.min(u32::MAX as u64) as u32,
+            prompt_tokens: usage.totals.input_tokens,
+            completion_tokens: usage.totals.output_tokens,
+        }
+    }
+
+    fn record_response(&mut self, usage: &xai_grok_sampling_types::TokenUsage) {
+        self.turns = self.turns.saturating_add(1);
+        self.prompt_tokens = self
+            .prompt_tokens
+            .saturating_add(u64::from(usage.prompt_tokens));
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(u64::from(usage.completion_tokens));
+    }
+}
+
+struct EmbeddedUsageObserver {
+    facts: Arc<Mutex<Option<EmbeddedUsageFacts>>>,
+}
+
+impl fmt::Debug for EmbeddedUsageObserver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("EmbeddedUsageObserver(..)")
+    }
+}
+
+impl xai_grok_sampler::HeaderInjector for EmbeddedUsageObserver {
+    fn inject(&self, _headers: &mut reqwest::header::HeaderMap) {}
+
+    fn observe_response_usage(&self, usage: &xai_grok_sampling_types::TokenUsage) {
+        if let Ok(mut facts) = self.facts.lock() {
+            facts
+                .get_or_insert(EmbeddedUsageFacts::default())
+                .record_response(usage);
+        }
+    }
 }
 
 impl EmbeddedError {
@@ -196,15 +251,90 @@ impl EmbeddedError {
                 message.chars().take(2_000).collect::<String>()
             );
         }
-        Self { kind, message }
+        Self {
+            kind,
+            message,
+            turns: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            files_written: Vec::new(),
+            output_summary: String::new(),
+        }
     }
 
-    fn from_acp(error: acp::Error, api_key: &str) -> Self {
+    fn from_acp(
+        error: acp::Error,
+        api_key: &str,
+        fallback_usage: Option<EmbeddedUsageFacts>,
+    ) -> Self {
+        let output_truncated = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("error_kind"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind == "max_tokens_truncation");
+        let error_usage = crate::sampling::error::prompt_usage_from_error(&error)
+            .as_ref()
+            .map(EmbeddedUsageFacts::from_prompt_usage);
+        let usage = if output_truncated {
+            fallback_usage.or(error_usage)
+        } else {
+            error_usage.or(fallback_usage)
+        };
         let rendered = error.data.as_ref().map_or_else(
             || error.message.clone(),
             |data| format!("{}: {data}", error.message),
         );
-        classify_error(rendered, api_key)
+        let mut mapped = if output_truncated {
+            Self::new(EmbeddedErrorKind::OutputTruncated, rendered, api_key)
+        } else {
+            classify_error(rendered, api_key)
+        };
+        if let Some(usage) = usage {
+            mapped.turns = usage.turns;
+            mapped.prompt_tokens = usage.prompt_tokens;
+            mapped.completion_tokens = usage.completion_tokens;
+        } else if output_truncated {
+            // A terminal max-token response consumed at least one model turn even
+            // when an upstream-compatible provider omitted usage.
+            mapped.turns = 1;
+        }
+        mapped
+    }
+
+    fn with_execution_facts(
+        mut self,
+        output: String,
+        files_written: Vec<String>,
+        api_key: &str,
+    ) -> Self {
+        self.files_written = files_written;
+        let output = if api_key.is_empty() {
+            output
+        } else {
+            output.replace(api_key, "[REDACTED]")
+        };
+        self.output_summary = if output.chars().count() > 2_000 {
+            format!(
+                "{}...[truncated]",
+                output.chars().take(2_000).collect::<String>()
+            )
+        } else {
+            output
+        };
+        self
+    }
+
+    fn with_usage_facts(
+        mut self,
+        turns: u32,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    ) -> Self {
+        self.turns = turns;
+        self.prompt_tokens = prompt_tokens;
+        self.completion_tokens = completion_tokens;
+        self
     }
 }
 
@@ -284,6 +414,7 @@ async fn execute_local(
     ));
     let (gateway, receiver) = xai_acp_lib::acp_gateway::<acp::AgentSide, _>(client.clone());
     let gateway_task = tokio::task::spawn_local(receiver.run());
+    let provider_usage = Arc::new(Mutex::new(None::<EmbeddedUsageFacts>));
     let sampling_config = xai_grok_sampler::SamplerConfig {
         api_key: Some(config.api_key.clone()),
         base_url: config.api_base_url.trim_end_matches('/').to_string(),
@@ -306,6 +437,9 @@ async fn execute_local(
         idle_timeout_secs: Some(config.timeout.as_secs()),
         client_identifier: Some("metheus-embedded".to_string()),
         client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        header_injector: Some(Arc::new(EmbeddedUsageObserver {
+            facts: Arc::clone(&provider_usage),
+        })),
         doom_loop_recovery: (config.max_doom_loop_retries > 0).then(|| {
             xai_grok_sampling_types::DoomLoopRecoveryPolicy {
                 max_threshold:
@@ -344,7 +478,7 @@ async fn execute_local(
             policy.clone(),
         )
         .await
-        .map_err(|error| EmbeddedError::from_acp(error, &config.api_key))?;
+        .map_err(|error| EmbeddedError::from_acp(error, &config.api_key, None))?;
     let handle = agent.embedded_session_handle(&session_id).ok_or_else(|| {
         EmbeddedError::new(
             EmbeddedErrorKind::Runtime,
@@ -434,14 +568,27 @@ async fn execute_local(
             policy_task.abort();
             agent.shutdown_metheus_embedded(&session_id).await;
             gateway_task.abort();
-            return Err(EmbeddedError::new(
-                EmbeddedErrorKind::Timeout,
-                format!(
-                    "Grok Build execution timed out after {} seconds",
-                    config.timeout.as_secs()
-                ),
-                &config.api_key,
-            ));
+            let output = client
+                .output
+                .lock()
+                .map(|value| value.text.clone())
+                .unwrap_or_default();
+            let files_written = client
+                .written
+                .lock()
+                .map(|paths| paths.iter().cloned().collect())
+                .unwrap_or_default();
+            return Err(
+                EmbeddedError::new(
+                    EmbeddedErrorKind::Timeout,
+                    format!(
+                        "Grok Build execution timed out after {} seconds",
+                        config.timeout.as_secs()
+                    ),
+                    &config.api_key,
+                )
+                .with_execution_facts(output, files_written, &config.api_key),
+            );
         }
     };
     cancel_task.abort();
@@ -454,13 +601,44 @@ async fn execute_local(
         .ok()
         .and_then(|value| value.clone())
     {
-        return Err(EmbeddedError::new(
-            EmbeddedErrorKind::ToolRejected,
-            message,
-            &config.api_key,
-        ));
+        let output = client
+            .output
+            .lock()
+            .map(|value| value.text.clone())
+            .unwrap_or_default();
+        let files_written = client
+            .written
+            .lock()
+            .map(|paths| paths.iter().cloned().collect())
+            .unwrap_or_default();
+        return Err(
+            EmbeddedError::new(EmbeddedErrorKind::ToolRejected, message, &config.api_key)
+                .with_execution_facts(output, files_written, &config.api_key),
+        );
     }
-    let response = response.map_err(|error| EmbeddedError::from_acp(error, &config.api_key))?;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            let provider_usage = provider_usage
+                .lock()
+                .ok()
+                .and_then(|facts| *facts);
+            let output = client
+                .output
+                .lock()
+                .map(|value| value.text.clone())
+                .unwrap_or_default();
+            let files_written = client
+                .written
+                .lock()
+                .map(|paths| paths.iter().cloned().collect())
+                .unwrap_or_default();
+            return Err(
+                EmbeddedError::from_acp(error, &config.api_key, provider_usage)
+                    .with_execution_facts(output, files_written, &config.api_key),
+            );
+        }
+    };
     let (turns, prompt_tokens, completion_tokens) =
         response
             .usage
@@ -472,44 +650,58 @@ async fn execute_local(
                     usage.totals.output_tokens,
                 )
             });
+    let output = client
+        .output
+        .lock()
+        .map(|value| value.text.clone())
+        .unwrap_or_default();
+    let files_written = client
+        .written
+        .lock()
+        .map(|paths| paths.iter().cloned().collect())
+        .unwrap_or_default();
     match response.completion_kind {
         PromptCompletionKind::Cancelled { .. } => {
-            return Err(EmbeddedError::new(
-                EmbeddedErrorKind::Cancelled,
-                "Grok Build execution was cancelled",
-                &config.api_key,
-            ));
+            return Err(
+                EmbeddedError::new(
+                    EmbeddedErrorKind::Cancelled,
+                    "Grok Build execution was cancelled",
+                    &config.api_key,
+                )
+                .with_usage_facts(turns, prompt_tokens, completion_tokens)
+                .with_execution_facts(output, files_written, &config.api_key),
+            );
         }
         PromptCompletionKind::MaxTurnsReached { limit } => {
-            return Err(EmbeddedError::new(
-                EmbeddedErrorKind::MaxTurns,
-                format!("Grok Build reached the configured maximum of {limit} turns"),
-                &config.api_key,
-            ));
+            return Err(
+                EmbeddedError::new(
+                    EmbeddedErrorKind::MaxTurns,
+                    format!("Grok Build reached the configured maximum of {limit} turns"),
+                    &config.api_key,
+                )
+                .with_usage_facts(turns, prompt_tokens, completion_tokens)
+                .with_execution_facts(output, files_written, &config.api_key),
+            );
         }
         PromptCompletionKind::RemovedFromQueue | PromptCompletionKind::Rewound => {
-            return Err(EmbeddedError::new(
-                EmbeddedErrorKind::Protocol,
-                "Grok Build did not execute the embedded prompt",
-                &config.api_key,
-            ));
+            return Err(
+                EmbeddedError::new(
+                    EmbeddedErrorKind::Protocol,
+                    "Grok Build did not execute the embedded prompt",
+                    &config.api_key,
+                )
+                .with_usage_facts(turns, prompt_tokens, completion_tokens)
+                .with_execution_facts(output, files_written, &config.api_key),
+            );
         }
         PromptCompletionKind::Completed => {}
     }
     Ok(EmbeddedResult {
-        output: client
-            .output
-            .lock()
-            .map(|value| value.text.clone())
-            .unwrap_or_default(),
+        output,
         turns,
         prompt_tokens,
         completion_tokens,
-        files_written: client
-            .written
-            .lock()
-            .map(|paths| paths.iter().cloned().collect())
-            .unwrap_or_default(),
+        files_written,
         stop_reason: format!("{:?}", response.stop_reason),
     })
 }

@@ -677,8 +677,13 @@ mod tests {
         project.current_milestone_id = "m".into();
         let task = &project.milestones[0].subtasks[0];
         let compiled = compile(task, None, 0, project.workload_profile.as_ref().unwrap());
-        let decision =
-            crate::control_scheduler::decide_next_action(task, &compiled, "facts", false);
+        let decision = crate::control_scheduler::decide_next_action(
+            task,
+            &compiled,
+            "facts",
+            false,
+            project.human_review_cadence,
+        );
         let decision_id = decision.decision_id.clone();
         project.task_control.last_decision = Some(decision);
 

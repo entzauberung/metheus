@@ -30,6 +30,12 @@ pub struct LogEntry {
     pub level: String,
     /// 日志文本
     pub text: String,
+    /// 结构化来源，例如 pipeline/stdout/stderr。
+    #[serde(default)]
+    pub source: String,
+    /// Provider 事件关联 ID；旧日志缺失时保持 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
 }
 
 /// 日志历史上限
@@ -73,10 +79,22 @@ pub struct PipelineState {
 
 /// 追加日志条目到 PipelineState，同时更新 current_log 并限制历史上限
 pub(crate) fn append_log(state: &mut PipelineState, level: &str, text: String) {
+    append_log_with_context(state, level, "pipeline", None, text);
+}
+
+fn append_log_with_context(
+    state: &mut PipelineState,
+    level: &str,
+    source: &str,
+    correlation_id: Option<String>,
+    text: String,
+) {
     let entry = LogEntry {
         timestamp: chrono::Utc::now().to_rfc3339(),
         level: level.to_string(),
         text: text.clone(),
+        source: source.to_string(),
+        correlation_id,
     };
     state.log_history.push(entry);
     // 保持最近 MAX_LOG_HISTORY 条
@@ -89,7 +107,34 @@ pub(crate) fn append_log(state: &mut PipelineState, level: &str, text: String) {
 
 /// 运行期实时日志：与 append_log 相同容量上限，供执行器流式写入
 pub(crate) fn append_runtime_log(state: &mut PipelineState, level: &str, text: String) {
-    append_log(state, level, text);
+    append_log_with_context(state, level, "runtime", None, text);
+}
+
+pub(crate) fn append_runtime_log_with_context(
+    state: &mut PipelineState,
+    level: &str,
+    source: &str,
+    correlation_id: Option<String>,
+    text: String,
+) {
+    append_log_with_context(state, level, source, correlation_id, text);
+}
+
+/// Thought/debug 只占一个有界 live slot，不进入普通 200 条日志历史。
+pub(crate) fn set_runtime_debug_log(
+    state: &mut PipelineState,
+    source: &str,
+    correlation_id: Option<String>,
+    text: String,
+) {
+    state.current_log = serde_json::json!({
+        "kind": "runtime_log",
+        "level": "debug",
+        "source": source,
+        "correlation_id": correlation_id,
+        "text": text,
+    })
+    .to_string();
 }
 
 /// 向调用方持有的项目事实追加执行历史；持久化由调用方在事务边界统一完成。
@@ -637,6 +682,7 @@ pub(crate) async fn execute_task_with_source(
             engine_model,
             endpoint_fingerprint,
             engine_executable_path,
+            human_review_cadence: proj.human_review_cadence,
         });
     }
 
@@ -672,6 +718,8 @@ pub(crate) async fn execute_task_with_source(
             timestamp: chrono::Utc::now().to_rfc3339(),
             level: "info".to_string(),
             text: format!("▶ 执行中 ({}/{})：{}", next_idx + 1, total, subtask_title),
+            source: "pipeline".to_string(),
+            correlation_id: None,
         }],
     };
     *pipeline_guard = Some(initial_state.clone());
@@ -737,6 +785,29 @@ pub(crate) async fn execute_task_with_source(
     });
 
     Ok(initial_state)
+}
+
+fn interrupted_execution_cost_facts(
+    error: &crate::engine::EngineError,
+) -> Option<(
+    Option<&crate::cost_ledger::ProviderUsage>,
+    bool,
+    &'static str,
+)> {
+    let (execution_result, failure_kind) = match error {
+        crate::engine::EngineError::Cancelled { execution_result } => {
+            (execution_result.as_deref(), "Cancelled")
+        }
+        crate::engine::EngineError::Timeout { execution_result } => {
+            (execution_result.as_deref(), "Timeout")
+        }
+        _ => return None,
+    };
+    Some((
+        execution_result.and_then(|result| result.token_usage.as_ref()),
+        execution_result.is_some_and(|result| !result.file_changes.is_empty()),
+        failure_kind,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -809,6 +880,13 @@ async fn execute_current_subtask_background(
                 failure_kind,
             );
         };
+    if let Err(error) = &engine_result {
+        if let Some((usage, produced_change, failure_kind)) =
+            interrupted_execution_cost_facts(error)
+        {
+            record_execution_cost(usage, produced_change, failure_kind);
+        }
+    }
     let exec_result = match engine_result {
         Ok(result) => {
             let failure_kind = result
@@ -823,17 +901,13 @@ async fn execute_current_subtask_background(
             );
             result
         }
-        Err(crate::engine::EngineError::Cancelled) => {
-            record_execution_cost(None, false, "Cancelled");
-            return Ok(());
-        }
-        Err(crate::engine::EngineError::Timeout) => {
-            record_execution_cost(None, false, "Timeout");
+        Err(crate::engine::EngineError::Cancelled { .. }) => return Ok(()),
+        Err(crate::engine::EngineError::Timeout { execution_result }) => {
             return Err(BackgroundExecutionFailure::engine(
                 project::RecoveryErrorKind::ExecutionError,
                 project::EngineFailureKind::Timeout,
                 "执行超时".to_string(),
-                None,
+                execution_result.map(|result| *result),
             ));
         }
         Err(error) => {
@@ -1071,6 +1145,7 @@ async fn execute_current_subtask_background(
         engine_model: session.engine_model,
         endpoint_fingerprint: session.endpoint_fingerprint,
         engine_executable_path: session.engine_executable_path,
+        human_review_cadence: session.human_review_cadence,
     });
     write_execution_history_with_source(
         &mut proj,
@@ -1322,13 +1397,21 @@ async fn finalize_background_execution_failure(
                     project::AutopilotRecoveryAction::RestoreExecutionBaseline;
             } else {
                 autopilot.next_retry_at = None;
-                autopilot.last_action =
-                    if crate::autopilot_failure::is_transient(&autopilot.last_failure_kind) {
-                        "执行引擎自动重试已耗尽，等待人工处理".to_string()
-                    } else {
-                        "执行引擎错误不可自动重试，等待人工处理".to_string()
-                    };
-                autopilot.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+                if failure.engine_failure_kind == Some(project::EngineFailureKind::OutputTruncated)
+                {
+                    autopilot.last_action =
+                        "内置执行续执行后仍被截断，正在进入受限重规划".to_string();
+                    autopilot.recovery_action =
+                        project::AutopilotRecoveryAction::RegenerateExecutionPlan;
+                } else {
+                    autopilot.last_action =
+                        if crate::autopilot_failure::is_transient(&autopilot.last_failure_kind) {
+                            "执行引擎自动重试已耗尽，等待人工处理".to_string()
+                        } else {
+                            "执行引擎错误不可自动重试，等待人工处理".to_string()
+                        };
+                    autopilot.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+                }
             }
             autopilot.last_action_at = chrono::Utc::now().to_rfc3339();
         }
@@ -1460,17 +1543,73 @@ fn validate_subtask_quality_gate_with_session_statuses(
         .as_ref()
         .ok_or("缺少测试结果，无法确认。测试服务可能不可用。".to_string())?;
 
-    let quality = crate::quality_gate::evaluate(
+    let quality = crate::quality_gate::evaluate_with_deferred(
         Some(test_result),
         &subtask.acceptance_ledger,
         subtask.acceptance_criteria.len(),
         false,
+        batch_deferred_review_is_complete(proj, subtask),
     );
     if !quality.passed() {
         return Err(quality.message);
     }
 
     Ok(())
+}
+
+fn batch_deferred_review_is_complete(proj: &project::Project, subtask: &project::Subtask) -> bool {
+    if proj.human_review_cadence != project::HumanReviewCadence::MilestoneBatch {
+        return false;
+    }
+    let deferred = subtask
+        .acceptance_ledger
+        .iter()
+        .filter(|item| {
+            matches!(
+                item.status,
+                project::AcceptanceStatus::AiProvisionallySatisfied
+                    | project::AcceptanceStatus::DeferredHumanReview
+            )
+        })
+        .collect::<Vec<_>>();
+    if deferred.is_empty() {
+        return false;
+    }
+    let Ok(Some(address)) = crate::task_tree::locate_task(proj, &subtask.id) else {
+        return false;
+    };
+    let Some(milestone) = proj
+        .milestones
+        .iter()
+        .find(|milestone| milestone.id == address.milestone_id)
+    else {
+        return false;
+    };
+    let contract_fingerprint = subtask
+        .contract_snapshot
+        .as_ref()
+        .map(|contract| contract.fingerprint.as_str())
+        .unwrap_or_default();
+    let Ok(execution_facts_fingerprint) =
+        crate::human_action_policy::execution_result_fingerprint(subtask)
+    else {
+        return false;
+    };
+    deferred.iter().all(|ledger| {
+        let id = project::milestone_human_review_item_id(
+            &address.milestone_id,
+            &subtask.id,
+            ledger.criterion_index,
+            contract_fingerprint,
+        );
+        milestone.human_review_items.iter().any(|item| {
+            item.id == id
+                && item.review_cycle == milestone.human_review_cycle
+                && item.contract_fingerprint == contract_fingerprint
+                && item.execution_facts_fingerprint == execution_facts_fingerprint
+                && item.ai_status == ledger.status
+        })
+    })
 }
 
 /// Reconcile stage state after any terminal task outcome. Passing, accepting a
@@ -5103,6 +5242,48 @@ mod tests {
     use tokio::sync::Mutex;
 
     #[test]
+    fn adaptive_execution_contract_builtin_interruptions_reach_cost_ledger_with_facts() {
+        let partial_result = || project::ExecutionResult {
+            file_changes: vec!["first.txt".to_string(), "continuation.txt".to_string()],
+            token_usage: Some(crate::cost_ledger::ProviderUsage {
+                input_tokens: Some(13),
+                output_tokens: Some(8),
+                total_tokens: Some(21),
+                cached_input_tokens: None,
+            }),
+            ..Default::default()
+        };
+        for error in [
+            crate::engine::EngineError::cancelled_with_result(partial_result()),
+            crate::engine::EngineError::timeout_with_result(partial_result()),
+        ] {
+            let (usage, produced_change, failure_kind) =
+                interrupted_execution_cost_facts(&error).expect("interruption facts");
+            let mut ledger = crate::cost_ledger::CostLedger::default();
+            crate::cost_ledger::record_execution_call(
+                &mut ledger,
+                failure_kind,
+                &crate::cost_ledger::ModelCallContext::default(),
+                "Grok Build",
+                "test-model",
+                "started".to_string(),
+                "ended".to_string(),
+                42,
+                usage,
+                produced_change,
+                failure_kind,
+            );
+            let call = ledger.calls.last().expect("recorded execution call");
+            assert_eq!(call.failure_kind, failure_kind);
+            assert_eq!(call.input_tokens, Some(13));
+            assert_eq!(call.output_tokens, Some(8));
+            assert_eq!(call.total_tokens, Some(21));
+            assert!(call.produced_change);
+            assert!(!call.no_progress);
+        }
+    }
+
+    #[test]
     fn operation_source_is_preserved_and_legacy_writer_is_conservative() {
         let mut project = project::Project::new("audit");
         write_execution_history_with_source(
@@ -5350,6 +5531,7 @@ mod tests {
             engine_model: String::new(),
             endpoint_fingerprint: String::new(),
             engine_executable_path: String::new(),
+            human_review_cadence: project::HumanReviewCadence::PerTask,
         }
     }
 

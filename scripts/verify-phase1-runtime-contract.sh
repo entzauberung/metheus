@@ -6,6 +6,40 @@ readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 readonly CORE_TARGET_DIR="${REPO_ROOT}/.build/core"
 readonly CORE_MAX_JOBS=2
 readonly VERIFY_SCOPE="${1:-full}"
+readonly -a PHASE1_FRONTEND_TESTS=(
+  src/utils/invokeWithTimeout.test.ts
+  src/engineHealthSync.test.ts
+  src/projectSyncPolicy.test.ts
+  src/hooks/useProjectStateSync.test.tsx
+  src/executionSyncPolicy.test.ts
+  src/hooks/useTaskControlWorkspace.test.tsx
+  src/components/ApplicationSettings.test.tsx
+  src/components/ExecutionEngineSelector.test.tsx
+  src/components/AutopilotControlBar.test.tsx
+  src/components/RecoveryDecisionDialog.test.tsx
+  src/RecoveryImpactDialog.test.tsx
+  src/components/RecoveryResultBanner.test.tsx
+  src/components/RecoveryNotice.test.tsx
+  src/components/SyncStatusIndicator.test.tsx
+  src/V1ExecutionPanel.test.tsx
+  src/TaskConsole.test.tsx
+  src/TaskInspector.test.tsx
+  src/autopilotPolicy.test.ts
+  src/taskControlPolicy.test.ts
+  src/components/ConsoleWorkspace.test.tsx
+  src/MilestoneHumanReviewDialog.test.tsx
+  src/MilestoneReviewPanel.test.tsx
+  src/consoleWritePolicy.test.ts
+  src/logPolicy.test.ts
+)
+
+for test_file in "${PHASE1_FRONTEND_TESTS[@]}"; do
+  if [[ ! -f "${REPO_ROOT}/${test_file}" ]]; then
+    echo "运行时验收清单缺少测试文件：${test_file}" >&2
+    exit 1
+  fi
+done
+echo "[phase1] selected frontend test files: ${#PHASE1_FRONTEND_TESTS[@]}"
 
 if [[ "${VERIFY_SCOPE}" != "--static-only" ]]; then
   "${SCRIPT_DIR}/resource-preflight.sh" core
@@ -19,26 +53,7 @@ if [[ "${VERIFY_SCOPE}" != "--static-only" ]]; then
 
   cd "${REPO_ROOT}"
   npx --no-install tsc --noEmit
-  npx --no-install vitest run \
-    src/utils/invokeWithTimeout.test.ts \
-    src/engineHealthSync.test.ts \
-    src/projectSyncPolicy.test.ts \
-    src/hooks/useProjectStateSync.test.tsx \
-    src/executionSyncPolicy.test.ts \
-    src/hooks/useTaskControlWorkspace.test.tsx \
-    src/components/ApplicationSettings.test.tsx \
-    src/components/ExecutionEngineSelector.test.tsx \
-    src/components/AutopilotControlBar.test.tsx \
-    src/components/RecoveryDecisionDialog.test.tsx \
-    src/RecoveryImpactDialog.test.tsx \
-    src/components/RecoveryResultBanner.test.tsx \
-    src/components/RecoveryNotice.test.tsx \
-    src/components/SyncStatusIndicator.test.tsx \
-    src/V1ExecutionPanel.test.tsx \
-    src/TaskConsole.test.tsx \
-    src/TaskInspector.test.tsx \
-    src/autopilotPolicy.test.ts \
-    src/taskControlPolicy.test.ts
+  npx --no-install vitest run "${PHASE1_FRONTEND_TESTS[@]}"
 fi
 
 cd "${REPO_ROOT}"

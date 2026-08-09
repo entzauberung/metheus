@@ -7,7 +7,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
 import "./App.css";
-import { Project, ViewMode, DiscussionReason, PipelineState, TestLog, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, TestResult, RecoveryPresentation, RecoveryResultSummary, RuntimeSnapshot, RuntimeMutationResult, ExecutionRecoveryImpact, RecoveryDecisionResolution } from "./types";
+import "./ConsoleWorkspace.css";
+import { Project, ViewMode, DiscussionReason, PipelineState, ChatMessage, Milestone, RollbackImpact, WorkflowStep, ExecutionWorkspaceStatus, RecoveryPresentation, RecoveryResultSummary, RuntimeSnapshot, RuntimeMutationResult, ExecutionRecoveryImpact, RecoveryDecisionResolution, MilestoneReviewSubmission } from "./types";
 import { ProjectEntry } from "./ProjectEntry";
 import { ExistingBaselinePanel } from "./ExistingBaselinePanel";
 import { PreflightPanel } from "./PreflightPanel";
@@ -19,7 +20,6 @@ import { ConsoleStepShell } from "./components/ConsoleStepShell";
 import { WorkflowActionBar } from "./components/WorkflowActionBar";
 import { ArrowLeft, Bot, GitBranch, PanelRightOpen, RotateCcw, Search, WandSparkles } from "lucide-react";
 import { AutopilotControlBar } from "./components/AutopilotControlBar";
-import { RecoveryNotice } from "./components/RecoveryNotice";
 import { RecoveryResultBanner } from "./components/RecoveryResultBanner";
 import { SyncStatusIndicator } from "./components/SyncStatusIndicator";
 import ExecutionTree from "./ExecutionTree";
@@ -31,8 +31,14 @@ import { PauseDecisionPanel } from "./PauseDecisionPanel";
 import { RollbackImpactDialog } from "./RollbackImpactDialog";
 import { RecoveryImpactDialog } from "./RecoveryImpactDialog";
 import { MilestoneReviewPanel } from "./MilestoneReviewPanel";
-import { ExecutionEngineSettings } from "./components/ExecutionEngineSettings";
 import { ApplicationSettings } from "./components/ApplicationSettings";
+import {
+  CONSOLE_LAYOUT_CONTRACT,
+  ConsoleCommandBar,
+  ConsoleWorkspace,
+} from "./components/ConsoleWorkspace";
+import { ConsoleNavigator } from "./components/ConsoleNavigator";
+import { ConsoleBottomPanel } from "./components/ConsoleBottomPanel";
 import FileTree from "./FileTree";
 import FloatingChatBalloon from "./FloatingChatBalloon";
 import TaskInspector from "./TaskInspector";
@@ -60,6 +66,7 @@ import {
   type TerminalSyncPhase,
 } from "./executionSyncPolicy";
 import { resolvePlanTarget } from "./planTargetPolicy";
+import { getConsoleWritePolicy, type ConsoleWritePolicy } from "./consoleWritePolicy";
 
 const WORKFLOW_STEPS = new Set<WorkflowStep>([
   "WaitingEntry", "ExistingAnalysis", "BaselineApproval", "Discussion", "ThreeChecks",
@@ -75,31 +82,6 @@ const EXECUTION_POLL_INTERVAL_MS = 1500;
 
 /** 连续轮询失败最大次数，防止界面无限静默等待 */
 const EXECUTION_POLL_MAX_FAILURES = 10;
-
-function verificationLabel(result: TestResult): string {
-  if (result.verification_kind === "DeterministicLocal") {
-    return result.passed ? "本地确定性验证通过" : "本地确定性验证未通过";
-  }
-  if (result.verification_kind === "AutomatedTestOnly") {
-    if (result.automated_test_status === "NotConfigured") return "未配置自动化测试";
-    if (result.automated_test_status === "Unavailable") return "自动化测试环境不可用";
-    return result.automated_test_status === "Passed"
-      ? "自动化测试通过"
-      : result.automated_test_status === "Failed"
-        ? "自动化测试未通过"
-        : "自动化测试结果未知";
-  }
-  if (result.automated_test_status === "NotConfigured") {
-    return result.passed ? "未配置自动化测试，代码审查通过" : "未配置自动化测试，代码审查未通过";
-  }
-  if (result.automated_test_status === "Unavailable") {
-    return "测试环境不可用";
-  }
-  if (result.verification_kind === "CodeReviewOnly") {
-    return result.passed ? "仅代码审查通过" : "代码审查未通过";
-  }
-  return result.passed ? "自动化测试与代码审查通过" : "未通过";
-}
 
 // ============================================================
 // App.tsx — 「弥」的前端总指挥
@@ -129,9 +111,6 @@ function App() {
 
   // Phase D: 动画控制（保留用于视觉过渡，不决定业务阶段）
   const animationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // 测试日志去重：记录已处理过的子任务 ID
-  const processedSubtaskIdsRef = useRef<Set<string>>(new Set());
 
   // 大阶段完成总结去重：记录已发送过总结消息的大阶段 ID
   const completedMilestonesRef = useRef<Set<string>>(new Set());
@@ -355,8 +334,13 @@ function App() {
   const isDecisionSubmitting = decisionAction !== null;
   const [consoleAction, setConsoleAction] = useState<string | null>(null);
   const consoleActionRef = useRef<string | null>(null);
+  const consoleWritePolicyRef = useRef<ConsoleWritePolicy>({ writable: true, reason: "" });
   const beginConsoleAction = useCallback((action: string) => {
     if (consoleActionRef.current !== null) return false;
+    if (action !== "sync_project" && !consoleWritePolicyRef.current.writable) {
+      setFeedbackMsg({ type: "warning", message: consoleWritePolicyRef.current.reason });
+      return false;
+    }
     consoleActionRef.current = action;
     setConsoleAction(action);
     return true;
@@ -367,7 +351,6 @@ function App() {
   }, []);
   const isConsoleBusy = consoleAction !== null;
 
-  const [testLogs, setTestLogs] = useState<TestLog[]>([]);
   // === 执行工作区状态（供 V1ExecutionPanel 和 TaskConsole 共用） ===
   const [workspaceStatus, setWorkspaceStatus] = useState<ExecutionWorkspaceStatus | null>(null);
   const applyRuntimeSnapshot = useCallback((snapshot: RuntimeSnapshot) => {
@@ -404,6 +387,11 @@ function App() {
     includeTaskControlSnapshot: inspectorOpen,
     onSnapshot: applyRuntimeSnapshot,
   });
+  const consoleWritePolicy = getConsoleWritePolicy(
+    project?.workflow_state.top_level_phase === "Console",
+    projectStateSync.state,
+  );
+  consoleWritePolicyRef.current = consoleWritePolicy;
   const forceRuntimeSync = projectStateSync.forceSync;
   const taskControlWorkspace = useTaskControlWorkspace({
     project,
@@ -608,25 +596,6 @@ function App() {
       try {
         const status = await invokeWithTimeout<PipelineState | null>("get_execution_status", {});
         executionPollFailuresRef.current = 0;
-
-        const newLogs: TestLog[] = [];
-        for (const item of status?.subtask_statuses ?? []) {
-          if (processedSubtaskIdsRef.current.has(item.subtask_id)) continue;
-          if (item.test_result && (item.status === "passed" || item.status === "retrying")) {
-            processedSubtaskIdsRef.current.add(item.subtask_id);
-            const testResult = item.test_result;
-            const reason = testResult.passed
-              ? ((testResult.issues ?? []).join("\n") || verificationLabel(testResult))
-              : `不通过: ${testResult.suggestion || "未提供建议"}`;
-            newLogs.push({
-              subtask_title: item.title,
-              status: item.status === "retrying" ? "retried" : "passed",
-              reason,
-              full_report: testResult.suggestion || undefined,
-            });
-          }
-        }
-        if (newLogs.length > 0) setTestLogs((previous) => [...previous, ...newLogs]);
 
         if (executionPollDecision(status, projectName) === "continue" && status) {
           setExecutionStatus(status);
@@ -1140,34 +1109,6 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
       && milestone.mid_stages.every(mid => mid.status === "Completed");
   };
 
-  // === V1 暂停：In Stop ===
-  const handleInStop = async () => {
-    if (!project || !beginConsoleAction("in_stop")) return;
-    try {
-      await invokeRuntimeMutation("request_in_stop_runtime", { projectName: project.name });
-      setIsExecuting(false);
-      setExecutionStatus(null);
-      setFeedbackMsg({ type: "warning", message: "执行已暂停并恢复到安全基线。" });
-    } catch (err) {
-      setFeedbackMsg({ type: "error", message: "暂停失败：" + String(err) });
-    } finally {
-      endConsoleAction();
-    }
-  };
-
-  // === V1 暂停：ED Stop ===
-  const handleEdStop = async () => {
-    if (!project || !beginConsoleAction("ed_stop")) return;
-    try {
-      await invokeRuntimeMutation("request_ed_stop_runtime", { projectName: project.name });
-      setFeedbackMsg({ type: "info", message: "将在当前任务完成并确认后暂停。" });
-    } catch (err) {
-      setFeedbackMsg({ type: "error", message: "ED Stop 请求失败：" + String(err) });
-    } finally {
-      endConsoleAction();
-    }
-  };
-
   // === V1 暂停决策：继续/调整/回退 ===
   const handleResolvePause = async (action: string) => {
     if (!project || !beginConsoleAction(`pause_${action}`)) return;
@@ -1181,6 +1122,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
       }
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "决策失败：" + String(err) });
+      throw err;
     } finally {
       endConsoleAction();
     }
@@ -1379,6 +1321,34 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
       setFeedbackMsg({ type: "info", message: "托管层已停止，当前步骤已交给手动处理。" });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "停止托管失败：" + String(err) });
+    } finally {
+      endConsoleAction();
+    }
+  };
+
+  const handlePauseManagedFlow = async () => {
+    if (!project || !beginConsoleAction("managed_pause")) return;
+    try {
+      await invokeRuntimeMutation("pause_managed_flow_runtime", {
+        projectName: project.name,
+      });
+      setFeedbackMsg({ type: "info", message: "托管层已暂停。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "暂停托管失败：" + String(err) });
+    } finally {
+      endConsoleAction();
+    }
+  };
+
+  const handleResumeManagedFlow = async () => {
+    if (!project || !beginConsoleAction("managed_resume")) return;
+    try {
+      await invokeRuntimeMutation("resume_managed_flow_runtime", {
+        projectName: project.name,
+      });
+      setFeedbackMsg({ type: "info", message: "托管层已恢复。" });
+    } catch (err) {
+      setFeedbackMsg({ type: "error", message: "恢复托管失败：" + String(err) });
     } finally {
       endConsoleAction();
     }
@@ -1606,6 +1576,8 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   const handleSyncProject = async () => {
     if (!project || !beginConsoleAction("sync_project")) return;
     try {
+      const snapshot = await forceRuntimeSync();
+      if (!snapshot) throw new Error("无法取得最新运行时快照");
       const result = await invokeRuntimeMutation("reconcile_managed_milestone_state_runtime", {
         projectName: project.name,
       });
@@ -1627,12 +1599,13 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   // === V1 A/B/C 大阶段审阅 ===
   // V1: enter_milestone_review is called via invokeWithTimeout directly when needed
 
-  const handleApproveMilestoneOutcome = async (branch: string) => {
+  const handleApproveMilestoneOutcome = async (submission: MilestoneReviewSubmission) => {
+    const branch = submission.branch;
     if (!project || !beginConsoleAction(`milestone_review_${branch}`)) return;
     try {
       const result = await invokeRuntimeMutation("approve_milestone_outcome_runtime", {
         projectName: project.name,
-        branch,
+        submission,
       });
       const updated = result.runtime_snapshot.project;
       const messages: Record<string, string> = {
@@ -1742,8 +1715,11 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   }
 
   return (
-    <div className="app-layout">
-      {project.milestones.length > 0 && (
+    <div
+      className="app-layout"
+      data-console-inspector-open={phase === "Console" && inspectorOpen ? "true" : "false"}
+    >
+      {project.milestones.length > 0 && phase !== "Console" && (
         <aside className="sidebar" style={{ width: sidebarWidth + 'px' }}>
           <ExecutionTree
             project={project}
@@ -1771,32 +1747,18 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
       )}
 
       <main className="main-content">
-        <div className="project-utility-bar">
+        {phase !== "Console" && <div className="project-utility-bar">
           <SyncStatusIndicator
             state={projectStateSync.state}
             onRetry={forceRuntimeSync}
             terminalPhase={terminalSyncPhase}
           />
-          {phase === "Console" && (
-            <button
-              type="button"
-              className={`icon-button${inspectorOpen ? " active" : ""}`}
-              onClick={() => setInspectorOpen(open => !open)}
-              title={inspectorOpen ? "关闭任务检查器" : "打开任务检查器"}
-              aria-label={inspectorOpen ? "关闭任务检查器" : "打开任务检查器"}
-              aria-expanded={inspectorOpen}
-              aria-controls="task-inspector"
-            >
-              <PanelRightOpen size={16} />
-            </button>
-          )}
-          <ApplicationSettings project={project} pipeline={executionStatus} />
-          <ExecutionEngineSettings
+          <ApplicationSettings
             project={project}
             pipeline={executionStatus}
             onRuntimeMutation={applyRuntimeMutation}
           />
-        </div>
+        </div>}
 
         {/* ===== Phase-dependent main content ===== */}
         {(phase === "FirstDiscussion" || phase === "Before") && (
@@ -1943,36 +1905,96 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
         )}
 
         {(phase === "Console") && (
-          <div className="execution-layout">
-            <FileTree projectPath={projectPath} />
+          <ConsoleWorkspace
+            commandBar={(
+              <ConsoleCommandBar>
+                <AutopilotControlBar
+                  project={project}
+                  recoveryPresentation={recoveryPresentation}
+                  executionStatus={executionStatus}
+                  busy={isConsoleBusy}
+                  writeDisabled={!consoleWritePolicy.writable}
+                  writeDisabledReason={consoleWritePolicy.reason}
+                  onToggle={handleToggleAutopilot}
+                  onPauseManagedFlow={handlePauseManagedFlow}
+                  onResumeManagedFlow={handleResumeManagedFlow}
+                  onStopManagedFlow={handleStopManagedFlow}
+                  onPauseNow={handleAutopilotPauseNow}
+                  onPauseAfterCurrent={handleAutopilotPauseAfterCurrent}
+                  onResume={handleAutopilotResume}
+                  onSync={handleSyncProject}
+                  onAcknowledgeRecovery={handleAcknowledgeExecutionRecovery}
+                  onRegeneratePlan={handleRegenerateInvalidPlan}
+                  onPrepareWorkspace={handlePrepareExecutionWorkspace}
+                  onRefreshWorkspace={handleRefreshExecutionWorkspace}
+                  onRetryGitConfirmation={handleRetryGitConfirmation}
+                  onRunAutomaticRecovery={handleRunAutomaticRecovery}
+                  onResolveHumanRecovery={handleResolveHumanRecovery}
+                />
+                <div className="console-command-tools">
+                  <span className={`console-sync-state ${projectStateSync.state.status}`}>
+                    {consoleWritePolicy.writable ? "状态已同步" : consoleWritePolicy.reason}
+                  </span>
+                  <button
+                    type="button"
+                    className={`icon-button${inspectorOpen ? " active" : ""}`}
+                    onClick={() => setInspectorOpen(open => !open)}
+                    title={inspectorOpen ? "关闭任务检查器" : "打开任务检查器"}
+                    aria-label={inspectorOpen ? "关闭任务检查器" : "打开任务检查器"}
+                    aria-expanded={inspectorOpen}
+                    aria-controls="task-inspector"
+                  >
+                    <PanelRightOpen size={16} />
+                  </button>
+                  <ApplicationSettings
+                    project={project}
+                    pipeline={executionStatus}
+                    writeBlockedReason={consoleWritePolicy.writable ? "" : consoleWritePolicy.reason}
+                    onRuntimeMutation={applyRuntimeMutation}
+                  />
+                </div>
+              </ConsoleCommandBar>
+            )}
+            navigator={(
+              <ConsoleNavigator
+                taskTree={(
+                  <ExecutionTree
+                    project={project}
+                    onSelectMilestone={handleSelectMilestone}
+                    projectPath={projectPath}
+                    onSelectMidStage={handleSelectMidStage}
+                    selectedTaskId={taskControlWorkspace.selectedTaskId}
+                    currentTaskId={taskControlWorkspace.snapshot?.current_task_id}
+                    onOpenTask={openTaskInspector}
+                  />
+                )}
+                fileTree={<FileTree projectPath={projectPath} />}
+              />
+            )}
+            bottom={step === "Execution" ? (
+              <ConsoleBottomPanel>
+                <TaskConsole
+                  projectPath={projectPath}
+                  projectName={project.name}
+                  executionStatus={executionStatus}
+                  testLogs={[]}
+                  workspaceReady={workspaceStatus?.git_metadata_ready === true}
+                  executionHistory={project.execution_history}
+                  verificationStage={project.execution_session?.verification_stage}
+                  validationRetryCount={project.workflow_state.recovery_state?.validation_retry_count}
+                  validationRetryLimit={project.workflow_state.recovery_state?.max_validation_retries}
+                  nextValidationRetryAt={project.workflow_state.recovery_state?.next_validation_retry_at}
+                  recoveryPresentation={recoveryPresentation}
+                  selectedTaskId={taskControlWorkspace.selectedTaskId}
+                  onOpenTask={openTaskInspector}
+                />
+              </ConsoleBottomPanel>
+            ) : undefined}
+          >
             <div className="execution-main">
               <RecoveryResultBanner
                 result={recoveryResult}
                 onDismiss={dismissRecoveryResult}
-              />
-              <RecoveryNotice
-                projectName={project.name}
-                recoveryPresentation={recoveryPresentation}
-              />
-              {/* 全局自动驾驶控制条 */}
-              <AutopilotControlBar
-                project={project}
-                recoveryPresentation={recoveryPresentation}
-                executionStatus={executionStatus}
-                busy={isConsoleBusy}
-                onToggle={handleToggleAutopilot}
-                onStopManagedFlow={handleStopManagedFlow}
-                onPauseNow={handleAutopilotPauseNow}
-                onPauseAfterCurrent={handleAutopilotPauseAfterCurrent}
-                onResume={handleAutopilotResume}
-                onSync={handleSyncProject}
-                onAcknowledgeRecovery={handleAcknowledgeExecutionRecovery}
-                onRegeneratePlan={handleRegenerateInvalidPlan}
-                onPrepareWorkspace={handlePrepareExecutionWorkspace}
-                onRefreshWorkspace={handleRefreshExecutionWorkspace}
-                onRetryGitConfirmation={handleRetryGitConfirmation}
-                onRunAutomaticRecovery={handleRunAutomaticRecovery}
-                onResolveHumanRecovery={handleResolveHumanRecovery}
               />
               <RecoveryImpactDialog
                 impact={recoveryImpact}
@@ -2011,25 +2033,24 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                 <ConsoleWorkflowPanel
                   project={project}
                   onRuntimeMutation={applyRuntimeMutation}
-                  externalBusy={isConsoleBusy}
+                  externalBusy={isConsoleBusy || !consoleWritePolicy.writable}
                   onActionStart={beginConsoleAction}
                   onActionEnd={endConsoleAction}
                   onFeedback={setFeedbackMsg}
                   workspaceStatus={workspaceStatus}
                   onPrepareWorkspace={handlePrepareExecutionWorkspace}
-                  onRefreshWorkspace={handleSyncProject}
                 />
               )}
               {/* V1 执行阶段 UI — 仅在 Execution 步骤渲染 */}
               {step === "Execution" && (
-                <>
-                  <V1ExecutionPanel
+                <V1ExecutionPanel
                     project={project}
                     recoveryPresentation={recoveryPresentation}
                     executionStatus={executionStatus}
                     workspaceStatus={workspaceStatus}
                     busy={
                       isConsoleBusy
+                      || !consoleWritePolicy.writable
                       || (project.workflow_state.autopilot_active === true
                         && project.workflow_state.autopilot_state?.run_status === "Running")
                     }
@@ -2037,26 +2058,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                     onExecute={handleExecuteCurrentSubtask}
                     onConfirm={handleConfirmSubtask}
                     onReject={handleRejectSubtask}
-                    onInStop={handleInStop}
-                    onEdStop={handleEdStop}
-                    onSyncProject={handleSyncProject}
                   />
-                  <TaskConsole
-                    projectPath={projectPath}
-                    projectName={project.name}
-                    executionStatus={executionStatus}
-                    testLogs={testLogs}
-                    workspaceReady={workspaceStatus?.git_metadata_ready === true}
-                    executionHistory={project.execution_history}
-                    verificationStage={project.execution_session?.verification_stage}
-                    validationRetryCount={project.workflow_state.recovery_state?.validation_retry_count}
-                    validationRetryLimit={project.workflow_state.recovery_state?.max_validation_retries}
-                    nextValidationRetryAt={project.workflow_state.recovery_state?.next_validation_retry_at}
-                    recoveryPresentation={recoveryPresentation}
-                    selectedTaskId={taskControlWorkspace.selectedTaskId}
-                    onOpenTask={openTaskInspector}
-                  />
-                </>
               )}
               {/* V1 暂停决策 */}
               {step === "PauseDecision" && (
@@ -2079,10 +2081,9 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
               {/* V1 大阶段审阅 A/B/C */}
               {step === "MilestoneReview" && (
                 <MilestoneReviewPanel
-                  milestoneTitle={project.milestones.find(m => m.id === project.current_milestone_id)?.title ?? "?"}
-                  onContinue={() => handleApproveMilestoneOutcome("A")}
-                  onFixPast={() => handleApproveMilestoneOutcome("B")}
-                  onAdjustFuture={() => handleApproveMilestoneOutcome("C")}
+                  milestone={project.milestones.find(m => m.id === project.current_milestone_id)!}
+                  projectRevision={project.workflow_state.data_revision}
+                  onSubmit={handleApproveMilestoneOutcome}
                   busy={isConsoleBusy}
                 />
               )}
@@ -2118,14 +2119,11 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                 step !== "FuturePlanApproval" && (
                 <div className="unsupported-console-step">
                   <h2>不支持的 Console 步骤</h2>
-                  <p>当前步骤：{step}。请同步项目状态后重试。</p>
-                  <button onClick={() => { void handleSyncProject(); }}>
-                    同步项目状态
-                  </button>
+                  <p>当前步骤：{step}。请使用顶部命令栏同步项目状态后重试。</p>
                 </div>
               )}
             </div>
-          </div>
+          </ConsoleWorkspace>
         )}
 
         {phase === "Completed" && (
@@ -2137,7 +2135,12 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
 
         {/* ===== Floating chat balloon in console mode ===== */}
         {phase === "Console" && (
-          <FloatingChatBalloon messages={currentThread.messages || []} />
+          <div
+            className="console-floating-chat-layer"
+            style={{ position: "relative", zIndex: CONSOLE_LAYOUT_CONTRACT.floatingLayerMaximum }}
+          >
+            <FloatingChatBalloon messages={currentThread.messages || []} />
+          </div>
         )}
       </main>
       {phase === "Console" && inspectorOpen && (
@@ -2145,11 +2148,13 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
           <button
             type="button"
             className="task-inspector-backdrop"
+            style={{ zIndex: CONSOLE_LAYOUT_CONTRACT.inspectorBackdropLayer }}
             onClick={() => setInspectorOpen(false)}
             aria-label="关闭任务检查器"
           />
           <div
             className={`task-inspector-resize-handle${isInspectorDragging ? " dragging" : ""}`}
+            style={{ zIndex: CONSOLE_LAYOUT_CONTRACT.inspectorResizeLayer }}
             onPointerDown={handleInspectorPointerDown}
             onDoubleClick={() => setInspectorWidth(DEFAULT_INSPECTOR_WIDTH)}
             onKeyDown={handleInspectorSeparatorKeyDown}
@@ -2162,7 +2167,13 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
             aria-controls="task-inspector"
             tabIndex={0}
           />
-          <div className="task-inspector-shell" style={{ width: `${inspectorWidth}px` }}>
+          <div
+            className="task-inspector-shell"
+            style={{
+              width: `${inspectorWidth}px`,
+              zIndex: CONSOLE_LAYOUT_CONTRACT.inspectorLayer,
+            }}
+          >
             <TaskInspector
               project={project}
               snapshot={taskControlWorkspace.snapshot}

@@ -59,11 +59,7 @@ pub(crate) async fn sample(
 ) -> Result<ConversationResponse, GrokBuildRuntimeError> {
     config.validate()?;
     let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let sampler = SamplerActor::spawn(
-        sampling_config(config),
-        retry_policy(config),
-        event_tx,
-    );
+    let sampler = SamplerActor::spawn(sampling_config(config), retry_policy(config), event_tx);
     sampler
         .submit_and_collect(xai_grok_sampler::RequestId::random(), request)
         .await

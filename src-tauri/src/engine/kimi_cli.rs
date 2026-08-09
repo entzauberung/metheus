@@ -16,7 +16,7 @@ pub(super) fn process_spec(
         display_name: "Kimi CLI",
         program,
         args: vec![
-            OsString::from("--yolo"),
+            OsString::from("--auto"),
             OsString::from("--prompt"),
             OsString::from(prompt),
             OsString::from("--output-format"),
@@ -43,7 +43,7 @@ pub(super) async fn capability_probe(program: &Path) -> Result<Vec<String>, Stri
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    for flag in ["--yolo", "--prompt", "stream-json"] {
+    for flag in ["--auto", "--prompt", "stream-json"] {
         if !help.contains(flag) {
             return Err(format!("当前 Kimi CLI 不支持必需能力 {flag}"));
         }
@@ -89,32 +89,13 @@ pub(super) async fn online_auth_probe(
     program: &Path,
     empty_directory: &Path,
 ) -> Result<EngineAuthVerificationMethod, EngineFailureKind> {
-    let skills_directory = empty_directory.join("skills");
-    std::fs::create_dir_all(&skills_directory).map_err(|_| EngineFailureKind::ProcessCrash)?;
-    let output = super::health::online_command_output(
-        program,
-        &[
-            "--auto",
-            "--prompt",
-            "Reply with OK only. Do not use tools.",
-            "--output-format",
-            "stream-json",
-            "--skills-dir",
-            skills_directory.to_string_lossy().as_ref(),
-        ],
-        empty_directory,
-        &[],
-    )
-    .await?;
-    if output.status.success() && !output.stdout.is_empty() {
-        Ok(EngineAuthVerificationMethod::OnlineMinimalRequest)
-    } else {
-        Err(super::classify_process_failure(
-            output.status.code(),
-            &String::from_utf8_lossy(&output.stdout),
-            &String::from_utf8_lossy(&output.stderr),
-        ))
-    }
+    let spec = process_spec(
+        program.as_os_str().to_owned(),
+        ProgramSource::SettingsOverride,
+        super::health::MINIMAL_PROBE_PROMPT,
+    );
+    super::health::run_minimal_process_probe(spec, empty_directory).await?;
+    Ok(EngineAuthVerificationMethod::OnlineMinimalRequest)
 }
 
 #[cfg(test)]
@@ -136,13 +117,25 @@ mod tests {
         assert_eq!(
             args,
             [
-                "--yolo",
+                "--auto",
                 "--prompt",
                 "approved prompt",
                 "--output-format",
                 "stream-json"
             ]
         );
+        assert!(!args
+            .iter()
+            .any(|argument| { matches!(argument.as_str(), "--yolo" | "--model" | "--provider") }));
+        assert_eq!(
+            args.iter()
+                .filter(|argument| argument.as_str() == "approved prompt")
+                .count(),
+            1
+        );
+        assert!(spec.stdin_payload.is_none());
         assert_eq!(spec.output_protocol, OutputProtocol::JsonLines);
+        assert!(spec.environment.is_empty());
+        assert!(spec.environment_remove.is_empty());
     }
 }

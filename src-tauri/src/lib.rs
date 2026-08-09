@@ -59,6 +59,7 @@ mod test_runner;
 mod validator_contract;
 mod validator_registry;
 mod validators;
+mod vision_review;
 mod workflow_resolution;
 mod workload_policy;
 use crate::pipeline::PipelineState;
@@ -334,6 +335,7 @@ pub fn run() {
             crate::commands::runtime_mutations::acknowledge_execution_recovery_runtime,
             crate::commands::runtime_mutations::resolve_human_recovery_runtime,
             crate::commands::runtime_mutations::approve_milestone_outcome_runtime,
+            crate::commands::runtime_mutations::update_human_review_policy_runtime,
             crate::commands::runtime_mutations::summarize_milestone_runtime,
             crate::commands::runtime_mutations::generate_milestone_draft_runtime,
             crate::commands::runtime_mutations::regenerate_milestone_draft_runtime,

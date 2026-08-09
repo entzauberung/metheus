@@ -4,15 +4,17 @@ use crate::constants::{
     DECISION_CREDENTIAL_ACCOUNT, DEEPSEEK_API_TIMEOUT_SECS, DEEPSEEK_API_URL,
     DEEPSEEK_WORKFLOW_MODEL, DEFAULT_BUILTIN_GROK_BUILD_API_BASE_URL,
     DEFAULT_BUILTIN_GROK_BUILD_MAX_TURNS, DEFAULT_BUILTIN_GROK_BUILD_MODEL,
-    EXECUTION_ENGINE_TIMEOUT_SECS, LEGACY_BUILTIN_GROK_BUILD_API_KEY_ENV,
-    LEGACY_DECISION_API_KEY_ENV, UPSTREAM_GROK_API_KEY_ENV,
+    DEFAULT_VISION_MAX_IMAGES, DEFAULT_VISION_MAX_IMAGE_BYTES, DEFAULT_VISION_MAX_TOTAL_BYTES,
+    DEFAULT_VISION_MODEL, DEFAULT_VISION_MODEL_REQUEST_URL, EXECUTION_ENGINE_TIMEOUT_SECS,
+    LEGACY_BUILTIN_GROK_BUILD_API_KEY_ENV, LEGACY_DECISION_API_KEY_ENV, UPSTREAM_GROK_API_KEY_ENV,
+    VISION_MODEL_CREDENTIAL_ACCOUNT,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-const SETTINGS_SCHEMA_VERSION: u32 = 2;
+const SETTINGS_SCHEMA_VERSION: u32 = 3;
 const MIN_TIMEOUT_SECS: u64 = 5;
 const MAX_TIMEOUT_SECS: u64 = 3_600;
 const MAX_MODEL_CHARS: usize = 200;
@@ -94,6 +96,32 @@ impl Default for BuiltInGrokBuildSettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct VisionModelSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    pub request_url: String,
+    pub model: String,
+    pub timeout_secs: u64,
+    pub max_image_bytes: u64,
+    pub max_total_bytes: u64,
+    pub max_images: u32,
+}
+
+impl Default for VisionModelSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            request_url: DEFAULT_VISION_MODEL_REQUEST_URL.to_string(),
+            model: DEFAULT_VISION_MODEL.to_string(),
+            timeout_secs: DEEPSEEK_API_TIMEOUT_SECS,
+            max_image_bytes: DEFAULT_VISION_MAX_IMAGE_BYTES,
+            max_total_bytes: DEFAULT_VISION_MAX_TOTAL_BYTES,
+            max_images: DEFAULT_VISION_MAX_IMAGES,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawAppSettings {
     #[serde(default = "default_schema_version")]
@@ -108,6 +136,8 @@ struct RawAppSettings {
     built_in_grok: Option<LegacyBuiltInGrokSettings>,
     #[serde(default)]
     plugin_cli: PluginCliSettings,
+    #[serde(default)]
+    vision_model: VisionModelSettings,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +166,12 @@ impl From<LegacyBuiltInGrokSettings> for BuiltInGrokBuildSettings {
 fn decode_settings(content: &str) -> Result<(AppSettings, Option<String>), String> {
     let raw: RawAppSettings =
         serde_json::from_str(content).map_err(|error| format!("解析失败：{error}"))?;
+    if raw.schema_version > SETTINGS_SCHEMA_VERSION {
+        return Err(format!(
+            "应用设置版本 {} 高于当前支持版本 {}，请升级 Metheus 后重试",
+            raw.schema_version, SETTINGS_SCHEMA_VERSION
+        ));
+    }
     let (built_in_grok_build, warning) = match (raw.built_in_grok_build, raw.built_in_grok) {
         (Some(current), Some(_)) => (
             current,
@@ -154,6 +190,7 @@ fn decode_settings(content: &str) -> Result<(AppSettings, Option<String>), Strin
         decision_model: raw.decision_model,
         built_in_grok_build,
         plugin_cli: raw.plugin_cli,
+        vision_model: raw.vision_model,
     })?;
     Ok((settings, warning))
 }
@@ -182,6 +219,8 @@ pub(crate) struct AppSettings {
     pub built_in_grok_build: BuiltInGrokBuildSettings,
     #[serde(default)]
     pub plugin_cli: PluginCliSettings,
+    #[serde(default)]
+    pub vision_model: VisionModelSettings,
 }
 
 impl Default for AppSettings {
@@ -192,6 +231,7 @@ impl Default for AppSettings {
             decision_model: DecisionModelSettings::default(),
             built_in_grok_build: BuiltInGrokBuildSettings::default(),
             plugin_cli: PluginCliSettings::default(),
+            vision_model: VisionModelSettings::default(),
         }
     }
 }
@@ -209,6 +249,7 @@ pub(crate) struct AppSettingsInput {
     pub decision_model: DecisionModelSettings,
     pub built_in_grok_build: BuiltInGrokBuildSettings,
     pub plugin_cli: PluginCliSettings,
+    pub vision_model: VisionModelSettings,
 }
 
 impl From<AppSettings> for AppSettingsInput {
@@ -217,6 +258,7 @@ impl From<AppSettings> for AppSettingsInput {
             decision_model: settings.decision_model,
             built_in_grok_build: settings.built_in_grok_build,
             plugin_cli: settings.plugin_cli,
+            vision_model: settings.vision_model,
         }
     }
 }
@@ -225,6 +267,7 @@ impl From<AppSettings> for AppSettingsInput {
 pub(crate) enum SecretTarget {
     DecisionModel,
     BuiltInGrokBuild,
+    VisionModel,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -271,6 +314,7 @@ pub(crate) struct AppSettingsView {
     pub settings: AppSettings,
     pub decision_secret: SecretStatus,
     pub built_in_grok_build_secret: SecretStatus,
+    pub vision_model_secret: SecretStatus,
     pub load_warning: Option<String>,
 }
 
@@ -278,6 +322,7 @@ pub(crate) struct AppSettingsView {
 pub(crate) enum ModelConnectionTarget {
     DecisionModel,
     BuiltInGrokBuild,
+    VisionModel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -308,6 +353,7 @@ pub(crate) struct ConnectionTestResult {
 struct RuntimeSecrets {
     decision_model: Option<RuntimeSecret>,
     built_in_grok_build: Option<RuntimeSecret>,
+    vision_model: Option<RuntimeSecret>,
 }
 
 #[derive(Debug, Clone)]
@@ -328,6 +374,8 @@ struct RuntimeState {
     secrets: RuntimeSecrets,
     load_warning: Option<String>,
     preserve_corrupt_file: bool,
+    disk_fingerprint: Option<String>,
+    write_blocked_reason: Option<String>,
     active_decision_requests: usize,
     active_engine_operations: usize,
 }
@@ -393,6 +441,13 @@ pub(crate) struct BuiltInGrokBuildRequestSnapshot {
     pub _activity: ActivityGuard,
 }
 
+pub(crate) struct VisionRequestSnapshot {
+    pub settings_revision: u64,
+    pub settings: VisionModelSettings,
+    pub api_key: String,
+    pub _activity: ActivityGuard,
+}
+
 pub(crate) fn settings_path() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "无法获取用户家目录路径".to_string())?;
     Ok(home.join(APP_SETTINGS_RELATIVE_PATH))
@@ -410,29 +465,44 @@ pub(crate) fn initialize_settings() -> Result<(), String> {
 }
 
 fn load_store(path: PathBuf) -> SettingsStore {
-    let (settings, load_warning, preserve_corrupt_file) = if !path.exists() {
-        (AppSettings::default(), None, false)
-    } else {
-        match std::fs::read_to_string(&path) {
-            Ok(content) => match decode_settings(&content) {
-                Ok((settings, warning)) => (settings, warning, false),
+    let (settings, load_warning, preserve_corrupt_file, disk_fingerprint, write_blocked_reason) =
+        if !path.exists() {
+            (AppSettings::default(), None, false, None, None)
+        } else {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    let fingerprint = Some(settings_content_fingerprint(&content));
+                    match decode_settings(&content) {
+                        Ok((settings, warning)) => (settings, warning, false, fingerprint, None),
+                        Err(error) => {
+                            let write_blocked_reason = future_schema_version(&content).map(|version| {
+                            format!(
+                                "磁盘设置版本 {version} 高于当前支持版本 {SETTINGS_SCHEMA_VERSION}，拒绝覆盖"
+                            )
+                        });
+                            (
+                                AppSettings::default(),
+                                Some(format!(
+                                    "应用设置文件无效，已使用默认设置；原文件保持不变：{error}"
+                                )),
+                                true,
+                                fingerprint,
+                                write_blocked_reason,
+                            )
+                        }
+                    }
+                }
                 Err(error) => (
                     AppSettings::default(),
                     Some(format!(
-                        "应用设置文件无效，已使用默认设置；原文件保持不变：{error}"
+                        "无法读取应用设置，已使用默认设置；原文件保持不变：{error}"
                     )),
                     true,
+                    None,
+                    Some("磁盘设置文件无法读取，拒绝覆盖".to_string()),
                 ),
-            },
-            Err(error) => (
-                AppSettings::default(),
-                Some(format!(
-                    "无法读取应用设置，已使用默认设置；原文件保持不变：{error}"
-                )),
-                true,
-            ),
-        }
-    };
+            }
+        };
 
     SettingsStore {
         path,
@@ -441,13 +511,28 @@ fn load_store(path: PathBuf) -> SettingsStore {
             secrets: RuntimeSecrets {
                 decision_model: None,
                 built_in_grok_build: None,
+                vision_model: None,
             },
             load_warning,
             preserve_corrupt_file,
+            disk_fingerprint,
+            write_blocked_reason,
             active_decision_requests: 0,
             active_engine_operations: 0,
         }),
     }
+}
+
+fn settings_content_fingerprint(content: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(content.as_bytes()))
+}
+
+fn future_schema_version(content: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()?
+        .get("schema_version")?
+        .as_u64()
+        .filter(|version| *version > SETTINGS_SCHEMA_VERSION as u64)
 }
 
 fn store() -> Result<&'static SettingsStore, String> {
@@ -457,6 +542,12 @@ fn store() -> Result<&'static SettingsStore, String> {
 }
 
 fn normalize_settings(mut settings: AppSettings) -> Result<AppSettings, String> {
+    if settings.schema_version > SETTINGS_SCHEMA_VERSION {
+        return Err(format!(
+            "应用设置版本 {} 高于当前支持版本 {}，拒绝降级覆盖",
+            settings.schema_version, SETTINGS_SCHEMA_VERSION
+        ));
+    }
     settings.schema_version = SETTINGS_SCHEMA_VERSION;
     if settings.revision == 0 {
         settings.revision = default_settings_revision();
@@ -471,12 +562,28 @@ fn normalize_settings(mut settings: AppSettings) -> Result<AppSettings, String> 
         "预装 Grok Build 接口地址",
         true,
     )?;
+    settings.vision_model.request_url = normalize_url(
+        &settings.vision_model.request_url,
+        "视觉模型请求地址",
+        false,
+    )?;
     validate_model(&settings.decision_model.model, "决策模型")?;
     validate_model(&settings.built_in_grok_build.model, "预装 Grok Build 模型")?;
+    validate_model(&settings.vision_model.model, "视觉模型")?;
     validate_timeout(settings.decision_model.timeout_secs, "决策模型")?;
     validate_timeout(settings.built_in_grok_build.timeout_secs, "预装 Grok Build")?;
+    validate_timeout(settings.vision_model.timeout_secs, "视觉模型")?;
     if !(1..=500).contains(&settings.built_in_grok_build.max_turns) {
         return Err("预装 Grok Build 最大执行轮数必须在 1 到 500 之间".to_string());
+    }
+    if settings.vision_model.max_image_bytes == 0
+        || settings.vision_model.max_total_bytes < settings.vision_model.max_image_bytes
+        || settings.vision_model.max_total_bytes > 100 * 1024 * 1024
+    {
+        return Err("视觉图片大小限制无效".to_string());
+    }
+    if !(1..=20).contains(&settings.vision_model.max_images) {
+        return Err("视觉图片数量必须在 1 到 20 之间".to_string());
     }
     normalize_plugin_paths(&mut settings.plugin_cli);
     Ok(settings)
@@ -564,6 +671,7 @@ fn secret_from_environment(target: &SecretTarget) -> Option<(String, SecretSourc
             ),
             (UPSTREAM_GROK_API_KEY_ENV, SecretSource::LegacyEnvironment),
         ],
+        SecretTarget::VisionModel => &[],
     };
     for (variable, source) in variables {
         let Ok(value) = std::env::var(variable) else {
@@ -580,6 +688,7 @@ fn credential_account(target: &SecretTarget) -> &'static str {
     match target {
         SecretTarget::DecisionModel => DECISION_CREDENTIAL_ACCOUNT,
         SecretTarget::BuiltInGrokBuild => BUILTIN_GROK_BUILD_CREDENTIAL_ACCOUNT,
+        SecretTarget::VisionModel => VISION_MODEL_CREDENTIAL_ACCOUNT,
     }
 }
 
@@ -610,9 +719,34 @@ fn delete_credential(target: &SecretTarget) -> Result<(), String> {
 }
 
 fn restore_credential(rollback: &SecretRollback) -> Result<(), String> {
+    restore_credential_with_store(rollback, write_credential, delete_credential)
+}
+
+fn restore_credential_with_store<Write, Delete>(
+    rollback: &SecretRollback,
+    mut write: Write,
+    mut delete: Delete,
+) -> Result<(), String>
+where
+    Write: FnMut(&SecretTarget, &str) -> Result<(), String>,
+    Delete: FnMut(&SecretTarget) -> Result<(), String>,
+{
     match rollback.previous.as_deref() {
-        Some(value) => write_credential(&rollback.target, value),
-        None => delete_credential(&rollback.target),
+        Some(value) => write(&rollback.target, value),
+        None => delete(&rollback.target),
+    }
+}
+
+fn credential_error_after_rollback(error: String, rollbacks: &[Option<&SecretRollback>]) -> String {
+    let rollback_errors = rollbacks
+        .iter()
+        .flatten()
+        .filter_map(|rollback| restore_credential(rollback).err())
+        .collect::<Vec<_>>();
+    if rollback_errors.is_empty() {
+        error
+    } else {
+        format!("{error}；恢复系统凭据失败：{}", rollback_errors.join("；"))
     }
 }
 
@@ -620,9 +754,14 @@ fn secret_value(
     state: &RuntimeState,
     target: &SecretTarget,
 ) -> Result<Option<(String, SecretSource)>, String> {
+    if *target == SecretTarget::VisionModel {
+        return credential_value(target)
+            .map(|value| value.map(|value| (value, SecretSource::SystemCredentialStore)));
+    }
     let session = match target {
         SecretTarget::DecisionModel => state.secrets.decision_model.as_ref(),
         SecretTarget::BuiltInGrokBuild => state.secrets.built_in_grok_build.as_ref(),
+        SecretTarget::VisionModel => state.secrets.vision_model.as_ref(),
     };
     if let Some(secret) = session {
         return Ok(Some((secret.value.clone(), secret.source.clone())));
@@ -640,9 +779,38 @@ fn secret_value(
 }
 
 fn secret_status(state: &RuntimeState, target: SecretTarget) -> SecretStatus {
+    if target == SecretTarget::VisionModel {
+        return match credential_value(&target) {
+            Ok(Some(_)) => SecretStatus {
+                configured: true,
+                source: SecretSource::SystemCredentialStore,
+                hint: "由系统凭据库提供".to_string(),
+                persistent_available: true,
+                persisted: true,
+                persistence_error: None,
+            },
+            Ok(None) => SecretStatus {
+                configured: false,
+                source: SecretSource::Missing,
+                hint: "未配置".to_string(),
+                persistent_available: true,
+                persisted: false,
+                persistence_error: None,
+            },
+            Err(error) => SecretStatus {
+                configured: false,
+                source: SecretSource::Missing,
+                hint: "系统凭据库不可用".to_string(),
+                persistent_available: false,
+                persisted: false,
+                persistence_error: Some(error),
+            },
+        };
+    }
     let session = match target {
         SecretTarget::DecisionModel => state.secrets.decision_model.as_ref(),
         SecretTarget::BuiltInGrokBuild => state.secrets.built_in_grok_build.as_ref(),
+        SecretTarget::VisionModel => state.secrets.vision_model.as_ref(),
     };
     if let Some(secret) = session {
         let persisted = secret.source == SecretSource::SystemCredentialStore;
@@ -706,6 +874,7 @@ fn view_from_state(state: &RuntimeState) -> AppSettingsView {
         settings: state.settings.clone(),
         decision_secret: secret_status(state, SecretTarget::DecisionModel),
         built_in_grok_build_secret: secret_status(state, SecretTarget::BuiltInGrokBuild),
+        vision_model_secret: secret_status(state, SecretTarget::VisionModel),
         load_warning: state.load_warning.clone(),
     }
 }
@@ -739,37 +908,85 @@ fn apply_secret_mutation(
     current: &mut Option<RuntimeSecret>,
     mutation: SecretMutation,
 ) -> Result<(bool, Option<SecretRollback>), String> {
+    apply_secret_mutation_with_store(
+        target,
+        current,
+        mutation,
+        credential_value,
+        write_credential,
+        delete_credential,
+    )
+}
+
+fn apply_secret_mutation_with_store<Read, Write, Delete>(
+    target: SecretTarget,
+    current: &mut Option<RuntimeSecret>,
+    mutation: SecretMutation,
+    mut read: Read,
+    mut write: Write,
+    mut delete: Delete,
+) -> Result<(bool, Option<SecretRollback>), String>
+where
+    Read: FnMut(&SecretTarget) -> Result<Option<String>, String>,
+    Write: FnMut(&SecretTarget, &str) -> Result<(), String>,
+    Delete: FnMut(&SecretTarget) -> Result<(), String>,
+{
     match mutation {
         SecretMutation::Unchanged => Ok((false, None)),
         SecretMutation::Replace { value, persistence } => {
-            let value = validate_secret(value)?;
-            if current.as_ref().is_some_and(|secret| {
-                secret.value == value
-                    && secret.source
-                        == match persistence {
-                            SecretPersistence::SecureStore => SecretSource::SystemCredentialStore,
-                            SecretPersistence::SessionOnly => SecretSource::Session,
-                        }
-            }) {
-                return Ok((false, None));
+            if target == SecretTarget::VisionModel && persistence == SecretPersistence::SessionOnly
+            {
+                return Err("视觉模型 API Key 只允许保存到系统凭据库，不支持仅会话使用".to_string());
             }
+            let value = validate_secret(value)?;
             let (source, rollback) = match persistence {
                 SecretPersistence::SecureStore => {
-                    let previous = credential_value(&target)?;
-                    write_credential(&target, &value)?;
+                    let previous = read(&target)?;
+                    let current_matches = current.as_ref().is_some_and(|secret| {
+                        secret.value == value
+                            && secret.source == SecretSource::SystemCredentialStore
+                    });
+                    if previous.as_deref() == Some(value.as_str()) && current_matches {
+                        return Ok((false, None));
+                    }
+                    let changed_credential = previous.as_deref() != Some(value.as_str());
+                    if changed_credential {
+                        write(&target, &value)?;
+                    }
                     (
                         SecretSource::SystemCredentialStore,
-                        Some(SecretRollback { target, previous }),
+                        changed_credential.then(|| SecretRollback {
+                            target: target.clone(),
+                            previous,
+                        }),
                     )
                 }
-                SecretPersistence::SessionOnly => (SecretSource::Session, None),
+                SecretPersistence::SessionOnly => {
+                    let previous = read(&target)?;
+                    let current_matches = current.as_ref().is_some_and(|secret| {
+                        secret.value == value && secret.source == SecretSource::Session
+                    });
+                    if previous.is_none() && current_matches {
+                        return Ok((false, None));
+                    }
+                    if previous.is_some() {
+                        delete(&target)?;
+                    }
+                    (
+                        SecretSource::Session,
+                        previous.map(|previous| SecretRollback {
+                            target: target.clone(),
+                            previous: Some(previous),
+                        }),
+                    )
+                }
             };
             *current = Some(RuntimeSecret { value, source });
             Ok((true, rollback))
         }
         SecretMutation::Clear => {
-            let previous = credential_value(&target)?;
-            delete_credential(&target)?;
+            let previous = read(&target)?;
+            delete(&target)?;
             let changed = current.take().is_some() || previous.is_some();
             Ok((changed, Some(SecretRollback { target, previous })))
         }
@@ -781,6 +998,7 @@ pub(crate) fn update_settings(
     input: AppSettingsInput,
     decision_secret: SecretMutation,
     built_in_grok_build_secret: SecretMutation,
+    vision_model_secret: SecretMutation,
 ) -> Result<AppSettingsView, String> {
     let store = store()?;
     let mut state = store
@@ -795,11 +1013,22 @@ pub(crate) fn update_settings(
         decision_model: input.decision_model,
         built_in_grok_build: input.built_in_grok_build,
         plugin_cli: input.plugin_cli,
+        vision_model: input.vision_model,
     };
     next_settings = normalize_settings(next_settings)?;
     let settings_changed = next_settings.decision_model != state.settings.decision_model
         || next_settings.built_in_grok_build != state.settings.built_in_grok_build
         || next_settings.plugin_cli != state.settings.plugin_cli;
+    let settings_changed =
+        settings_changed || next_settings.vision_model != state.settings.vision_model;
+
+    let _disk_lock = acquire_settings_write_lock(&store.path)?;
+    verify_settings_disk_snapshot(
+        &store.path,
+        state.settings.revision,
+        state.disk_fingerprint.as_deref(),
+        state.preserve_corrupt_file,
+    )?;
 
     let mut next_secrets = state.secrets.clone();
     let (decision_changed, decision_rollback) = apply_secret_mutation(
@@ -814,40 +1043,55 @@ pub(crate) fn update_settings(
     ) {
         Ok(result) => result,
         Err(error) => {
-            if let Some(rollback) = decision_rollback.as_ref() {
-                let _ = restore_credential(rollback);
-            }
-            return Err(error);
+            return Err(credential_error_after_rollback(
+                error,
+                &[decision_rollback.as_ref()],
+            ));
         }
     };
-    if !settings_changed && !decision_changed && !grok_changed {
+    let (vision_changed, vision_rollback) = match apply_secret_mutation(
+        SecretTarget::VisionModel,
+        &mut next_secrets.vision_model,
+        vision_model_secret,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            return Err(credential_error_after_rollback(
+                error,
+                &[grok_rollback.as_ref(), decision_rollback.as_ref()],
+            ));
+        }
+    };
+    if !settings_changed && !decision_changed && !grok_changed && !vision_changed {
         return Ok(view_from_state(&state));
     }
 
     next_settings.revision = state.settings.revision.saturating_add(1);
-    if let Err(error) = persist_settings(&store.path, &next_settings, state.preserve_corrupt_file) {
-        let mut rollback_errors = Vec::new();
-        for rollback in [grok_rollback.as_ref(), decision_rollback.as_ref()]
-            .into_iter()
-            .flatten()
-        {
-            if let Err(rollback_error) = restore_credential(rollback) {
-                rollback_errors.push(rollback_error);
-            }
+    let persisted_fingerprint = match persist_settings_if_snapshot(
+        &store.path,
+        &next_settings,
+        state.preserve_corrupt_file,
+        state.settings.revision,
+        state.disk_fingerprint.as_deref(),
+    ) {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            return Err(credential_error_after_rollback(
+                error,
+                &[
+                    vision_rollback.as_ref(),
+                    grok_rollback.as_ref(),
+                    decision_rollback.as_ref(),
+                ],
+            ));
         }
-        return if rollback_errors.is_empty() {
-            Err(error)
-        } else {
-            Err(format!(
-                "{error}；恢复系统凭据失败：{}",
-                rollback_errors.join("；")
-            ))
-        };
-    }
+    };
     state.settings = next_settings;
     state.secrets = next_secrets;
     state.load_warning = None;
     state.preserve_corrupt_file = false;
+    state.disk_fingerprint = Some(persisted_fingerprint);
+    state.write_blocked_reason = None;
     Ok(view_from_state(&state))
 }
 
@@ -868,10 +1112,22 @@ pub(crate) fn replace_secret(
                 persistence,
             },
             SecretMutation::Unchanged,
+            SecretMutation::Unchanged,
         ),
         SecretTarget::BuiltInGrokBuild => update_settings(
             expected_revision,
             input,
+            SecretMutation::Unchanged,
+            SecretMutation::Replace {
+                value: secret,
+                persistence,
+            },
+            SecretMutation::Unchanged,
+        ),
+        SecretTarget::VisionModel => update_settings(
+            expected_revision,
+            input,
+            SecretMutation::Unchanged,
             SecretMutation::Unchanged,
             SecretMutation::Replace {
                 value: secret,
@@ -893,10 +1149,19 @@ pub(crate) fn clear_secret(
             input,
             SecretMutation::Clear,
             SecretMutation::Unchanged,
+            SecretMutation::Unchanged,
         ),
         SecretTarget::BuiltInGrokBuild => update_settings(
             expected_revision,
             input,
+            SecretMutation::Unchanged,
+            SecretMutation::Clear,
+            SecretMutation::Unchanged,
+        ),
+        SecretTarget::VisionModel => update_settings(
+            expected_revision,
+            input,
+            SecretMutation::Unchanged,
             SecretMutation::Unchanged,
             SecretMutation::Clear,
         ),
@@ -904,6 +1169,9 @@ pub(crate) fn clear_secret(
 }
 
 fn ensure_update_allowed(state: &RuntimeState, expected_revision: u64) -> Result<(), String> {
+    if let Some(reason) = &state.write_blocked_reason {
+        return Err(reason.clone());
+    }
     if state.settings.revision != expected_revision {
         return Err(format!(
             "应用设置已更新，请同步后重试（当前修订 {}，请求修订 {}）",
@@ -999,6 +1267,28 @@ pub(crate) fn begin_built_in_grok_build_request() -> Result<BuiltInGrokBuildRequ
     result
 }
 
+pub(crate) fn begin_vision_request() -> Result<VisionRequestSnapshot, String> {
+    let activity = begin_activity(ActivityKind::DecisionRequest)?;
+    (|| {
+        let state = store()?
+            .state
+            .lock()
+            .map_err(|_| "应用设置锁已损坏".to_string())?;
+        if !state.settings.vision_model.enabled {
+            return Err("视觉模型辅助未启用".to_string());
+        }
+        let api_key = secret_value(&state, &SecretTarget::VisionModel)?
+            .map(|(value, _)| value)
+            .ok_or_else(|| "视觉模型 API Key 未配置；请在应用设置中安全保存".to_string())?;
+        Ok(VisionRequestSnapshot {
+            settings_revision: state.settings.revision,
+            settings: state.settings.vision_model.clone(),
+            api_key,
+            _activity: activity,
+        })
+    })()
+}
+
 fn persist_settings(
     path: &Path,
     settings: &AppSettings,
@@ -1033,6 +1323,95 @@ fn persist_settings(
         return Err(error);
     }
     Ok(())
+}
+
+struct SettingsWriteLock {
+    path: PathBuf,
+}
+
+impl Drop for SettingsWriteLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn settings_write_lock_path(path: &Path) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "app-settings.json".into());
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+fn acquire_settings_write_lock(path: &Path) -> Result<SettingsWriteLock, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "应用设置路径缺少父目录".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("创建设置目录失败：{error}"))?;
+    let lock_path = settings_write_lock_path(path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .map_err(|error| format!("另一个进程正在保存应用设置，当前写入已取消：{error}"))?;
+    Ok(SettingsWriteLock { path: lock_path })
+}
+
+fn verify_settings_disk_snapshot(
+    path: &Path,
+    expected_revision: u64,
+    expected_fingerprint: Option<&str>,
+    allow_known_corrupt_file: bool,
+) -> Result<(), String> {
+    let content = match (expected_fingerprint, path.exists()) {
+        (None, false) => return Ok(()),
+        (None, true) => {
+            return Err("应用设置磁盘冲突：加载后出现了新的设置文件，请同步后重试".to_string())
+        }
+        (Some(_), false) => {
+            return Err("应用设置磁盘冲突：已加载的设置文件被外部删除，请同步后重试".to_string())
+        }
+        (Some(_), true) => std::fs::read_to_string(path)
+            .map_err(|error| format!("复核应用设置磁盘状态失败：{error}"))?,
+    };
+    let actual_fingerprint = settings_content_fingerprint(&content);
+    if expected_fingerprint != Some(actual_fingerprint.as_str()) {
+        return Err("应用设置磁盘冲突：文件已被其他进程修改，请同步后重试".to_string());
+    }
+    if let Some(version) = future_schema_version(&content) {
+        return Err(format!(
+            "磁盘设置版本 {version} 高于当前支持版本 {SETTINGS_SCHEMA_VERSION}，拒绝覆盖"
+        ));
+    }
+    match decode_settings(&content) {
+        Ok((settings, _)) if settings.revision == expected_revision => Ok(()),
+        Ok((settings, _)) => Err(format!(
+            "应用设置磁盘修订冲突：加载修订 {expected_revision}，磁盘修订 {}",
+            settings.revision
+        )),
+        Err(_) if allow_known_corrupt_file => Ok(()),
+        Err(error) => Err(format!("应用设置磁盘内容无法安全复核：{error}")),
+    }
+}
+
+fn persist_settings_if_snapshot(
+    path: &Path,
+    settings: &AppSettings,
+    preserve_corrupt_file: bool,
+    expected_revision: u64,
+    expected_fingerprint: Option<&str>,
+) -> Result<String, String> {
+    verify_settings_disk_snapshot(
+        path,
+        expected_revision,
+        expected_fingerprint,
+        preserve_corrupt_file,
+    )?;
+    persist_settings(path, settings, preserve_corrupt_file)?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| format!("复核已保存应用设置失败：{error}"))?;
+    Ok(settings_content_fingerprint(&content))
 }
 
 #[cfg(not(windows))]
@@ -1132,6 +1511,285 @@ mod tests {
     }
 
     #[test]
+    fn v2_settings_upgrade_to_v3_without_losing_existing_models_or_plugin_paths(
+    ) -> Result<(), String> {
+        let v2 = serde_json::json!({
+            "schema_version": 2,
+            "revision": 11,
+            "decision_model": {
+                "request_url": "https://decision.example/v1/chat/completions",
+                "model": "decision-custom",
+                "timeout_secs": 77,
+                "structured_output": "PromptOnly"
+            },
+            "built_in_grok_build": {
+                "api_backend": "Messages",
+                "api_base_url": "https://grok.example/v1",
+                "model": "grok-custom",
+                "timeout_secs": 88,
+                "max_turns": 19
+            },
+            "plugin_cli": {
+                "claude_code_path": "/tools/claude",
+                "codex_path": "/tools/codex",
+                "kimi_path": "/tools/kimi",
+                "grok_path": "/tools/grok"
+            }
+        });
+
+        let (settings, _) = decode_settings(&v2.to_string())?;
+
+        assert_eq!(settings.schema_version, 3);
+        assert_eq!(settings.revision, 11);
+        assert_eq!(settings.decision_model.model, "decision-custom");
+        assert_eq!(settings.decision_model.timeout_secs, 77);
+        assert_eq!(settings.built_in_grok_build.model, "grok-custom");
+        assert_eq!(settings.built_in_grok_build.max_turns, 19);
+        assert_eq!(
+            settings.built_in_grok_build.api_backend,
+            GrokBuildApiBackend::Messages
+        );
+        assert_eq!(
+            settings.plugin_cli.claude_code_path.as_deref(),
+            Some("/tools/claude")
+        );
+        assert_eq!(
+            settings.plugin_cli.codex_path.as_deref(),
+            Some("/tools/codex")
+        );
+        assert_eq!(
+            settings.plugin_cli.kimi_path.as_deref(),
+            Some("/tools/kimi")
+        );
+        assert_eq!(
+            settings.plugin_cli.grok_path.as_deref(),
+            Some("/tools/grok")
+        );
+        assert!(!settings.vision_model.enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn v3_settings_preserve_known_vision_fields() -> Result<(), String> {
+        let v3 = serde_json::json!({
+            "schema_version": 3,
+            "revision": 12,
+            "vision_model": {
+                "enabled": true,
+                "request_url": "https://vision.example/v1/chat/completions",
+                "model": "vision-custom",
+                "timeout_secs": 91,
+                "max_image_bytes": 1048576,
+                "max_total_bytes": 4194304,
+                "max_images": 4
+            }
+        });
+
+        let (settings, _) = decode_settings(&v3.to_string())?;
+        assert_eq!(settings.schema_version, 3);
+        assert_eq!(settings.revision, 12);
+        assert!(settings.vision_model.enabled);
+        assert_eq!(settings.vision_model.model, "vision-custom");
+        assert_eq!(settings.vision_model.max_images, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn future_schema_is_rejected_and_disk_file_stays_byte_identical() -> Result<(), String> {
+        let directory = TestDirectory::new("future-schema")?;
+        let path = directory.path.join("app-settings.json");
+        let original = r#"{"schema_version":4,"revision":99,"future":{"keep":true}}"#;
+        std::fs::write(&path, original).map_err(|error| error.to_string())?;
+
+        let store = load_store(path.clone());
+        let state = store
+            .state
+            .lock()
+            .map_err(|_| "测试设置锁已损坏".to_string())?;
+        assert!(state.preserve_corrupt_file);
+        assert!(state
+            .load_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("高于当前支持版本")));
+        assert!(state.write_blocked_reason.is_some());
+        assert!(ensure_update_allowed(&state, state.settings.revision)
+            .unwrap_err()
+            .contains("拒绝覆盖"));
+        drop(state);
+        assert_eq!(
+            std::fs::read_to_string(path).map_err(|error| error.to_string())?,
+            original
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disk_snapshot_cas_rejects_external_revision_without_overwrite() -> Result<(), String> {
+        let directory = TestDirectory::new("disk-cas")?;
+        let path = directory.path.join("app-settings.json");
+        let mut initial = AppSettings::default();
+        initial.revision = 7;
+        initial.decision_model.model = "initial-model".to_string();
+        persist_settings(&path, &initial, false)?;
+        let loaded_content = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let loaded_fingerprint = settings_content_fingerprint(&loaded_content);
+
+        let mut external = initial.clone();
+        external.revision = 8;
+        external.decision_model.model = "external-winner".to_string();
+        persist_settings(&path, &external, false)?;
+
+        let mut attempted = initial;
+        attempted.revision = 8;
+        attempted.decision_model.model = "stale-local".to_string();
+        let _lock = acquire_settings_write_lock(&path)?;
+        let error =
+            persist_settings_if_snapshot(&path, &attempted, false, 7, Some(&loaded_fingerprint))
+                .unwrap_err();
+        assert!(error.contains("磁盘冲突"));
+        let disk = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        let (decoded, _) = decode_settings(&disk)?;
+        assert_eq!(decoded.revision, 8);
+        assert_eq!(decoded.decision_model.model, "external-winner");
+        assert!(!disk.contains("stale-local"));
+        Ok(())
+    }
+
+    #[test]
+    fn vision_secret_policy_rejects_session_and_environment_sources_without_store_access() {
+        assert!(secret_from_environment(&SecretTarget::VisionModel).is_none());
+        let mut current = Some(RuntimeSecret {
+            value: "legacy-session-secret".to_string(),
+            source: SecretSource::Session,
+        });
+        let original = current.clone();
+        let error = apply_secret_mutation_with_store(
+            SecretTarget::VisionModel,
+            &mut current,
+            SecretMutation::Replace {
+                value: "new-vision-secret".to_string(),
+                persistence: SecretPersistence::SessionOnly,
+            },
+            |_| panic!("SessionOnly 拒绝不得读取凭据库"),
+            |_, _| panic!("SessionOnly 拒绝不得写入凭据库"),
+            |_| panic!("SessionOnly 拒绝不得删除凭据库"),
+        )
+        .unwrap_err();
+        assert!(error.contains("只允许保存到系统凭据库"));
+        assert_eq!(
+            current.as_ref().map(|secret| &secret.value),
+            original.as_ref().map(|secret| &secret.value)
+        );
+        assert_eq!(
+            current.as_ref().map(|secret| &secret.source),
+            original.as_ref().map(|secret| &secret.source)
+        );
+    }
+
+    #[test]
+    fn persistence_change_deletes_old_credential_and_delete_failure_keeps_memory(
+    ) -> Result<(), String> {
+        use std::cell::RefCell;
+
+        let credential = RefCell::new(Some("persisted-old".to_string()));
+        let mut current = Some(RuntimeSecret {
+            value: "persisted-old".to_string(),
+            source: SecretSource::SystemCredentialStore,
+        });
+        let (changed, rollback) = apply_secret_mutation_with_store(
+            SecretTarget::DecisionModel,
+            &mut current,
+            SecretMutation::Replace {
+                value: "session-new".to_string(),
+                persistence: SecretPersistence::SessionOnly,
+            },
+            |_| Ok(credential.borrow().clone()),
+            |_, value| {
+                *credential.borrow_mut() = Some(value.to_string());
+                Ok(())
+            },
+            |_| {
+                credential.borrow_mut().take();
+                Ok(())
+            },
+        )?;
+        assert!(changed);
+        assert!(credential.borrow().is_none());
+        assert_eq!(
+            current.as_ref().map(|secret| &secret.source),
+            Some(&SecretSource::Session)
+        );
+        assert_eq!(
+            rollback.and_then(|value| value.previous),
+            Some("persisted-old".to_string())
+        );
+
+        let mut unchanged = Some(RuntimeSecret {
+            value: "persisted-current".to_string(),
+            source: SecretSource::SystemCredentialStore,
+        });
+        let error = apply_secret_mutation_with_store(
+            SecretTarget::DecisionModel,
+            &mut unchanged,
+            SecretMutation::Replace {
+                value: "session-new".to_string(),
+                persistence: SecretPersistence::SessionOnly,
+            },
+            |_| Ok(Some("persisted-current".to_string())),
+            |_, _| Ok(()),
+            |_| Err("isolated delete failure".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(error, "isolated delete failure");
+        assert_eq!(
+            unchanged
+                .as_ref()
+                .map(|secret| (secret.value.as_str(), &secret.source)),
+            Some(("persisted-current", &SecretSource::SystemCredentialStore))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn credential_rollback_restores_previous_or_removes_new_value() -> Result<(), String> {
+        use std::cell::RefCell;
+
+        let stored = RefCell::new(Some("new-value".to_string()));
+        restore_credential_with_store(
+            &SecretRollback {
+                target: SecretTarget::VisionModel,
+                previous: Some("previous-value".to_string()),
+            },
+            |_, value| {
+                *stored.borrow_mut() = Some(value.to_string());
+                Ok(())
+            },
+            |_| {
+                stored.borrow_mut().take();
+                Ok(())
+            },
+        )?;
+        assert_eq!(stored.borrow().as_deref(), Some("previous-value"));
+
+        restore_credential_with_store(
+            &SecretRollback {
+                target: SecretTarget::VisionModel,
+                previous: None,
+            },
+            |_, value| {
+                *stored.borrow_mut() = Some(value.to_string());
+                Ok(())
+            },
+            |_| {
+                stored.borrow_mut().take();
+                Ok(())
+            },
+        )?;
+        assert!(stored.borrow().is_none());
+        Ok(())
+    }
+
+    #[test]
     fn current_built_in_grok_build_field_wins_over_legacy_field() -> Result<(), String> {
         let value = serde_json::json!({
             "built_in_grok_build": {
@@ -1223,9 +1881,12 @@ mod tests {
             secrets: RuntimeSecrets {
                 decision_model: None,
                 built_in_grok_build: None,
+                vision_model: None,
             },
             load_warning: None,
             preserve_corrupt_file: false,
+            disk_fingerprint: None,
+            write_blocked_reason: None,
             active_decision_requests: 0,
             active_engine_operations: 0,
         }

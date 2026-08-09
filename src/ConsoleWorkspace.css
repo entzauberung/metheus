@@ -1,0 +1,256 @@
+.console-workspace {
+  display: grid;
+  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  width: 100%;
+  max-width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: #f6f8fa;
+}
+
+.console-workspace > *,
+.console-command-bar > *,
+.console-command-tools > * {
+  min-width: 0;
+}
+
+.console-workspace-command {
+  grid-column: 1 / -1;
+  min-width: 0;
+  border-bottom: 1px solid #d0d7de;
+  background: #fff;
+}
+
+.console-command-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 12px;
+}
+
+.console-command-bar > .autopilot-control-bar {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+}
+
+.console-command-tools {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 100%;
+}
+
+.console-sync-state {
+  min-width: 0;
+  color: #656d76;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  white-space: nowrap;
+}
+
+.console-sync-state.synced {
+  color: #1a7f37;
+}
+
+.console-workspace-navigator {
+  grid-column: 1;
+  grid-row: 2 / 4;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-right: 1px solid #d0d7de;
+  background: #fff;
+}
+
+.console-navigator {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+}
+
+.console-navigator-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 3px;
+  padding: 8px;
+  border-bottom: 1px solid #d0d7de;
+}
+
+.console-navigator-tabs button {
+  min-width: 0;
+  min-height: 32px;
+  padding: 4px 6px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #57606a;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.console-navigator-tabs button[aria-selected="true"] {
+  background: #ddf4ff;
+  color: #0969da;
+  font-weight: 600;
+}
+
+.console-navigator-body {
+  min-height: 0;
+  overflow: auto;
+}
+
+.console-navigator-body > .execution-tree,
+.console-navigator-body > .file-tree {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  border: 0;
+}
+
+.console-workspace-main {
+  grid-column: 2;
+  grid-row: 2;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  background: #fff;
+}
+
+.console-workspace-main > .execution-main {
+  min-width: 0;
+  min-height: 100%;
+}
+
+.console-workspace-bottom {
+  grid-column: 2;
+  grid-row: 3;
+  min-width: 0;
+  max-width: 100%;
+  max-height: min(42vh, 420px);
+  overflow: hidden;
+  border-top: 1px solid #d0d7de;
+  background: #fff;
+}
+
+.console-bottom-panel,
+.console-bottom-content {
+  min-width: 0;
+  min-height: 0;
+}
+
+.console-bottom-panel.open {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: min(42vh, 420px);
+}
+
+.console-bottom-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  padding: 6px 12px;
+  border: 0;
+  background: #f6f8fa;
+  color: #24292f;
+  font-weight: 600;
+}
+
+.console-bottom-content {
+  max-width: 100%;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 1024px) {
+  .console-workspace {
+    grid-template-columns: minmax(200px, 230px) minmax(0, 1fr);
+  }
+
+  .console-command-bar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .console-command-tools {
+    justify-content: flex-end;
+  }
+}
+
+@media (max-width: 600px) {
+  .console-workspace {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    overflow: hidden;
+  }
+
+  .console-workspace-command,
+  .console-workspace-navigator,
+  .console-workspace-main,
+  .console-workspace-bottom {
+    grid-column: 1;
+  }
+
+  .console-workspace-command { grid-row: 1; }
+  .console-workspace-navigator {
+    grid-row: 2;
+    max-height: 210px;
+    border-right: 0;
+    border-bottom: 1px solid #d0d7de;
+  }
+  .console-workspace-main { grid-row: 3; }
+  .console-workspace-bottom { grid-row: 4; }
+
+  .console-command-tools {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    width: 100%;
+  }
+
+  .console-sync-state {
+    white-space: normal;
+  }
+
+  .console-bottom-panel.open {
+    height: min(36vh, 320px);
+  }
+}
+
+@media (max-width: 420px) {
+  .console-command-bar {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  .console-workspace-navigator {
+    max-height: min(180px, 28vh);
+  }
+
+  .console-navigator-tabs {
+    padding: 6px;
+  }
+
+  .console-command-tools {
+    align-items: center;
+  }
+
+  .console-sync-state {
+    line-height: 1.35;
+  }
+
+  .console-bottom-toggle {
+    padding-inline: 8px;
+  }
+}

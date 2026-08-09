@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Activity, Clock3, Pause, Play, Square, Target } from "lucide-react";
+import { Activity, Clock3, Target } from "lucide-react";
 import { ExecutionWorkspaceStatus, Project, RuntimeMutationResult } from "./types";
 import { invokeWithTimeout, isInvokeTimeoutError } from "./utils/invokeWithTimeout";
 import { ConsoleFeedback } from "./components/ConsoleStepShell";
@@ -18,14 +18,13 @@ interface Props {
   onFeedback: (feedback: ConsoleFeedback | null) => void;
   workspaceStatus: ExecutionWorkspaceStatus | null;
   onPrepareWorkspace: () => Promise<void>;
-  onRefreshWorkspace: () => Promise<void>;
 }
 
 type RegenerationSource = "check_failed" | "approval_rejected";
 
 export function ConsoleWorkflowPanel({
   project, onRuntimeMutation, externalBusy, onActionStart, onActionEnd, onFeedback,
-  workspaceStatus, onPrepareWorkspace, onRefreshWorkspace,
+  workspaceStatus, onPrepareWorkspace,
 }: Props) {
   const step = project.workflow_state.current_step;
   const busy = externalBusy;
@@ -61,19 +60,6 @@ export function ConsoleWorkflowPanel({
       }
     }
     return false;
-  };
-
-  const handleSync = async () => {
-    if (!beginAction("console_sync")) return;
-    setFeedback({ type: "info", message: "正在同步项目状态..." });
-    try {
-      await syncProject();
-      setFeedback({ type: "success", message: "项目状态已同步。" });
-    } catch (error) {
-      setFeedback({ type: "error", message: "同步失败：" + String(error) });
-    } finally {
-      onActionEnd();
-    }
   };
 
   const runProjectCommand = async (
@@ -208,27 +194,6 @@ export function ConsoleWorkflowPanel({
           <span><Clock3 size={14} />心跳：{managedPresentation?.heartbeatLabel}</span>
           {managedPresentation?.detail && <span className="managed-flow-detail">{managedPresentation.detail}</span>}
         </div>
-        <div className="managed-flow-actions">
-          {managedPresentation?.canPause && (
-            <button className="ap-bar-btn"
-              disabled={busy}
-              onClick={() => runProjectCommand("pause_managed_flow", { projectName: project.name }, "托管层已暂停。")}>
-              <Pause size={14} />暂停托管
-            </button>
-          )}
-          {managedPresentation?.canResume && (
-            <button className="ap-bar-btn ap-bar-btn-primary"
-              disabled={busy}
-              onClick={() => runProjectCommand("resume_managed_flow", { projectName: project.name }, "托管层已恢复。")}>
-              <Play size={14} />{managedPresentation.resumeLabel}
-            </button>
-          )}
-          <button className="ap-bar-btn"
-            disabled={busy}
-            onClick={() => runProjectCommand("stop_managed_flow", { projectName: project.name }, "托管层已停止，已转为手动处理。")}>
-            <Square size={14} />停止托管
-          </button>
-        </div>
       </div>
     </div>
   ) : null;
@@ -242,7 +207,7 @@ export function ConsoleWorkflowPanel({
       onApprove={() => runProjectCommand("approve_milestone_draft", { projectName: project.name }, "大阶段已批准。")}
       onSelect={(milestoneId) => runProjectCommand("select_milestone", { projectName: project.name, milestoneId }, "已选择大阶段。")}
       onContinue={() => runProjectCommand("continue_current_milestone", { projectName: project.name }, "已按项目事实继续当前大阶段。")}
-      onRegenerate={handleRegenerateMilestone} onSync={handleSync}
+      onRegenerate={handleRegenerateMilestone}
     /></>;
   }
 
@@ -269,7 +234,6 @@ export function ConsoleWorkflowPanel({
       onRegenerate={handleRegeneratePlan}
       workspaceStatus={workspaceStatus}
       onPrepareWorkspace={onPrepareWorkspace}
-      onRefreshWorkspace={onRefreshWorkspace}
     /></>;
   }
 

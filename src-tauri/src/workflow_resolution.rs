@@ -124,6 +124,7 @@ pub(crate) fn apply_milestone_review_boundary(
     milestone.status = project::MilestoneStatus::Completed;
     milestone.review_status = Some("pending_review".to_string());
     milestone.review_conclusion = None;
+    milestone.human_review_fingerprint = project::milestone_human_review_fingerprint(milestone);
     proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
     proj.workflow_state.current_step = project::WorkflowStep::MilestoneReview;
     proj.workflow_state.review_node_id = milestone_id.to_string();

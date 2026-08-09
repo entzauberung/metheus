@@ -1,3 +1,4 @@
+use crate::config::TokenUsage;
 use thiserror::Error;
 use xai_grok_sampling_types::SamplingError;
 
@@ -16,6 +17,7 @@ pub enum GrokBuildRuntimeErrorKind {
     ToolRejected,
     ToolFailed,
     Protocol,
+    OutputTruncated,
     MaxTurns,
     Runtime,
 }
@@ -25,6 +27,10 @@ pub enum GrokBuildRuntimeErrorKind {
 pub struct GrokBuildRuntimeError {
     pub kind: GrokBuildRuntimeErrorKind,
     message: String,
+    pub turns: u32,
+    pub token_usage: Option<TokenUsage>,
+    pub files_written: Vec<String>,
+    pub output_summary: String,
 }
 
 impl GrokBuildRuntimeError {
@@ -36,7 +42,25 @@ impl GrokBuildRuntimeError {
         Self {
             kind,
             message: truncate(&redact_bearer_tokens(&message.into())),
+            turns: 0,
+            token_usage: None,
+            files_written: Vec::new(),
+            output_summary: String::new(),
         }
+    }
+
+    pub(crate) fn with_execution_facts(
+        mut self,
+        turns: u32,
+        token_usage: Option<TokenUsage>,
+        files_written: Vec<String>,
+        output_summary: String,
+    ) -> Self {
+        self.turns = turns;
+        self.token_usage = token_usage;
+        self.files_written = files_written;
+        self.output_summary = truncate(&redact_bearer_tokens(&output_summary));
+        self
     }
 
     pub(crate) fn invalid_configuration(message: impl Into<String>) -> Self {
@@ -91,9 +115,11 @@ impl GrokBuildRuntimeError {
             SamplingError::Serialization(_)
             | SamplingError::StreamError { .. }
             | SamplingError::EmptyResponse { .. }
-            | SamplingError::MaxTokensTruncation
             | SamplingError::DoomLoopDetected { .. } => {
                 Self::new(GrokBuildRuntimeErrorKind::Protocol, rendered)
+            }
+            SamplingError::MaxTokensTruncation => {
+                Self::new(GrokBuildRuntimeErrorKind::OutputTruncated, rendered)
             }
         }
     }

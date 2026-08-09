@@ -17,7 +17,6 @@ interface Props {
   onRegenerate: (source: "check_failed" | "approval_rejected") => void;
   workspaceStatus: ExecutionWorkspaceStatus | null;
   onPrepareWorkspace: () => Promise<void>;
-  onRefreshWorkspace: () => Promise<void>;
 }
 
 function blockingCheckDetails(check: StagePlanCheckResult): string[] {
@@ -110,9 +109,7 @@ export function ExecutionPlanStep(props: Props) {
               准备 Git
             </ActionButton>
           )}
-          <ActionButton icon={<RefreshCw size={16} />} disabled={props.busy} onClick={props.onRefreshWorkspace}>
-            刷新工作区
-          </ActionButton>
+          <span className="settings-hint">准备后请使用顶部命令栏同步工作区状态。</span>
         </WorkflowActionBar>
       </>
     )}

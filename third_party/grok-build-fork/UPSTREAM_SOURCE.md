@@ -8,8 +8,8 @@
 - Imported: 2026-07-23
 - License: Apache-2.0
 - Required Rust toolchain: 1.92
-- Metheus fork revision: `metheus.3`
-- Metheus adapter version: 3
+- Metheus fork revision: `metheus.4`
+- Metheus adapter version: 4
 
 This directory starts from the unmodified archive recorded above and contains
 the controlled Metheus changes listed in `PATCHSET.md`. The pristine audit
@@ -22,6 +22,10 @@ application process. It does not invoke the Grok CLI. Its model-visible tools
 are restricted to `read_file`, `search_replace`, `list_dir`, and `grep`, all
 under a frozen project-root and exact write authorization policy.
 
-The `metheus.3` facade additionally freezes sampler transport retries and
+The `metheus.4` facade retains the `metheus.3` sampler transport retries and
 upstream Doom-loop recovery retries per task, and forwards structured
 SessionActor failure/retry events without expanding the tool surface.
+
+The `metheus.4` facade additionally preserves max-token truncation, consumed
+turns, provider usage, authorized write facts, and a bounded output summary as
+a typed adapter error. It never exposes streaming partials as model context.

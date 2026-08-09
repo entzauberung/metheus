@@ -7,6 +7,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import {
+  decisionModelInvokeTimeoutMs,
   DEFAULT_TIMEOUT_SECS,
   invokeWithTimeout,
   resolveInvokeTimeout,
@@ -27,9 +28,9 @@ describe("resolveInvokeTimeout", () => {
   });
 
   it.each([
-    ["generate_execution_plan_runtime", 180_000],
-    ["generate_milestone_draft_runtime", 150_000],
-    ["run_error_recovery_runtime", 1_500_000],
+    ["generate_execution_plan_runtime", 3_610_000],
+    ["generate_milestone_draft_runtime", 3_610_000],
+    ["run_error_recovery_runtime", 3_610_000],
   ])("inherits one runtime suffix for %s", (command, timeoutMs) => {
     expect(resolveInvokeTimeout(command)).toEqual({
       timeoutMs,
@@ -41,6 +42,7 @@ describe("resolveInvokeTimeout", () => {
   it.each([
     ["reconcile_on_startup_runtime", 30_000],
     ["update_execution_profile_runtime", 15_000],
+    ["update_human_review_policy_runtime", 15_000],
     ["start_managed_flow_runtime", 15_000],
     ["retry_git_confirmation_runtime", 30_000],
     ["acknowledge_execution_recovery_runtime", 30_000],
@@ -79,6 +81,14 @@ describe("resolveInvokeTimeout", () => {
       source: "default",
       usedDefault: true,
     });
+  });
+
+  it("stays above the backend decision-model hard deadline", () => {
+    expect(decisionModelInvokeTimeoutMs(120)).toBe(370_000);
+    expect(decisionModelInvokeTimeoutMs(3_600)).toBe(3_610_000);
+    expect(resolveInvokeTimeout("check_subtask").timeoutMs).toBeGreaterThan(
+      decisionModelInvokeTimeoutMs(3_600) - 1,
+    );
   });
 });
 

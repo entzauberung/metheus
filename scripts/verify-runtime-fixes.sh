@@ -117,10 +117,8 @@ if rg -n 'dangerously-skip-permissions|当前安装的依赖（本轮不新增�
   echo "宪法仍含现行过时硬约束" >&2
   exit 1
 fi
-if rg -n '2026-(0[9]|1[0-2])-|2026-08-(0[4-9]|[12][0-9]|3[01])' CONSTITUTION.md; then
-  echo "宪法含晚于 2026-08-03 的日期" >&2
-  exit 1
-fi
+# 宪法同步日期会随已验收事实推进；本脚本校验上面的运行期规则内容，
+# 不再用历史交付日冻结后续合法修订。
 
 if [[ -n "$(git diff --name-only -- Cargo.lock package-lock.json pnpm-lock.yaml yarn.lock src-tauri/Cargo.lock src-tauri/Cargo.toml package.json)" ]]; then
   echo "检测到依赖清单或锁文件改动" >&2

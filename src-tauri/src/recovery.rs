@@ -2243,7 +2243,7 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             crate::save_project(&proj)?;
             return crate::load_project(&project_name);
         }
-        Err(crate::engine::EngineError::Cancelled) => {
+        Err(crate::engine::EngineError::Cancelled { .. }) => {
             finish_repair_checkpoint(&mut proj, true)?;
             mark_waiting_human(
                 &mut proj,
@@ -2259,14 +2259,14 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             crate::save_project(&proj)?;
             return crate::load_project(&project_name);
         }
-        Err(crate::engine::EngineError::Timeout) => {
+        Err(crate::engine::EngineError::Timeout { execution_result }) => {
             handle_repair_engine_block(
                 &mut proj,
                 &session,
                 &recovery_execution_id,
                 "自动修复执行超时",
                 project::EngineFailureKind::Timeout,
-                None,
+                execution_result.map(|result| *result),
                 &mut pipeline_guard,
             )?;
             crate::save_project(&proj)?;
@@ -2398,7 +2398,12 @@ pub(crate) async fn run_error_recovery_with_pipeline(
 pub(crate) fn engine_block_boundary(
     kind: &project::EngineFailureKind,
 ) -> (project::RecoveryErrorKind, project::RecoveryPhase) {
-    if crate::engine::requires_human_recovery(kind) {
+    if kind == &project::EngineFailureKind::OutputTruncated {
+        (
+            project::RecoveryErrorKind::PlanFailure,
+            project::RecoveryPhase::Replanning,
+        )
+    } else if crate::engine::requires_human_recovery(kind) {
         (
             project::RecoveryErrorKind::HumanRequired,
             project::RecoveryPhase::WaitingHuman,
@@ -4034,6 +4039,13 @@ mod tests {
             (
                 project::RecoveryErrorKind::EngineBlocked,
                 project::RecoveryPhase::WaitingEngine,
+            )
+        );
+        assert_eq!(
+            engine_block_boundary(&project::EngineFailureKind::OutputTruncated),
+            (
+                project::RecoveryErrorKind::PlanFailure,
+                project::RecoveryPhase::Replanning,
             )
         );
     }

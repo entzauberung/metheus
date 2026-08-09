@@ -79,6 +79,16 @@ pub(crate) fn evaluate(
     criterion_count: usize,
     review_oscillation: bool,
 ) -> QualityGateEvaluation {
+    evaluate_with_deferred(test, ledger, criterion_count, review_oscillation, false)
+}
+
+pub(crate) fn evaluate_with_deferred(
+    test: Option<&project::TestResult>,
+    ledger: &[project::AcceptanceLedgerItem],
+    criterion_count: usize,
+    review_oscillation: bool,
+    allow_matching_deferred_human_review: bool,
+) -> QualityGateEvaluation {
     let Some(test) = test else {
         return evaluation(
             QualityGateOutcome::TestUnavailable,
@@ -159,6 +169,19 @@ pub(crate) fn evaluate(
         return evaluation(
             QualityGateOutcome::EvidenceInsufficient,
             "验收账本不完整或存在未证明项",
+        );
+    }
+    let has_deferred = ledger.iter().any(|item| {
+        matches!(
+            item.status,
+            project::AcceptanceStatus::AiProvisionallySatisfied
+                | project::AcceptanceStatus::DeferredHumanReview
+        )
+    });
+    if has_deferred && !allow_matching_deferred_human_review {
+        return evaluation(
+            QualityGateOutcome::EvidenceInsufficient,
+            "AI 临时结论缺少匹配的大阶段人工确认清单",
         );
     }
     if ledger
@@ -319,16 +342,65 @@ mod tests {
     fn explicit_automated_test_failure_always_blocks() {
         let mut test = reviewed_test();
         test.automated_test_status = project::AutomatedTestStatus::Failed;
-        let result = evaluate(
+        let result = evaluate_with_deferred(
             Some(&test),
             &ledger(project::AcceptanceStatus::Satisfied),
             1,
             false,
+            true,
         );
         assert_eq!(result.outcome, QualityGateOutcome::CodeUnsatisfied);
         assert_eq!(
             result.recovery_error_kind(Some(&test)),
             project::RecoveryErrorKind::TestFailure
+        );
+    }
+
+    #[test]
+    fn deferred_human_status_only_passes_the_explicit_matching_batch_path() {
+        let test = reviewed_test();
+        let deferred = ledger(project::AcceptanceStatus::DeferredHumanReview);
+
+        assert_eq!(
+            evaluate(Some(&test), &deferred, 1, false).outcome,
+            QualityGateOutcome::EvidenceInsufficient
+        );
+        assert_eq!(
+            evaluate_with_deferred(Some(&test), &deferred, 1, false, true).outcome,
+            QualityGateOutcome::Passed
+        );
+        assert_eq!(
+            evaluate_with_deferred(
+                Some(&test),
+                &ledger(project::AcceptanceStatus::Unsatisfied),
+                1,
+                false,
+                true,
+            )
+            .outcome,
+            QualityGateOutcome::CodeUnsatisfied
+        );
+        assert_eq!(
+            evaluate_with_deferred(
+                Some(&test),
+                &ledger(project::AcceptanceStatus::Unknown),
+                1,
+                false,
+                true,
+            )
+            .outcome,
+            QualityGateOutcome::EvidenceInsufficient
+        );
+        assert_eq!(
+            evaluate_with_deferred(
+                Some(&test),
+                &ledger(project::AcceptanceStatus::Contradictory),
+                1,
+                false,
+                true,
+            )
+            .outcome,
+            QualityGateOutcome::ContractConflict
         );
     }
 

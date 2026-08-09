@@ -2,7 +2,7 @@
 
 - Upstream baseline: `7cfcb20d2b50b0d18801a6c0af2e401c0e060894`
 - Upstream Git tree: `0043d955d5848e0275c36458fc63d5c06a804b9b`
-- Fork revision: `metheus.3`
+- Fork revision: `metheus.4`
 - Created: 2026-07-23
 - License: Apache-2.0
 
@@ -20,10 +20,14 @@ credentials or model configuration, or starts Shell, `rg`, MCP, plugin, skill,
 memory, hook, or subagent facilities. All modified paths and their rationale are
 listed in `PATCHSET.md`.
 
-Revision `metheus.3` adds only frozen transport/Doom retry budgets and
+Revision `metheus.4` includes the `metheus.3` frozen transport/Doom retry budgets and
 structured failed-tool/retry event forwarding. Detection, classification,
 backoff, and SessionActor execution remain upstream implementations; the
 four-tool boundary is unchanged.
+
+Revision `metheus.4` preserves max-token truncation as a typed error and
+exports only bounded recovery facts and provider usage. Continuation policy
+remains in the Metheus adapter and does not expand the embedded tool boundary.
 
 ## Baseline spot hashes
 

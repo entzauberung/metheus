@@ -95,6 +95,8 @@ describe("AutopilotControlBar recovery presentation", () => {
       refresh: vi.fn(async () => undefined),
       runRecovery: vi.fn(async () => undefined),
       resolve: vi.fn(async () => undefined),
+      pauseManaged: vi.fn(async () => undefined),
+      resumeManaged: vi.fn(async () => undefined),
       noop: vi.fn(async () => undefined),
     };
     act(() => {
@@ -105,6 +107,8 @@ describe("AutopilotControlBar recovery presentation", () => {
           executionStatus={null}
           busy={false}
           onToggle={handlers.toggle}
+          onPauseManagedFlow={handlers.pauseManaged}
+          onResumeManagedFlow={handlers.resumeManaged}
           onStopManagedFlow={handlers.noop}
           onPauseNow={handlers.noop}
           onPauseAfterCurrent={handlers.noop}
@@ -335,5 +339,36 @@ describe("AutopilotControlBar recovery presentation", () => {
     expect(host.textContent).toContain("动作：生成大阶段草稿");
     expect(host.textContent).toContain("心跳：");
     expect(host.textContent).toContain("正在生成首个大阶段");
+    const labels = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
+    expect(labels).toEqual(["同步", "暂停托管", "停止托管"]);
+  });
+
+  it("keeps managed resume in the same command bar without a duplicate pause action", () => {
+    const value = project();
+    value.workflow_state.autopilot_active = false;
+    value.workflow_state.managed_flow_state = {
+      active: true,
+      managed_state: "paused",
+      managed_target: "MilestoneSelection",
+      last_action: "等待恢复",
+      last_action_at: "2026-07-31T05:00:00Z",
+      run_status: "Paused",
+      error_message: "",
+      job_id: "job-1",
+      job_generation: 1,
+      current_action: "",
+      current_action_id: "",
+      heartbeat_at: "2026-07-31T05:00:00Z",
+      retry_count: 0,
+      last_completed_action: "generate_milestone_draft",
+    };
+
+    const handlers = render(null, value);
+    const labels = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
+    expect(labels).toEqual(["同步", "恢复托管", "停止托管"]);
+    const resume = [...host.querySelectorAll<HTMLButtonElement>("button")]
+      .find(button => button.textContent?.includes("恢复托管"));
+    act(() => resume?.click());
+    expect(handlers.resumeManaged).toHaveBeenCalledTimes(1);
   });
 });

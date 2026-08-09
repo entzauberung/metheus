@@ -40,7 +40,10 @@ pub fn aggregate_ancestors(
         let parent = crate::task_tree::find_task(project, parent_id)?
             .ok_or_else(|| format!("聚合父任务不存在：{}", parent_id))?
             .clone();
-        let aggregation = aggregate_parent(&parent);
+        let aggregation = aggregate_parent(
+            &parent,
+            project.human_review_cadence == crate::project::HumanReviewCadence::MilestoneBatch,
+        );
         let parent_mut = crate::task_tree::find_task_mut(project, parent_id)?
             .ok_or_else(|| format!("聚合父任务不存在：{}", parent_id))?;
         parent_mut.status = aggregation.status;
@@ -80,7 +83,7 @@ fn validate_terminal_source(project: &Project, task: &Subtask) -> Result<(), Str
     Ok(())
 }
 
-fn aggregate_parent(parent: &Subtask) -> ParentAggregation {
+fn aggregate_parent(parent: &Subtask, allow_deferred: bool) -> ParentAggregation {
     let now = chrono::Utc::now().to_rfc3339();
     let all_children_terminal = !parent.child_tasks.is_empty()
         && parent
@@ -132,8 +135,15 @@ fn aggregate_parent(parent: &Subtask) -> ParentAggregation {
     let all_criteria_proven = ledger.iter().all(|item| {
         matches!(
             item.status,
-            AcceptanceStatus::Satisfied | AcceptanceStatus::AcceptedDeviation
-        )
+            AcceptanceStatus::Satisfied
+                | AcceptanceStatus::AcceptedDeviation
+                | AcceptanceStatus::AiProvisionallySatisfied
+                | AcceptanceStatus::DeferredHumanReview
+        ) && (allow_deferred
+            || !matches!(
+                item.status,
+                AcceptanceStatus::AiProvisionallySatisfied | AcceptanceStatus::DeferredHumanReview
+            ))
     });
     let has_deviation = ledger
         .iter()
@@ -253,6 +263,16 @@ fn aggregate_proof_status(proofs: &[ChildProof]) -> AcceptanceStatus {
         .any(|proof| proof.status == AcceptanceStatus::Unknown)
     {
         AcceptanceStatus::Unknown
+    } else if proofs
+        .iter()
+        .any(|proof| proof.status == AcceptanceStatus::DeferredHumanReview)
+    {
+        AcceptanceStatus::DeferredHumanReview
+    } else if proofs
+        .iter()
+        .any(|proof| proof.status == AcceptanceStatus::AiProvisionallySatisfied)
+    {
+        AcceptanceStatus::AiProvisionallySatisfied
     } else if proofs
         .iter()
         .any(|proof| proof.status == AcceptanceStatus::AcceptedDeviation)
@@ -378,6 +398,84 @@ mod tests {
         assert_eq!(
             project.milestones[0].subtasks[0].status,
             SubtaskStatus::Pending
+        );
+    }
+
+    #[test]
+    fn batch_parent_and_runtime_snapshot_preserve_temporary_review_states() {
+        let parent = Subtask {
+            id: "parent".to_string(),
+            title: "Parent".to_string(),
+            acceptance_criteria: vec!["criterion 1".to_string(), "criterion 2".to_string()],
+            child_tasks: vec![
+                proven_child("one", 1, AcceptanceStatus::AiProvisionallySatisfied),
+                proven_child("two", 2, AcceptanceStatus::DeferredHumanReview),
+            ],
+            ..Default::default()
+        };
+        let mut project = project_with_parent(parent);
+        let outcome = aggregate_ancestors(&mut project, "two").unwrap();
+        assert!(!outcome.contract_conflict);
+        let parent = &project.milestones[0].subtasks[0];
+        assert_eq!(parent.status, SubtaskStatus::Passed);
+        assert_eq!(
+            parent.acceptance_ledger[0].status,
+            AcceptanceStatus::AiProvisionallySatisfied
+        );
+        assert_eq!(
+            parent.acceptance_ledger[1].status,
+            AcceptanceStatus::DeferredHumanReview
+        );
+
+        project.milestones[0].human_review_items = vec![crate::project::MilestoneHumanReviewItem {
+            ai_status: AcceptanceStatus::AiProvisionallySatisfied,
+            human_decision: crate::project::MilestoneHumanDecision::Pending,
+            ..Default::default()
+        }];
+        let snapshot = crate::runtime_snapshot::compose_runtime_snapshot(
+            project,
+            None,
+            crate::project_state_bus::ProjectStateSubscription {
+                subscription_id: String::new(),
+                process_start_id: "aggregation-test".to_string(),
+                event_sequence: 1,
+            },
+        );
+        let snapshot_parent = &snapshot.project.milestones[0].subtasks[0];
+        assert_eq!(
+            snapshot_parent.acceptance_ledger[0].status,
+            AcceptanceStatus::AiProvisionallySatisfied
+        );
+        assert_eq!(
+            snapshot_parent.acceptance_ledger[1].status,
+            AcceptanceStatus::DeferredHumanReview
+        );
+        assert_eq!(
+            snapshot.project.milestones[0].human_review_items[0].human_decision,
+            crate::project::MilestoneHumanDecision::Pending
+        );
+    }
+
+    #[test]
+    fn contradictory_child_evidence_remains_a_batch_contract_conflict() {
+        let parent = Subtask {
+            id: "parent".to_string(),
+            title: "Parent".to_string(),
+            acceptance_criteria: vec!["criterion 1".to_string()],
+            child_tasks: vec![
+                proven_child("one", 1, AcceptanceStatus::AiProvisionallySatisfied),
+                proven_child("two", 1, AcceptanceStatus::Contradictory),
+            ],
+            ..Default::default()
+        };
+        let mut project = project_with_parent(parent);
+        let outcome = aggregate_ancestors(&mut project, "two").unwrap();
+        let parent = &project.milestones[0].subtasks[0];
+        assert!(outcome.contract_conflict);
+        assert_eq!(parent.status, SubtaskStatus::Pending);
+        assert_eq!(
+            parent.acceptance_ledger[0].status,
+            AcceptanceStatus::Contradictory
         );
     }
 

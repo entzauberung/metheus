@@ -2209,11 +2209,65 @@ pub(crate) async fn enter_milestone_review(
     crate::save_and_reload_project(&proj)
 }
 
-async fn approve_milestone_outcome_state(
-    project_name: String,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct MilestoneHumanReviewDecisionSubmission {
+    pub item_id: String,
+    pub decision: project::MilestoneHumanDecision,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct MilestoneReviewSubmission {
+    pub milestone_id: String,
+    pub review_cycle: u64,
+    pub expected_revision: u64,
+    pub review_fingerprint: String,
+    pub branch: String,
+    #[serde(default)]
+    pub branch_reason: String,
+    #[serde(default)]
+    pub decisions: Vec<MilestoneHumanReviewDecisionSubmission>,
+}
+
+fn legacy_empty_review_submission(
+    project_name: &str,
     branch: String,
-) -> Result<project::Project, String> {
-    let mut proj = crate::load_project(&project_name)?;
+) -> Result<MilestoneReviewSubmission, String> {
+    let proj = crate::load_project(project_name)?;
+    let milestone = proj
+        .milestones
+        .iter()
+        .find(|milestone| milestone.id == proj.current_milestone_id)
+        .ok_or_else(|| "大阶段不存在。".to_string())?;
+    if milestone
+        .human_review_items
+        .iter()
+        .any(|item| item.review_cycle == milestone.human_review_cycle)
+    {
+        return Err("当前大阶段包含集中人工确认项，必须提交完整审阅清单".to_string());
+    }
+    Ok(MilestoneReviewSubmission {
+        milestone_id: milestone.id.clone(),
+        review_cycle: milestone.human_review_cycle,
+        expected_revision: proj.workflow_state.data_revision,
+        review_fingerprint: project::milestone_human_review_fingerprint(milestone),
+        branch,
+        branch_reason: String::new(),
+        decisions: Vec::new(),
+    })
+}
+
+fn apply_milestone_review_submission(
+    proj: &mut project::Project,
+    submission: &MilestoneReviewSubmission,
+) -> Result<(), String> {
+    if proj.workflow_state.data_revision != submission.expected_revision {
+        return Err(format!(
+            "项目修订冲突：请求={}，磁盘={}",
+            submission.expected_revision, proj.workflow_state.data_revision
+        ));
+    }
 
     if proj.workflow_state.current_step != project::WorkflowStep::MilestoneReview {
         return Err(format!(
@@ -2222,11 +2276,17 @@ async fn approve_milestone_outcome_state(
         ));
     }
 
-    if !matches!(branch.as_str(), "A" | "B" | "C") {
-        return Err(format!("未知分支：{}（仅支持 A/B/C）", branch));
+    if !matches!(submission.branch.as_str(), "A" | "B" | "C") {
+        return Err(format!("未知分支：{}（仅支持 A/B/C）", submission.branch));
     }
 
     let milestone_id = proj.current_milestone_id.clone();
+    if submission.milestone_id != milestone_id {
+        return Err(format!(
+            "大阶段审阅目标已变化：请求={}，当前={}",
+            submission.milestone_id, milestone_id
+        ));
+    }
     let now = chrono::Utc::now().to_rfc3339();
     let review_cycle_id = format!(
         "{}:{}",
@@ -2242,6 +2302,173 @@ async fn approve_milestone_outcome_state(
         .iter()
         .position(|milestone| milestone.id == milestone_id)
         .ok_or("大阶段不存在。".to_string())?;
+    let current_milestone = proj
+        .milestones
+        .get(current_idx)
+        .ok_or_else(|| "大阶段不存在。".to_string())?;
+    if submission.review_cycle != current_milestone.human_review_cycle {
+        return Err(format!(
+            "审阅周期已变化：请求={}，当前={}",
+            submission.review_cycle, current_milestone.human_review_cycle
+        ));
+    }
+    let actual_fingerprint = project::milestone_human_review_fingerprint(current_milestone);
+    if submission.review_fingerprint != actual_fingerprint {
+        return Err(format!(
+            "审阅状态指纹已失效：请求={}，当前={}",
+            submission.review_fingerprint, actual_fingerprint
+        ));
+    }
+
+    let active_items = current_milestone
+        .human_review_items
+        .iter()
+        .filter(|item| item.review_cycle == submission.review_cycle)
+        .map(|item| item.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let submitted_items = submission
+        .decisions
+        .iter()
+        .map(|decision| decision.item_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if submission.decisions.len() != submitted_items.len() {
+        return Err("集中确认清单包含重复项目".to_string());
+    }
+    if active_items != submitted_items {
+        let missing = active_items
+            .difference(&submitted_items)
+            .cloned()
+            .collect::<Vec<_>>();
+        let extra = submitted_items
+            .difference(&active_items)
+            .cloned()
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "集中确认清单与当前状态不一致：遗漏={:?}，额外={:?}",
+            missing, extra
+        ));
+    }
+    if submission
+        .decisions
+        .iter()
+        .any(|decision| decision.decision == project::MilestoneHumanDecision::Pending)
+    {
+        return Err("集中确认清单仍有未处理项目".to_string());
+    }
+    if matches!(submission.branch.as_str(), "A" | "C")
+        && submission
+            .decisions
+            .iter()
+            .any(|decision| decision.decision != project::MilestoneHumanDecision::Confirmed)
+    {
+        return Err("A/C 分支要求全部集中确认项均由人工确认".to_string());
+    }
+    if submission.branch == "B" {
+        let has_rejected = submission
+            .decisions
+            .iter()
+            .any(|decision| decision.decision == project::MilestoneHumanDecision::Rejected);
+        if !has_rejected || submission.branch_reason.trim().is_empty() {
+            return Err("B 分支必须同时包含至少一个拒绝项和非空修正理由".to_string());
+        }
+    }
+
+    let decisions = submission
+        .decisions
+        .iter()
+        .map(|decision| (decision.item_id.clone(), decision.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut task_decisions = std::collections::BTreeMap::<
+        String,
+        Vec<(u32, project::MilestoneHumanDecision, String)>,
+    >::new();
+    {
+        let milestone = proj
+            .milestones
+            .get_mut(current_idx)
+            .ok_or_else(|| "大阶段不存在。".to_string())?;
+        for item in milestone
+            .human_review_items
+            .iter_mut()
+            .filter(|item| item.review_cycle == submission.review_cycle)
+        {
+            let decision = decisions
+                .get(&item.id)
+                .ok_or_else(|| format!("缺少集中确认项目：{}", item.id))?;
+            item.human_decision = decision.decision.clone();
+            item.human_reason = decision.reason.trim().to_string();
+            item.branch_reason = if submission.branch == "B" {
+                submission.branch_reason.trim().to_string()
+            } else {
+                String::new()
+            };
+            item.decided_at = Some(now.clone());
+            item.updated_at = now.clone();
+            task_decisions
+                .entry(item.task_id.clone())
+                .or_default()
+                .push((
+                    item.criterion_index,
+                    decision.decision.clone(),
+                    item.human_reason.clone(),
+                ));
+        }
+    }
+
+    let reviewed_tree_revision = proj.task_control.tree_revision;
+    for (task_id, decisions) in &task_decisions {
+        let task = crate::task_tree::find_task_mut(proj, task_id)?
+            .ok_or_else(|| format!("集中确认任务不存在：{}", task_id))?;
+        for (criterion_index, decision, reason) in decisions {
+            let ledger = task
+                .acceptance_ledger
+                .iter_mut()
+                .find(|item| item.criterion_index == *criterion_index)
+                .ok_or_else(|| format!("任务 {} 缺少验收项 {}", task_id, criterion_index))?;
+            ledger.status = match decision {
+                project::MilestoneHumanDecision::Confirmed => project::AcceptanceStatus::Satisfied,
+                project::MilestoneHumanDecision::Rejected => project::AcceptanceStatus::Unsatisfied,
+                project::MilestoneHumanDecision::Pending => unreachable!(),
+            };
+            if !reason.is_empty() {
+                ledger.evidence = format!("{}；人工结论：{}", ledger.evidence, reason);
+            }
+            ledger.updated_at = now.clone();
+        }
+        if decisions
+            .iter()
+            .all(|(_, decision, _)| *decision == project::MilestoneHumanDecision::Confirmed)
+        {
+            let execution_result_fingerprint =
+                crate::human_action_policy::execution_result_fingerprint(task)?;
+            let verification_reason = decisions
+                .iter()
+                .filter_map(|(_, _, reason)| (!reason.is_empty()).then_some(reason.as_str()))
+                .collect::<Vec<_>>()
+                .join("；");
+            task.human_verification = Some(project::HumanVerification {
+                verification_kind: project::VerificationKind::HumanOverride,
+                verification_reason: if verification_reason.is_empty() {
+                    "大阶段集中人工确认".to_string()
+                } else {
+                    verification_reason
+                },
+                verified_at: now.clone(),
+                original_test_failure: task
+                    .test_result
+                    .as_ref()
+                    .map(|test| test.issues.join("；"))
+                    .unwrap_or_default(),
+                resolution: project::HumanResolution::ConfirmActualPass,
+                accepted_criteria: Vec::new(),
+                dependency_check: String::new(),
+                action_source: format!("milestone_review:{}", submission.branch),
+                execution_result_fingerprint,
+                task_tree_revision: reviewed_tree_revision,
+                project_revision: submission.expected_revision,
+            });
+        }
+    }
     let next_target = proj
         .milestones
         .iter()
@@ -2254,8 +2481,8 @@ async fn approve_milestone_outcome_state(
             .milestones
             .get_mut(current_idx)
             .ok_or("大阶段不存在。".to_string())?;
-        milestone.review_conclusion = Some(branch.clone());
-        match branch.as_str() {
+        milestone.review_conclusion = Some(submission.branch.clone());
+        match submission.branch.as_str() {
             "A" => {
                 milestone.review_status = Some("approved".to_string());
                 milestone.approved_at = Some(now.clone());
@@ -2264,9 +2491,16 @@ async fn approve_milestone_outcome_state(
             "C" => milestone.review_status = Some("future_adjusted".to_string()),
             _ => {}
         }
+        if matches!(submission.branch.as_str(), "B" | "C") {
+            milestone.human_review_cycle = milestone
+                .human_review_cycle
+                .checked_add(1)
+                .ok_or_else(|| "人工审阅周期已耗尽，无法创建新周期".to_string())?;
+        }
+        milestone.human_review_fingerprint = project::milestone_human_review_fingerprint(milestone);
     }
 
-    match branch.as_str() {
+    match submission.branch.as_str() {
         "A" => match next_target {
             Some((next_id, next_title)) => {
                 proj.workflow_state.current_step = project::WorkflowStep::MilestoneSelection;
@@ -2318,7 +2552,7 @@ async fn approve_milestone_outcome_state(
         _ => {}
     }
 
-    if matches!(branch.as_str(), "B" | "C") && proj.workflow_state.autopilot_active {
+    if matches!(submission.branch.as_str(), "B" | "C") && proj.workflow_state.autopilot_active {
         let autopilot = proj
             .workflow_state
             .autopilot_state
@@ -2326,7 +2560,7 @@ async fn approve_milestone_outcome_state(
         autopilot.active = true;
         autopilot.target_milestone_id = milestone_id;
         autopilot.run_status = project::AutopilotRunStatus::Paused;
-        autopilot.last_action = format!("大阶段审阅选择 {}，等待人工后续流程", branch);
+        autopilot.last_action = format!("大阶段审阅选择 {}，等待人工后续流程", submission.branch);
         autopilot.last_action_at = now.clone();
         autopilot.error_message.clear();
     }
@@ -2334,7 +2568,33 @@ async fn approve_milestone_outcome_state(
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = now;
 
-    crate::save_and_reload_project(&proj)
+    Ok(())
+}
+
+fn commit_milestone_review_submission(
+    project_name: &str,
+    submission: &MilestoneReviewSubmission,
+) -> Result<(), String> {
+    crate::mutate_project_for_control(project_name, |proj| {
+        apply_milestone_review_submission(proj, submission)?;
+        Ok(((), true))
+    })
+}
+
+async fn approve_milestone_review_submission_state(
+    project_name: String,
+    submission: MilestoneReviewSubmission,
+) -> Result<project::Project, String> {
+    commit_milestone_review_submission(&project_name, &submission)?;
+    crate::load_project(&project_name)
+}
+
+async fn approve_milestone_outcome_state(
+    project_name: String,
+    branch: String,
+) -> Result<project::Project, String> {
+    let submission = legacy_empty_review_submission(&project_name, branch)?;
+    approve_milestone_review_submission_state(project_name, submission).await
 }
 
 /// 大阶段审阅决策：A（继续）/ B（修正过去）/ C（调整未来）。
@@ -2343,9 +2603,18 @@ async fn approve_milestone_outcome_state(
 pub(crate) async fn approve_milestone_outcome(
     state: tauri::State<'_, crate::AppState>,
     project_name: String,
-    branch: String,
+    branch: Option<String>,
+    submission: Option<MilestoneReviewSubmission>,
 ) -> Result<project::Project, String> {
-    let project = approve_milestone_outcome_state(project_name.clone(), branch).await?;
+    let submission = match submission {
+        Some(submission) => submission,
+        None => legacy_empty_review_submission(
+            &project_name,
+            branch.ok_or_else(|| "缺少大阶段审阅提交".to_string())?,
+        )?,
+    };
+    let project =
+        approve_milestone_review_submission_state(project_name.clone(), submission).await?;
     let should_start = project.workflow_state.autopilot_active
         && project
             .workflow_state
@@ -3140,13 +3409,14 @@ mod tests {
 
     struct ProjectDataGuard {
         path: PathBuf,
+        lock_path: PathBuf,
     }
 
     impl ProjectDataGuard {
         fn new(project_name: &str) -> Result<Self, String> {
-            Ok(Self {
-                path: crate::project_data_path(project_name)?,
-            })
+            let path = crate::project_data_path(project_name)?;
+            let lock_path = path.with_extension("control-action.lock");
+            Ok(Self { path, lock_path })
         }
     }
 
@@ -3155,6 +3425,15 @@ mod tests {
             if let Err(error) = std::fs::remove_file(&self.path) {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     eprintln!("清理测试项目 {} 失败：{}", self.path.display(), error);
+                }
+            }
+            if let Err(error) = std::fs::remove_file(&self.lock_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "清理测试项目锁 {} 失败：{}",
+                        self.lock_path.display(),
+                        error
+                    );
                 }
             }
         }
@@ -3244,6 +3523,86 @@ mod tests {
         .expect("professional test profile")
     }
 
+    async fn approve_review_branch_for_test(
+        project_name: String,
+        branch: &str,
+    ) -> Result<project::Project, String> {
+        if branch == "B" {
+            let mut proj = crate::load_project(&project_name)?;
+            for (milestone_index, milestone) in proj.milestones.iter_mut().enumerate().skip(1) {
+                for mid_stage in &mut milestone.mid_stages {
+                    for task in &mut mid_stage.subtasks {
+                        task.id = format!("{}-milestone-{}", task.id, milestone_index + 1);
+                    }
+                }
+                for task in &mut milestone.subtasks {
+                    task.id = format!("{}-milestone-{}", task.id, milestone_index + 1);
+                }
+            }
+            let has_active_items = proj.milestones[0]
+                .human_review_items
+                .iter()
+                .any(|item| item.review_cycle == proj.milestones[0].human_review_cycle);
+            if !has_active_items {
+                let (task_id, criterion) = {
+                    let task = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+                    task.acceptance_criteria = vec!["操作员确认真实桌面行为".to_string()];
+                    task.acceptance_ledger = vec![project::AcceptanceLedgerItem {
+                        criterion_index: 1,
+                        criterion: task.acceptance_criteria[0].clone(),
+                        status: project::AcceptanceStatus::DeferredHumanReview,
+                        ..Default::default()
+                    }];
+                    task.execution_result = Some(project::ExecutionResult {
+                        success: true,
+                        output: "completed".to_string(),
+                        ..Default::default()
+                    });
+                    (task.id.clone(), task.acceptance_criteria[0].clone())
+                };
+                let milestone = &mut proj.milestones[0];
+                if milestone.human_review_cycle == 0 {
+                    milestone.human_review_cycle = 1;
+                }
+                let contract_fingerprint = "test-branch-contract".to_string();
+                milestone
+                    .human_review_items
+                    .push(project::MilestoneHumanReviewItem {
+                        id: project::milestone_human_review_item_id(
+                            &milestone.id,
+                            &task_id,
+                            1,
+                            &contract_fingerprint,
+                        ),
+                        milestone_id: milestone.id.clone(),
+                        task_id,
+                        criterion_index: 1,
+                        criterion,
+                        contract_fingerprint,
+                        execution_facts_fingerprint: "test-branch-facts".to_string(),
+                        review_cycle: milestone.human_review_cycle,
+                        ai_status: project::AcceptanceStatus::DeferredHumanReview,
+                        updated_at: "2026-08-08T00:00:00Z".to_string(),
+                        ..Default::default()
+                    });
+                milestone.human_review_fingerprint =
+                    project::milestone_human_review_fingerprint(milestone);
+                crate::save_project(&proj)?;
+            }
+            let proj = crate::load_project(&project_name)?;
+            let submission = human_review_submission(
+                &proj,
+                "B",
+                project::MilestoneHumanDecision::Rejected,
+                "测试拒绝项",
+                "测试记录：返回修正过去流程",
+            );
+            return approve_milestone_review_submission_state(project_name, submission).await;
+        }
+        let submission = legacy_empty_review_submission(&project_name, branch.to_string())?;
+        approve_milestone_review_submission_state(project_name, submission).await
+    }
+
     fn test_milestone(
         id: &str,
         title: &str,
@@ -3309,6 +3668,77 @@ mod tests {
             ));
         }
         proj
+    }
+
+    fn review_project_with_human_item(project_name: &str) -> project::Project {
+        let mut proj = review_project(project_name, false);
+        proj.workflow_state.data_revision = 12;
+        proj.task_control.tree_revision = 4;
+        let (task_id, criterion) = {
+            let task = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+            task.acceptance_criteria = vec!["操作员确认真实桌面行为".to_string()];
+            task.acceptance_ledger = vec![project::AcceptanceLedgerItem {
+                criterion_index: 1,
+                criterion: task.acceptance_criteria[0].clone(),
+                status: project::AcceptanceStatus::DeferredHumanReview,
+                evidence: "AI 无法从文本证据确认桌面行为".to_string(),
+                ..Default::default()
+            }];
+            task.execution_result = Some(project::ExecutionResult {
+                success: true,
+                output: "completed".to_string(),
+                ..Default::default()
+            });
+            (task.id.clone(), task.acceptance_criteria[0].clone())
+        };
+
+        let milestone = &mut proj.milestones[0];
+        milestone.human_review_cycle = 2;
+        let contract_fingerprint = "contract-fingerprint-1".to_string();
+        milestone.human_review_items = vec![project::MilestoneHumanReviewItem {
+            id: project::milestone_human_review_item_id(
+                &milestone.id,
+                &task_id,
+                1,
+                &contract_fingerprint,
+            ),
+            milestone_id: milestone.id.clone(),
+            task_id,
+            criterion_index: 1,
+            criterion,
+            contract_fingerprint,
+            execution_facts_fingerprint: "facts-fingerprint-1".to_string(),
+            review_cycle: milestone.human_review_cycle,
+            ai_status: project::AcceptanceStatus::DeferredHumanReview,
+            ai_evidence: "AI 无法从文本证据确认桌面行为".to_string(),
+            updated_at: "2026-08-07T00:00:00Z".to_string(),
+            ..Default::default()
+        }];
+        milestone.human_review_fingerprint = project::milestone_human_review_fingerprint(milestone);
+        proj
+    }
+
+    fn human_review_submission(
+        proj: &project::Project,
+        branch: &str,
+        decision: project::MilestoneHumanDecision,
+        reason: &str,
+        branch_reason: &str,
+    ) -> MilestoneReviewSubmission {
+        let milestone = &proj.milestones[0];
+        MilestoneReviewSubmission {
+            milestone_id: milestone.id.clone(),
+            review_cycle: milestone.human_review_cycle,
+            expected_revision: proj.workflow_state.data_revision,
+            review_fingerprint: project::milestone_human_review_fingerprint(milestone),
+            branch: branch.to_string(),
+            branch_reason: branch_reason.to_string(),
+            decisions: vec![MilestoneHumanReviewDecisionSubmission {
+                item_id: milestone.human_review_items[0].id.clone(),
+                decision,
+                reason: reason.to_string(),
+            }],
+        }
     }
 
     fn quick_completed_review_project(project_name: &str) -> project::Project {
@@ -3479,6 +3909,7 @@ mod tests {
         pending.order = Some(2);
         pending.status = project::MidStageStatus::Pending;
         pending.completed_at = None;
+        pending.subtasks.clear();
         milestone.mid_stages.push(pending);
         proj.milestones.push(milestone);
         crate::save_project(&proj)?;
@@ -4125,6 +4556,247 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concentrated_review_atomically_confirms_items_and_branch_a() -> Result<(), String> {
+        let project_name = unique_project_name("review-a-human-items");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = review_project_with_human_item(&project_name);
+        let submission = human_review_submission(
+            &proj,
+            "A",
+            project::MilestoneHumanDecision::Confirmed,
+            "已在真实桌面复核",
+            "",
+        );
+        crate::save_project(&proj)?;
+
+        let updated = approve_milestone_review_submission_state(project_name, submission).await?;
+
+        assert_eq!(updated.workflow_state.data_revision, 13);
+        assert_eq!(
+            updated.milestones[0].human_review_items[0].human_decision,
+            project::MilestoneHumanDecision::Confirmed
+        );
+        let task = &updated.milestones[0].mid_stages[0].subtasks[0];
+        assert_eq!(
+            task.acceptance_ledger[0].status,
+            project::AcceptanceStatus::Satisfied
+        );
+        let verification = task
+            .human_verification
+            .as_ref()
+            .ok_or_else(|| "集中确认后缺少 HumanVerification".to_string())?;
+        assert_eq!(
+            verification.verification_kind,
+            project::VerificationKind::HumanOverride
+        );
+        assert_eq!(verification.project_revision, 12);
+        assert_eq!(verification.task_tree_revision, 4);
+        crate::human_action_policy::validate_recorded_human_acceptance(&updated, task)?;
+        assert_eq!(
+            updated.milestones[0].review_conclusion.as_deref(),
+            Some("A")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concentrated_review_branch_b_records_rejection_and_fix_reason() -> Result<(), String> {
+        let project_name = unique_project_name("review-b-human-items");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = review_project_with_human_item(&project_name);
+        let submission = human_review_submission(
+            &proj,
+            "B",
+            project::MilestoneHumanDecision::Rejected,
+            "窗口在 390px 仍发生遮挡",
+            "修正移动端布局",
+        );
+        crate::save_project(&proj)?;
+
+        let updated = approve_milestone_review_submission_state(project_name, submission).await?;
+
+        assert_eq!(
+            updated.workflow_state.current_step,
+            project::WorkflowStep::BranchDiscussion
+        );
+        assert_eq!(
+            updated.workflow_state.discussion_scope,
+            project::DiscussionScope::FixPast
+        );
+        let item = &updated.milestones[0].human_review_items[0];
+        assert_eq!(
+            item.human_decision,
+            project::MilestoneHumanDecision::Rejected
+        );
+        assert_eq!(item.human_reason, "窗口在 390px 仍发生遮挡");
+        assert_eq!(item.branch_reason, "修正移动端布局");
+        assert_eq!(item.review_cycle, 2);
+        assert_eq!(updated.milestones[0].human_review_cycle, 3);
+        let task = &updated.milestones[0].mid_stages[0].subtasks[0];
+        assert_eq!(
+            task.acceptance_ledger[0].status,
+            project::AcceptanceStatus::Unsatisfied
+        );
+        assert!(task.acceptance_ledger[0].evidence.contains("人工结论"));
+        assert!(task.human_verification.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concentrated_review_rejects_stale_or_malformed_submissions_without_saving(
+    ) -> Result<(), String> {
+        let project_name = unique_project_name("review-human-invalid");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = review_project_with_human_item(&project_name);
+        let valid = human_review_submission(
+            &proj,
+            "A",
+            project::MilestoneHumanDecision::Confirmed,
+            "人工确认",
+            "",
+        );
+        crate::save_project(&proj)?;
+
+        let mut invalid = Vec::new();
+        let mut stale_revision = valid.clone();
+        stale_revision.expected_revision = stale_revision.expected_revision.saturating_sub(1);
+        invalid.push(stale_revision);
+        let mut stale_fingerprint = valid.clone();
+        stale_fingerprint.review_fingerprint = "sha256:stale".to_string();
+        invalid.push(stale_fingerprint);
+        let mut stale_cycle = valid.clone();
+        stale_cycle.review_cycle = stale_cycle.review_cycle.saturating_add(1);
+        invalid.push(stale_cycle);
+        let mut missing = valid.clone();
+        missing.decisions.clear();
+        invalid.push(missing);
+        let mut extra = valid.clone();
+        extra
+            .decisions
+            .push(MilestoneHumanReviewDecisionSubmission {
+                item_id: "extra-item".to_string(),
+                decision: project::MilestoneHumanDecision::Confirmed,
+                reason: String::new(),
+            });
+        invalid.push(extra);
+        let mut duplicate = valid.clone();
+        duplicate.decisions.push(duplicate.decisions[0].clone());
+        invalid.push(duplicate);
+        let mut pending = valid.clone();
+        pending.decisions[0].decision = project::MilestoneHumanDecision::Pending;
+        invalid.push(pending);
+        let mut rejected_a = valid.clone();
+        rejected_a.decisions[0].decision = project::MilestoneHumanDecision::Rejected;
+        let mut rejected_c = rejected_a.clone();
+        rejected_c.branch = "C".to_string();
+        invalid.push(rejected_a);
+        invalid.push(rejected_c);
+        let mut b_missing_reason = valid.clone();
+        b_missing_reason.branch = "B".to_string();
+        b_missing_reason.decisions[0].decision = project::MilestoneHumanDecision::Rejected;
+        b_missing_reason.branch_reason.clear();
+        invalid.push(b_missing_reason);
+        let mut b_missing_rejection = valid.clone();
+        b_missing_rejection.branch = "B".to_string();
+        b_missing_rejection.branch_reason = "已填写理由但未选择拒绝项".to_string();
+        invalid.push(b_missing_rejection);
+
+        for submission in invalid {
+            approve_milestone_review_submission_state(project_name.clone(), submission)
+                .await
+                .expect_err("失效或不完整提交必须被拒绝");
+        }
+
+        let persisted = crate::load_project(&project_name)?;
+        assert_eq!(persisted.workflow_state.data_revision, 12);
+        assert_eq!(
+            persisted.workflow_state.current_step,
+            project::WorkflowStep::MilestoneReview
+        );
+        assert_eq!(
+            persisted.milestones[0].human_review_items[0].human_decision,
+            project::MilestoneHumanDecision::Pending
+        );
+        assert_eq!(
+            persisted.milestones[0].mid_stages[0].subtasks[0].acceptance_ledger[0].status,
+            project::AcceptanceStatus::DeferredHumanReview
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_review_submissions_have_exactly_one_cas_winner() -> Result<(), String> {
+        let project_name = unique_project_name("review-concurrent-cas");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let proj = review_project_with_human_item(&project_name);
+        let submission_a = human_review_submission(
+            &proj,
+            "A",
+            project::MilestoneHumanDecision::Confirmed,
+            "人工确认通过",
+            "",
+        );
+        let submission_b = human_review_submission(
+            &proj,
+            "B",
+            project::MilestoneHumanDecision::Rejected,
+            "发现阻断问题",
+            "返回修正已发现的问题",
+        );
+        crate::save_project(&proj)?;
+
+        let name_a = project_name.clone();
+        let name_b = project_name.clone();
+        let thread_a =
+            std::thread::spawn(move || commit_milestone_review_submission(&name_a, &submission_a));
+        let thread_b =
+            std::thread::spawn(move || commit_milestone_review_submission(&name_b, &submission_b));
+        let result_a = thread_a.join().map_err(|_| "A 提交线程崩溃".to_string())?;
+        let result_b = thread_b.join().map_err(|_| "B 提交线程崩溃".to_string())?;
+
+        assert_eq!(
+            usize::from(result_a.is_ok()) + usize::from(result_b.is_ok()),
+            1
+        );
+        let loser = if result_a.is_err() {
+            result_a
+        } else {
+            result_b
+        };
+        assert!(loser.unwrap_err().contains("项目修订冲突"));
+
+        let persisted = crate::load_project(&project_name)?;
+        assert_eq!(persisted.workflow_state.data_revision, 13);
+        let item = &persisted.milestones[0].human_review_items[0];
+        let task = &persisted.milestones[0].mid_stages[0].subtasks[0];
+        match persisted.milestones[0].review_conclusion.as_deref() {
+            Some("A") => {
+                assert_eq!(
+                    item.human_decision,
+                    project::MilestoneHumanDecision::Confirmed
+                );
+                assert_eq!(
+                    task.acceptance_ledger[0].status,
+                    project::AcceptanceStatus::Satisfied
+                );
+            }
+            Some("B") => {
+                assert_eq!(
+                    item.human_decision,
+                    project::MilestoneHumanDecision::Rejected
+                );
+                assert_eq!(item.branch_reason, "返回修正已发现的问题");
+                assert_eq!(
+                    task.acceptance_ledger[0].status,
+                    project::AcceptanceStatus::Unsatisfied
+                );
+            }
+            other => return Err(format!("并发提交留下无效分支状态：{other:?}")),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn branches_b_and_c_pause_autopilot_and_reject_duplicate_submit() -> Result<(), String> {
         let cases = [
             ("B", "needs_fix", project::DiscussionScope::FixPast),
@@ -4140,8 +4812,7 @@ mod tests {
             let _guard = ProjectDataGuard::new(&project_name)?;
             crate::save_project(&review_project(&project_name, true))?;
 
-            let updated =
-                approve_milestone_outcome_state(project_name.clone(), branch.to_string()).await?;
+            let updated = approve_review_branch_for_test(project_name.clone(), branch).await?;
             assert_eq!(
                 updated.workflow_state.current_step,
                 project::WorkflowStep::BranchDiscussion
@@ -4169,7 +4840,7 @@ mod tests {
                 project::AutopilotRunStatus::Paused
             );
 
-            let duplicate = approve_milestone_outcome_state(project_name, branch.to_string()).await;
+            let duplicate = approve_review_branch_for_test(project_name, branch).await;
             assert!(duplicate.is_err());
         }
         Ok(())
@@ -4182,6 +4853,7 @@ mod tests {
         let project_name = unique_project_name(&format!("review-{}-reentry", branch));
         let _guard = ProjectDataGuard::new(&project_name)?;
         let mut seeded = review_project(&project_name, false);
+        let previous_review_cycle = seeded.milestones[0].human_review_cycle;
         crate::pipeline::write_execution_history_with_source(
             &mut seeded,
             "info",
@@ -4194,9 +4866,14 @@ mod tests {
         );
         crate::save_project(&seeded)?;
 
-        let branched =
-            approve_milestone_outcome_state(project_name.clone(), branch.to_string()).await?;
+        let branched = approve_review_branch_for_test(project_name.clone(), branch).await?;
         assert_eq!(branched.workflow_state.discussion_scope, scope);
+        let branched_review_cycle = branched.milestones[0].human_review_cycle;
+        assert!(branched_review_cycle > previous_review_cycle);
+        assert!(branched.milestones[0]
+            .human_review_items
+            .iter()
+            .all(|item| item.review_cycle < branched_review_cycle));
         let thread_id = branched
             .active_discussion_thread()
             .ok_or("B/C 分支活动线程缺失".to_string())?
@@ -4231,6 +4908,10 @@ mod tests {
         assert_eq!(
             reviewed.workflow_state.data_revision,
             before_review_revision + 1
+        );
+        assert_eq!(
+            reviewed.milestones[0].human_review_cycle,
+            branched_review_cycle
         );
         assert_eq!(reviewed.workflow_state.review_node_id, "milestone-1");
         assert_eq!(

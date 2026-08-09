@@ -490,11 +490,129 @@ pub struct RecoveryIssue {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum AcceptanceStatus {
     Satisfied,
+    AiProvisionallySatisfied,
+    DeferredHumanReview,
     Unsatisfied,
     #[default]
     Unknown,
     Contradictory,
     AcceptedDeviation,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum HumanReviewCadence {
+    #[default]
+    PerTask,
+    MilestoneBatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum MilestoneHumanDecision {
+    #[default]
+    Pending,
+    Confirmed,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum VisualReviewStatus {
+    #[default]
+    Unavailable,
+    Satisfied,
+    Unsatisfied,
+    EvidenceInsufficient,
+    Conflict,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VisualEvidenceReference {
+    pub path: String,
+    pub sha256: String,
+    pub mime: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct MilestoneHumanReviewItem {
+    pub id: String,
+    pub milestone_id: String,
+    pub task_id: String,
+    pub criterion_index: u32,
+    pub criterion: String,
+    pub contract_fingerprint: String,
+    pub execution_facts_fingerprint: String,
+    pub review_cycle: u64,
+    pub ai_status: AcceptanceStatus,
+    pub ai_evidence: String,
+    #[serde(default)]
+    pub visual_status: VisualReviewStatus,
+    #[serde(default)]
+    pub visual_summary: String,
+    #[serde(default)]
+    pub visual_evidence: Vec<VisualEvidenceReference>,
+    #[serde(default)]
+    pub human_decision: MilestoneHumanDecision,
+    #[serde(default)]
+    pub human_reason: String,
+    /// Branch-level reason captured with a B review submission. Historical
+    /// cycles retain it even after a new active cycle starts.
+    #[serde(default)]
+    pub branch_reason: String,
+    #[serde(default)]
+    pub decided_at: Option<String>,
+    pub updated_at: String,
+}
+
+pub fn milestone_human_review_item_id(
+    milestone_id: &str,
+    task_id: &str,
+    criterion_index: u32,
+    contract_fingerprint: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(milestone_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(task_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(criterion_index.to_le_bytes());
+    hasher.update([0]);
+    hasher.update(contract_fingerprint.as_bytes());
+    format!("human-review-{:x}", hasher.finalize())
+}
+
+/// Fingerprint the exact milestone-review facts a human is being asked to
+/// decide. The UI may echo this value, but only the backend derives and
+/// validates it.
+pub fn milestone_human_review_fingerprint(milestone: &Milestone) -> String {
+    use sha2::{Digest, Sha256};
+    let mut items = milestone
+        .human_review_items
+        .iter()
+        .filter(|item| item.review_cycle == milestone.human_review_cycle)
+        .map(|item| {
+            (
+                item.id.as_str(),
+                item.task_id.as_str(),
+                item.criterion_index,
+                item.contract_fingerprint.as_str(),
+                item.execution_facts_fingerprint.as_str(),
+                &item.ai_status,
+                &item.visual_status,
+                item.visual_summary.as_str(),
+                &item.visual_evidence,
+                &item.human_decision,
+                item.human_reason.as_str(),
+                item.branch_reason.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|left, right| left.0.cmp(right.0));
+    let payload = serde_json::to_vec(&(milestone.id.as_str(), milestone.human_review_cycle, items))
+        .unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(payload);
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 /// One durable row per acceptance criterion. Unknown is intentionally distinct
@@ -1266,6 +1384,7 @@ pub enum EngineFailureKind {
     ProcessCrash,
     ToolRejected,
     ProtocolError,
+    OutputTruncated,
     MaxTurnsExceeded,
     RuntimeError,
     TaskExecutionError,
@@ -1477,6 +1596,15 @@ pub struct Milestone {
     pub last_plan_issue_count: u32,
     #[serde(default)]
     pub plan_no_progress_count: u32,
+    /// Human-review items deferred within this milestone. AI evidence and
+    /// explicit human decisions remain separate fields.
+    #[serde(default)]
+    pub human_review_items: Vec<MilestoneHumanReviewItem>,
+    #[serde(default)]
+    pub human_review_cycle: u64,
+    /// Backend-derived fingerprint for optimistic, atomic review submission.
+    #[serde(default)]
+    pub human_review_fingerprint: String,
 }
 
 impl Default for Milestone {
@@ -1511,6 +1639,9 @@ impl Default for Milestone {
             last_plan_failure_fingerprint: String::new(),
             last_plan_issue_count: 0,
             plan_no_progress_count: 0,
+            human_review_items: Vec::new(),
+            human_review_cycle: 0,
+            human_review_fingerprint: String::new(),
         }
     }
 }
@@ -2098,6 +2229,13 @@ pub struct Project {
     /// 项目后续执行默认使用的引擎；旧项目自动映射为 Claude Code。
     #[serde(default)]
     pub execution_profile: ExecutionProfile,
+    /// Missing on legacy projects, therefore conservatively defaults to PerTask.
+    #[serde(default)]
+    pub human_review_cadence: HumanReviewCadence,
+    /// Project-level opt-in. App-level vision service settings remain disabled
+    /// by default and both switches are required before any image leaves disk.
+    #[serde(default)]
+    pub vision_review_enabled: bool,
     ///当前大阶段 ID
     #[serde(default)]
     pub current_milestone_id: String,
@@ -2193,6 +2331,8 @@ impl Project {
             },
             workload_profile: None,
             execution_profile: ExecutionProfile::default(),
+            human_review_cadence: HumanReviewCadence::MilestoneBatch,
+            vision_review_enabled: false,
             current_milestone_id: "".to_string(),
             current_mid_stage_id: "".to_string(),
             version_plan: "".to_string(),
@@ -2702,6 +2842,9 @@ pub struct ExecutionSession {
     /// 健康检查实际解析到的插件可执行文件路径。
     #[serde(default)]
     pub engine_executable_path: String,
+    /// Frozen cadence for this execution. Legacy sessions remain PerTask.
+    #[serde(default)]
+    pub human_review_cadence: HumanReviewCadence,
 }
 
 impl ExecutionSession {
@@ -2777,6 +2920,7 @@ impl Default for ExecutionSession {
             engine_model: String::new(),
             endpoint_fingerprint: String::new(),
             engine_executable_path: String::new(),
+            human_review_cadence: HumanReviewCadence::PerTask,
         }
     }
 }
@@ -3068,6 +3212,7 @@ mod tests {
             "engine_model",
             "endpoint_fingerprint",
             "engine_executable_path",
+            "human_review_cadence",
         ] {
             object.remove(field);
         }
@@ -3088,21 +3233,127 @@ mod tests {
         assert!(restored.engine_model.is_empty());
         assert!(restored.endpoint_fingerprint.is_empty());
         assert!(restored.engine_executable_path.is_empty());
+        assert_eq!(restored.human_review_cadence, HumanReviewCadence::PerTask);
         Ok(())
     }
 
     #[test]
-    fn old_project_without_execution_profile_defaults_to_claude() -> Result<(), String> {
+    fn old_project_uses_safe_human_review_cadence_while_new_project_batches() -> Result<(), String>
+    {
+        let new_project = Project::new("new-project");
+        assert_eq!(
+            new_project.human_review_cadence,
+            HumanReviewCadence::MilestoneBatch
+        );
+
         let mut value = serde_json::to_value(Project::new("legacy"))
             .map_err(|error| format!("序列化项目失败：{error}"))?;
-        value
+        let object = value
             .as_object_mut()
-            .ok_or("项目未序列化为对象".to_string())?
-            .remove("execution_profile");
+            .ok_or("项目未序列化为对象".to_string())?;
+        object.remove("execution_profile");
+        object.remove("human_review_cadence");
         let restored: Project = serde_json::from_value(value)
             .map_err(|error| format!("反序列化旧项目失败：{error}"))?;
         assert_eq!(restored.execution_profile, ExecutionProfile::default());
+        assert_eq!(restored.human_review_cadence, HumanReviewCadence::PerTask);
         Ok(())
+    }
+
+    #[test]
+    fn human_review_cadence_roundtrips_only_the_two_supported_values() {
+        for cadence in [
+            HumanReviewCadence::PerTask,
+            HumanReviewCadence::MilestoneBatch,
+        ] {
+            let encoded = serde_json::to_string(&cadence).expect("serialize cadence");
+            let restored: HumanReviewCadence =
+                serde_json::from_str(&encoded).expect("deserialize supported cadence");
+            assert_eq!(restored, cadence);
+        }
+
+        let mut value =
+            serde_json::to_value(Project::new("unknown-cadence")).expect("serialize project");
+        value["human_review_cadence"] = serde_json::json!("AlwaysAuto");
+        let error = serde_json::from_value::<Project>(value)
+            .expect_err("unknown cadence must not silently migrate");
+        assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn provisional_acceptance_statuses_roundtrip_without_human_promotion() {
+        for status in [
+            AcceptanceStatus::AiProvisionallySatisfied,
+            AcceptanceStatus::DeferredHumanReview,
+        ] {
+            let item = MilestoneHumanReviewItem {
+                ai_status: status.clone(),
+                human_decision: MilestoneHumanDecision::Pending,
+                ..Default::default()
+            };
+            let encoded = serde_json::to_value(item).expect("serialize review item");
+            let restored: MilestoneHumanReviewItem =
+                serde_json::from_value(encoded).expect("deserialize review item");
+            assert_eq!(restored.ai_status, status);
+            assert_ne!(restored.ai_status, AcceptanceStatus::Satisfied);
+            assert_eq!(restored.human_decision, MilestoneHumanDecision::Pending);
+        }
+    }
+
+    #[test]
+    fn damaged_review_cycle_and_unknown_temporary_status_are_rejected() {
+        let item = MilestoneHumanReviewItem::default();
+
+        let mut damaged_cycle = serde_json::to_value(&item).expect("serialize review item");
+        damaged_cycle["review_cycle"] = serde_json::json!(-1);
+        let cycle_error = serde_json::from_value::<MilestoneHumanReviewItem>(damaged_cycle)
+            .expect_err("negative review cycle must be rejected");
+        assert!(cycle_error.to_string().contains("u64"));
+
+        let mut unknown_status = serde_json::to_value(item).expect("serialize review item");
+        unknown_status["ai_status"] = serde_json::json!("TemporarilyApproved");
+        let status_error = serde_json::from_value::<MilestoneHumanReviewItem>(unknown_status)
+            .expect_err("unknown temporary status must be rejected");
+        assert!(status_error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn milestone_human_review_identity_is_stable_and_facts_change_the_fingerprint() {
+        let id = milestone_human_review_item_id("milestone-1", "task-1", 2, "contract-a");
+        assert_eq!(
+            id,
+            milestone_human_review_item_id("milestone-1", "task-1", 2, "contract-a")
+        );
+        assert_ne!(
+            id,
+            milestone_human_review_item_id("milestone-1", "task-1", 2, "contract-b")
+        );
+
+        let item = MilestoneHumanReviewItem {
+            id,
+            milestone_id: "milestone-1".to_string(),
+            task_id: "task-1".to_string(),
+            criterion_index: 2,
+            criterion: "visual result matches".to_string(),
+            contract_fingerprint: "contract-a".to_string(),
+            execution_facts_fingerprint: "facts-a".to_string(),
+            review_cycle: 3,
+            ai_status: AcceptanceStatus::DeferredHumanReview,
+            ai_evidence: "not enough evidence".to_string(),
+            updated_at: "2026-08-07T00:00:00Z".to_string(),
+            ..Default::default()
+        };
+        let mut milestone = Milestone {
+            id: "milestone-1".to_string(),
+            human_review_items: vec![item],
+            human_review_cycle: 3,
+            ..Default::default()
+        };
+        let first = milestone_human_review_fingerprint(&milestone);
+        assert_eq!(first, milestone_human_review_fingerprint(&milestone));
+
+        milestone.human_review_items[0].execution_facts_fingerprint = "facts-b".to_string();
+        assert_ne!(first, milestone_human_review_fingerprint(&milestone));
     }
 
     #[test]

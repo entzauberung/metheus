@@ -14,7 +14,7 @@
 
 .task-inspector-shell {
   position: relative;
-  z-index: 30;
+  z-index: 120;
   flex: 0 0 auto;
   height: 100vh;
   min-width: 0;
@@ -222,7 +222,7 @@
 
 .task-inspector-resize-handle {
   position: relative;
-  z-index: 35;
+  z-index: 125;
   flex: 0 0 5px;
   width: 5px;
   height: 100vh;
@@ -355,7 +355,7 @@
 @media (max-width: 1199px) {
   .task-inspector-backdrop {
     position: fixed;
-    z-index: 40;
+    z-index: 110;
     inset: 0;
     display: block;
     width: 100vw;
@@ -371,7 +371,7 @@
 
   .task-inspector-shell {
     position: fixed;
-    z-index: 50;
+    z-index: 120;
     top: 0;
     right: 0;
     bottom: 0;
@@ -384,6 +384,35 @@
 @media (max-width: 899px) {
   .task-inspector-shell {
     width: 100vw !important;
+  }
+}
+
+@media (max-width: 480px) {
+  .task-inspector-header {
+    padding: 10px;
+  }
+
+  .task-inspector-heading,
+  .task-inspector-mode {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .task-inspector-heading h2 {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .task-inspector-mode select {
+    max-width: 100%;
+  }
+
+  .task-inspector-toolbar button,
+  .task-control-deviation-form button,
+  .task-inspector-tab-list button {
+    height: auto;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 }
 
@@ -3115,13 +3144,13 @@
 }
 
 .application-settings {
-  width: 520px;
+  width: 680px;
   max-width: 100%;
 }
 
 .settings-tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 4px;
   padding: 3px;
   border: 1px solid #d0d7de;
@@ -3153,6 +3182,91 @@
   display: flex;
   flex-direction: column;
   gap: 12px;
+}
+
+.settings-form + .settings-form {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid #d0d7de;
+}
+
+.settings-form h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.settings-segmented {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid #d0d7de;
+  border-radius: 7px;
+  background: #f6f8fa;
+}
+
+.settings-segmented button {
+  min-height: 36px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+}
+
+.settings-segmented button[aria-checked="true"] {
+  background: #fff;
+  color: #0969da;
+  box-shadow: 0 1px 3px rgb(31 35 40 / 15%);
+  font-weight: 600;
+}
+
+.settings-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.settings-toggle-row input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+}
+
+.settings-save-state {
+  margin-top: 12px;
+  color: #656d76;
+  font-size: 12px;
+  text-align: right;
+}
+
+.settings-save-state.saved {
+  color: #116329;
+}
+
+.settings-save-state.error {
+  color: #a40e26;
+}
+
+.execution-log-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 6px 8px;
+  border-bottom: 1px solid #d0d7de;
+}
+
+.execution-log-filters button {
+  padding: 3px 8px;
+  border: 1px solid #d0d7de;
+  border-radius: 999px;
+  background: #fff;
+  color: #656d76;
+  font-size: 11px;
+}
+
+.execution-log-filters button[aria-pressed="true"] {
+  border-color: #54aeff;
+  background: #ddf4ff;
+  color: #0969da;
 }
 
 .settings-form > label,
@@ -3379,7 +3493,8 @@
   }
 
   .settings-grid-two,
-  .settings-secret-row {
+  .settings-secret-row,
+  .settings-tabs {
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -3831,6 +3946,104 @@
   font-size: 13px;
   color: #656d76;
   line-height: 1.5;
+}
+
+.milestone-human-review-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(15 23 42 / 52%);
+}
+
+.milestone-human-review-dialog {
+  width: min(760px, 100%);
+  max-height: min(820px, calc(100vh - 48px));
+  overflow: auto;
+  padding: 24px;
+  border: 1px solid var(--border-color, #d0d7de);
+  border-radius: 14px;
+  background: var(--panel-bg, #fff);
+  box-shadow: 0 24px 60px rgb(15 23 42 / 28%);
+}
+
+.milestone-human-review-list,
+.milestone-human-review-group,
+.milestone-human-review-item {
+  display: grid;
+  gap: 12px;
+}
+
+.milestone-human-review-list {
+  margin: 20px 0;
+}
+
+.milestone-human-review-group {
+  padding-top: 16px;
+  border-top: 1px solid var(--border-color, #d0d7de);
+}
+
+.milestone-human-review-item {
+  padding: 16px;
+  border: 1px solid var(--border-color, #d0d7de);
+  border-radius: 10px;
+  background: var(--surface-muted, #f6f8fa);
+}
+
+.milestone-human-review-copy,
+.milestone-human-review-copy span {
+  display: grid;
+  gap: 6px;
+}
+
+.milestone-human-review-item fieldset {
+  display: flex;
+  gap: 18px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.milestone-human-review-item fieldset label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.milestone-human-review-reason {
+  display: grid;
+  gap: 6px;
+}
+
+.milestone-human-review-reason textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.milestone-human-review-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+@media (max-width: 600px) {
+  .milestone-human-review-backdrop {
+    align-items: end;
+    padding: 0;
+  }
+
+  .milestone-human-review-dialog {
+    max-height: 92vh;
+    padding: 18px;
+    border-radius: 16px 16px 0 0;
+  }
+
+  .milestone-human-review-actions {
+    flex-direction: column-reverse;
+  }
 }
 
 /* ===== Blueprint: 回退影响弹窗 ===== */

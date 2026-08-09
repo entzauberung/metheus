@@ -1,6 +1,6 @@
 # Metheus fork patch set
 
-Fork revision: `metheus.3`
+Fork revision: `metheus.4`
 
 The only supported embedded call chain is:
 
@@ -22,7 +22,8 @@ metheus-grok-engine
 | `UPSTREAM_SOURCE.md` | Identify this directory as the controlled fork rather than the pristine archive |
 | `crates/codegen/xai-file-utils/src/events/tracker.rs` | Add a no-op event tracker so embedded sessions never create `~/.grok` event files |
 | `crates/codegen/xai-grok-sampler/src/client.rs` | Remove authorization and API-key prefix fields from sampler trace events; retain only non-secret authentication type/presence metadata |
-| `crates/codegen/xai-grok-sampler/src/config.rs` | Redact API keys and extra header values from `SamplerConfig` debug output |
+| `crates/codegen/xai-grok-sampler/src/config.rs` | Redact API keys and extra header values from `SamplerConfig` debug output; extend the existing in-process `HeaderInjector` hook with a token-only response-usage observer for the embedded facade |
+| `crates/codegen/xai-grok-sampler/src/actor/request_task.rs` | Forward decoded provider token usage before Length responses are converted into terminal max-token errors; do not expose response content or alter retry behavior |
 | `crates/codegen/xai-grok-sampler/src/sampling_log.rs` | Remove credential prefixes from sampling request spans so sampler tracing cannot persist partial API keys |
 | `crates/codegen/xai-grok-shell/Cargo.toml` | Declare the opt-in `metheus-embedded` feature |
 | `crates/codegen/xai-grok-shell/src/lib.rs` | Export the feature-gated embedded facade |
@@ -35,7 +36,7 @@ metheus-grok-engine
 | `crates/codegen/xai-grok-shell/src/agent/subagent/handle_request.rs` | Supply non-embedded defaults to the extended upstream spawn signature |
 | `crates/codegen/xai-grok-shell/src/session/acp_types.rs` | Add non-persisted embedded and frozen-auth startup hints |
 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/prompt_queue.rs` | Suppress host prompt-history writes in embedded sessions |
-| `crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs` | Reconstruct requests solely from the frozen snapshot; disable model-catalog auth and bearer refresh paths |
+| `crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs` | Preserve the complete process-local frozen sampler config in embedded mode (including the token-only usage observer); ordinary sessions continue model-catalog auth refresh and per-turn reconstruction |
 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/session_setup.rs` | Suppress system prompt and chat-history persistence |
 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/spawn.rs` | Build the restricted upstream agent, bind its in-memory workspace route, and suppress host services and persistence |
 | `crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs` | Suppress host task-resume injection |
@@ -59,6 +60,7 @@ baseline without first being added to this inventory with a security rationale.
 - The event bridge distinguishes completed and failed tools and exposes structured retry scheduling/exhaustion without forwarding reasoning content.
 - Embedded requests do not read Grok CLI model credentials or add URL-derived Grok authentication headers.
 - Cancellation, timeout, maximum turns, policy rejection, auth, quota, rate limit, network, protocol, and runtime failures remain typed across the adapter boundary.
+- Max-token truncation remains distinct from protocol failures and carries bounded output, authorized writes, consumed turns, and provider usage for one host-controlled continuation.
 
 Audit the inventory with:
 

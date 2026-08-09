@@ -385,6 +385,7 @@ fn shadow_action_family(
         | ControlActionKind::LocalValidate
         | ControlActionKind::AutomatedValidate
         | ControlActionKind::TargetedValidate
+        | ControlActionKind::ProvisionalValidate
         | ControlActionKind::Recompile => None,
     }
 }

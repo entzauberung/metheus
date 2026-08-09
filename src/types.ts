@@ -100,11 +100,70 @@ export type EngineFailureKind =
   | "ProcessCrash"
   | "ToolRejected"
   | "ProtocolError"
+  | "OutputTruncated"
   | "MaxTurnsExceeded"
   | "RuntimeError"
   | "TaskExecutionError";
 
-export type AcceptanceStatus = "Satisfied" | "Unsatisfied" | "Unknown" | "Contradictory" | "AcceptedDeviation";
+export type AcceptanceStatus =
+  | "Satisfied"
+  | "AiProvisionallySatisfied"
+  | "DeferredHumanReview"
+  | "Unsatisfied"
+  | "Unknown"
+  | "Contradictory"
+  | "AcceptedDeviation";
+export type HumanReviewCadence = "PerTask" | "MilestoneBatch";
+export type MilestoneHumanDecision = "Pending" | "Confirmed" | "Rejected";
+export type VisualReviewStatus =
+  | "Unavailable"
+  | "Satisfied"
+  | "Unsatisfied"
+  | "EvidenceInsufficient"
+  | "Conflict";
+
+export interface VisualEvidenceReference {
+  path: string;
+  sha256: string;
+  mime: string;
+  size_bytes: number;
+}
+
+export interface MilestoneHumanReviewItem {
+  id: string;
+  milestone_id: string;
+  task_id: string;
+  criterion_index: number;
+  criterion: string;
+  contract_fingerprint: string;
+  execution_facts_fingerprint: string;
+  review_cycle: number;
+  ai_status: AcceptanceStatus;
+  ai_evidence: string;
+  visual_status: VisualReviewStatus;
+  visual_summary: string;
+  visual_evidence: VisualEvidenceReference[];
+  human_decision: MilestoneHumanDecision;
+  human_reason: string;
+  decided_at?: string;
+  updated_at: string;
+}
+
+export interface MilestoneHumanReviewDecisionSubmission {
+  item_id: string;
+  decision: Exclude<MilestoneHumanDecision, "Pending">;
+  reason: string;
+}
+
+export interface MilestoneReviewSubmission {
+  milestone_id: string;
+  review_cycle: number;
+  expected_revision: number;
+  review_fingerprint: string;
+  branch: "A" | "B" | "C";
+  branch_reason: string;
+  decisions: MilestoneHumanReviewDecisionSubmission[];
+}
 export type Provability = "Deterministic" | "AutomatedTest" | "SemanticReview" | "HumanReview" | "Unprovable";
 export type ProvabilitySource = "PlanningExplicit" | "SystemInferred" | "HumanCorrected";
 export type EvidenceSourceType = "LocalScan" | "AutomatedTestOutput" | "CodeSnippet" | "ExpandedCodeSnippet" | "RuntimeOrHuman";
@@ -590,12 +649,23 @@ export interface PluginCliSettingsView {
   grok_path?: string;
 }
 
+export interface VisionModelSettingsView {
+  enabled: boolean;
+  request_url: string;
+  model: string;
+  timeout_secs: number;
+  max_image_bytes: number;
+  max_total_bytes: number;
+  max_images: number;
+}
+
 export interface AppSettingsData {
   schema_version: number;
   revision: number;
   decision_model: DecisionModelSettingsView;
   built_in_grok_build: BuiltInGrokBuildSettingsView;
   plugin_cli: PluginCliSettingsView;
+  vision_model: VisionModelSettingsView;
 }
 
 export type SecretPersistence = "SecureStore" | "SessionOnly";
@@ -619,10 +689,11 @@ export interface AppSettingsView {
   settings: AppSettingsData;
   decision_secret: SecretStatus;
   built_in_grok_build_secret: SecretStatus;
+  vision_model_secret: SecretStatus;
   load_warning?: string;
 }
 
-export type ModelConnectionTarget = "DecisionModel" | "BuiltInGrokBuild";
+export type ModelConnectionTarget = "DecisionModel" | "BuiltInGrokBuild" | "VisionModel";
 export type ModelConnectionErrorKind =
   | "MissingSecret"
   | "InvalidConfiguration"
@@ -1041,6 +1112,9 @@ export interface Milestone {
   last_plan_failure_fingerprint: string;
   last_plan_issue_count: number;
   plan_no_progress_count: number;
+  human_review_items: MilestoneHumanReviewItem[];
+  human_review_cycle: number;
+  human_review_fingerprint: string;
 }
 
 export interface ChatMessage {
@@ -1086,6 +1160,8 @@ export interface Project {
   workflow_state: WorkflowState;
   workload_profile?: WorkloadProfile;
   execution_profile: ExecutionProfile;
+  human_review_cadence: HumanReviewCadence;
+  vision_review_enabled: boolean;
   current_milestone_id: string;
   current_mid_stage_id: string;
   version_plan: string;
@@ -1496,6 +1572,7 @@ export interface ExecutionSession {
   engine_model: string;
   endpoint_fingerprint: string;
   engine_executable_path: string;
+  human_review_cadence: HumanReviewCadence;
 }
 
 // ========== 宪法变更历史 ==========
@@ -1618,8 +1695,10 @@ export interface SubtaskStatusItem {
 
 export interface LogEntry {
   timestamp: string;  // ISO 8601
-  level: string;      // "info" | "success" | "error" | "pause"
+  level: string;      // "info" | "success" | "error" | "pause" | "debug"
   text: string;
+  source?: string;
+  correlation_id?: string;
 }
 
 export interface PipelineState {

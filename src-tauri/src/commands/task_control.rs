@@ -509,7 +509,10 @@ fn manual_executor_actions(
         ));
     }
     if !human.is_empty() {
-        actions.push((crate::control_action::ControlActionKind::Human, human));
+        actions.push((
+            crate::control_scheduler::human_review_action_for_cadence(project.human_review_cadence),
+            human,
+        ));
     }
     Ok(actions)
 }
@@ -965,8 +968,9 @@ mod tests {
     }
 
     #[test]
-    fn revalidation_routes_human_review_to_its_own_action() {
+    fn revalidation_routes_human_review_by_project_cadence() {
         let mut project = project_with_task();
+        project.human_review_cadence = project::HumanReviewCadence::PerTask;
         project.milestones[0].subtasks[0].acceptance_criteria = vec![
             "file exists: `index.html`".to_string(),
             "自动化测试通过".to_string(),
@@ -1036,6 +1040,17 @@ mod tests {
         assert_eq!(
             actions[3],
             (crate::control_action::ControlActionKind::Human, vec![4])
+        );
+
+        project.human_review_cadence = project::HumanReviewCadence::MilestoneBatch;
+        let batch_actions = manual_executor_actions(&project, &request, "task").unwrap();
+        assert_eq!(&batch_actions[..3], &actions[..3]);
+        assert_eq!(
+            batch_actions[3],
+            (
+                crate::control_action::ControlActionKind::ProvisionalValidate,
+                vec![4]
+            )
         );
     }
 

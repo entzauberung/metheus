@@ -3,24 +3,26 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+const DECISION_MODEL_INVOKE_TIMEOUT_SECS = 3_610;
+
 /// 各 Tauri 命令的超时秒数映射表
 /// Key: 完整 invoke 命令名或 `_runtime` 包装命令的基础名，Value: 超时秒数
 /// 未在此表中的命令使用默认值 DEFAULT_TIMEOUT_SECS（30 秒）
 const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   // 聊天/讨论类 — 用户可感知，不宜过长
-  send_message: 60,
-  chat_with_role: 60,
+  send_message: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
+  chat_with_role: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
   cancel_chat_stream: 10,
 
   // 方案生成类 — 大模型计算密集，给充裕时间
-  generate_version_plan: 180,
+  generate_version_plan: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
 
   // 执行控制类 — 后端轻量操作
   approve_version_plan: 30,
 
   // 测试/检查类 — 涉及文件读写和子进程调用
   execute_subtask: 120,
-  check_subtask: 120,
+  check_subtask: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
 
   // 状态查询类 — 高频轮询，短超时
   get_execution_status: 10,
@@ -37,7 +39,7 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   update_app_settings: 15,
   set_api_secret: 15,
   clear_api_secret: 15,
-  test_model_connection: 620,
+  test_model_connection: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
   test_grok_build_runtime: 620,
   verify_engine_authentication: 45,
   get_project_files: 15,
@@ -51,7 +53,7 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   // Git 操作类
 
   // 宪法管理（AI 调用 + 文件 I/O）
-  update_constitution: 120,
+  update_constitution: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
 
   // 快照持久化
   save_snapshot_event: 15,
@@ -64,31 +66,32 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   // V1 新增命令 - 项目入口
   initialize_project_entry: 30,
   scan_existing_project: 60,
-  generate_existing_baseline: 120,
+  generate_existing_baseline: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
   approve_existing_baseline: 15,
   update_execution_profile: 15,
+  update_human_review_policy: 15,
 
   // V1 新增命令 - 三项检查
-  run_preflight_check: 120,
+  run_preflight_check: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
 
   // V1 新增命令 - 执行计划
-  generate_execution_plan: 180,
-  check_stage_plan: 150,
+  generate_execution_plan: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
+  check_stage_plan: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
   approve_stage_plan: 15,
 
   // V1 Console 规划闭环 - AI 命令必须长于后端 120 秒 HTTP 超时
-  generate_milestone_draft: 150,
-  regenerate_milestone_draft: 150,
-  check_milestone_draft: 150,
+  generate_milestone_draft: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
+  regenerate_milestone_draft: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
+  check_milestone_draft: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
   approve_milestone_draft: 15,
   select_milestone: 15,
   continue_current_milestone: 15,
-  generate_mid_stage_draft: 150,
-  regenerate_mid_stage_draft: 150,
-  check_mid_stage_draft: 150,
+  generate_mid_stage_draft: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
+  regenerate_mid_stage_draft: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
+  check_mid_stage_draft: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
   approve_mid_stage_draft: 15,
   select_mid_stage: 15,
-  regenerate_execution_plan: 180,
+  regenerate_execution_plan: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
 
   // V1 新增命令 - 执行控制（autopilot 也需要这些）
   execute_current_subtask: 15,
@@ -98,9 +101,9 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   prepare_execution_workspace: 60,
   refresh_execution_workspace: 15,
   retry_git_confirmation: 30,
-  run_error_recovery: 1500,
+  run_error_recovery: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
   acknowledge_execution_recovery: 30,
-  resolve_human_recovery: 900,
+  resolve_human_recovery: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
   request_in_stop: 30,
   request_ed_stop: 15,
   resolve_pause_decision: 15,
@@ -127,23 +130,23 @@ const INVOKE_TIMEOUT_MAP: Record<string, number> = {
   restart_checks: 15,
 
   // V1 新增命令 - 暂停决策
-  suggest_rollback_checkpoint: 120,
+  suggest_rollback_checkpoint: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
   approve_milestone_outcome: 15,
 
   // V1 新增命令 - 大阶段审阅与未来规划
   enter_milestone_review: 15,
   approve_future_milestones: 15,
-  generate_future_milestone_draft: 150,
-  summarize_milestone: 120,
+  generate_future_milestone_draft: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
+  summarize_milestone: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
 
   // V1 新增命令 - 宪法
-  get_constitution_summary: 15,
-  compact_constitution: 60,
+  get_constitution_summary: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
+  compact_constitution: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
 
   // V1 新增命令 - 方案和控制台
   reject_version_plan: 15,
   enter_console: 15,
-  analyze_existing_project: 180,
+  analyze_existing_project: DECISION_MODEL_INVOKE_TIMEOUT_SECS,
 };
 
 /// 未显式配置的命令超时秒数
@@ -155,6 +158,11 @@ export interface InvokeTimeoutResolution {
   timeoutMs: number;
   source: InvokeTimeoutSource;
   usedDefault: boolean;
+}
+
+export function decisionModelInvokeTimeoutMs(timeoutSecs: number): number {
+  const hardTimeoutSecs = Math.min(Math.max(timeoutSecs, 0) * 3, 3_600);
+  return (hardTimeoutSecs + 10) * 1_000;
 }
 
 /**
@@ -242,4 +250,4 @@ export async function invokeWithTimeout<T>(
   }
 }
 
-export { INVOKE_TIMEOUT_MAP, DEFAULT_TIMEOUT_SECS };
+export { DECISION_MODEL_INVOKE_TIMEOUT_SECS, INVOKE_TIMEOUT_MAP, DEFAULT_TIMEOUT_SECS };

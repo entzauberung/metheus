@@ -11,6 +11,27 @@ const EVIDENCE_CONTEXT_LINES: usize = 6;
 const MAX_ANCHOR_TERMS: usize = 64;
 const MAX_PREFERRED_FILES: usize = 32;
 
+pub(crate) fn declared_visual_evidence_paths(task: &project::Subtask) -> Vec<String> {
+    task.evidence_files
+        .iter()
+        .chain(task.expected_artifacts.iter())
+        .filter(|path| {
+            std::path::Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(
+                        extension.to_ascii_lowercase().as_str(),
+                        "png" | "jpg" | "jpeg" | "webp"
+                    )
+                })
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ReviewEvidenceRequest {
     pub strategy: project::ReviewEvidenceStrategy,
@@ -728,6 +749,22 @@ pub(crate) fn build_review_evidence_with_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visual_evidence_uses_only_explicit_image_declarations() {
+        let task = project::Subtask {
+            evidence_files: vec!["shots/a.png".into(), "notes.txt".into()],
+            expected_artifacts: vec!["shots/b.JPEG".into(), "shots/a.png".into()],
+            allowed_file_paths: vec!["shots/not-declared.webp".into()],
+            read_file_paths: vec!["shots/also-not-declared.jpg".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            declared_visual_evidence_paths(&task),
+            vec!["shots/a.png".to_string(), "shots/b.JPEG".to_string()]
+        );
+    }
 
     #[test]
     fn parses_middle_diff_hunks_with_new_line_ranges() {

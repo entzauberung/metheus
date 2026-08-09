@@ -217,6 +217,11 @@ pub type SharedBearerResolver = std::sync::Arc<dyn BearerResolver>;
 /// Per-request header injection (e.g. OTel `traceparent`).
 pub trait HeaderInjector: Send + Sync + std::fmt::Debug {
     fn inject(&self, headers: &mut reqwest::header::HeaderMap);
+
+    /// Observe provider token facts before terminal response classification.
+    /// Ordinary header injectors use the no-op default; the embedded facade
+    /// uses this to retain usage when a Length response becomes an error.
+    fn observe_response_usage(&self, _usage: &xai_grok_sampling_types::TokenUsage) {}
 }
 
 pub type SharedHeaderInjector = std::sync::Arc<dyn HeaderInjector>;

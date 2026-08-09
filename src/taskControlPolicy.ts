@@ -41,7 +41,15 @@ export function acceptanceCounts(items: AcceptanceLedgerItem[]) {
   return items.reduce((counts, item) => {
     counts[item.status] += 1;
     return counts;
-  }, { Satisfied: 0, Unsatisfied: 0, Unknown: 0, Contradictory: 0, AcceptedDeviation: 0 });
+  }, {
+    Satisfied: 0,
+    AiProvisionallySatisfied: 0,
+    DeferredHumanReview: 0,
+    Unsatisfied: 0,
+    Unknown: 0,
+    Contradictory: 0,
+    AcceptedDeviation: 0,
+  });
 }
 
 export function hasControlCapability(capabilities: string[], action: string): boolean {

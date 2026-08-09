@@ -6075,6 +6075,7 @@ dependencies = [
 name = "metheus"
 version = "0.0.3"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
  "dotenvy",

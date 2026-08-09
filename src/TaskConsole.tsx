@@ -3,7 +3,11 @@ import * as Tabs from "@radix-ui/react-tabs";
 import { ArrowDown, CheckCircle2, FileDiff, FileText, History, Layers, Milestone, Tags } from "lucide-react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
 import type { ChangeHistoryEntry, ConstitutionChangeHistory, ExecutionHistoryEntry, GitTagTree, PipelineState, RecoveryPresentation, TestLog, VerificationStage } from "./types";
-import { mergeExecutionLogs } from "./logPolicy";
+import {
+  currentLogDuplicatesTimeline,
+  mergeExecutionLogs,
+  normalizeCurrentExecutionLog,
+} from "./logPolicy";
 import { getVerificationStageLabel } from "./autopilotPolicy";
 
 const LOG_LEVEL_ICON: Record<string, string> = {
@@ -11,7 +15,16 @@ const LOG_LEVEL_ICON: Record<string, string> = {
   success: "✅",
   error: "❌",
   pause: "⏸",
+  debug: "·",
 };
+
+const LOG_FILTERS = [
+  ["info", "信息"],
+  ["success", "成功"],
+  ["error", "错误"],
+  ["pause", "暂停"],
+  ["debug", "调试"],
+] as const;
 
 const OPERATION_SOURCE_LABEL = {
   User: "用户",
@@ -23,6 +36,7 @@ const OPERATION_SOURCE_LABEL = {
 function formatLogTime(iso: string): string {
   try {
     const d = new Date(iso);
+    if (!Number.isFinite(d.getTime())) return "";
     return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   } catch {
     return "";
@@ -72,7 +86,7 @@ export default function TaskConsole({
   projectPath,
   projectName,
   executionStatus,
-  testLogs: _testLogs,
+  testLogs,
   workspaceReady = false,
   executionHistory,
   verificationStage,
@@ -90,6 +104,9 @@ export default function TaskConsole({
   const [gitTagTree, setGitTagTree] = useState<GitTagTree | null>(null);
   const [loading, setLoading] = useState(false);
   const [stickToBottom, setStickToBottom] = useState(true);
+  const [visibleLevels, setVisibleLevels] = useState<Set<string>>(
+    () => new Set(["info", "success", "error", "pause"]),
+  );
   const logRef = useRef<HTMLDivElement>(null);
 
   const loadTab = useCallback(async () => {
@@ -139,10 +156,18 @@ export default function TaskConsole({
     }
   }, [executionStatus?.log_history?.length, executionStatus?.current_log, executionHistory?.length, stickToBottom]);
 
-  const mergedLogs = mergeExecutionLogs(executionHistory, executionStatus?.log_history);
-  const hasAnyLog =
-    mergedLogs.length > 0
-    || !!executionStatus?.current_log;
+  const mergedLogs = mergeExecutionLogs(
+    executionHistory,
+    executionStatus?.log_history,
+    testLogs,
+  );
+  const filteredLogs = mergedLogs.filter((entry) => visibleLevels.has(entry.level));
+  const currentLog = normalizeCurrentExecutionLog(executionStatus);
+  const showCurrentLog = executionStatus?.status === "Running"
+    && Boolean(currentLog)
+    && visibleLevels.has(currentLog?.level ?? "")
+    && !currentLogDuplicatesTimeline(currentLog!, mergedLogs);
+  const hasAnyLog = filteredLogs.length > 0 || showCurrentLog;
   const recovery = recoveryPresentation?.kind !== "None" ? recoveryPresentation : null;
   const displayedValidationStage = recovery
     ? recovery.validation_phase_label
@@ -167,6 +192,21 @@ export default function TaskConsole({
 
         <Tabs.Content className="task-tab-content" value="logs">
           <div className="execution-log-panel">
+            <div className="execution-log-filters" aria-label="日志级别筛选">
+              {LOG_FILTERS.map(([level, label]) => (
+                <button
+                  aria-pressed={visibleLevels.has(level)}
+                  key={level}
+                  onClick={() => setVisibleLevels((current) => {
+                    const next = new Set(current);
+                    if (next.has(level)) next.delete(level);
+                    else next.add(level);
+                    return next;
+                  })}
+                  type="button"
+                >{label}</button>
+              ))}
+            </div>
             {displayedValidationStage && (
               <div className="task-console-validation-strip">
                 <span>验证阶段：{displayedValidationStage}</span>
@@ -183,10 +223,10 @@ export default function TaskConsole({
               className="execution-log-list"
               onScroll={handleLogScroll}
             >
-              {mergedLogs.map((entry) => (
+              {filteredLogs.map((entry) => (
                 <div
                   key={entry.key}
-                  className={`execution-log-entry log-${entry.level}${entry.source === "runtime" ? " log-runtime" : ""}${entry.taskId ? " has-task-link" : ""}`}
+                  className={`execution-log-entry log-${entry.level}${entry.timelineSource === "runtime" ? " log-runtime" : ""}${entry.taskId ? " has-task-link" : ""}`}
                   role={entry.taskId ? "button" : undefined}
                   tabIndex={entry.taskId ? 0 : undefined}
                   aria-current={entry.taskId && entry.taskId === selectedTaskId ? "true" : undefined}
@@ -201,10 +241,11 @@ export default function TaskConsole({
                   }}
                 >
                   <span className="execution-log-time">{formatLogTime(entry.timestamp)}</span>
-                  <span className="execution-log-level">{LOG_LEVEL_ICON[entry.level] || (entry.source === "runtime" ? "⚡" : "")}</span>
+                  <span className="execution-log-level">{LOG_LEVEL_ICON[entry.level] || (entry.timelineSource === "runtime" ? "⚡" : "")}</span>
                   <span className={`execution-log-source source-${entry.operationSource.toLowerCase()}`}>
                     {OPERATION_SOURCE_LABEL[entry.operationSource]}
                   </span>
+                  <span className="execution-log-channel">{entry.source || entry.timelineSource}</span>
                   <span className="execution-log-text">{entry.text}</span>
                   {(entry.criterionIndex || entry.actionId || entry.modelCallId) && (
                     <span className="execution-log-links">
@@ -219,12 +260,16 @@ export default function TaskConsole({
                 <p className="execution-log-empty">暂无执行日志。执行操作后将在此显示历史记录。</p>
               )}
               {/* 当前阶段状态（执行中 / 测试中） */}
-              {executionStatus?.status === "Running" && executionStatus.current_log && (
+              {showCurrentLog && currentLog && (
                 <div className="execution-log-entry log-live">
                   <span className="execution-log-time">现在</span>
-                  <span className="execution-log-level">⚡</span>
+                  <span className="execution-log-level">{LOG_LEVEL_ICON[currentLog.level] || "⚡"}</span>
                   <span className="execution-log-source source-system">系统历史</span>
-                  <span className="execution-log-text">{executionStatus.current_log}</span>
+                  <span className="execution-log-channel">{currentLog.source || "runtime"}</span>
+                  <span className="execution-log-text">{currentLog.text}</span>
+                  {currentLog.correlation_id && (
+                    <span className="execution-log-links">关联 {currentLog.correlation_id}</span>
+                  )}
                 </div>
               )}
             </div>

@@ -799,13 +799,71 @@ pub(crate) async fn resolve_human_recovery_runtime(
 pub(crate) async fn approve_milestone_outcome_runtime(
     state: tauri::State<'_, crate::AppState>,
     project_name: String,
-    branch: String,
+    branch: Option<String>,
+    submission: Option<crate::commands::milestone::MilestoneReviewSubmission>,
 ) -> Result<RuntimeMutationResult, String> {
     let pipeline_state = state.pipeline_state.clone();
-    crate::commands::milestone::approve_milestone_outcome(state, project_name.clone(), branch)
-        .await?;
+    crate::commands::milestone::approve_milestone_outcome(
+        state,
+        project_name.clone(),
+        branch,
+        submission,
+    )
+    .await?;
     let pipeline = pipeline_state.lock().await.clone();
     finish(&project_name, pipeline, "approve_milestone_outcome")
+}
+
+#[tauri::command]
+pub(crate) async fn update_human_review_policy_runtime(
+    state: tauri::State<'_, crate::AppState>,
+    project_name: String,
+    expected_revision: u64,
+    human_review_cadence: crate::project::HumanReviewCadence,
+    vision_review_enabled: bool,
+) -> Result<RuntimeMutationResult, String> {
+    let pipeline = state.pipeline_state.lock().await.clone();
+    if pipeline.as_ref().is_some_and(|pipeline| {
+        pipeline.project_name == project_name
+            && pipeline.status == crate::pipeline::PipelineStatus::Running
+    }) {
+        return Err("执行正在运行，不能修改人工确认或视觉审查策略".to_string());
+    }
+    crate::mutate_project_for_control(&project_name, |project| {
+        if project.workflow_state.data_revision != expected_revision {
+            return Err(format!(
+                "项目修订冲突：请求={}，磁盘={}",
+                expected_revision, project.workflow_state.data_revision
+            ));
+        }
+        if project
+            .execution_session
+            .as_ref()
+            .is_some_and(|session| session.active)
+        {
+            return Err("活动执行会话期间不能修改人工确认或视觉审查策略".to_string());
+        }
+        if project.milestones.iter().any(|milestone| {
+            milestone.human_review_items.iter().any(|item| {
+                item.review_cycle == milestone.human_review_cycle
+                    && item.human_decision == crate::project::MilestoneHumanDecision::Pending
+            })
+        }) {
+            return Err("存在未决的大阶段人工确认清单，处理完成前不能切换策略".to_string());
+        }
+        if project.human_review_cadence == human_review_cadence
+            && project.vision_review_enabled == vision_review_enabled
+        {
+            return Ok(((), false));
+        }
+        project.human_review_cadence = human_review_cadence;
+        project.vision_review_enabled = vision_review_enabled;
+        project.workflow_state.data_revision =
+            project.workflow_state.data_revision.saturating_add(1);
+        project.workflow_state.last_transition_at = chrono::Utc::now().to_rfc3339();
+        Ok(((), true))
+    })?;
+    finish(&project_name, pipeline, "update_human_review_policy")
 }
 
 #[tauri::command]

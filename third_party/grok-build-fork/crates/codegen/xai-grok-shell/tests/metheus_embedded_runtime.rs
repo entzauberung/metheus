@@ -181,6 +181,30 @@ fn text_turn() -> String {
     ])
 }
 
+fn truncated_turn() -> String {
+    sse_response(&[
+        serde_json::json!({
+            "id": "chatcmpl-truncated",
+            "object": "chat.completion.chunk",
+            "created": 3,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {"role": "assistant", "content": "partial output"},
+                "finish_reason": null
+            }]
+        }),
+        serde_json::json!({
+            "id": "chatcmpl-truncated",
+            "object": "chat.completion.chunk",
+            "created": 3,
+            "model": "test-model",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+            "usage": {"prompt_tokens": 30, "completion_tokens": 16, "total_tokens": 46}
+        }),
+    ])
+}
+
 fn test_config(address: SocketAddr) -> EmbeddedConfig {
     EmbeddedConfig {
         api_backend: EmbeddedApiBackend::ChatCompletions,
@@ -442,10 +466,44 @@ async fn upstream_session_actor_enforces_max_turns() -> Result<(), Box<dyn std::
     )
     .await;
     server.join().map_err(|_| "server thread panicked")??;
-    assert_eq!(
-        result.expect_err("turn limit must stop the loop").kind,
-        EmbeddedErrorKind::MaxTurns
-    );
+    let error = result.expect_err("turn limit must stop the loop");
+    assert_eq!(error.kind, EmbeddedErrorKind::MaxTurns);
+    assert_eq!(error.turns, 1);
+    assert_eq!(error.prompt_tokens, 10);
+    assert_eq!(error.completion_tokens, 4);
+    assert_eq!(error.files_written, vec!["allowed.txt"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn max_token_truncation_preserves_typed_usage_and_bounded_output()
+-> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = std::thread::spawn(move || -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        let _ = read_request(&mut stream)?;
+        stream.write_all(truncated_turn().as_bytes())?;
+        Ok(())
+    });
+    let directory = tempfile::tempdir()?;
+    let error = execute(
+        test_config(address),
+        test_request(
+            directory.path(),
+            "max-token-truncation",
+            Arc::new(AtomicBool::new(false)),
+        ),
+    )
+    .await
+    .expect_err("max-token response must remain typed");
+    server.join().map_err(|_| "server thread panicked")??;
+    assert_eq!(error.kind, EmbeddedErrorKind::OutputTruncated);
+    assert_eq!(error.turns, 1);
+    assert_eq!(error.prompt_tokens, 30);
+    assert_eq!(error.completion_tokens, 16);
+    assert!(error.output_summary.contains("partial output"));
+    assert!(error.output_summary.chars().count() <= 2_000);
     Ok(())
 }
 
@@ -695,7 +753,10 @@ async fn doom_loop_budget_one_resamples_once_and_accepts_clean_response()
         "result: {result:#?}; requests: {:#?}",
         server.requests()
     );
-    assert!(result.output.contains("clean answer"), "result: {result:#?}");
+    assert!(
+        result.output.contains("clean answer"),
+        "result: {result:#?}"
+    );
     assert!(!result.output.contains("poisoned answer"));
     Ok(())
 }

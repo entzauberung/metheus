@@ -1,10 +1,18 @@
 import { CheckCircle2, CircleAlert, HelpCircle, OctagonAlert } from "lucide-react";
 import type { AcceptanceLedgerItem, Provability } from "./types";
 
-const labels = { Satisfied: "已满足", Unsatisfied: "未满足", Unknown: "证据不足", Contradictory: "契约冲突", AcceptedDeviation: "接受偏差" } as const;
+const labels = {
+  Satisfied: "已满足",
+  AiProvisionallySatisfied: "AI 临时通过",
+  DeferredHumanReview: "延期人工确认",
+  Unsatisfied: "未满足",
+  Unknown: "证据不足",
+  Contradictory: "契约冲突",
+  AcceptedDeviation: "接受偏差",
+} as const;
 
 function statusIcon(status: AcceptanceLedgerItem["status"]) {
-  if (status === "Satisfied") return <CheckCircle2 size={15} />;
+  if (status === "Satisfied" || status === "AiProvisionallySatisfied") return <CheckCircle2 size={15} />;
   if (status === "Unsatisfied") return <OctagonAlert size={15} />;
   if (status === "Contradictory") return <CircleAlert size={15} />;
   return <HelpCircle size={15} />;

@@ -33,6 +33,7 @@ pub(crate) fn expected_action_duration_secs(action: ControlActionKind) -> u64 {
         ControlActionKind::LocalValidate
         | ControlActionKind::AutomatedValidate
         | ControlActionKind::TargetedValidate
+        | ControlActionKind::ProvisionalValidate
         | ControlActionKind::GitConfirm => CONTROL_ACTION_VALIDATION_EXPECTED_SECS,
         ControlActionKind::Repair => CONTROL_ACTION_REPAIR_EXPECTED_SECS,
         ControlActionKind::Split
@@ -744,7 +745,8 @@ fn validate_request(
         }
         ControlActionKind::LocalValidate
         | ControlActionKind::AutomatedValidate
-        | ControlActionKind::TargetedValidate => {
+        | ControlActionKind::TargetedValidate
+        | ControlActionKind::ProvisionalValidate => {
             if !task.child_tasks.is_empty() || crate::task_tree::is_terminal(&task.status) {
                 return Err("验证动作只能作用于未完成叶子任务".to_string());
             }
@@ -843,6 +845,10 @@ async fn dispatch(
         ControlActionKind::TargetedValidate => {
             run_targeted_validation(project_name, request).await?;
             Ok("定向验证已完成".to_string())
+        }
+        ControlActionKind::ProvisionalValidate => {
+            run_provisional_validation(project_name, request).await?;
+            Ok("人工验收项已形成 AI 临时结论并登记到大阶段清单".to_string())
         }
         ControlActionKind::Repair => {
             let mut project = claimed_project;
@@ -1269,6 +1275,291 @@ async fn run_targeted_validation(
     crate::save_project(&project)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProvisionalReviewSource {
+    project_revision: u64,
+    tree_revision: u64,
+    contract_fingerprint: String,
+    execution_facts_fingerprint: String,
+}
+
+fn current_contract_fingerprint(
+    project: &project::Project,
+    task_id: &str,
+) -> Result<String, String> {
+    let address = crate::task_tree::locate_task(project, task_id)?
+        .ok_or_else(|| format!("任务节点不存在：{}", task_id))?;
+    let task = crate::task_tree::find_task(project, task_id)?
+        .ok_or_else(|| format!("任务节点不存在：{}", task_id))?;
+    let workload = crate::workload_policy::current_profile(project)?;
+    Ok(crate::task_compiler::compile(
+        task,
+        address.ancestor_task_ids.last().map(String::as_str),
+        address.depth,
+        workload,
+    )
+    .contract
+    .fingerprint)
+}
+
+fn provisional_review_source(
+    project: &project::Project,
+    task_id: &str,
+) -> Result<ProvisionalReviewSource, String> {
+    let task = crate::task_tree::find_task(project, task_id)?
+        .ok_or_else(|| format!("任务节点不存在：{}", task_id))?;
+    Ok(ProvisionalReviewSource {
+        project_revision: project.workflow_state.data_revision,
+        tree_revision: project.task_control.tree_revision,
+        contract_fingerprint: current_contract_fingerprint(project, task_id)?,
+        execution_facts_fingerprint: crate::human_action_policy::execution_result_fingerprint(
+            task,
+        )?,
+    })
+}
+
+fn validate_provisional_review_source(
+    project: &project::Project,
+    task_id: &str,
+    source: &ProvisionalReviewSource,
+) -> Result<(), String> {
+    if project.human_review_cadence != project::HumanReviewCadence::MilestoneBatch {
+        return Err("人工审查策略已变化，拒绝写入旧临时审查结果".to_string());
+    }
+    if project.workflow_state.data_revision != source.project_revision
+        || project.task_control.tree_revision != source.tree_revision
+    {
+        return Err(format!(
+            "临时审查源修订已失效：项目修订 {}->{}, 任务树修订 {}->{}",
+            source.project_revision,
+            project.workflow_state.data_revision,
+            source.tree_revision,
+            project.task_control.tree_revision,
+        ));
+    }
+    let current_contract = current_contract_fingerprint(project, task_id)?;
+    if current_contract != source.contract_fingerprint {
+        return Err("任务合同指纹已变化，拒绝写入旧临时审查结果".to_string());
+    }
+    let task = crate::task_tree::find_task(project, task_id)?
+        .ok_or_else(|| format!("任务节点不存在：{}", task_id))?;
+    let current_facts = crate::human_action_policy::execution_result_fingerprint(task)?;
+    if current_facts != source.execution_facts_fingerprint {
+        return Err("任务执行事实已变化，拒绝写入旧临时审查结果".to_string());
+    }
+    Ok(())
+}
+
+async fn run_provisional_validation(
+    project_name: &str,
+    request: &ControlActionRequest,
+) -> Result<(), String> {
+    let project = crate::load_project(project_name)?;
+    if project.human_review_cadence != project::HumanReviewCadence::MilestoneBatch {
+        return Err("逐任务确认策略不能执行临时人工审查".to_string());
+    }
+    let task = crate::task_tree::find_task(&project, &request.task_id)?
+        .ok_or_else(|| format!("任务节点不存在：{}", request.task_id))?
+        .clone();
+    let source = provisional_review_source(&project, &request.task_id)?;
+    if !request.contract_fingerprint.is_empty()
+        && request.contract_fingerprint != source.contract_fingerprint
+    {
+        return Err("控制动作合同指纹与临时审查源不一致".to_string());
+    }
+    let address = crate::task_tree::locate_task(&project, &request.task_id)?
+        .ok_or_else(|| format!("任务节点不存在：{}", request.task_id))?;
+    let authorized = crate::plan_contract::validate_subtask(&task, "临时人工审查任务")?;
+    let targets = validation_targets_for_mode(
+        &task,
+        &request.criterion_indexes,
+        crate::validator_contract::VerificationMode::HumanReview,
+    )?;
+    let previous_test = task.test_result.clone().unwrap_or_default();
+    let mut result = crate::test_runner::review_subtask_with_context_and_model(
+        &project.project_path,
+        if task.goal.is_empty() {
+            &task.title
+        } else {
+            &task.goal
+        },
+        &task.id,
+        &address.milestone_id,
+        &address.mid_stage_id,
+        Some(task.acceptance_criteria.clone()),
+        Some(authorized.clone()),
+        Some(crate::plan_compiler::compile_execution_prompt(&task)),
+        Some(crate::review_evidence::ReviewEvidenceRequest::for_task(
+            &task,
+            project::ReviewEvidenceStrategy::Targeted,
+            targets.clone(),
+        )),
+        &previous_test,
+        Some(crate::cost_ledger::ModelCallContext {
+            project_name: project.name.clone(),
+            milestone_id: address.milestone_id.clone(),
+            stage_id: if address.mid_stage_id.is_empty() {
+                address.milestone_id.clone()
+            } else {
+                address.mid_stage_id.clone()
+            },
+            task_id: task.id.clone(),
+            purpose: Some(crate::cost_ledger::ModelCallPurpose::Review),
+            decision_id: request.decision_id.clone(),
+            action_id: request.action_id.clone(),
+        }),
+    )
+    .await?;
+    let updates = crate::acceptance::build_ledger(&task.acceptance_criteria, &result, &authorized)
+        .into_iter()
+        .filter(|item| targets.contains(&item.criterion_index))
+        .map(|mut item| {
+            item.status = match item.status {
+                project::AcceptanceStatus::Satisfied => {
+                    project::AcceptanceStatus::AiProvisionallySatisfied
+                }
+                project::AcceptanceStatus::Unknown => {
+                    project::AcceptanceStatus::DeferredHumanReview
+                }
+                status => status,
+            };
+            item
+        })
+        .collect::<Vec<_>>();
+    let vision_review = if project.vision_review_enabled {
+        let context = crate::cost_ledger::ModelCallContext {
+            project_name: project.name.clone(),
+            milestone_id: address.milestone_id.clone(),
+            stage_id: if address.mid_stage_id.is_empty() {
+                address.milestone_id.clone()
+            } else {
+                address.mid_stage_id.clone()
+            },
+            task_id: task.id.clone(),
+            purpose: Some(crate::cost_ledger::ModelCallPurpose::VisionReview),
+            decision_id: request.decision_id.clone(),
+            action_id: request.action_id.clone(),
+        };
+        Some(crate::vision_review::review_task_images(&project, &task, &targets, context).await)
+    } else {
+        None
+    };
+    let execution_facts_fingerprint = source.execution_facts_fingerprint.clone();
+    let contract_fingerprint = source.contract_fingerprint.clone();
+
+    let mut project = crate::load_project(project_name)?;
+    validate_provisional_review_source(&project, &request.task_id, &source)?;
+    if let Some(Ok(review)) = &vision_review {
+        if !project.vision_review_enabled {
+            return Err("项目视觉辅助开关已关闭，拒绝写入旧视觉结果".to_string());
+        }
+        let current_task = crate::task_tree::find_task(&project, &request.task_id)?
+            .ok_or_else(|| format!("任务节点不存在：{}", request.task_id))?;
+        crate::vision_review::validate_visual_evidence_fingerprints(
+            &project.project_path,
+            current_task,
+            &review.evidence,
+        )?;
+    }
+    merge_ledger_updates(&mut project, &request.task_id, updates.clone())?;
+    {
+        let task = crate::task_tree::find_task_mut(&mut project, &request.task_id)?
+            .ok_or_else(|| format!("任务节点不存在：{}", request.task_id))?;
+        result.acceptance_results = task.acceptance_ledger.clone();
+        result.passed = !updates.iter().any(|item| {
+            matches!(
+                item.status,
+                project::AcceptanceStatus::Unsatisfied | project::AcceptanceStatus::Contradictory
+            )
+        });
+        task.test_result = Some(result);
+    }
+    let milestone = project
+        .milestones
+        .iter_mut()
+        .find(|milestone| milestone.id == address.milestone_id)
+        .ok_or_else(|| format!("大阶段不存在：{}", address.milestone_id))?;
+    if milestone.human_review_cycle == 0 {
+        milestone.human_review_cycle = 1;
+    }
+    for update in updates {
+        let id = project::milestone_human_review_item_id(
+            &address.milestone_id,
+            &request.task_id,
+            update.criterion_index,
+            &contract_fingerprint,
+        );
+        let (mut visual_status, visual_summary, visual_evidence) = match &vision_review {
+            Some(Ok(review)) => {
+                let criterion = review
+                    .criteria
+                    .iter()
+                    .find(|result| result.criterion_index == update.criterion_index);
+                (
+                    criterion
+                        .map(|result| result.status.clone())
+                        .unwrap_or(project::VisualReviewStatus::EvidenceInsufficient),
+                    criterion
+                        .map(|result| result.summary.clone())
+                        .unwrap_or_else(|| "视觉模型缺少该验收项结论".to_string()),
+                    review.evidence.clone(),
+                )
+            }
+            Some(Err(error)) => (
+                project::VisualReviewStatus::Unavailable,
+                error.clone(),
+                Vec::new(),
+            ),
+            None => (
+                project::VisualReviewStatus::Unavailable,
+                "视觉辅助未启用".to_string(),
+                Vec::new(),
+            ),
+        };
+        visual_status =
+            crate::vision_review::reconcile_visual_status(&update.status, visual_status);
+        let item = project::MilestoneHumanReviewItem {
+            id: id.clone(),
+            milestone_id: address.milestone_id.clone(),
+            task_id: request.task_id.clone(),
+            criterion_index: update.criterion_index,
+            criterion: update.criterion,
+            contract_fingerprint: contract_fingerprint.clone(),
+            execution_facts_fingerprint: execution_facts_fingerprint.clone(),
+            review_cycle: milestone.human_review_cycle,
+            ai_status: update.status,
+            ai_evidence: update.evidence,
+            visual_status,
+            visual_summary,
+            visual_evidence,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        };
+        if let Some(existing) = milestone
+            .human_review_items
+            .iter_mut()
+            .find(|existing| existing.id == id)
+        {
+            let facts_changed = existing.execution_facts_fingerprint
+                != item.execution_facts_fingerprint
+                || existing.ai_status != item.ai_status;
+            let decision = (!facts_changed)
+                .then(|| existing.human_decision.clone())
+                .unwrap_or_default();
+            let reason = (!facts_changed)
+                .then(|| existing.human_reason.clone())
+                .unwrap_or_default();
+            *existing = item;
+            existing.human_decision = decision;
+            existing.human_reason = reason;
+        } else {
+            milestone.human_review_items.push(item);
+        }
+    }
+    milestone.human_review_fingerprint = project::milestone_human_review_fingerprint(milestone);
+    crate::save_project_if_revision(&project, source.project_revision, source.tree_revision)
+}
+
 fn merge_ledger_updates(
     project: &mut project::Project,
     task_id: &str,
@@ -1398,6 +1689,7 @@ fn append_control_event(
         ControlActionKind::LocalValidate => Some("local_validator_registry".to_string()),
         ControlActionKind::AutomatedValidate => Some("automated_test_runner".to_string()),
         ControlActionKind::TargetedValidate => Some("semantic_review".to_string()),
+        ControlActionKind::ProvisionalValidate => Some("provisional_human_review".to_string()),
         ControlActionKind::Human if !request.criterion_indexes.is_empty() => {
             Some("human_boundary_review".to_string())
         }
@@ -2217,6 +2509,44 @@ mod tests {
             )
             .unwrap(),
             vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn provisional_review_rejects_stale_revision_contract_and_execution_facts() {
+        let mut project = project_with_task(project::SubtaskStatus::AwaitingConfirmation);
+        prepare_deviation_task(&mut project.milestones[0].subtasks[0]);
+        let source = provisional_review_source(&project, "task").unwrap();
+        validate_provisional_review_source(&project, "task", &source).unwrap();
+
+        let mut stale_revision = project.clone();
+        stale_revision.workflow_state.data_revision += 1;
+        assert!(
+            validate_provisional_review_source(&stale_revision, "task", &source)
+                .unwrap_err()
+                .contains("源修订已失效")
+        );
+
+        let mut stale_contract = project.clone();
+        stale_contract.milestones[0].subtasks[0]
+            .acceptance_criteria
+            .push("new criterion".to_string());
+        assert!(
+            validate_provisional_review_source(&stale_contract, "task", &source)
+                .unwrap_err()
+                .contains("合同指纹已变化")
+        );
+
+        let mut stale_facts = project;
+        stale_facts.milestones[0].subtasks[0]
+            .execution_result
+            .as_mut()
+            .expect("execution result")
+            .output = "changed execution output".to_string();
+        assert!(
+            validate_provisional_review_source(&stale_facts, "task", &source)
+                .unwrap_err()
+                .contains("执行事实已变化")
         );
     }
 

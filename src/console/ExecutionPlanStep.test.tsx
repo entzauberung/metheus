@@ -105,7 +105,6 @@ describe("ExecutionPlanStep plan targets", () => {
           onRegenerate={noop}
           workspaceStatus={null}
           onPrepareWorkspace={vi.fn(async () => undefined)}
-          onRefreshWorkspace={vi.fn(async () => undefined)}
         />,
       );
     });

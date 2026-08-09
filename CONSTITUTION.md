@@ -1594,7 +1594,7 @@ Phase 30、Phase 31 记录的独立任务控制标签页是当时已经完成并
 
 - 任务合同冻结 scale、split 深度和 `max_executor_turns`、`max_transport_retries`、`max_doom_loop_retries`；Pipeline 将同一预算复制到执行请求，内置执行器轮数取任务预算与用户设置上限的较小值，插件不得拼装未支持的参数。
 - 模型连接 adapter 由单一 `retry_policy(config)` 驱动，`SamplerConfig.max_retries` 与 `RetryPolicy.max_retries` 都严格读取 `max_transport_retries`；零预算不重试，非零预算不被内部默认值改写。
-- Grok 只能经 `engine/builtin.rs -> metheus-grok-engine -> metheus_embedded -> SessionActor/sampler` 使用。受控 fork 修订为 `metheus.3`，复用上游 sampler 重试、错误分类、退避与 `DoomLoopRecoveryPolicy`，不扩大 Shell、terminal、网页、MCP、plugin、skill、memory、hook 或 subagent 工具面。
+- Grok 只能经 `engine/builtin.rs -> metheus-grok-engine -> metheus_embedded -> SessionActor/sampler` 使用。受控 fork 修订为 `metheus.4`，复用上游 sampler 重试、错误分类、退避与 `DoomLoopRecoveryPolicy`，不扩大 Shell、terminal、网页、MCP、plugin、skill、memory、hook 或 subagent 工具面。
 - Embedded 会话继承 facade 已冻结的 Doom policy，重采样时只丢弃当前未接受尝试的聚合输出，不复制上游检测或恢复算法；Responses fake-SSE 证明 transport retry 为 0 时，Doom 预算 1 恰好发出两次请求并只返回 clean response，预算 0 恰好发出一次请求并保留原响应。
 - `ToolCompleted` 与 `ToolFailed` 分流；只转发 `x.ai/session_notification` 的结构化 retry 状态。结构化事件到达前刷新文本缓存，事件桥不阻塞 SessionActor，诊断经过脱敏和限长。
 - `ToolRejected`、`ProtocolError`、`MaxTurnsExceeded` 与 `RuntimeError` 进入人工边界且禁止自动代码修复；网络、服务不可用、限流与超时继续沿用有限恢复。Core 决策 API 保持独立，不由 Grok sampler 替换。

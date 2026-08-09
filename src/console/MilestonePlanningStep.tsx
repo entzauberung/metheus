@@ -24,7 +24,6 @@ interface Props {
   onSelect: (id: string) => void;
   onContinue: () => void;
   onRegenerate: (source: "check_failed" | "approval_rejected") => void;
-  onSync: () => void;
 }
 
 export function MilestonePlanningStep(props: Props) {
@@ -81,7 +80,7 @@ export function MilestonePlanningStep(props: Props) {
           <ActionButton icon={<RefreshCw size={16} />} variant="danger" loading={busy} onClick={() => props.onRegenerate("check_failed")}>重新生成</ActionButton>
         </WorkflowActionBar>}>
         {draft?.check_result && <FeedbackBanner type={failed ? "error" : "success"} message={failed ? "检查未通过" : "检查通过"} details={[draft.check_result]} />}
-        {candidates.length > 0 ? renderCandidates() : <EmptyState title="草稿数据缺失" message="工作流已进入检查步骤，但候选大阶段为空。" actionLabel="同步项目状态" onAction={props.onSync} />}
+        {candidates.length > 0 ? renderCandidates() : <EmptyState title="草稿数据缺失" message="工作流已进入检查步骤，但候选大阶段为空。请使用顶部命令栏同步项目状态。" />}
         {failed && <textarea className="console-feedback-input" value={props.regenerationFeedback} onChange={(event) => props.setRegenerationFeedback(event.target.value)} placeholder="补充重新生成反馈；留空时使用检查结果" disabled={busy} />}
       </ConsoleStepShell>
     );

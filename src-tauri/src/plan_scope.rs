@@ -387,6 +387,9 @@ mod tests {
             last_plan_failure_fingerprint: String::new(),
             last_plan_issue_count: 0,
             plan_no_progress_count: 0,
+            human_review_items: vec![],
+            human_review_cycle: 0,
+            human_review_fingerprint: String::new(),
         }
     }
 

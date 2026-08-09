@@ -120,6 +120,7 @@ pub(crate) async fn run_request_task(
     let doom_policy = config.doom_loop_recovery;
     let doom_max_retries = doom_policy.map_or(0, |p| p.max_retries);
     let mut doom_retry_count: u32 = 0;
+    let response_usage_observer = config.header_injector.clone();
 
     loop {
         if cancel_token.is_cancelled() {
@@ -138,6 +139,7 @@ pub(crate) async fn run_request_task(
             &event_tx,
             &cancel_token,
             doom_check,
+            response_usage_observer.as_ref(),
         )
         .instrument(sampling_span.clone())
         .await;
@@ -424,6 +426,7 @@ async fn run_one_attempt(
     event_tx: &mpsc::UnboundedSender<SamplingEvent>,
     cancel_token: &CancellationToken,
     doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    response_usage_observer: Option<&crate::config::SharedHeaderInjector>,
 ) -> AttemptOutcome {
     match client.api_backend() {
         ApiBackend::ChatCompletions => {
@@ -433,7 +436,16 @@ async fn run_one_attempt(
             };
             let (teed, captured) = tee_errors(raw);
             let l2 = stream_chat_completions(teed, metadata, request_id.clone(), idle_timeout);
-            drive_l2(l2, request_id, event_tx, cancel_token, captured, None).await
+            drive_l2(
+                l2,
+                request_id,
+                event_tx,
+                cancel_token,
+                captured,
+                None,
+                response_usage_observer,
+            )
+            .await
         }
         ApiBackend::Responses => {
             let (raw, metadata, doom_loop) =
@@ -448,7 +460,16 @@ async fn run_one_attempt(
             }
             let (teed, captured) = tee_errors(raw);
             let l2 = stream_responses(teed, metadata, request_id.clone(), idle_timeout, doom_loop);
-            drive_l2(l2, request_id, event_tx, cancel_token, captured, doom_check).await
+            drive_l2(
+                l2,
+                request_id,
+                event_tx,
+                cancel_token,
+                captured,
+                doom_check,
+                response_usage_observer,
+            )
+            .await
         }
         ApiBackend::Messages => {
             let (raw, metadata) = match client.conversation_stream_messages(request).await {
@@ -457,7 +478,16 @@ async fn run_one_attempt(
             };
             let (teed, captured) = tee_errors(raw);
             let l2 = stream_messages(teed, metadata, request_id.clone(), idle_timeout);
-            drive_l2(l2, request_id, event_tx, cancel_token, captured, None).await
+            drive_l2(
+                l2,
+                request_id,
+                event_tx,
+                cancel_token,
+                captured,
+                None,
+                response_usage_observer,
+            )
+            .await
         }
     }
 }
@@ -504,6 +534,7 @@ async fn drive_l2(
     cancel_token: &CancellationToken,
     captured: ErrorCell,
     doom_check: Option<xai_grok_sampling_types::DoomLoopRecoveryPolicy>,
+    response_usage_observer: Option<&crate::config::SharedHeaderInjector>,
 ) -> AttemptOutcome {
     let mut l2 = pin!(l2);
     loop {
@@ -514,6 +545,11 @@ async fn drive_l2(
             }
             next = l2.next() => match next {
                 Some(SamplingEvent::Completed { response, metrics, .. }) => {
+                    if let Some(observer) = response_usage_observer
+                        && let Some(usage) = response.usage.as_ref()
+                    {
+                        observer.observe_response_usage(usage);
+                    }
                     // Doom outranks the truncation/empty classes: a confident
                     // loop poisons the attempt whatever else it looks like.
                     if let Some(policy) = doom_check {

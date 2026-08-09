@@ -1410,6 +1410,11 @@ mod tests {
 
         let mut human = autopilot_project(AutopilotRecoveryAction::WaitHumanDecision);
         human.name = "human-decision".to_string();
+        human.workflow_state.recovery_state = Some(RecoveryState {
+            error_kind: RecoveryErrorKind::HumanRequired,
+            phase: RecoveryPhase::WaitingHuman,
+            ..RecoveryState::default()
+        });
         assert_eq!(
             present_recovery(&human).kind,
             RecoveryPresentationKind::HumanDecision

@@ -1662,6 +1662,7 @@ fn evaluate_control_decision(
         &compiled,
         facts_fingerprint,
         shadow,
+        proj.human_review_cadence,
     )))
 }
 
@@ -3493,6 +3494,7 @@ mod tests {
         run_status: project::ManagedRunStatus,
     ) -> project::Project {
         let mut proj = project::Project::new(project_name);
+        proj.workload_profile = Some(professional_workload_profile());
         proj.workflow_state.top_level_phase = project::TopLevelPhase::Console;
         proj.workflow_state.current_step = project::WorkflowStep::MilestoneApproval;
         proj.workflow_state.managed_flow_state = Some(project::ManagedFlowState {

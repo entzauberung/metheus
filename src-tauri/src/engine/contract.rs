@@ -1,4 +1,4 @@
-use crate::project::{EngineFailureKind, ExecutionProvider, ExecutionRuntime};
+use crate::project::{EngineFailureKind, ExecutionProvider, ExecutionResult, ExecutionRuntime};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fmt;
@@ -19,9 +19,13 @@ pub(crate) enum EngineError {
     Unavailable(String),
     InvalidConfiguration(String),
     StartFailed(String),
-    Timeout,
+    Timeout {
+        execution_result: Option<Box<ExecutionResult>>,
+    },
     ProcessFailed(String),
-    Cancelled,
+    Cancelled {
+        execution_result: Option<Box<ExecutionResult>>,
+    },
     ProtocolError(String),
 }
 
@@ -34,8 +38,34 @@ impl fmt::Display for EngineError {
             | Self::StartFailed(message)
             | Self::ProcessFailed(message)
             | Self::ProtocolError(message) => formatter.write_str(message),
-            Self::Timeout => formatter.write_str("执行超时"),
-            Self::Cancelled => formatter.write_str("执行已暂停"),
+            Self::Timeout { .. } => formatter.write_str("执行超时"),
+            Self::Cancelled { .. } => formatter.write_str("执行已暂停"),
+        }
+    }
+}
+
+impl EngineError {
+    pub(crate) fn timeout() -> Self {
+        Self::Timeout {
+            execution_result: None,
+        }
+    }
+
+    pub(crate) fn cancelled() -> Self {
+        Self::Cancelled {
+            execution_result: None,
+        }
+    }
+
+    pub(crate) fn timeout_with_result(result: ExecutionResult) -> Self {
+        Self::Timeout {
+            execution_result: Some(Box::new(result)),
+        }
+    }
+
+    pub(crate) fn cancelled_with_result(result: ExecutionResult) -> Self {
+        Self::Cancelled {
+            execution_result: Some(Box::new(result)),
         }
     }
 }

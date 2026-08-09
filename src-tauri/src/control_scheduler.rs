@@ -6,6 +6,17 @@ use sha2::{Digest, Sha256};
 
 pub const NO_PROGRESS_STOP_THRESHOLD: u32 = 3;
 
+pub(crate) fn human_review_action_for_cadence(
+    cadence: crate::project::HumanReviewCadence,
+) -> ControlActionKind {
+    match cadence {
+        crate::project::HumanReviewCadence::PerTask => ControlActionKind::Human,
+        crate::project::HumanReviewCadence::MilestoneBatch => {
+            ControlActionKind::ProvisionalValidate
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AcceptanceSummary {
     pub satisfied: u32,
@@ -13,6 +24,8 @@ pub struct AcceptanceSummary {
     pub unknown: u32,
     pub contradictory: u32,
     pub accepted_deviation: u32,
+    pub ai_provisionally_satisfied: u32,
+    pub deferred_human_review: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,6 +48,7 @@ pub fn decide_next_action(
     compile_result: &TaskCompileResult,
     facts_fingerprint: &str,
     shadow: bool,
+    cadence: crate::project::HumanReviewCadence,
 ) -> TaskControlDecision {
     let acceptance = summarize(&subtask.acceptance_ledger);
     let (action, reason) = if matches!(
@@ -93,13 +107,24 @@ pub fn decide_next_action(
         {
             ControlActionKind::TargetedValidate
         } else if modes.contains(&crate::validator_contract::VerificationMode::HumanReview) {
-            ControlActionKind::Human
+            human_review_action_for_cadence(cadence)
         } else {
             ControlActionKind::Human
         };
         (
             ControlAction::new(kind, "仅补充尚未证明的验收项"),
             "证据不足，不重跑已满足项".to_string(),
+        )
+    } else if subtask.status == SubtaskStatus::AwaitingConfirmation
+        && (acceptance.ai_provisionally_satisfied > 0 || acceptance.deferred_human_review > 0)
+        && cadence == crate::project::HumanReviewCadence::MilestoneBatch
+    {
+        (
+            ControlAction::new(
+                ControlActionKind::GitConfirm,
+                "大阶段集中确认项已登记，任务可进入串行确认",
+            ),
+            "AI 临时结论仅用于阶段内推进，不代表人工确认".to_string(),
         )
     } else if subtask.status == SubtaskStatus::AwaitingConfirmation {
         (
@@ -152,6 +177,8 @@ fn summarize(items: &[crate::project::AcceptanceLedgerItem]) -> AcceptanceSummar
             AcceptanceStatus::Unknown => summary.unknown += 1,
             AcceptanceStatus::Contradictory => summary.contradictory += 1,
             AcceptanceStatus::AcceptedDeviation => summary.accepted_deviation += 1,
+            AcceptanceStatus::AiProvisionallySatisfied => summary.ai_provisionally_satisfied += 1,
+            AcceptanceStatus::DeferredHumanReview => summary.deferred_human_review += 1,
         }
     }
     summary
@@ -191,7 +218,13 @@ mod tests {
     #[test]
     fn unknown_evidence_prefers_local_validation() {
         let (task, compiled) = compiled_task();
-        let decision = decide_next_action(&task, &compiled, "facts-1", false);
+        let decision = decide_next_action(
+            &task,
+            &compiled,
+            "facts-1",
+            false,
+            crate::project::HumanReviewCadence::PerTask,
+        );
         assert_eq!(decision.action.kind, ControlActionKind::LocalValidate);
     }
 
@@ -203,7 +236,13 @@ mod tests {
         task.status = SubtaskStatus::AwaitingConfirmation;
         let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
         task.contract_snapshot = Some(compiled.contract.clone());
-        let decision = decide_next_action(&task, &compiled, "facts", false);
+        let decision = decide_next_action(
+            &task,
+            &compiled,
+            "facts",
+            false,
+            crate::project::HumanReviewCadence::PerTask,
+        );
         assert_eq!(decision.action.kind, ControlActionKind::AutomatedValidate);
     }
 
@@ -220,8 +259,81 @@ mod tests {
         crate::task_contract::refresh_fingerprint(&mut contract);
         task.contract_snapshot = Some(contract);
 
-        let decision = decide_next_action(&task, &compiled, "facts", false);
+        let decision = decide_next_action(
+            &task,
+            &compiled,
+            "facts",
+            false,
+            crate::project::HumanReviewCadence::PerTask,
+        );
         assert_eq!(decision.action.kind, ControlActionKind::Human);
+
+        let batch_decision = decide_next_action(
+            &task,
+            &compiled,
+            "facts",
+            false,
+            crate::project::HumanReviewCadence::MilestoneBatch,
+        );
+        assert_eq!(
+            batch_decision.action.kind,
+            ControlActionKind::ProvisionalValidate
+        );
+    }
+
+    #[test]
+    fn batch_only_defers_human_review_and_preserves_hard_boundaries() {
+        let (mut task, _) = compiled_task();
+        task.acceptance_ledger = vec![crate::project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            criterion: task.acceptance_criteria[0].clone(),
+            status: AcceptanceStatus::Contradictory,
+            ..Default::default()
+        }];
+        let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
+        assert_eq!(
+            decide_next_action(
+                &task,
+                &compiled,
+                "facts",
+                false,
+                crate::project::HumanReviewCadence::MilestoneBatch,
+            )
+            .action
+            .kind,
+            ControlActionKind::Human
+        );
+
+        task.acceptance_ledger[0].status = AcceptanceStatus::Unsatisfied;
+        let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
+        assert_eq!(
+            decide_next_action(
+                &task,
+                &compiled,
+                "facts",
+                false,
+                crate::project::HumanReviewCadence::MilestoneBatch,
+            )
+            .action
+            .kind,
+            ControlActionKind::Repair
+        );
+
+        task.acceptance_ledger[0].status = AcceptanceStatus::Satisfied;
+        task.status = SubtaskStatus::Rejected;
+        let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
+        assert_eq!(
+            decide_next_action(
+                &task,
+                &compiled,
+                "facts",
+                false,
+                crate::project::HumanReviewCadence::MilestoneBatch,
+            )
+            .action
+            .kind,
+            ControlActionKind::Human
+        );
     }
 
     #[test]
@@ -236,9 +348,15 @@ mod tests {
         task.status = SubtaskStatus::Executing;
         let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
         assert_eq!(
-            decide_next_action(&task, &compiled, "facts-1", false)
-                .action
-                .kind,
+            decide_next_action(
+                &task,
+                &compiled,
+                "facts-1",
+                false,
+                crate::project::HumanReviewCadence::PerTask,
+            )
+            .action
+            .kind,
             ControlActionKind::Wait
         );
 
@@ -251,9 +369,15 @@ mod tests {
         }];
         let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
         assert_eq!(
-            decide_next_action(&task, &compiled, "facts-1", false)
-                .action
-                .kind,
+            decide_next_action(
+                &task,
+                &compiled,
+                "facts-1",
+                false,
+                crate::project::HumanReviewCadence::PerTask,
+            )
+            .action
+            .kind,
             ControlActionKind::GitConfirm
         );
     }

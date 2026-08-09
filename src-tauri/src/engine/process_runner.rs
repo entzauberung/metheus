@@ -1,16 +1,24 @@
 use super::contract::{EngineError, OutputProtocol, ProcessOutput, ProcessSpec, ProgramSource};
-use crate::pipeline::{append_runtime_log, PipelineState, PipelineStatus};
+use crate::pipeline::{
+    append_runtime_log, append_runtime_log_with_context, set_runtime_debug_log, PipelineState,
+    PipelineStatus,
+};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 const MAX_RUNTIME_LOG_CHARS: usize = 2_000;
-const MAX_STREAM_BYTES: usize = 256 * 1024;
+const MAX_FINAL_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_ERROR_TAIL_BYTES: usize = 64 * 1024;
+const MAX_JSON_LINE_BYTES: usize = 512 * 1024;
 
 fn event_text(value: &serde_json::Value) -> Option<&str> {
     let event_type = value.get("type").and_then(serde_json::Value::as_str);
-    if matches!(event_type, Some("text" | "thought")) {
+    if event_type == Some("thought") {
+        return None;
+    }
+    if event_type == Some("text") {
         return value.get("data").and_then(serde_json::Value::as_str);
     }
     for field in ["content", "text", "message", "result", "response", "data"] {
@@ -24,6 +32,14 @@ fn event_text(value: &serde_json::Value) -> Option<&str> {
         .and_then(serde_json::Value::as_str)
 }
 
+fn event_correlation(value: &serde_json::Value) -> Option<String> {
+    ["correlation_id", "call_id", "message_id", "id"]
+        .into_iter()
+        .find_map(|field| value.get(field).and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+}
+
+#[cfg(test)]
 fn normalize_stdout(protocol: OutputProtocol, stdout: String) -> String {
     if protocol == OutputProtocol::RawText {
         return stdout;
@@ -33,15 +49,31 @@ fn normalize_stdout(protocol: OutputProtocol, stdout: String) -> String {
         match serde_json::from_str::<serde_json::Value>(line) {
             Ok(value) => {
                 if let Some(text) = event_text(&value) {
-                    normalized.push_str(text);
-                    if !text.ends_with('\n') {
+                    let remaining = MAX_FINAL_OUTPUT_BYTES.saturating_sub(normalized.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    let bytes = text.as_bytes();
+                    normalized.push_str(&String::from_utf8_lossy(
+                        &bytes[..bytes.len().min(remaining)],
+                    ));
+                    if !text.ends_with('\n') && normalized.len() < MAX_FINAL_OUTPUT_BYTES {
                         normalized.push('\n');
                     }
                 }
             }
             Err(_) => {
-                normalized.push_str(line);
-                normalized.push('\n');
+                let remaining = MAX_FINAL_OUTPUT_BYTES.saturating_sub(normalized.len());
+                if remaining == 0 {
+                    break;
+                }
+                let bytes = line.as_bytes();
+                normalized.push_str(&String::from_utf8_lossy(
+                    &bytes[..bytes.len().min(remaining)],
+                ));
+                if normalized.len() < MAX_FINAL_OUTPUT_BYTES {
+                    normalized.push('\n');
+                }
             }
         }
     }
@@ -71,11 +103,14 @@ async fn collect_pipe(reader: JoinHandle<Vec<u8>>, name: &str) -> Vec<u8> {
 async fn stream_process_pipe(
     mut reader: impl tokio::io::AsyncRead + Unpin,
     stream_name: &str,
+    output_protocol: OutputProtocol,
     execution_id: String,
     state: Arc<Mutex<Option<PipelineState>>>,
 ) -> Vec<u8> {
     let mut collected = Vec::new();
     let mut truncated = false;
+    let mut pending_line = Vec::new();
+    let mut discarding_oversized_line = false;
     let mut buffer = [0u8; 4_096];
 
     loop {
@@ -83,39 +118,55 @@ async fn stream_process_pipe(
             Ok(0) => break,
             Ok(size) => {
                 let chunk = &buffer[..size];
-                if !truncated && collected.len() < MAX_STREAM_BYTES {
-                    let remaining = MAX_STREAM_BYTES.saturating_sub(collected.len());
-                    if chunk.len() > remaining {
-                        collected.extend_from_slice(&chunk[..remaining]);
+                if stream_name == "stderr" {
+                    collected.extend_from_slice(chunk);
+                    if collected.len() > MAX_ERROR_TAIL_BYTES {
+                        let excess = collected.len() - MAX_ERROR_TAIL_BYTES;
+                        collected.drain(..excess);
                         truncated = true;
-                    } else {
-                        collected.extend_from_slice(chunk);
                     }
-                } else if !truncated {
-                    truncated = true;
-                }
-
-                let text = String::from_utf8_lossy(chunk);
-                let display: String = text.chars().take(MAX_RUNTIME_LOG_CHARS).collect();
-                let display = if text.chars().count() > MAX_RUNTIME_LOG_CHARS {
-                    format!("{display}…[截断]")
-                } else {
-                    display
-                };
-                if !display.trim().is_empty() {
-                    let mut guard = state.lock().await;
-                    if let Some(pipeline) = guard.as_mut() {
-                        if pipeline.status != PipelineStatus::Paused
-                            && pipeline.status != PipelineStatus::Failed
-                            && (execution_id.is_empty() || pipeline.execution_id == execution_id)
-                        {
-                            append_runtime_log(
-                                pipeline,
-                                "info",
-                                format!("[{stream_name}] {}", display.trim()),
-                            );
+                    append_stream_log(&state, &execution_id, "error", stream_name, chunk).await;
+                } else if output_protocol == OutputProtocol::JsonLines {
+                    for byte in chunk {
+                        if *byte == b'\n' {
+                            if discarding_oversized_line {
+                                append_stream_log(
+                                    &state,
+                                    &execution_id,
+                                    "error",
+                                    stream_name,
+                                    b"JSON Lines event exceeded its bounded line quota and was discarded",
+                                )
+                                .await;
+                            } else {
+                                consume_json_line(
+                                    &pending_line,
+                                    &mut collected,
+                                    &mut truncated,
+                                    &state,
+                                    &execution_id,
+                                    stream_name,
+                                )
+                                .await;
+                            }
+                            pending_line.clear();
+                            discarding_oversized_line = false;
+                        } else if !discarding_oversized_line {
+                            if pending_line.len() < MAX_JSON_LINE_BYTES {
+                                pending_line.push(*byte);
+                            } else {
+                                pending_line.clear();
+                                discarding_oversized_line = true;
+                            }
                         }
                     }
+                } else {
+                    let remaining = MAX_FINAL_OUTPUT_BYTES.saturating_sub(collected.len());
+                    if remaining > 0 {
+                        collected.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                    }
+                    truncated |= chunk.len() > remaining;
+                    append_stream_log(&state, &execution_id, "info", stream_name, chunk).await;
                 }
             }
             Err(error) => {
@@ -126,7 +177,7 @@ async fn stream_process_pipe(
                         append_runtime_log(pipeline, "error", message.clone());
                     }
                 }
-                if collected.len() < MAX_STREAM_BYTES {
+                if stream_name == "stderr" && collected.len() < MAX_ERROR_TAIL_BYTES {
                     collected.extend_from_slice(message.as_bytes());
                 }
                 break;
@@ -134,8 +185,35 @@ async fn stream_process_pipe(
         }
     }
 
+    if stream_name == "stdout" && output_protocol == OutputProtocol::JsonLines {
+        if discarding_oversized_line {
+            append_stream_log(
+                &state,
+                &execution_id,
+                "error",
+                stream_name,
+                b"JSON Lines event exceeded its bounded line quota and was discarded",
+            )
+            .await;
+        } else if !pending_line.is_empty() {
+            consume_json_line(
+                &pending_line,
+                &mut collected,
+                &mut truncated,
+                &state,
+                &execution_id,
+                stream_name,
+            )
+            .await;
+        }
+    }
+
     if truncated {
-        let marker = format!("\n…[输出已截断，累计超过 {MAX_STREAM_BYTES} 字节上限]");
+        let marker = if stream_name == "stderr" {
+            format!("\n…[仅保留最近 {MAX_ERROR_TAIL_BYTES} 字节错误输出]")
+        } else {
+            format!("\n…[最终输出已截断，累计超过 {MAX_FINAL_OUTPUT_BYTES} 字节上限]")
+        };
         collected.extend_from_slice(marker.as_bytes());
         let mut guard = state.lock().await;
         if let Some(pipeline) = guard.as_mut() {
@@ -143,12 +221,123 @@ async fn stream_process_pipe(
                 append_runtime_log(
                     pipeline,
                     "error",
-                    format!("[{stream_name}] 输出已截断，累计超过 {MAX_STREAM_BYTES} 字节上限"),
+                    format!("[{stream_name}] 输出已按独立通道配额截断"),
                 );
             }
         }
     }
     collected
+}
+
+async fn append_stream_log(
+    state: &Arc<Mutex<Option<PipelineState>>>,
+    execution_id: &str,
+    level: &str,
+    stream_name: &str,
+    content: &[u8],
+) {
+    append_stream_log_with_correlation(state, execution_id, level, stream_name, None, content)
+        .await;
+}
+
+async fn append_stream_log_with_correlation(
+    state: &Arc<Mutex<Option<PipelineState>>>,
+    execution_id: &str,
+    level: &str,
+    stream_name: &str,
+    correlation_id: Option<String>,
+    content: &[u8],
+) {
+    let text = String::from_utf8_lossy(content);
+    let mut characters = text.chars();
+    let display: String = characters.by_ref().take(MAX_RUNTIME_LOG_CHARS).collect();
+    let display = if characters.next().is_some() {
+        format!("{display}…[截断]")
+    } else {
+        display
+    };
+    if display.trim().is_empty() {
+        return;
+    }
+    let mut guard = state.lock().await;
+    if let Some(pipeline) = guard.as_mut() {
+        if pipeline.status != PipelineStatus::Paused
+            && pipeline.status != PipelineStatus::Failed
+            && (execution_id.is_empty() || pipeline.execution_id == execution_id)
+        {
+            let text = format!("[{stream_name}] {}", display.trim());
+            if level == "debug" {
+                set_runtime_debug_log(pipeline, stream_name, correlation_id, text);
+            } else {
+                append_runtime_log_with_context(pipeline, level, stream_name, correlation_id, text);
+            }
+        }
+    }
+}
+
+fn append_final_output(collected: &mut Vec<u8>, content: &[u8], add_newline: bool) -> bool {
+    let remaining = MAX_FINAL_OUTPUT_BYTES.saturating_sub(collected.len());
+    let copied = content.len().min(remaining);
+    collected.extend_from_slice(&content[..copied]);
+    let mut truncated = copied < content.len();
+    if add_newline {
+        if collected.len() < MAX_FINAL_OUTPUT_BYTES {
+            collected.push(b'\n');
+        } else {
+            truncated = true;
+        }
+    }
+    truncated
+}
+
+async fn consume_json_line(
+    line: &[u8],
+    collected: &mut Vec<u8>,
+    truncated: &mut bool,
+    state: &Arc<Mutex<Option<PipelineState>>>,
+    execution_id: &str,
+    stream_name: &str,
+) {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return;
+    }
+    match serde_json::from_slice::<serde_json::Value>(line) {
+        Ok(value) if value.get("type").and_then(serde_json::Value::as_str) == Some("thought") => {
+            let thought = value
+                .get("data")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("thought event");
+            append_stream_log_with_correlation(
+                state,
+                execution_id,
+                "debug",
+                stream_name,
+                event_correlation(&value),
+                thought.as_bytes(),
+            )
+            .await;
+        }
+        Ok(value) => {
+            if let Some(text) = event_text(&value) {
+                *truncated |=
+                    append_final_output(collected, text.as_bytes(), !text.ends_with('\n'));
+                append_stream_log_with_correlation(
+                    state,
+                    execution_id,
+                    "info",
+                    stream_name,
+                    event_correlation(&value),
+                    text.as_bytes(),
+                )
+                .await;
+            }
+        }
+        Err(_) => {
+            *truncated |= append_final_output(collected, line, true);
+            append_stream_log(state, execution_id, "info", stream_name, line).await;
+        }
+    }
 }
 
 async fn terminate_child(
@@ -243,11 +432,26 @@ pub(super) async fn run_process(
     let stderr_state = state.clone();
     let stdout_execution_id = execution_id.to_string();
     let stderr_execution_id = execution_id.to_string();
+    let stdout_protocol = spec.output_protocol;
     let stdout_reader = tokio::spawn(async move {
-        stream_process_pipe(&mut stdout, "stdout", stdout_execution_id, stdout_state).await
+        stream_process_pipe(
+            &mut stdout,
+            "stdout",
+            stdout_protocol,
+            stdout_execution_id,
+            stdout_state,
+        )
+        .await
     });
     let stderr_reader = tokio::spawn(async move {
-        stream_process_pipe(&mut stderr, "stderr", stderr_execution_id, stderr_state).await
+        stream_process_pipe(
+            &mut stderr,
+            "stderr",
+            OutputProtocol::RawText,
+            stderr_execution_id,
+            stderr_state,
+        )
+        .await
     });
 
     {
@@ -267,10 +471,7 @@ pub(super) async fn run_process(
                 let stderr = collect_pipe(stderr_reader, "stderr").await;
                 clear_child_pid(&state, execution_id).await;
                 return Ok(ProcessOutput {
-                    stdout: normalize_stdout(
-                        spec.output_protocol,
-                        String::from_utf8_lossy(&stdout).to_string(),
-                    ),
+                    stdout: String::from_utf8_lossy(&stdout).to_string(),
                     stderr: String::from_utf8_lossy(&stderr).to_string(),
                     exit_code: status.code(),
                     success: status.success(),
@@ -304,7 +505,7 @@ pub(super) async fn run_process(
                     return if stop_state == PipelineStatus::Failed {
                         Err(EngineError::ProcessFailed("用户停止执行".to_string()))
                     } else {
-                        Err(EngineError::Cancelled)
+                        Err(EngineError::cancelled())
                     };
                 }
 
@@ -315,7 +516,7 @@ pub(super) async fn run_process(
                     let _ = collect_pipe(stderr_reader, "stderr").await;
                     clear_child_pid(&state, execution_id).await;
                     termination?;
-                    return Err(EngineError::Timeout);
+                    return Err(EngineError::timeout());
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -394,16 +595,125 @@ mod tests {
     #[tokio::test]
     async fn stream_output_is_truncated_and_stale_logs_are_dropped() {
         let state = Arc::new(Mutex::new(Some(test_pipeline("current"))));
-        let oversized = vec![b'x'; MAX_STREAM_BYTES + 100];
+        let oversized = vec![b'x'; MAX_FINAL_OUTPUT_BYTES + 100];
         let collected = stream_process_pipe(
             Cursor::new(oversized),
             "stdout",
+            OutputProtocol::RawText,
             "stale".to_string(),
             state.clone(),
         )
         .await;
         assert!(String::from_utf8_lossy(&collected).contains("输出已截断"));
         assert!(state.lock().await.as_ref().unwrap().log_history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_thought_line_cannot_displace_later_final_output() {
+        let state = Arc::new(Mutex::new(Some(test_pipeline("json-lines"))));
+        let thought = "x".repeat(MAX_JSON_LINE_BYTES + 1);
+        let input = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"thought","data":thought}),
+            serde_json::json!({"type":"text","data":"FINAL_RESULT"}),
+        );
+        let collected = stream_process_pipe(
+            Cursor::new(input.into_bytes()),
+            "stdout",
+            OutputProtocol::JsonLines,
+            "json-lines".to_string(),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(String::from_utf8(collected).unwrap(), "FINAL_RESULT\n");
+        let guard = state.lock().await;
+        let logs = &guard.as_ref().unwrap().log_history;
+        assert!(logs.iter().any(|entry| entry.level == "error"));
+        assert!(logs.iter().any(|entry| entry.text.contains("FINAL_RESULT")));
+    }
+
+    #[tokio::test]
+    async fn thought_uses_structured_live_slot_without_entering_normal_history() {
+        let state = Arc::new(Mutex::new(Some(test_pipeline("thought-live"))));
+        let input = format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "thought",
+                "data": "bounded thought",
+                "correlation_id": "turn-7"
+            }),
+        );
+        let collected = stream_process_pipe(
+            Cursor::new(input.into_bytes()),
+            "stdout",
+            OutputProtocol::JsonLines,
+            "thought-live".to_string(),
+            state.clone(),
+        )
+        .await;
+        assert!(collected.is_empty());
+        let guard = state.lock().await;
+        let pipeline = guard.as_ref().unwrap();
+        assert!(pipeline.log_history.is_empty());
+        let current: serde_json::Value = serde_json::from_str(&pipeline.current_log).unwrap();
+        assert_eq!(current["kind"], "runtime_log");
+        assert_eq!(current["level"], "debug");
+        assert_eq!(current["source"], "stdout");
+        assert_eq!(current["correlation_id"], "turn-7");
+        assert!(current["text"]
+            .as_str()
+            .unwrap()
+            .contains("bounded thought"));
+    }
+
+    #[tokio::test]
+    async fn thought_flood_preserves_normal_history_and_final_output_budget() {
+        let mut pipeline = test_pipeline("thought-flood");
+        append_runtime_log(&mut pipeline, "error", "critical history".to_string());
+        let state = Arc::new(Mutex::new(Some(pipeline)));
+        let mut input = String::new();
+        for index in 0..250 {
+            input.push_str(
+                &serde_json::json!({
+                    "type": "thought",
+                    "data": format!("thought-{index}"),
+                    "id": format!("thought-{index}")
+                })
+                .to_string(),
+            );
+            input.push('\n');
+        }
+        input.push_str(
+            &serde_json::json!({
+                "type": "text",
+                "data": "FINAL_RESULT",
+                "id": "final-1"
+            })
+            .to_string(),
+        );
+        input.push('\n');
+
+        let collected = stream_process_pipe(
+            Cursor::new(input.into_bytes()),
+            "stdout",
+            OutputProtocol::JsonLines,
+            "thought-flood".to_string(),
+            state.clone(),
+        )
+        .await;
+        assert_eq!(String::from_utf8(collected).unwrap(), "FINAL_RESULT\n");
+        let guard = state.lock().await;
+        let logs = &guard.as_ref().unwrap().log_history;
+        assert_eq!(logs.len(), 2);
+        assert!(logs.iter().any(|entry| entry.text == "critical history"));
+        let final_entry = logs
+            .iter()
+            .find(|entry| entry.text.contains("FINAL_RESULT"))
+            .expect("final log");
+        assert_eq!(final_entry.level, "info");
+        assert_eq!(final_entry.source, "stdout");
+        assert_eq!(final_entry.correlation_id.as_deref(), Some("final-1"));
+        assert!(logs.iter().all(|entry| entry.level != "debug"));
     }
 
     #[cfg(unix)]
@@ -539,7 +849,12 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         state.lock().await.as_mut().unwrap().status = PipelineStatus::Paused;
         let result = task.await.unwrap();
-        assert!(matches!(result, Err(EngineError::Cancelled)));
+        assert!(matches!(
+            result,
+            Err(EngineError::Cancelled {
+                execution_result: None
+            })
+        ));
         assert_eq!(state.lock().await.as_ref().unwrap().child_pid, None);
     }
 
@@ -550,6 +865,27 @@ mod tests {
             "{\"type\":\"text\",\"data\":\"hello \"}\n{\"type\":\"text\",\"data\":\"world\"}\n{\"type\":\"end\"}\n".to_string(),
         );
         assert_eq!(output, "hello \nworld\n");
+    }
+
+    #[test]
+    fn thought_channel_does_not_consume_final_output_budget() {
+        let thought = "x".repeat(256 * 1024);
+        let input = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"thought","data":thought}),
+            serde_json::json!({"type":"text","data":"FINAL_RESULT"}),
+        );
+        let output = normalize_stdout(OutputProtocol::JsonLines, input);
+        assert_eq!(output, "FINAL_RESULT\n");
+    }
+
+    #[test]
+    fn json_line_split_across_transport_chunks_is_complete_after_collection() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"{\"type\":\"text\",\"da");
+        bytes.extend_from_slice(b"ta\":\"complete\"}\n");
+        let output = normalize_stdout(OutputProtocol::JsonLines, String::from_utf8(bytes).unwrap());
+        assert_eq!(output, "complete\n");
     }
 
     #[cfg(unix)]
@@ -576,6 +912,11 @@ mod tests {
             state,
         )
         .await;
-        assert!(matches!(result, Err(EngineError::Timeout)));
+        assert!(matches!(
+            result,
+            Err(EngineError::Timeout {
+                execution_result: None
+            })
+        ));
     }
 }

@@ -1,5 +1,4 @@
-# Logs
-logs
+# Logs# Logs
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -7,24 +6,24 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
+# 依赖与构建产物
+node_modules/
+dist/
+dist-ssr/
+target/
+**/.build/
 
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
+# 本地/编辑器文件
+*.local
 .idea
 .DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-.env
 PROGRESS.md
-target/
-/.build/
-dist/
-*log
+.claude/settings.local.json
+
+# 密钥
+.env
+.env.*
+!.env.example
+
+# 蓝图（按你的设计不入库）
+ai/

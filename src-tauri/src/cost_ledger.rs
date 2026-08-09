@@ -20,6 +20,7 @@ pub enum ModelCallPurpose {
     ExecutionPlanCheck,
     TaskCalibration,
     EvidenceSupplement,
+    VisionReview,
     SchemaRepair,
     ConstitutionSummary,
     ConstitutionCompression,

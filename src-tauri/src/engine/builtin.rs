@@ -11,7 +11,7 @@ use crate::settings::{
 };
 use metheus_grok_engine::{
     GrokBuildExecutionConfig, GrokBuildExecutionRequest, GrokBuildRuntimeErrorKind,
-    GrokBuildRuntimeEvent, RuntimeEventSink,
+    GrokBuildRuntimeEvent, RuntimeEventSink, TokenUsage,
 };
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -288,6 +288,7 @@ fn map_connection_error(kind: GrokBuildRuntimeErrorKind) -> ModelConnectionError
         | GrokBuildRuntimeErrorKind::ToolRejected
         | GrokBuildRuntimeErrorKind::ToolFailed
         | GrokBuildRuntimeErrorKind::Protocol
+        | GrokBuildRuntimeErrorKind::OutputTruncated
         | GrokBuildRuntimeErrorKind::MaxTurns
         | GrokBuildRuntimeErrorKind::Runtime => ModelConnectionErrorKind::Protocol,
     }
@@ -307,6 +308,7 @@ fn map_failure_kind(kind: GrokBuildRuntimeErrorKind) -> EngineFailureKind {
         GrokBuildRuntimeErrorKind::Timeout => EngineFailureKind::Timeout,
         GrokBuildRuntimeErrorKind::ToolRejected => EngineFailureKind::ToolRejected,
         GrokBuildRuntimeErrorKind::Protocol => EngineFailureKind::ProtocolError,
+        GrokBuildRuntimeErrorKind::OutputTruncated => EngineFailureKind::OutputTruncated,
         GrokBuildRuntimeErrorKind::MaxTurns => EngineFailureKind::MaxTurnsExceeded,
         GrokBuildRuntimeErrorKind::InvalidConfiguration | GrokBuildRuntimeErrorKind::Runtime => {
             EngineFailureKind::RuntimeError
@@ -408,6 +410,67 @@ fn event_sink(
     })
 }
 
+fn provider_usage(usage: Option<TokenUsage>) -> Option<crate::cost_ledger::ProviderUsage> {
+    usage.map(|usage| crate::cost_ledger::ProviderUsage {
+        input_tokens: Some(usage.prompt_tokens),
+        output_tokens: Some(usage.completion_tokens),
+        total_tokens: Some(usage.total_tokens),
+        cached_input_tokens: None,
+    })
+}
+
+fn merge_file_facts(mut detected: Vec<String>, runtime: Vec<String>) -> Vec<String> {
+    for path in runtime {
+        if !detected.contains(&path) {
+            detected.push(path);
+        }
+    }
+    detected
+}
+
+#[allow(clippy::too_many_arguments)]
+fn runtime_failure_result(
+    app_settings: &AppSettings,
+    kind: GrokBuildRuntimeErrorKind,
+    message: String,
+    output_summary: String,
+    token_usage: Option<TokenUsage>,
+    runtime_files: Vec<String>,
+    detected_files: Vec<String>,
+) -> ExecutionResult {
+    ExecutionResult {
+        success: false,
+        output: output_summary.clone(),
+        error_log: message.clone(),
+        file_changes: merge_file_facts(detected_files, runtime_files),
+        exit_code: None,
+        engine_provider: Some(ExecutionProvider::GrokBuild),
+        engine_runtime: ExecutionRuntime::BuiltIn,
+        engine_settings_revision: app_settings.revision,
+        engine_source_revision: metheus_grok_engine::source_revision().to_string(),
+        engine_api_backend: app_settings
+            .built_in_grok_build
+            .api_backend
+            .as_str()
+            .to_string(),
+        stdout: output_summary,
+        stderr: message,
+        engine_failure_kind: Some(map_failure_kind(kind)),
+        token_usage: provider_usage(token_usage),
+    }
+}
+
+fn interrupted_engine_error(
+    kind: GrokBuildRuntimeErrorKind,
+    result: ExecutionResult,
+) -> Result<ExecutionResult, EngineError> {
+    match kind {
+        GrokBuildRuntimeErrorKind::Cancelled => Err(EngineError::cancelled_with_result(result)),
+        GrokBuildRuntimeErrorKind::Timeout => Err(EngineError::timeout_with_result(result)),
+        _ => Ok(result),
+    }
+}
+
 pub(super) async fn execute(
     app_settings: &AppSettings,
     api_key: &str,
@@ -467,19 +530,12 @@ pub(super) async fn execute(
     match result {
         Ok(result) => {
             let output = result.output;
-            let token_usage = result
-                .token_usage
-                .map(|usage| crate::cost_ledger::ProviderUsage {
-                    input_tokens: Some(usage.prompt_tokens),
-                    output_tokens: Some(usage.completion_tokens),
-                    total_tokens: Some(usage.total_tokens),
-                    cached_input_tokens: None,
-                });
+            let token_usage = provider_usage(result.token_usage);
             Ok(ExecutionResult {
                 success: true,
                 output: output.clone(),
                 error_log: String::new(),
-                file_changes,
+                file_changes: merge_file_facts(file_changes, result.files_written),
                 exit_code: None,
                 engine_provider: Some(ExecutionProvider::GrokBuild),
                 engine_runtime: ExecutionRuntime::BuiltIn,
@@ -496,32 +552,19 @@ pub(super) async fn execute(
                 token_usage,
             })
         }
-        Err(error) if error.kind == GrokBuildRuntimeErrorKind::Cancelled => {
-            Err(EngineError::Cancelled)
-        }
-        Err(error) if error.kind == GrokBuildRuntimeErrorKind::Timeout => Err(EngineError::Timeout),
         Err(error) => {
+            let kind = error.kind;
             let message = error.message().to_string();
-            Ok(ExecutionResult {
-                success: false,
-                output: String::new(),
-                error_log: message.clone(),
+            let result = runtime_failure_result(
+                app_settings,
+                kind,
+                message,
+                error.output_summary,
+                error.token_usage,
+                error.files_written,
                 file_changes,
-                exit_code: None,
-                engine_provider: Some(ExecutionProvider::GrokBuild),
-                engine_runtime: ExecutionRuntime::BuiltIn,
-                engine_settings_revision: app_settings.revision,
-                engine_source_revision: metheus_grok_engine::source_revision().to_string(),
-                engine_api_backend: app_settings
-                    .built_in_grok_build
-                    .api_backend
-                    .as_str()
-                    .to_string(),
-                stdout: String::new(),
-                stderr: message,
-                engine_failure_kind: Some(map_failure_kind(error.kind)),
-                token_usage: None,
-            })
+            );
+            interrupted_engine_error(kind, result)
         }
     }
 }
@@ -635,6 +678,10 @@ mod tests {
                 EngineFailureKind::ProtocolError,
             ),
             (
+                GrokBuildRuntimeErrorKind::OutputTruncated,
+                EngineFailureKind::OutputTruncated,
+            ),
+            (
                 GrokBuildRuntimeErrorKind::MaxTurns,
                 EngineFailureKind::MaxTurnsExceeded,
             ),
@@ -657,6 +704,58 @@ mod tests {
         ];
         for (source, expected) in cases {
             assert_eq!(map_failure_kind(source), expected);
+        }
+    }
+
+    #[test]
+    fn adaptive_grok_contract_interruptions_preserve_usage_files_and_output() {
+        for (kind, expected_failure) in [
+            (
+                GrokBuildRuntimeErrorKind::Timeout,
+                EngineFailureKind::Timeout,
+            ),
+            (
+                GrokBuildRuntimeErrorKind::Cancelled,
+                EngineFailureKind::TaskExecutionError,
+            ),
+        ] {
+            let result = runtime_failure_result(
+                &AppSettings::default(),
+                kind,
+                format!("{kind:?}"),
+                "first attempt\ncontinuation".to_string(),
+                Some(TokenUsage {
+                    prompt_tokens: 11,
+                    completion_tokens: 7,
+                    total_tokens: 18,
+                }),
+                vec!["shared.txt".to_string(), "runtime.txt".to_string()],
+                vec!["detected.txt".to_string(), "shared.txt".to_string()],
+            );
+            let error = interrupted_engine_error(kind, result).unwrap_err();
+            let partial = match error {
+                EngineError::Timeout { execution_result }
+                | EngineError::Cancelled { execution_result } => {
+                    execution_result.expect("BuiltIn interruption must retain execution facts")
+                }
+                other => panic!("unexpected interruption mapping: {other:?}"),
+            };
+            assert_eq!(partial.engine_failure_kind, Some(expected_failure));
+            assert_eq!(partial.output, "first attempt\ncontinuation");
+            assert_eq!(partial.stdout, partial.output);
+            assert_eq!(
+                partial.file_changes,
+                vec!["detected.txt", "shared.txt", "runtime.txt"]
+            );
+            assert_eq!(
+                partial.token_usage,
+                Some(crate::cost_ledger::ProviderUsage {
+                    input_tokens: Some(11),
+                    output_tokens: Some(7),
+                    total_tokens: Some(18),
+                    cached_input_tokens: None,
+                })
+            );
         }
     }
 }

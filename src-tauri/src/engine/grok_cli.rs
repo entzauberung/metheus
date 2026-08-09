@@ -34,7 +34,6 @@ pub(super) fn process_spec(
         environment_remove: vec![
             OsString::from(crate::constants::BUILTIN_GROK_BUILD_API_KEY_ENV),
             OsString::from(crate::constants::LEGACY_BUILTIN_GROK_BUILD_API_KEY_ENV),
-            OsString::from(crate::constants::UPSTREAM_GROK_API_KEY_ENV),
         ],
         output_protocol: OutputProtocol::JsonLines,
         program_source,
@@ -115,26 +114,14 @@ pub(super) async fn online_auth_probe(
     program: &Path,
     empty_directory: &Path,
 ) -> Result<EngineAuthVerificationMethod, EngineFailureKind> {
-    let output = super::health::online_command_output(
-        program,
-        &["models"],
-        empty_directory,
-        &[
-            crate::constants::BUILTIN_GROK_BUILD_API_KEY_ENV,
-            crate::constants::LEGACY_BUILTIN_GROK_BUILD_API_KEY_ENV,
-            crate::constants::UPSTREAM_GROK_API_KEY_ENV,
-        ],
-    )
-    .await?;
-    if output.status.success() && !output.stdout.is_empty() {
-        Ok(EngineAuthVerificationMethod::OnlineModelList)
-    } else {
-        Err(super::classify_process_failure(
-            output.status.code(),
-            &String::from_utf8_lossy(&output.stdout),
-            &String::from_utf8_lossy(&output.stderr),
-        ))
-    }
+    let spec = process_spec(
+        program.as_os_str().to_owned(),
+        ProgramSource::SettingsOverride,
+        empty_directory.to_string_lossy().as_ref(),
+        super::health::MINIMAL_PROBE_PROMPT,
+    );
+    super::health::run_minimal_process_probe(spec, empty_directory).await?;
+    Ok(EngineAuthVerificationMethod::OnlineMinimalRequest)
 }
 
 #[cfg(test)]
@@ -154,17 +141,37 @@ mod tests {
             .iter()
             .map(|argument| argument.to_string_lossy().to_string())
             .collect();
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--cwd", "/tmp/project"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["--single", "approved prompt"]));
-        assert!(args.contains(&"--always-approve".to_string()));
-        assert!(args.contains(&"--no-memory".to_string()));
-        assert!(args.contains(&"--no-subagents".to_string()));
-        assert!(args.contains(&"--disable-web-search".to_string()));
+        assert_eq!(
+            args,
+            [
+                "--cwd",
+                "/tmp/project",
+                "--single",
+                "approved prompt",
+                "--always-approve",
+                "--output-format",
+                "streaming-json",
+                "--no-memory",
+                "--no-subagents",
+                "--disable-web-search",
+                "--verbatim",
+            ]
+        );
+        assert!(!args
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "--model" | "--provider")));
+        assert!(spec.stdin_payload.is_none());
         assert_eq!(spec.output_protocol, OutputProtocol::JsonLines);
         assert!(spec.environment.is_empty());
+        assert_eq!(
+            spec.environment_remove,
+            [
+                OsString::from(crate::constants::BUILTIN_GROK_BUILD_API_KEY_ENV),
+                OsString::from(crate::constants::LEGACY_BUILTIN_GROK_BUILD_API_KEY_ENV),
+            ]
+        );
+        assert!(!spec
+            .environment_remove
+            .contains(&OsString::from(crate::constants::UPSTREAM_GROK_API_KEY_ENV)));
     }
 }

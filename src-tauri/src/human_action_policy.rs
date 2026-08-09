@@ -275,6 +275,17 @@ pub fn execution_result_fingerprint(task: &crate::project::Subtask) -> Result<St
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
+fn trusted_human_action_source(source: &str) -> bool {
+    matches!(
+        source,
+        "task_control"
+            | "recovery"
+            | "milestone_review:A"
+            | "milestone_review:B"
+            | "milestone_review:C"
+    )
+}
+
 pub fn validate_recorded_human_acceptance(
     project: &Project,
     task: &crate::project::Subtask,
@@ -295,10 +306,7 @@ pub fn validate_recorded_human_acceptance(
     {
         return Err("人工终态记录缺少明确依据".to_string());
     }
-    if !matches!(
-        verification.action_source.as_str(),
-        "task_control" | "recovery"
-    ) {
+    if !trusted_human_action_source(&verification.action_source) {
         return Err("人工终态记录缺少可信后端动作来源".to_string());
     }
     if verification.project_revision == 0
@@ -567,5 +575,45 @@ mod tests {
             "不能用人工按钮替代语义审查",
         )
         .is_err());
+    }
+
+    #[test]
+    fn milestone_review_sources_are_auditable_but_unknown_sources_are_rejected() {
+        for source in ["milestone_review:A", "milestone_review:C"] {
+            let mut human = task("leaf", SubtaskStatus::Passed, Some(true));
+            human.acceptance_ledger[0].status = AcceptanceStatus::Satisfied;
+            let fingerprint = execution_result_fingerprint(&human).unwrap();
+            human.human_verification = Some(crate::project::HumanVerification {
+                verification_kind: crate::project::VerificationKind::HumanOverride,
+                verification_reason: "集中人工确认".to_string(),
+                verified_at: "2026-08-08T00:00:00Z".to_string(),
+                original_test_failure: String::new(),
+                resolution: crate::project::HumanResolution::ConfirmActualPass,
+                accepted_criteria: Vec::new(),
+                dependency_check: String::new(),
+                action_source: source.to_string(),
+                execution_result_fingerprint: fingerprint,
+                task_tree_revision: 2,
+                project_revision: 3,
+            });
+            let mut project = project_with_tasks(vec![human]);
+            project.task_control.tree_revision = 2;
+            project.workflow_state.data_revision = 4;
+            let task = &project.milestones[0].subtasks[0];
+            validate_recorded_human_acceptance(&project, task)
+                .expect("registered milestone source must validate");
+
+            let mut forged = project.clone();
+            forged.milestones[0].subtasks[0]
+                .human_verification
+                .as_mut()
+                .unwrap()
+                .action_source = "milestone_review:D".to_string();
+            assert!(
+                validate_recorded_human_acceptance(&forged, &forged.milestones[0].subtasks[0],)
+                    .unwrap_err()
+                    .contains("可信后端动作来源")
+            );
+        }
     }
 }

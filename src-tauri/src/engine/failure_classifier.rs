@@ -71,6 +71,7 @@ pub(crate) fn blocks_code_recovery(kind: &EngineFailureKind) -> bool {
             | EngineFailureKind::ProcessCrash
             | EngineFailureKind::ToolRejected
             | EngineFailureKind::ProtocolError
+            | EngineFailureKind::OutputTruncated
             | EngineFailureKind::MaxTurnsExceeded
             | EngineFailureKind::RuntimeError
     )
@@ -119,11 +120,16 @@ mod tests {
         for kind in [
             EngineFailureKind::ToolRejected,
             EngineFailureKind::ProtocolError,
+            EngineFailureKind::OutputTruncated,
             EngineFailureKind::MaxTurnsExceeded,
             EngineFailureKind::RuntimeError,
         ] {
             assert!(blocks_code_recovery(&kind), "{kind:?}");
-            assert!(requires_human_recovery(&kind), "{kind:?}");
+            assert_eq!(
+                requires_human_recovery(&kind),
+                kind != EngineFailureKind::OutputTruncated,
+                "{kind:?}"
+            );
         }
         assert!(!blocks_code_recovery(
             &EngineFailureKind::TaskExecutionError

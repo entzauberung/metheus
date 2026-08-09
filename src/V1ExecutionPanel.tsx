@@ -5,12 +5,8 @@ import {
   FileQuestion,
   GitBranch,
   ListTodo,
-  Pause,
   Play,
-  RefreshCw,
-  RotateCcw,
   ScanSearch,
-  Square,
   TestTube2,
   X,
 } from "lucide-react";
@@ -36,7 +32,7 @@ import { resolvePlanTarget } from "./planTargetPolicy";
 export default function V1ExecutionPanel({
   project, executionStatus, workspaceStatus, busy: externalBusy,
   recoveryPresentation,
-  onPrepareWorkspace, onExecute, onConfirm, onReject, onInStop, onEdStop, onSyncProject,
+  onPrepareWorkspace, onExecute, onConfirm, onReject,
 }: {
   project: Project; executionStatus: PipelineState | null;
   workspaceStatus: ExecutionWorkspaceStatus | null;
@@ -45,8 +41,6 @@ export default function V1ExecutionPanel({
   onPrepareWorkspace: () => Promise<void>;
   onExecute: () => Promise<void>; onConfirm: () => Promise<void>;
   onReject: (reason: string) => Promise<void>;
-  onInStop: () => Promise<void>; onEdStop: () => Promise<void>;
-  onSyncProject: () => Promise<void>;
 }) {
   const [rejectReason, setRejectReason] = useState("");
   const [localBusy, setLocalBusy] = useState(false);
@@ -121,43 +115,6 @@ export default function V1ExecutionPanel({
     <div className="v1-execution-panel" style={{ padding: "24px" }}>
       <h2 className="execution-panel-title"><ListTodo size={20} />执行</h2>
 
-      {recoveryBlocked && recoveryPresentation && (
-        <div className="execution-failure-panel" style={{
-          marginBottom: "20px", padding: "16px",
-          background: recoveryPresentation.severity === "Error" ? "#ffebe9" : "#fff8c5",
-          borderRadius: "8px",
-          border: `1px solid ${recoveryPresentation.severity === "Error" ? "#cf222e" : "#d4a72c"}`,
-        }}>
-          <div style={{ fontWeight: 600, fontSize: "14px", marginBottom: "8px", color: "#cf222e" }}>
-            {recoveryPresentation.title}
-          </div>
-          <div style={{ fontSize: "13px", color: "#24292f", marginBottom: "8px", overflowWrap: "anywhere" }}>
-            {recoveryPresentation.affected_task_label && <div>受影响任务：{recoveryPresentation.affected_task_label}</div>}
-            {recoveryPresentation.phase_label && <div style={{ marginTop: "4px" }}>恢复阶段：{recoveryPresentation.phase_label}</div>}
-            {recoveryPresentation.validation_phase_label && <div style={{ marginTop: "4px" }}>验证阶段：{recoveryPresentation.validation_phase_label}</div>}
-            <div style={{ marginTop: "6px", whiteSpace: "pre-wrap" }}>
-              阻断原因：{recoveryPresentation.reason}
-            </div>
-            {recoveryPresentation.baseline_reference && recoveryPresentation.requires_baseline_restore && (
-              <div style={{ marginTop: "4px", color: "#656d76", fontFamily: "monospace", fontSize: "12px" }}>
-                基线：{recoveryPresentation.baseline_reference}
-              </div>
-            )}
-            {recoveryPresentation.heartbeat_status && <div style={{ marginTop: "4px" }}>心跳：{recoveryPresentation.heartbeat_status}</div>}
-            {recoveryPresentation.control_action_description && <div style={{ marginTop: "4px" }}>控制占用：{recoveryPresentation.control_action_description}</div>}
-            {recoveryPresentation.kind === "ControlActionOccupied" && <div style={{ marginTop: "4px" }}>已持续：{recoveryPresentation.control_action_elapsed_seconds ?? 0} 秒</div>}
-            {recoveryPresentation.control_lock_failure_reason && <div style={{ marginTop: "4px" }}>失效原因：{recoveryPresentation.control_lock_failure_reason}</div>}
-            {[recoveryPresentation.automated_test_status, recoveryPresentation.code_review_status,
-              recoveryPresentation.review_protocol_status, recoveryPresentation.acceptance_evidence_status]
-              .filter(Boolean)
-              .map(status => <div key={status} style={{ marginTop: "4px" }}>{status}</div>)}
-          </div>
-          <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
-            请使用页面顶部的唯一恢复入口处理；这里仅展示任务与阻断事实。
-          </p>
-        </div>
-      )}
-
       {/* Workspace status banner — 失败会话期间隐藏准备环境 */}
       {!recoveryBlocked && planApproved && workspaceStatus && !workspaceReady && (
         <FeedbackBanner
@@ -183,18 +140,14 @@ export default function V1ExecutionPanel({
       {!recoveryBlocked && planApproved && workspaceStatus &&
         workspaceAction !== "none" && workspaceAction !== "prepare"
         && workspaceAction !== "managed_task_changes" && (
-        <div style={{ marginBottom: "20px" }}>
-          <ActionButton icon={<RefreshCw size={16} />} disabled={busy} onClick={onSyncProject}>
-            刷新工作区
-          </ActionButton>
-          <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
-            {workspaceAction === "resolve_changes"
+        <FeedbackBanner
+          type="warning"
+          message={workspaceAction === "resolve_changes"
               ? "请先处理上方列出的工作区变更，再刷新状态。"
               : workspaceAction === "configure_identity"
                 ? "请先配置 Git user.name 和 user.email，再刷新状态。"
                 : "请修复项目路径后刷新状态。"}
-          </p>
-        </div>
+        />
       )}
 
       {/* Awaiting confirmation */}
@@ -287,48 +240,6 @@ export default function V1ExecutionPanel({
         </div>
       )}
 
-      {/* Pause controls — only visible when execution is actively running */}
-      {!recoveryBlocked && isExecuting && !isAwaiting && (
-        <div style={{
-          marginBottom: "20px", padding: "16px",
-          background: "#fff8f0", borderRadius: "8px", border: "1px solid #e6a23c",
-        }}>
-          <div style={{ fontWeight: 600, fontSize: "14px", marginBottom: "12px", color: "#9a6700" }}>
-            ⏸ 暂停执行
-          </div>
-          <div style={{ display: "flex", gap: "16px", flexWrap: "wrap" }}>
-            <div style={{ flex: 1, minWidth: "180px" }}>
-              <ActionButton
-                icon={<Square size={16} />}
-                variant="danger"
-                disabled={busy}
-                onClick={async () => { setLocalBusy(true); await onInStop(); setLocalBusy(false); }}
-                fullWidth
-              >
-                立即暂停 (In Stop)
-              </ActionButton>
-              <p style={{ color: "#656d76", fontSize: "12px", marginTop: "4px" }}>
-                立即终止当前任务，回到上一个稳定检查点。未完成的任务不保留部分结果。
-              </p>
-            </div>
-            <div style={{ flex: 1, minWidth: "180px" }}>
-              <ActionButton
-                icon={<Pause size={16} />}
-                variant="secondary"
-                disabled={busy}
-                onClick={async () => { setLocalBusy(true); await onEdStop(); setLocalBusy(false); }}
-                fullWidth
-              >
-                完成后暂停 (ED Stop)
-              </ActionButton>
-              <p style={{ color: "#656d76", fontSize: "12px", marginTop: "4px" }}>
-                当前任务执行完成并确认后再暂停，已完成的任务得到保留。
-              </p>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* All done — workflow should have auto-advanced; this is a safety net */}
       {!recoveryBlocked && !isAwaiting && planApproved && workspaceReady && !nextSubtask && (
         <div style={{ marginBottom: "20px" }}>
@@ -336,23 +247,6 @@ export default function V1ExecutionPanel({
             type="success"
             message={`${planTarget?.kind === "Milestone" ? "当前大阶段" : "当前中阶段"}所有小阶段已执行完成。`}
           />
-          <p style={{ color: "#656d76", fontSize: "13px", marginTop: "12px" }}>
-            如果页面未自动跳转，请手动同步项目状态。
-          </p>
-          <ActionButton
-            icon={<RotateCcw size={16} />}
-            variant="secondary"
-            onClick={onSyncProject}
-          >
-            同步项目状态
-          </ActionButton>
-        </div>
-      )}
-
-      {/* Execution log */}
-      {executionStatus && (
-        <div style={{ marginTop: "20px", padding: "10px", background: "#f6f8fa", borderRadius: "6px", fontSize: "12px", fontFamily: "monospace", color: "#656d76" }}>
-          {executionStatus.current_log}
         </div>
       )}
     </div>

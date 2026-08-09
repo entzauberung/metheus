@@ -28,6 +28,7 @@ pub(crate) fn from_engine_failure(
         project::EngineFailureKind::ProcessCrash => project::AutopilotFailureKind::ProcessCrash,
         project::EngineFailureKind::ToolRejected
         | project::EngineFailureKind::ProtocolError
+        | project::EngineFailureKind::OutputTruncated
         | project::EngineFailureKind::MaxTurnsExceeded
         | project::EngineFailureKind::RuntimeError
         | project::EngineFailureKind::TaskExecutionError => {

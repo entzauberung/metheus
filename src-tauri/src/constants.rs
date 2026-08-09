@@ -25,6 +25,14 @@ pub(crate) const UPSTREAM_GROK_API_KEY_ENV: &str = "XAI_API_KEY";
 pub(crate) const CREDENTIAL_SERVICE: &str = "com.bruce.metheus";
 pub(crate) const DECISION_CREDENTIAL_ACCOUNT: &str = "decision-model-api-key";
 pub(crate) const BUILTIN_GROK_BUILD_CREDENTIAL_ACCOUNT: &str = "built-in-grok-build-api-key";
+pub(crate) const VISION_MODEL_CREDENTIAL_ACCOUNT: &str = "vision-model-api-key";
+
+pub(crate) const DEFAULT_VISION_MODEL_REQUEST_URL: &str =
+    "https://api.openai.com/v1/chat/completions";
+pub(crate) const DEFAULT_VISION_MODEL: &str = "gpt-4.1-mini";
+pub(crate) const DEFAULT_VISION_MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+pub(crate) const DEFAULT_VISION_MAX_TOTAL_BYTES: u64 = 15 * 1024 * 1024;
+pub(crate) const DEFAULT_VISION_MAX_IMAGES: u32 = 6;
 
 pub(crate) const DEFAULT_BUILTIN_GROK_BUILD_API_BASE_URL: &str = "https://api.x.ai/v1";
 pub(crate) const DEFAULT_BUILTIN_GROK_BUILD_MODEL: &str = "grok-4.5";

@@ -1,0 +1,140 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "plan",
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "reserved": 30000
+  },
+  "watcher": {
+    "ignore": [
+      ".git/**",
+      "node_modules/**",
+      "dist/**",
+      "build/**",
+      ".build/**",
+      ".build-*/*",
+      "target/**",
+      "src-tauri/target/**"
+    ]
+  },
+  "mcp": {
+    "distill": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "distill-mcp",
+        "serve"
+      ],
+      "enabled": true,
+      "timeout": 60000
+    },
+    "largefile": {
+      "type": "local",
+      "command": [
+        "uvx",
+        "--from",
+        "largefile",
+        "largefile-mcp"
+      ],
+      "enabled": true,
+      "timeout": 60000
+    },
+    "project-memory-r": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ],
+      "enabled": true,
+      "timeout": 30000
+    },
+    "ripgrep-search": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "mcp-ripgrep@0.4.0"
+      ],
+      "enabled": false,
+      "timeout": 30000
+    },
+    "rlm": {
+      "type": "local",
+      "command": [
+        "rlm-mcp"
+      ],
+      "enabled": false,
+      "timeout": 60000
+    },
+    "slimcontext-tool压缩上下文对话历史": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "slimcontext-mcp-server"
+      ],
+      "enabled": false,
+      "timeout": 30000
+    }
+  },
+  "agent": {
+    "build": {
+      "description": "只读取项目并生成模块化施工蓝图。只允许写入项目根目录 ai/，禁止修改源码、配置、依赖、测试和文档，禁止执行任何命令。",
+      "mode": "primary",
+      "steps": 64,
+      "prompt": "你是施工蓝图写入代理。你的任务是读取当前项目、理解用户的大需求，并把完整施工蓝图模块化写入项目根目录 ai/。你不能修改源码，不能修改配置，不能执行命令，不能运行测试、构建、安装依赖或启动服务。必须生成全部工单和全部子任务，不得只生成第一个工单。所有旧的 ai/work-orders/*.md 和 ai/tasks/*.md 必须在生成新蓝图前清理，然后重新写入。稳定文件 CONTROL.md、STATE.md 和 LATEST-REPORT.md 必须覆盖更新。EXECUTION-PROTOCOL.md 是固定执行协议，存在时不得修改。完整蓝图不得全部输出到聊天窗口，只在最后报告蓝图编号、工单数量、子任务数量、首个任务和写入文件列表。",
+      "permission": {
+        "read": {
+          "*": "allow",
+          "*.env": "deny",
+          "*.env.*": "deny",
+          "*.env.example": "allow"
+        },
+        "edit": {
+          "*": "deny",
+          "ai/**": "allow"
+        },
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "lsp": "allow",
+        "bash": "deny",
+        "task": "deny",
+        "todowrite": "deny",
+        "question": "deny",
+        "external_directory": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "doom_loop": "ask",
+        "distill_*": "allow",
+        "distill_code_execute": "deny",
+        "largefile_*": "allow",
+        "largefile_edit*": "deny",
+        "largefile_revert*": "deny",
+        "project-memory-r_*": "deny",
+        "project-memory-r_read_graph": "allow",
+        "project-memory-r_search_nodes": "allow",
+        "project-memory-r_open_nodes": "allow",
+        "ripgrep-search_*": "deny",
+        "rlm_*": "deny",
+        "slimcontext-tool压缩上下文对话历史_*": "deny",
+        "skill": {
+          "*": "deny",
+          "project-evidence": "allow",
+          "construction-blueprint": "allow",
+          "delivery-review": "allow"
+        }
+      }
+    }
+  },
+  "command": {
+    "blueprint": {
+      "description": "把当前大需求生成并覆盖写入 ai/ 模块化施工蓝图",
+      "agent": "build",
+      "template": "现在生成完整的模块化施工蓝图。必须先加载 project-evidence 技能，再加载 construction-blueprint 技能。只读取当前项目，不执行命令，不修改源码，不修改依赖，不修改配置，不运行测试，不启动服务。\\n\\n必须使用当前用户需求和当前项目证据生成全部内容。生成前清理旧的 ai/work-orders/*.md 和 ai/tasks/*.md，但不得删除 ai/EXECUTION-PROTOCOL.md。\\n\\n必须覆盖写入以下文件：\\n1. ai/CONTROL.md：蓝图编号、用户目标、非目标、总约束、资源约束、工单依赖图、完整推进顺序、全局停止条件。\\n2. ai/STATE.md：状态、当前 WO、当前 ST、已完成 WO/ST、下一任务、阻塞原因、最近报告。\\n3. ai/LATEST-REPORT.md：本次蓝图生成报告，覆盖旧内容。\\n4. ai/work-orders/WO-xxx.md：为每一个工单分别生成完整文件。\\n5. ai/tasks/WO-xxx-ST-xxx.md：为每一个原子子任务分别生成完整文件。\\n\\n每个工单必须包含目标、前置依赖、工单分约束、允许改动范围、禁止改动范围、改动坐标、实施顺序、完成定义、验收标准、测试要求、资源策略、风险、回滚点和硬停止条件。\\n\\n每个子任务必须包含执行顺序、输入、输出、依赖、改动坐标、允许文件、禁止文件、精确实施要求、验收标准、允许执行命令、禁止执行命令、验证等级 R0/R1/R2、最大修复轮数、最大运行时间、资源风险和硬停止条件。\\n\\n验证等级必须遵守：R0 不运行命令；R1 只运行当前模块的定向验证；R2 才允许全量测试、全量构建、发布构建或桌面打包，而且 R2 必须标记为人工批准门禁。普通工单不得生成 R2。\\n\\n不得在聊天窗口输出完整蓝图，最后只输出不超过 500 字的摘要、首个 WO/ST、写入文件列表和阻塞项。\\n\\n用户的完整需求如下：\\n$ARGUMENTS"
+    }
+  }
+}
