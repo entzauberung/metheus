@@ -1,6 +1,7 @@
 use super::contract::{
-    EngineAuthState, EngineAuthVerificationMethod, EngineAuthenticationResult, EngineHealth,
-    EngineHealthStatus, EngineLocalAuthState, EngineOnlineAuthState, ProcessSpec, ProgramSource,
+    EngineAuthState, EngineAuthVerificationMethod, EngineAuthenticationResult,
+    EngineConfigurationEvidenceSource, EngineHealth, EngineHealthStatus, EngineLocalAuthState,
+    EngineOnlineAuthState, EngineRuntimeConfigurationEvidence, ProcessSpec, ProgramSource,
 };
 use crate::project::{EngineFailureKind, ExecutionProfile, ExecutionProvider, ExecutionRuntime};
 use crate::settings::AppSettings;
@@ -15,6 +16,7 @@ const CAPABILITY_PROBE_TIMEOUT_SECS: u64 = 5;
 const ONLINE_AUTH_PROBE_TIMEOUT_SECS: u64 = 30;
 const AUTH_RESULT_TTL_SECS: u64 = 5 * 60;
 const AUTH_PROBE_CONTRACT_VERSION: &str = "minimal-ok-v2";
+const MAX_CONFIGURATION_EVIDENCE_LENGTH: usize = 96;
 pub(super) const MINIMAL_PROBE_PROMPT: &str = "Reply with OK only. Do not use tools.";
 
 #[derive(Clone)]
@@ -390,6 +392,49 @@ fn health_status(authentication: &EngineAuthenticationResult) -> EngineHealthSta
     }
 }
 
+fn sanitize_configuration_evidence(value: &str) -> Option<String> {
+    let cleaned = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<String>();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty()
+        || cleaned.chars().count() > MAX_CONFIGURATION_EVIDENCE_LENGTH
+        || !cleaned.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.' | '/' | ':' | '+')
+        })
+    {
+        return None;
+    }
+    Some(cleaned.to_string())
+}
+
+pub(super) fn builtin_runtime_configuration_evidence(
+    settings: &AppSettings,
+) -> EngineRuntimeConfigurationEvidence {
+    let model = sanitize_configuration_evidence(&settings.built_in_grok_build.model);
+    EngineRuntimeConfigurationEvidence {
+        model_source: if model.is_some() {
+            EngineConfigurationEvidenceSource::Confirmed
+        } else {
+            EngineConfigurationEvidenceSource::Unknown
+        },
+        model,
+        reasoning_effort: None,
+        reasoning_effort_source: EngineConfigurationEvidenceSource::ProviderDefault,
+    }
+}
+
+fn plugin_runtime_configuration_evidence() -> EngineRuntimeConfigurationEvidence {
+    EngineRuntimeConfigurationEvidence {
+        model: None,
+        model_source: EngineConfigurationEvidenceSource::ProviderDefault,
+        reasoning_effort: None,
+        reasoning_effort_source: EngineConfigurationEvidenceSource::ProviderDefault,
+    }
+}
+
 fn verification_failure_message(kind: &EngineFailureKind) -> &'static str {
     match kind {
         EngineFailureKind::AuthenticationError => "认证失败",
@@ -414,6 +459,11 @@ fn unavailable_health(
     configuration_valid: bool,
     message: String,
 ) -> HealthCheckResult {
+    let mut authentication =
+        EngineAuthenticationResult::unknown("尚未获得执行引擎认证信息");
+    if profile.runtime == ExecutionRuntime::Plugin {
+        authentication.runtime_configuration = Some(plugin_runtime_configuration_evidence());
+    }
     HealthCheckResult {
         health: EngineHealth {
             runtime: profile.runtime.clone(),
@@ -422,7 +472,7 @@ fn unavailable_health(
             executable_path: None,
             version: None,
             auth_state: EngineAuthState::Unknown,
-            authentication: EngineAuthenticationResult::unknown("尚未获得执行引擎认证信息"),
+            authentication,
             supports_unattended: false,
             configuration_valid,
             capabilities: vec![],
@@ -502,6 +552,7 @@ pub(super) async fn check_engine_health_with_settings(
                     verified_at: None,
                     expires_at: None,
                     failure_kind: None,
+                    runtime_configuration: Some(plugin_runtime_configuration_evidence()),
                     message,
                 }
             }
@@ -514,6 +565,7 @@ pub(super) async fn check_engine_health_with_settings(
                     verified_at: None,
                     expires_at: None,
                     failure_kind: None,
+                    runtime_configuration: Some(plugin_runtime_configuration_evidence()),
                     message,
                 }
             }
@@ -546,6 +598,7 @@ pub(super) async fn check_engine_health_with_settings(
                     verified_at: None,
                     expires_at: None,
                     failure_kind: None,
+                    runtime_configuration: Some(plugin_runtime_configuration_evidence()),
                     message: match authenticated {
                         Some(true) => format!("{} 已认证", profile.provider.display_name()),
                         Some(false) => format!("{} 尚未认证", profile.provider.display_name()),
@@ -645,6 +698,7 @@ pub(super) async fn verify_engine_authentication_with_settings(
             verified_at: Some(verified_at.to_rfc3339()),
             expires_at: Some(expires_at.to_rfc3339()),
             failure_kind: None,
+            runtime_configuration: Some(plugin_runtime_configuration_evidence()),
             message: format!("{} 在线认证验证成功", profile.provider.display_name()),
         },
         Err(kind) => EngineAuthenticationResult {
@@ -653,6 +707,7 @@ pub(super) async fn verify_engine_authentication_with_settings(
             method: EngineAuthVerificationMethod::OnlineMinimalRequest,
             verified_at: Some(verified_at.to_rfc3339()),
             expires_at: Some(expires_at.to_rfc3339()),
+            runtime_configuration: Some(plugin_runtime_configuration_evidence()),
             message: format!(
                 "{} 在线认证验证失败：{}；本地状态：{}",
                 profile.provider.display_name(),
@@ -737,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn only_known_unusable_health_states_block_execution() {
+    fn only_available_health_state_allows_execution() {
         assert!(EngineHealthStatus::NotInstalled.blocks_execution());
         assert!(EngineHealthStatus::Unauthenticated.blocks_execution());
         assert!(EngineHealthStatus::UnsupportedVersion.blocks_execution());
@@ -745,7 +800,72 @@ mod tests {
         assert!(EngineHealthStatus::VerificationRequired.blocks_execution());
         assert!(EngineHealthStatus::VerificationFailed.blocks_execution());
         assert!(!EngineHealthStatus::Available.blocks_execution());
-        assert!(!EngineHealthStatus::Unknown.blocks_execution());
+        assert!(EngineHealthStatus::Unknown.blocks_execution());
+    }
+
+    #[test]
+    fn runtime_configuration_evidence() {
+        let legacy = serde_json::json!({
+            "local_state": "Unknown",
+            "online_state": "NotVerified",
+            "method": "None",
+            "verified_at": null,
+            "expires_at": null,
+            "failure_kind": null,
+            "message": "legacy payload"
+        });
+        let legacy: EngineAuthenticationResult = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.runtime_configuration.is_none());
+
+        let plugin = plugin_runtime_configuration_evidence();
+        assert!(plugin.model.is_none());
+        assert_eq!(
+            plugin.model_source,
+            EngineConfigurationEvidenceSource::ProviderDefault
+        );
+        assert!(plugin.reasoning_effort.is_none());
+        assert_eq!(
+            plugin.reasoning_effort_source,
+            EngineConfigurationEvidenceSource::ProviderDefault
+        );
+
+        let mut settings = AppSettings::default();
+        settings.built_in_grok_build.model = "  grok-4\n  ".to_string();
+        let built_in = builtin_runtime_configuration_evidence(&settings);
+        assert_eq!(built_in.model.as_deref(), Some("grok-4"));
+        assert_eq!(
+            built_in.model_source,
+            EngineConfigurationEvidenceSource::Confirmed
+        );
+        assert_eq!(
+            built_in.reasoning_effort_source,
+            EngineConfigurationEvidenceSource::ProviderDefault
+        );
+
+        settings.built_in_grok_build.model = "x".repeat(MAX_CONFIGURATION_EVIDENCE_LENGTH + 1);
+        let rejected = builtin_runtime_configuration_evidence(&settings);
+        assert!(rejected.model.is_none());
+        assert_eq!(
+            rejected.model_source,
+            EngineConfigurationEvidenceSource::Unknown
+        );
+
+        let serialized = serde_json::to_value(EngineAuthenticationResult {
+            local_state: EngineLocalAuthState::ConfiguredEvidence,
+            online_state: EngineOnlineAuthState::Verified,
+            method: EngineAuthVerificationMethod::OnlineMinimalRequest,
+            verified_at: None,
+            expires_at: None,
+            failure_kind: None,
+            runtime_configuration: Some(plugin),
+            message: "verified".to_string(),
+        })
+        .unwrap();
+        let evidence = serialized.get("runtime_configuration").unwrap();
+        assert_eq!(evidence.get("model_source").unwrap(), "ProviderDefault");
+        assert!(evidence.get("model").is_none());
+        assert!(serialized.get("api_key").is_none());
+        assert!(serialized.get("endpoint").is_none());
     }
 
     #[cfg(unix)]
@@ -893,6 +1013,7 @@ mod tests {
             verified_at: None,
             expires_at: None,
             failure_kind: Some(EngineFailureKind::ProtocolError),
+            runtime_configuration: Some(plugin_runtime_configuration_evidence()),
             message: "脱敏失败".to_string(),
         };
         cache_authentication(&ExecutionProvider::ClaudeCode, &cli, &capabilities, failed);
@@ -907,6 +1028,7 @@ mod tests {
             verified_at: None,
             expires_at: None,
             failure_kind: None,
+            runtime_configuration: Some(plugin_runtime_configuration_evidence()),
             message: "验证成功".to_string(),
         };
         cache_authentication(

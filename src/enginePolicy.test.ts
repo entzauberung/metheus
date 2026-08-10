@@ -40,7 +40,7 @@ describe("execution engine change policy", () => {
     expect(executionProviderAllowed("BuiltIn", "KimiCli")).toBe(false);
   });
 
-  it("blocks known unusable engines but permits unknown probes", () => {
+  it("allows only available engines to execute", () => {
     const health = (status: EngineHealth["status"]) => ({ status } as EngineHealth);
     expect(engineHealthBlocksExecution(health("NotInstalled"))).toBe(true);
     expect(engineHealthBlocksExecution(health("Unauthenticated"))).toBe(true);
@@ -49,7 +49,7 @@ describe("execution engine change policy", () => {
     expect(engineHealthBlocksExecution(health("VerificationRequired"))).toBe(true);
     expect(engineHealthBlocksExecution(health("VerificationFailed"))).toBe(true);
     expect(engineHealthBlocksExecution(health("Available"))).toBe(false);
-    expect(engineHealthBlocksExecution(health("Unknown"))).toBe(false);
+    expect(engineHealthBlocksExecution(health("Unknown"))).toBe(true);
   });
 
   it("allows changes at a stable boundary", () => {

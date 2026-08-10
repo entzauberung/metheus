@@ -92,12 +92,47 @@ describe("ExecutionEngineSelector health invalidation", () => {
     render();
     await flushPromises();
     expect(host.textContent).toContain("需要运行时自检");
+    expect(host.textContent).toContain("待运行时自检");
+    expect(host.textContent).toContain("下一步：运行时自检");
+    expect(host.textContent).not.toContain("在线验证");
 
     act(() => invalidateEngineHealth(BUILT_IN_GROK_BUILD_HEALTH_TARGET));
     await flushPromises();
 
     expect(invokeMock).toHaveBeenCalledTimes(2);
     expect(host.textContent).toContain("内置引擎可用");
+    expect(host.textContent).toContain("可执行");
+  });
+
+  it("presents a BuiltIn self-test failure without online-auth terminology", async () => {
+    const failed = health("VerificationFailed", "运行时自检没有通过");
+    failed.runtime_self_test = "Failed";
+    failed.authentication.online_state = "Failed";
+    invokeMock.mockResolvedValue(failed);
+    render();
+    await flushPromises();
+
+    expect(host.textContent).toContain("自检失败");
+    expect(host.textContent).toContain("下一步：查看原因并重试自检");
+    expect(host.textContent).not.toContain("在线验证");
+  });
+
+  it("explains configured evidence as pending verification rather than runnable", async () => {
+    const pending = health("VerificationRequired", "只发现本地认证配置", "Plugin");
+    pending.authentication = {
+      local_state: "ConfiguredEvidence",
+      online_state: "NotVerified",
+      method: "PassiveConfiguration",
+      message: "发现配置",
+    };
+    invokeMock.mockResolvedValue(pending);
+    render(profile("Plugin"));
+    await flushPromises();
+
+    expect(host.textContent).toContain("待在线验证");
+    expect(host.textContent).toContain("本地配置：已发现配置");
+    expect(host.textContent).toContain("下一步：在线验证");
+    expect(host.textContent).not.toContain("后端健康检查已确认该插件可用于执行");
   });
 
   it("keeps request sequence protection when an old health response arrives last", async () => {
@@ -121,6 +156,32 @@ describe("ExecutionEngineSelector health invalidation", () => {
     });
     expect(host.textContent).toContain("最新健康状态");
     expect(host.textContent).not.toContain("过期健康状态");
+  });
+
+  it("ignores the old provider response after the selected provider changes", async () => {
+    const grokRequest = deferred<EngineHealth>();
+    const codexRequest = deferred<EngineHealth>();
+    invokeMock
+      .mockReturnValueOnce(grokRequest.promise)
+      .mockReturnValueOnce(codexRequest.promise);
+    const grokProfile = profile("Plugin");
+    render(grokProfile);
+    render({ ...grokProfile, provider: "Codex" });
+
+    const codexHealth = health("Available", "Codex 最新状态", "Plugin");
+    codexHealth.provider = "Codex";
+    await act(async () => {
+      codexRequest.resolve(codexHealth);
+      await codexRequest.promise;
+    });
+    expect(host.textContent).toContain("Codex 最新状态");
+
+    await act(async () => {
+      grokRequest.resolve(health("VerificationRequired", "Grok 旧状态", "Plugin"));
+      await grokRequest.promise;
+    });
+    expect(host.textContent).toContain("Codex 最新状态");
+    expect(host.textContent).not.toContain("Grok 旧状态");
   });
 
   it("does not recheck Plugin Grok for a BuiltIn invalidation", async () => {

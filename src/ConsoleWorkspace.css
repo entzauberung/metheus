@@ -13,7 +13,7 @@
 
 .console-workspace > *,
 .console-command-bar > *,
-.console-command-tools > * {
+.console-runtime-row > * {
   min-width: 0;
 }
 
@@ -25,26 +25,39 @@
 }
 
 .console-command-bar {
-  display: flex;
+  display: grid;
+  grid-template-rows: auto auto;
+  min-width: 0;
+  padding: 0;
+}
+
+.console-utility-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
   min-width: 0;
-  padding: 8px 12px;
+  padding: 6px 12px;
+  border-bottom: 1px solid #d8dee4;
+  background: #f6f8fa;
 }
 
-.console-command-bar > .autopilot-control-bar {
-  flex: 1 1 auto;
+.console-utility-sync {
   min-width: 0;
-  margin: 0;
 }
 
-.console-command-tools {
+.console-utility-tools {
   display: inline-flex;
   align-items: center;
-  flex: 0 0 auto;
-  flex-wrap: wrap;
   gap: 6px;
-  max-width: 100%;
+  min-width: 0;
+}
+
+.console-runtime-row {
+  min-width: 0;
+  padding: 8px 12px 0;
+  overflow: visible;
+  background: #fff;
 }
 
 .console-sync-state {
@@ -131,6 +144,13 @@
   min-height: 100%;
 }
 
+.console-workspace-main > .execution-main,
+.console-bottom-panel,
+.console-bottom-content,
+.console-bottom-panel [role="tabpanel"] {
+  min-height: 0;
+}
+
 .console-workspace-bottom {
   grid-column: 2;
   grid-row: 3;
@@ -179,13 +199,8 @@
     grid-template-columns: minmax(200px, 230px) minmax(0, 1fr);
   }
 
-  .console-command-bar {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .console-command-tools {
-    justify-content: flex-end;
+  .console-utility-bar {
+    grid-template-columns: minmax(0, 1fr) auto;
   }
 }
 
@@ -213,14 +228,13 @@
   .console-workspace-main { grid-row: 3; }
   .console-workspace-bottom { grid-row: 4; }
 
-  .console-command-tools {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto auto;
-    width: 100%;
+  .console-utility-bar {
+    grid-template-columns: minmax(0, 1fr) auto;
+    padding-inline: 8px;
   }
 
-  .console-sync-state {
-    white-space: normal;
+  .console-utility-sync {
+    min-width: 0;
   }
 
   .console-bottom-panel.open {
@@ -229,9 +243,8 @@
 }
 
 @media (max-width: 420px) {
-  .console-command-bar {
-    gap: 6px;
-    padding: 6px 8px;
+  .console-runtime-row {
+    padding-inline: 8px;
   }
 
   .console-workspace-navigator {
@@ -240,10 +253,6 @@
 
   .console-navigator-tabs {
     padding: 6px;
-  }
-
-  .console-command-tools {
-    align-items: center;
   }
 
   .console-sync-state {

@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
+  PipelineState,
   Project,
   RecoveryActionPresentation,
   RecoveryCapability,
@@ -83,7 +84,11 @@ describe("AutopilotControlBar recovery presentation", () => {
     vi.restoreAllMocks();
   });
 
-  function render(recovery: RecoveryPresentation | null, projectValue = project()) {
+  function render(
+    recovery: RecoveryPresentation | null,
+    projectValue = project(),
+    executionStatus: PipelineState | null = null,
+  ) {
     const handlers = {
       toggle: vi.fn(async () => undefined),
       sync: vi.fn(async () => undefined),
@@ -97,6 +102,8 @@ describe("AutopilotControlBar recovery presentation", () => {
       resolve: vi.fn(async () => undefined),
       pauseManaged: vi.fn(async () => undefined),
       resumeManaged: vi.fn(async () => undefined),
+      pauseNow: vi.fn(async () => undefined),
+      pauseAfterCurrent: vi.fn(async () => undefined),
       noop: vi.fn(async () => undefined),
     };
     act(() => {
@@ -104,14 +111,14 @@ describe("AutopilotControlBar recovery presentation", () => {
         <AutopilotControlBar
           project={projectValue}
           recoveryPresentation={recovery}
-          executionStatus={null}
+          executionStatus={executionStatus}
           busy={false}
           onToggle={handlers.toggle}
           onPauseManagedFlow={handlers.pauseManaged}
           onResumeManagedFlow={handlers.resumeManaged}
           onStopManagedFlow={handlers.noop}
-          onPauseNow={handlers.noop}
-          onPauseAfterCurrent={handlers.noop}
+          onPauseNow={handlers.pauseNow}
+          onPauseAfterCurrent={handlers.pauseAfterCurrent}
           onResume={handlers.resume}
           onSync={handlers.sync}
           onAcknowledgeRecovery={handlers.acknowledge}
@@ -144,7 +151,7 @@ describe("AutopilotControlBar recovery presentation", () => {
     const buttons = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
 
     expect(host.querySelector(`[data-recovery-kind='${kind}']`)).not.toBeNull();
-    expect(buttons).toEqual(["同步状态", label]);
+    expect(buttons).toEqual([label, "同步状态"]);
   });
 
   it("shows validation retry as automatic without inventing a recovery button", () => {
@@ -163,6 +170,40 @@ describe("AutopilotControlBar recovery presentation", () => {
     render(presentation("None", null));
     expect(host.querySelector("[data-recovery-kind]")).toBeNull();
     expect(host.textContent).toContain("已暂停");
+  });
+
+  it("keeps status, summary, and actions regions in a stable order across states", () => {
+    const recoveryView = presentation(
+      "GitReconfirmation",
+      action("RetryGitConfirmation", "重新确认提交"),
+      { reason: "一段很长但不能推动主操作区的恢复诊断说明" },
+    );
+    render(recoveryView);
+
+    const recoveryBar = host.querySelector<HTMLElement>(".autopilot-control-bar");
+    expect([...recoveryBar!.children].map(child => child.classList[0])).toEqual([
+      "ap-bar-status-region",
+      "ap-bar-summary-region",
+      "ap-bar-actions-region",
+    ]);
+    expect([...recoveryBar!.querySelectorAll("[data-action-slot]")]
+      .map(slot => slot.getAttribute("data-action-slot")))
+      .toEqual(["primary", "secondary", "overflow"]);
+    expect(recoveryBar?.dataset.apState).toBe("Error");
+    expect(recoveryBar?.querySelector(".ap-bar-summary")?.getAttribute("title"))
+      .toBe("GitReconfirmation 标题");
+    expect(recoveryBar?.querySelector(".ap-bar-details")).not.toBeNull();
+    expect(recoveryBar?.querySelector(".ap-bar-detail-content")?.textContent)
+      .toContain("恢复诊断说明");
+
+    render(null);
+    const pausedBar = host.querySelector<HTMLElement>(".autopilot-control-bar");
+    expect([...pausedBar!.children].map(child => child.classList[0])).toEqual([
+      "ap-bar-status-region",
+      "ap-bar-summary-region",
+      "ap-bar-actions-region",
+    ]);
+    expect(pausedBar?.dataset.apState).toBe("Paused");
   });
 
   it("uses capability routing and never substitutes baseline recovery for Git", () => {
@@ -340,7 +381,7 @@ describe("AutopilotControlBar recovery presentation", () => {
     expect(host.textContent).toContain("心跳：");
     expect(host.textContent).toContain("正在生成首个大阶段");
     const labels = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
-    expect(labels).toEqual(["同步", "暂停托管", "停止托管"]);
+    expect(labels).toEqual(["暂停托管", "停止托管"]);
   });
 
   it("keeps managed resume in the same command bar without a duplicate pause action", () => {
@@ -365,10 +406,153 @@ describe("AutopilotControlBar recovery presentation", () => {
 
     const handlers = render(null, value);
     const labels = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
-    expect(labels).toEqual(["同步", "恢复托管", "停止托管"]);
+    expect(labels).toEqual(["恢复托管", "停止托管"]);
     const resume = [...host.querySelectorAll<HTMLButtonElement>("button")]
       .find(button => button.textContent?.includes("恢复托管"));
     act(() => resume?.click());
     expect(handlers.resumeManaged).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves the responsive region contract while switching Running, Paused, and Recovery", () => {
+    const value = project();
+    value.workflow_state.autopilot_state!.run_status = "Running";
+    render(null, value);
+
+    const runningBar = host.querySelector<HTMLElement>(".autopilot-control-bar");
+    expect(runningBar?.dataset.apState).toBe("Running");
+    expect(runningBar?.querySelector(".ap-bar-status-region")?.getAttribute("role")).toBe("status");
+    expect(runningBar?.querySelector(".ap-bar-summary-region")?.getAttribute("aria-label"))
+      .toBe("执行摘要");
+    expect(runningBar?.querySelector(".ap-bar-actions-region")?.getAttribute("aria-label"))
+      .toBe("自动驾驶操作");
+    expect(runningBar?.querySelector(".ap-bar-actions-region")?.textContent)
+      .toContain("暂停自动驾驶");
+
+    value.workflow_state.autopilot_state!.run_status = "Paused";
+    render(null, value);
+    const pausedBar = host.querySelector<HTMLElement>(".autopilot-control-bar");
+    expect(pausedBar?.dataset.apState).toBe("Paused");
+    expect(pausedBar?.querySelector(".ap-bar-actions-region")?.textContent).toContain("恢复");
+
+    render(presentation(
+      "GitReconfirmation",
+      action("RetryGitConfirmation", "重新确认提交"),
+    ));
+    const recoveryBar = host.querySelector<HTMLElement>(".autopilot-control-bar");
+    expect(recoveryBar?.dataset.apState).toBe("Error");
+    expect(recoveryBar?.querySelector(".ap-bar-actions-region")?.textContent)
+      .toContain("重新确认提交");
+    expect([...recoveryBar!.children].map(child => child.classList[0])).toEqual([
+      "ap-bar-status-region",
+      "ap-bar-summary-region",
+      "ap-bar-actions-region",
+    ]);
+  });
+
+  it("keeps long action, long error, and retry facts in focusable details without moving actions", () => {
+    const longAction = "execute_a_very_long_action_name_that_must_not_expand_the_command_track";
+    const value = project();
+    value.workflow_state.autopilot_state!.run_status = "Running";
+    value.workflow_state.autopilot_state!.current_action_kind = longAction;
+    value.workflow_state.autopilot_state!.transient_retry_count = 2;
+    value.workflow_state.autopilot_state!.next_retry_at = "2026-07-31T05:00:00Z";
+    render(null, value);
+
+    const runningBar = host.querySelector<HTMLElement>(".autopilot-control-bar");
+    expect(runningBar?.querySelector(".ap-bar-summary")?.getAttribute("title"))
+      .not.toContain(longAction);
+    expect(runningBar?.querySelector(".ap-bar-detail-content")?.textContent)
+      .toContain(longAction);
+    expect(runningBar?.querySelector(".ap-bar-detail-content")?.textContent).toContain("重试 2/3");
+    expect(runningBar?.querySelector(".ap-bar-actions-region")?.textContent)
+      .toContain("暂停自动驾驶");
+
+    const longError = "恢复诊断很长，需要保留完整错误信息但不能把核心操作推出窄屏可视区域";
+    render(presentation(
+      "GitReconfirmation",
+      action("RetryGitConfirmation", "重新确认提交"),
+      {
+        reason: longError,
+        retry_count: 2,
+        retry_limit: 3,
+        next_retry_at: "2026-07-31T05:00:00Z",
+      },
+    ));
+
+    const recoveryBar = host.querySelector<HTMLElement>(".autopilot-control-bar");
+    const details = recoveryBar?.querySelector<HTMLDetailsElement>(".ap-bar-details");
+    const detailsSummary = details?.querySelector<HTMLElement>("summary");
+    const primaryAction = recoveryBar?.querySelector<HTMLButtonElement>(
+      ".ap-bar-actions-region .ap-bar-btn-primary",
+    );
+    expect(details?.textContent).toContain(longError);
+    expect(details?.textContent).toContain("后台重试 2/3");
+    expect(primaryAction?.textContent).toContain("重新确认提交");
+
+    act(() => detailsSummary?.focus());
+    expect(document.activeElement).toBe(detailsSummary);
+    act(() => primaryAction?.focus());
+    expect(document.activeElement).toBe(primaryAction);
+  });
+
+  it.each([390, 600, 1024, 1280])(
+    "keeps fixed regions and action slots at a %dpx viewport contract",
+    (width) => {
+      host.style.width = `${width}px`;
+      const value = project();
+      value.workflow_state.autopilot_state!.run_status = "Running";
+      render(null, value);
+
+      const bar = host.querySelector<HTMLElement>(".autopilot-control-bar");
+      expect(bar?.dataset.actionLayout).toBe("fixed-slots");
+      expect(bar?.dataset.detailLayout).toBe("flow-bounded");
+      expect([...bar!.children].map(child => child.classList[0])).toEqual([
+        "ap-bar-status-region",
+        "ap-bar-summary-region",
+        "ap-bar-actions-region",
+      ]);
+      expect([...bar!.querySelectorAll("[data-action-slot]")]
+        .map(slot => slot.getAttribute("data-action-slot")))
+        .toEqual(["primary", "secondary", "overflow"]);
+      expect(bar?.querySelector("[data-action-slot='primary']")?.textContent)
+        .toContain("暂停自动驾驶");
+    },
+  );
+
+  it("keeps all additional recovery actions keyboard reachable in overflow", () => {
+    const view = presentation(
+      "EngineBlocked",
+      action("AcknowledgeExecutionRecovery", "重试执行"),
+      {
+        secondary_actions: [
+          action("SyncProject", "同步状态"),
+          action("RefreshExecutionWorkspace", "刷新工作区"),
+          action("CloseAutopilot", "关闭自动驾驶"),
+        ],
+        capabilities: [
+          "AcknowledgeExecutionRecovery",
+          "SyncProject",
+          "RefreshExecutionWorkspace",
+          "CloseAutopilot",
+        ],
+      },
+    );
+    render(view);
+
+    const primary = host.querySelector<HTMLElement>("[data-action-slot='primary']");
+    const secondary = host.querySelector<HTMLElement>("[data-action-slot='secondary']");
+    const overflow = host.querySelector<HTMLDetailsElement>(".ap-action-overflow");
+    const overflowSummary = overflow?.querySelector<HTMLElement>("summary");
+    expect(primary?.textContent).toContain("重试执行");
+    expect(secondary?.textContent).toContain("同步状态");
+    expect(overflow?.textContent).toContain("刷新工作区");
+    expect(overflow?.textContent).toContain("关闭自动驾驶");
+
+    act(() => overflowSummary?.focus());
+    expect(document.activeElement).toBe(overflowSummary);
+    const refresh = [...overflow!.querySelectorAll<HTMLButtonElement>("button")]
+      .find(button => button.textContent?.includes("刷新工作区"));
+    act(() => refresh?.focus());
+    expect(document.activeElement).toBe(refresh);
   });
 });

@@ -7,13 +7,16 @@ import {
   Circle,
   CircleDot,
   Clock3,
+  Eye,
   PauseCircle,
+  Play,
 } from "lucide-react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
 import type { Project, Subtask } from "./types";
 import { IconButton } from "./components/IconButton";
 import { Modal } from "./components/Modal";
 import { findProjectSubtaskPath } from "./taskTreePolicy";
+import type { TaskSelectionMode } from "./taskSelectionPolicy";
 
 interface Props {
   project: Project;
@@ -22,6 +25,7 @@ interface Props {
   onSelectMidStage: (id: string) => Promise<void>;
   selectedTaskId?: string;
   currentTaskId?: string;
+  selectionMode?: TaskSelectionMode;
   onOpenTask?: (taskId: string) => void;
 }
 
@@ -46,6 +50,7 @@ function SubtaskBranches({
   tasks,
   currentTaskId,
   selectedTaskId,
+  selectionMode,
   collapsedTaskIds,
   onToggle,
   onOpenTask,
@@ -53,6 +58,7 @@ function SubtaskBranches({
   tasks: Subtask[];
   currentTaskId: string;
   selectedTaskId: string;
+  selectionMode: TaskSelectionMode;
   collapsedTaskIds: Set<string>;
   onToggle: (id: string) => void;
   onOpenTask?: (id: string) => void;
@@ -93,12 +99,26 @@ function SubtaskBranches({
                 type="button"
                 className="tree-subtask-select"
                 onClick={() => onOpenTask?.(task.id)}
-                aria-current={current ? "true" : undefined}
+                aria-current={current ? "step" : undefined}
+                aria-label={`${task.title}${current ? "，当前执行任务" : ""}${selected ? "，正在查看" : ""}`}
+                aria-pressed={selected}
               >
                 {hasChildren && statusIcon(task.status)}
                 <span className="tree-label">{task.title}</span>
               </button>
-              {task.auto_tag && <code className="tree-tag">{task.auto_tag}</code>}
+              <span className="tree-task-meta">
+                {current && (
+                  <span className="tree-task-marker tree-task-marker-current" title="当前执行任务">
+                    <Play size={10} aria-hidden="true" />当前
+                  </span>
+                )}
+                {selected && selectionMode === "pinned" && (
+                  <span className="tree-task-marker tree-task-marker-selected" title="正在查看任务">
+                    <Eye size={10} aria-hidden="true" />查看
+                  </span>
+                )}
+                {task.auto_tag && <code className="tree-tag">{task.auto_tag}</code>}
+              </span>
             </div>
             {hasChildren && expanded && (
               <ul className="tree-children tree-subtasks">
@@ -106,6 +126,7 @@ function SubtaskBranches({
                   tasks={children}
                   currentTaskId={currentTaskId}
                   selectedTaskId={selectedTaskId}
+                  selectionMode={selectionMode}
                   collapsedTaskIds={collapsedTaskIds}
                   onToggle={onToggle}
                   onOpenTask={onOpenTask}
@@ -126,6 +147,7 @@ export default function ExecutionTree({
   onSelectMidStage,
   selectedTaskId = "",
   currentTaskId: currentTaskIdProp,
+  selectionMode = "follow",
   onOpenTask,
 }: Props) {
   const [constitutionOpen, setConstitutionOpen] = useState(false);
@@ -241,6 +263,7 @@ export default function ExecutionTree({
                     tasks={milestone.subtasks}
                     currentTaskId={currentTaskId}
                     selectedTaskId={selectedTaskId}
+                    selectionMode={selectionMode}
                     collapsedTaskIds={collapsedTaskIds}
                     onToggle={toggleTask}
                     onOpenTask={onOpenTask}
@@ -270,6 +293,7 @@ export default function ExecutionTree({
                               tasks={midStage.subtasks}
                               currentTaskId={currentTaskId}
                               selectedTaskId={selectedTaskId}
+                              selectionMode={selectionMode}
                               collapsedTaskIds={collapsedTaskIds}
                               onToggle={toggleTask}
                               onOpenTask={onOpenTask}

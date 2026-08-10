@@ -8,8 +8,10 @@ import { ConsoleNavigator } from "./ConsoleNavigator";
 import {
   CONSOLE_LAYOUT_CONTRACT,
   ConsoleCommandBar,
+  ConsoleRuntimeRow,
   ConsoleWorkspace,
 } from "./ConsoleWorkspace";
+import { ConsoleUtilityBar } from "./ConsoleUtilityBar";
 
 describe("Console workspace structure", () => {
   let host: HTMLDivElement;
@@ -31,7 +33,17 @@ describe("Console workspace structure", () => {
   it("keeps one command region and switches the navigator without duplicating content", () => {
     act(() => root.render(
       <ConsoleWorkspace
-        commandBar={<ConsoleCommandBar><button type="button">同步</button></ConsoleCommandBar>}
+        commandBar={(
+          <ConsoleCommandBar>
+            <ConsoleUtilityBar
+              syncStatus="状态已同步"
+              inspectorOpen={false}
+              onOpenInspector={() => {}}
+              settings={<button type="button">设置</button>}
+            />
+            <ConsoleRuntimeRow><button type="button">同步</button></ConsoleRuntimeRow>
+          </ConsoleCommandBar>
+        )}
         navigator={<ConsoleNavigator taskTree={<p>任务树内容</p>} fileTree={<p>文件树内容</p>} />}
         bottom={<ConsoleBottomPanel><p>日志内容</p></ConsoleBottomPanel>}
       >
@@ -41,6 +53,8 @@ describe("Console workspace structure", () => {
 
     expect(host.querySelectorAll('[aria-label="Console 命令栏"]')).toHaveLength(1);
     expect(host.querySelectorAll('[data-console-region="command"]')).toHaveLength(1);
+    expect(host.querySelectorAll('[data-console-region="utility"]')).toHaveLength(1);
+    expect(host.querySelectorAll('[data-console-region="runtime"]')).toHaveLength(1);
     expect(host.querySelectorAll('[data-console-region="navigator"]')).toHaveLength(1);
     expect(host.querySelectorAll('[data-console-region="main"]')).toHaveLength(1);
     expect(host.querySelectorAll('[data-console-region="bottom"]')).toHaveLength(1);
@@ -85,7 +99,7 @@ describe("Console workspace structure", () => {
       .toBeGreaterThan(CONSOLE_LAYOUT_CONTRACT.inspectorLayer);
   });
 
-  it.each([390, 600, 1280])(
+  it.each([390, 600, 1024, 1280])(
     "keeps one accessible region set at a %dpx viewport contract",
     (width) => {
       host.style.width = `${width}px`;

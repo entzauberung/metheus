@@ -116,7 +116,7 @@ describe("useTaskControlWorkspace", () => {
     act(() => root.render(<Harness />));
   }
 
-  it("uses one fallback poller and keeps a valid selection across refreshes", async () => {
+  it("uses one fallback poller and preserves a valid pinned selection", async () => {
     const interval = vi.spyOn(window, "setInterval");
     const refreshed = snapshot("alpha", 2, "task-b");
     refreshed.nodes.push(snapshot("alpha", 2, "task-a").nodes[0]);
@@ -130,9 +130,42 @@ describe("useTaskControlWorkspace", () => {
     expect(workspace?.selectedTaskId).toBe("task-a");
 
     act(() => workspace?.selectTask("task-a"));
+    expect(workspace?.selectionMode).toBe("pinned");
     await act(async () => { vi.advanceTimersByTime(1_000); await Promise.resolve(); });
     expect(workspace?.selectedTaskId).toBe("task-a");
+    expect(workspace?.selectionMode).toBe("pinned");
     expect(invokeHarness.invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("follows the backend current task across refreshes by default", async () => {
+    invokeHarness.invoke
+      .mockResolvedValueOnce(snapshot("alpha", 1, "task-a"))
+      .mockResolvedValueOnce(snapshot("alpha", 2, "task-b"));
+
+    render(project("alpha", 1));
+    await act(async () => { await Promise.resolve(); });
+    expect(workspace?.selectionMode).toBe("follow");
+    expect(workspace?.selectedTaskId).toBe("task-a");
+
+    await act(async () => { await workspace?.refresh(); });
+    expect(workspace?.selectionMode).toBe("follow");
+    expect(workspace?.selectedTaskId).toBe("task-b");
+  });
+
+  it("restores follow mode on demand after a manual selection", async () => {
+    const initial = snapshot("alpha", 1, "task-a");
+    initial.nodes.push(snapshot("alpha", 1, "task-b").nodes[0]);
+    invokeHarness.invoke.mockResolvedValueOnce(initial);
+
+    render(project("alpha", 1));
+    await act(async () => { await Promise.resolve(); });
+    act(() => workspace?.selectTask("task-b"));
+    expect(workspace?.selectionMode).toBe("pinned");
+    expect(workspace?.selectedTaskId).toBe("task-b");
+
+    act(() => workspace?.followCurrentTask());
+    expect(workspace?.selectionMode).toBe("follow");
+    expect(workspace?.selectedTaskId).toBe("task-a");
   });
 
   it("falls back to the backend current task when the selection disappears", async () => {
@@ -144,6 +177,7 @@ describe("useTaskControlWorkspace", () => {
     act(() => workspace?.selectTask("missing"));
     await act(async () => { await workspace?.refresh(); });
     expect(workspace?.selectedTaskId).toBe("task-b");
+    expect(workspace?.selectionMode).toBe("follow");
   });
 
   it("does not let an old project response replace a newer project", async () => {
@@ -161,6 +195,7 @@ describe("useTaskControlWorkspace", () => {
     await act(async () => { resolveOld?.(snapshot("alpha", 1)); await Promise.resolve(); });
     expect(workspace?.snapshot?.project_name).toBe("beta");
     expect(workspace?.selectedTaskId).toBe("beta-task");
+    expect(workspace?.selectionMode).toBe("follow");
   });
 
   it("does not let an old revision replace a newer revision of the same project", async () => {
@@ -178,6 +213,7 @@ describe("useTaskControlWorkspace", () => {
     await act(async () => { resolveOld?.(snapshot("alpha", 1, "old-task")); await Promise.resolve(); });
     expect(workspace?.snapshot?.project_revision).toBe(5);
     expect(workspace?.selectedTaskId).toBe("new-task");
+    expect(workspace?.selectionMode).toBe("follow");
   });
 
   it("applies the unified action result without a compensating project fetch", async () => {

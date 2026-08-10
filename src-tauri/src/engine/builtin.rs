@@ -173,6 +173,9 @@ pub(super) fn health(settings: &AppSettings, api_key: Option<&str>) -> EngineHea
             verified_at: self_test.as_ref().map(|result| result.verified_at.clone()),
             expires_at: None,
             failure_kind: None,
+            runtime_configuration: Some(super::health::builtin_runtime_configuration_evidence(
+                settings,
+            )),
             message: message.clone(),
         },
         supports_unattended: true,
@@ -583,6 +586,64 @@ mod tests {
             health.source_revision.as_deref(),
             Some(metheus_grok_engine::source_revision())
         );
+    }
+
+    #[test]
+    fn builtin_health_reflects_self_test_state() {
+        let settings = AppSettings::default();
+        let api_key = "self-test-state-secret";
+        if let Ok(mut cache) = SELF_TEST_CACHE.get_or_init(|| Mutex::new(None)).lock() {
+            *cache = None;
+        }
+
+        let not_run = health(&settings, Some(api_key));
+        assert_eq!(not_run.status, EngineHealthStatus::VerificationRequired);
+        assert_eq!(
+            not_run.runtime_self_test,
+            EngineRuntimeSelfTestState::NotRun
+        );
+        assert_eq!(
+            not_run
+                .authentication
+                .runtime_configuration
+                .as_ref()
+                .and_then(|evidence| evidence.model.as_deref()),
+            Some(settings.built_in_grok_build.model.as_str())
+        );
+
+        cache_self_test(
+            &settings,
+            api_key,
+            EngineRuntimeSelfTestResult {
+                success: true,
+                state: EngineRuntimeSelfTestState::Passed,
+                source_revision: metheus_grok_engine::source_revision().to_string(),
+                verified_at: "2026-08-10T00:00:00Z".to_string(),
+                message: "passed".to_string(),
+            },
+        );
+        let passed = health(&settings, Some(api_key));
+        assert_eq!(passed.status, EngineHealthStatus::Available);
+        assert_eq!(passed.runtime_self_test, EngineRuntimeSelfTestState::Passed);
+
+        cache_self_test(
+            &settings,
+            api_key,
+            EngineRuntimeSelfTestResult {
+                success: false,
+                state: EngineRuntimeSelfTestState::Failed,
+                source_revision: metheus_grok_engine::source_revision().to_string(),
+                verified_at: "2026-08-10T00:00:01Z".to_string(),
+                message: "failed".to_string(),
+            },
+        );
+        let failed = health(&settings, Some(api_key));
+        assert_eq!(failed.status, EngineHealthStatus::VerificationFailed);
+        assert_eq!(failed.runtime_self_test, EngineRuntimeSelfTestState::Failed);
+
+        if let Ok(mut cache) = SELF_TEST_CACHE.get_or_init(|| Mutex::new(None)).lock() {
+            *cache = None;
+        }
     }
 
     #[test]

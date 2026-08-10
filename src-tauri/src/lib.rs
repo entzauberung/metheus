@@ -456,6 +456,7 @@ pub fn run() {
             crate::commands::project_ops::initialize_project_entry,
             crate::commands::project_ops::validate_project_path,
             crate::commands::project_ops::get_project_files,
+            crate::commands::project_ops::read_project_file_preview,
             crate::constitution::get_constitution_summary,
             crate::constitution::get_constitution_change_history,
             crate::snapshot::save_snapshot_event,

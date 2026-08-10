@@ -12,6 +12,7 @@ import TaskContractPanel from "./TaskContractPanel";
 import TaskCostPanel from "./TaskCostPanel";
 import TaskInspectorHeader from "./TaskInspectorHeader";
 import { findProjectSubtaskById } from "./taskTreePolicy";
+import type { TaskSelectionMode } from "./taskSelectionPolicy";
 import type {
   Project,
   RecoveryPresentation,
@@ -36,6 +37,8 @@ interface Props {
   onAction: (name: string, options?: { criterionIndexes?: number[]; reason?: string }) => void;
   onConfirmHumanReview?: (criterionIndex: number, reason: string) => void;
   onChangeMode: (mode: TaskControlMode, reason?: string) => void;
+  selectionMode?: TaskSelectionMode;
+  onFollowCurrentTask?: () => void;
 }
 
 const EMPTY_COST = {
@@ -64,6 +67,8 @@ export default function TaskInspector({
   onAction,
   onConfirmHumanReview,
   onChangeMode,
+  selectionMode = "follow",
+  onFollowCurrentTask = () => undefined,
 }: Props) {
   const [activeTab, setActiveTab] = useState("overview");
   const [deviationCriterion, setDeviationCriterion] = useState("");
@@ -139,6 +144,8 @@ export default function TaskInspector({
         onRefresh={onRefresh}
         onAction={name => onAction(name)}
         onChangeMode={onChangeMode}
+        selectionMode={selectionMode}
+        onFollowCurrentTask={onFollowCurrentTask}
       />
       {error && <div className="task-control-error" role="alert">{error}</div>}
       <div className={`task-control-freshness${snapshotStale || detailsSyncing ? " stale" : ""}`} role="status">

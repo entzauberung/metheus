@@ -18,13 +18,13 @@ import { FeedbackBanner } from "./components/FeedbackBanner";
 import { ActionButton } from "./components/ActionButton";
 import { ConsoleStepShell } from "./components/ConsoleStepShell";
 import { WorkflowActionBar } from "./components/WorkflowActionBar";
-import { ArrowLeft, Bot, GitBranch, PanelRightOpen, RotateCcw, Search, WandSparkles } from "lucide-react";
+import { ArrowLeft, Bot, GitBranch, RotateCcw, Search, WandSparkles } from "lucide-react";
 import { AutopilotControlBar } from "./components/AutopilotControlBar";
 import { RecoveryResultBanner } from "./components/RecoveryResultBanner";
 import { SyncStatusIndicator } from "./components/SyncStatusIndicator";
 import ExecutionTree from "./ExecutionTree";
 import ChatRoom from "./ChatRoom";
-import TaskConsole from "./TaskConsole";
+import TaskConsole, { collectProjectTestLogs } from "./TaskConsole";
 import { ConsoleWorkflowPanel } from "./ConsoleWorkflowPanel";
 import { FuturePlanningWorkspace } from "./FuturePlanningWorkspace";
 import { PauseDecisionPanel } from "./PauseDecisionPanel";
@@ -35,11 +35,14 @@ import { ApplicationSettings } from "./components/ApplicationSettings";
 import {
   CONSOLE_LAYOUT_CONTRACT,
   ConsoleCommandBar,
+  ConsoleRuntimeRow,
   ConsoleWorkspace,
 } from "./components/ConsoleWorkspace";
 import { ConsoleNavigator } from "./components/ConsoleNavigator";
-import { ConsoleBottomPanel } from "./components/ConsoleBottomPanel";
+import { ConsoleBottomPanel, type ConsoleBottomView } from "./components/ConsoleBottomPanel";
+import { ConsoleUtilityBar } from "./components/ConsoleUtilityBar";
 import FileTree from "./FileTree";
+import FilePreview from "./FilePreview";
 import FloatingChatBalloon from "./FloatingChatBalloon";
 import TaskInspector from "./TaskInspector";
 import V1ExecutionPanel from "./V1ExecutionPanel";
@@ -67,6 +70,7 @@ import {
 } from "./executionSyncPolicy";
 import { resolvePlanTarget } from "./planTargetPolicy";
 import { getConsoleWritePolicy, type ConsoleWritePolicy } from "./consoleWritePolicy";
+import { shouldCollapseConsolePanel } from "./consolePanelPolicy";
 
 const WORKFLOW_STEPS = new Set<WorkflowStep>([
   "WaitingEntry", "ExistingAnalysis", "BaselineApproval", "Discussion", "ThreeChecks",
@@ -353,6 +357,26 @@ function App() {
 
   // === 执行工作区状态（供 V1ExecutionPanel 和 TaskConsole 共用） ===
   const [workspaceStatus, setWorkspaceStatus] = useState<ExecutionWorkspaceStatus | null>(null);
+  const [bottomPanelOpen, setBottomPanelOpen] = useState(true);
+  const [bottomPanelView, setBottomPanelView] = useState<ConsoleBottomView>("logs");
+  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
+  const previousWorkflowStepRef = useRef<WorkflowStep | null>(null);
+  useEffect(() => {
+    const nextStep = project?.workflow_state.current_step ?? null;
+    if (shouldCollapseConsolePanel(previousWorkflowStepRef.current, nextStep)) {
+      setBottomPanelOpen(false);
+    }
+    previousWorkflowStepRef.current = nextStep;
+  }, [project?.workflow_state.current_step]);
+  useEffect(() => {
+    setSelectedFilePath(null);
+    setBottomPanelView("logs");
+  }, [projectPath]);
+  const handleFileSelect = useCallback((path: string) => {
+    setSelectedFilePath(path);
+    setBottomPanelView("preview");
+    setBottomPanelOpen(true);
+  }, []);
   const applyRuntimeSnapshot = useCallback((snapshot: RuntimeSnapshot) => {
     if (!handleChatComplete(snapshot.project)) return;
     setExecutionStatus(snapshot.pipeline_state);
@@ -1728,6 +1752,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
             onSelectMidStage={handleSelectMidStage}
             selectedTaskId={taskControlWorkspace.selectedTaskId}
             currentTaskId={taskControlWorkspace.snapshot?.current_task_id}
+            selectionMode={taskControlWorkspace.selectionMode}
             onOpenTask={openTaskInspector}
           />
           <div
@@ -1908,51 +1933,46 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
           <ConsoleWorkspace
             commandBar={(
               <ConsoleCommandBar>
-                <AutopilotControlBar
-                  project={project}
-                  recoveryPresentation={recoveryPresentation}
-                  executionStatus={executionStatus}
-                  busy={isConsoleBusy}
-                  writeDisabled={!consoleWritePolicy.writable}
-                  writeDisabledReason={consoleWritePolicy.reason}
-                  onToggle={handleToggleAutopilot}
-                  onPauseManagedFlow={handlePauseManagedFlow}
-                  onResumeManagedFlow={handleResumeManagedFlow}
-                  onStopManagedFlow={handleStopManagedFlow}
-                  onPauseNow={handleAutopilotPauseNow}
-                  onPauseAfterCurrent={handleAutopilotPauseAfterCurrent}
-                  onResume={handleAutopilotResume}
-                  onSync={handleSyncProject}
-                  onAcknowledgeRecovery={handleAcknowledgeExecutionRecovery}
-                  onRegeneratePlan={handleRegenerateInvalidPlan}
-                  onPrepareWorkspace={handlePrepareExecutionWorkspace}
-                  onRefreshWorkspace={handleRefreshExecutionWorkspace}
-                  onRetryGitConfirmation={handleRetryGitConfirmation}
-                  onRunAutomaticRecovery={handleRunAutomaticRecovery}
-                  onResolveHumanRecovery={handleResolveHumanRecovery}
-                />
-                <div className="console-command-tools">
-                  <span className={`console-sync-state ${projectStateSync.state.status}`}>
+                <ConsoleUtilityBar
+                  syncStatus={<span className={`console-sync-state ${projectStateSync.state.status}`}>
                     {consoleWritePolicy.writable ? "状态已同步" : consoleWritePolicy.reason}
-                  </span>
-                  <button
-                    type="button"
-                    className={`icon-button${inspectorOpen ? " active" : ""}`}
-                    onClick={() => setInspectorOpen(open => !open)}
-                    title={inspectorOpen ? "关闭任务检查器" : "打开任务检查器"}
-                    aria-label={inspectorOpen ? "关闭任务检查器" : "打开任务检查器"}
-                    aria-expanded={inspectorOpen}
-                    aria-controls="task-inspector"
-                  >
-                    <PanelRightOpen size={16} />
-                  </button>
-                  <ApplicationSettings
+                  </span>}
+                  inspectorOpen={inspectorOpen}
+                  onOpenInspector={() => setInspectorOpen(true)}
+                  settings={(
+                    <ApplicationSettings
+                      project={project}
+                      pipeline={executionStatus}
+                      writeBlockedReason={consoleWritePolicy.writable ? "" : consoleWritePolicy.reason}
+                      onRuntimeMutation={applyRuntimeMutation}
+                    />
+                  )}
+                />
+                <ConsoleRuntimeRow>
+                  <AutopilotControlBar
                     project={project}
-                    pipeline={executionStatus}
-                    writeBlockedReason={consoleWritePolicy.writable ? "" : consoleWritePolicy.reason}
-                    onRuntimeMutation={applyRuntimeMutation}
+                    recoveryPresentation={recoveryPresentation}
+                    executionStatus={executionStatus}
+                    busy={isConsoleBusy}
+                    writeDisabled={!consoleWritePolicy.writable}
+                    writeDisabledReason={consoleWritePolicy.reason}
+                    onToggle={handleToggleAutopilot}
+                    onPauseManagedFlow={handlePauseManagedFlow}
+                    onResumeManagedFlow={handleResumeManagedFlow}
+                    onStopManagedFlow={handleStopManagedFlow}
+                    onPauseNow={handleAutopilotPauseNow}
+                    onPauseAfterCurrent={handleAutopilotPauseAfterCurrent}
+                    onResume={handleAutopilotResume}
+                    onSync={handleSyncProject}
+                    onAcknowledgeRecovery={handleAcknowledgeExecutionRecovery}
+                    onRegeneratePlan={handleRegenerateInvalidPlan}
+                    onPrepareWorkspace={handlePrepareExecutionWorkspace}
+                    onRefreshWorkspace={handleRefreshExecutionWorkspace}
+                    onRetryGitConfirmation={handleRetryGitConfirmation}
+                    onRunAutomaticRecovery={handleRunAutomaticRecovery}
+                    onResolveHumanRecovery={handleResolveHumanRecovery}
                   />
-                </div>
+                </ConsoleRuntimeRow>
               </ConsoleCommandBar>
             )}
             navigator={(
@@ -1965,19 +1985,26 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                     onSelectMidStage={handleSelectMidStage}
                     selectedTaskId={taskControlWorkspace.selectedTaskId}
                     currentTaskId={taskControlWorkspace.snapshot?.current_task_id}
+                    selectionMode={taskControlWorkspace.selectionMode}
                     onOpenTask={openTaskInspector}
                   />
                 )}
-                fileTree={<FileTree projectPath={projectPath} />}
+                fileTree={<FileTree projectPath={projectPath} onFileSelect={handleFileSelect} />}
               />
             )}
-            bottom={step === "Execution" ? (
-              <ConsoleBottomPanel>
+            bottom={(
+              <ConsoleBottomPanel
+                activeView={bottomPanelView}
+                onActiveViewChange={setBottomPanelView}
+                onOpenChange={setBottomPanelOpen}
+                open={bottomPanelOpen}
+                preview={<FilePreview projectPath={projectPath} filePath={selectedFilePath} />}
+              >
                 <TaskConsole
                   projectPath={projectPath}
                   projectName={project.name}
                   executionStatus={executionStatus}
-                  testLogs={[]}
+                  testLogs={collectProjectTestLogs(project)}
                   workspaceReady={workspaceStatus?.git_metadata_ready === true}
                   executionHistory={project.execution_history}
                   verificationStage={project.execution_session?.verification_stage}
@@ -1989,7 +2016,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                   onOpenTask={openTaskInspector}
                 />
               </ConsoleBottomPanel>
-            ) : undefined}
+            )}
           >
             <div className="execution-main">
               <RecoveryResultBanner
@@ -2179,6 +2206,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
               snapshot={taskControlWorkspace.snapshot}
               selectedNode={taskControlWorkspace.selectedNode}
               selectedTaskId={taskControlWorkspace.selectedTaskId}
+              selectionMode={taskControlWorkspace.selectionMode}
               busy={isConsoleBusy || taskControlWorkspace.busy}
               error={taskControlWorkspace.error}
               recoveryPresentation={recoveryPresentation}
@@ -2191,6 +2219,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                 void handleResolveHumanRecovery("confirm_actual_pass", reason, [criterionIndex]);
               }}
               onChangeMode={(mode, reason) => { void changeTaskControlMode(mode, reason); }}
+              onFollowCurrentTask={taskControlWorkspace.followCurrentTask}
             />
           </div>
         </>

@@ -7,6 +7,13 @@ import {
   TASK_CONTROL_MAX_SYNC_FAILURES,
   type TaskControlFallbackReason,
 } from "../projectSyncPolicy";
+import {
+  createFollowingTaskSelection,
+  createPinnedTaskSelection,
+  reconcileTaskSelection,
+  type TaskSelectionMode,
+  type TaskSelectionState,
+} from "../taskSelectionPolicy";
 import type {
   Project,
   RuntimeMutationResult,
@@ -45,6 +52,7 @@ interface UseTaskControlWorkspaceOptions {
 export interface TaskControlWorkspace {
   snapshot: TaskControlSnapshot | null;
   selectedTaskId: string;
+  selectionMode: TaskSelectionMode;
   selectedNode: TaskTreeNodeView | null;
   busy: boolean;
   error: string;
@@ -54,6 +62,7 @@ export interface TaskControlWorkspace {
   detailFallbackReason: TaskControlFallbackReason | null;
   refresh: () => Promise<void>;
   selectTask: (taskId: string) => void;
+  followCurrentTask: () => void;
   executeAction: (name: string, options?: TaskControlActionOptions) => Promise<void>;
   changeMode: (mode: TaskControlMode, reason?: string) => Promise<void>;
 }
@@ -115,6 +124,17 @@ function subtaskView(task: Subtask): TaskTreeNodeView {
   };
 }
 
+function taskExists(
+  snapshot: TaskControlSnapshot,
+  project: Project,
+  taskId: string,
+): boolean {
+  return Boolean(taskId && (
+    findTaskControlNode(snapshot.nodes, taskId)
+    || findProjectSubtaskById(project, taskId)
+  ));
+}
+
 export function useTaskControlWorkspace({
   project,
   enabled = true,
@@ -132,7 +152,10 @@ export function useTaskControlWorkspace({
   onRuntimeMutation,
 }: UseTaskControlWorkspaceOptions): TaskControlWorkspace {
   const [snapshot, setSnapshot] = useState<TaskControlSnapshot | null>(null);
-  const [selectedTaskId, setSelectedTaskId] = useState("");
+  const [selection, setSelection] = useState<TaskSelectionState>(
+    () => createFollowingTaskSelection(),
+  );
+  const selectedTaskId = selection.selectedTaskId;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [sourceEventSequence, setSourceEventSequence] = useState(0);
@@ -180,14 +203,14 @@ export function useTaskControlWorkspace({
       current,
       next.source_event_sequence,
     ));
-    setSelectedTaskId(current => {
-      if (findTaskControlNode(next.nodes, current) || findProjectSubtaskById(currentProject, current)) {
-        return current;
-      }
-      return findTaskControlNode(next.nodes, next.current_task_id)?.id
-        ?? findProjectSubtaskById(currentProject, next.current_task_id)?.id
-        ?? "";
-    });
+    setSelection(current => reconcileTaskSelection(
+      current,
+      next.current_task_id,
+      {
+        currentTaskExists: taskExists(next, currentProject, next.current_task_id),
+        selectedTaskExists: taskExists(next, currentProject, current.selectedTaskId),
+      },
+    ));
     setDetailRetryAttempt(0);
     setError("");
   }, []);
@@ -238,7 +261,7 @@ export function useTaskControlWorkspace({
   useEffect(() => {
     requestSequence.current += 1;
     setSnapshot(null);
-    setSelectedTaskId("");
+    setSelection(createFollowingTaskSelection());
     setSourceEventSequence(0);
     setDetailRetryAttempt(0);
     setError("");
@@ -325,8 +348,18 @@ export function useTaskControlWorkspace({
   }, [project, selectedTaskId, visibleSnapshot]);
 
   const selectTask = useCallback((taskId: string) => {
-    setSelectedTaskId(taskId);
+    setSelection(createPinnedTaskSelection(taskId));
   }, []);
+
+  const followCurrentTask = useCallback(() => {
+    const currentProject = projectRef.current;
+    const currentTaskId = visibleSnapshot?.current_task_id ?? "";
+    setSelection(createFollowingTaskSelection(
+      visibleSnapshot && currentProject && taskExists(visibleSnapshot, currentProject, currentTaskId)
+        ? currentTaskId
+        : "",
+    ));
+  }, [visibleSnapshot]);
 
   const executeAction = useCallback(async (
     name: string,
@@ -361,8 +394,7 @@ export function useTaskControlWorkspace({
           snapshotVersion: result.runtime_snapshot.task_control_snapshot_version,
         };
         if (isTaskControlSnapshotCurrent(result.task_control_snapshot, resultCursor)) {
-          setSnapshot(result.task_control_snapshot);
-          setSourceEventSequence(result.task_control_snapshot.source_event_sequence);
+          applyDetailedSnapshot(result.task_control_snapshot, project);
         }
       }
       onRuntimeMutation?.(result);
@@ -375,7 +407,7 @@ export function useTaskControlWorkspace({
     } finally {
       if (scope.current.projectName === project.name) setBusy(false);
     }
-  }, [busy, onRuntimeMutation, project, refresh, selectedTaskId, visibleSnapshot]);
+  }, [applyDetailedSnapshot, busy, onRuntimeMutation, project, refresh, selectedTaskId, visibleSnapshot]);
 
   const changeMode = useCallback(async (mode: TaskControlMode, reason = "") => {
     if (!project?.name || !visibleSnapshot || busy || mode === visibleSnapshot.control_mode) return;
@@ -402,8 +434,7 @@ export function useTaskControlWorkspace({
           snapshotVersion: result.runtime_snapshot.task_control_snapshot_version,
         };
         if (isTaskControlSnapshotCurrent(result.task_control_snapshot, resultCursor)) {
-          setSnapshot(result.task_control_snapshot);
-          setSourceEventSequence(result.task_control_snapshot.source_event_sequence);
+          applyDetailedSnapshot(result.task_control_snapshot, project);
         }
       }
       onRuntimeMutation?.(result);
@@ -413,11 +444,12 @@ export function useTaskControlWorkspace({
     } finally {
       if (scope.current.projectName === project.name) setBusy(false);
     }
-  }, [busy, onRuntimeMutation, project, refresh, visibleSnapshot]);
+  }, [applyDetailedSnapshot, busy, onRuntimeMutation, project, refresh, visibleSnapshot]);
 
   return {
     snapshot: visibleSnapshot,
     selectedTaskId,
+    selectionMode: selection.mode,
     selectedNode,
     busy,
     error,
@@ -427,6 +459,7 @@ export function useTaskControlWorkspace({
     detailFallbackReason: fallbackDecision.reason,
     refresh,
     selectTask,
+    followCurrentTask,
     executeAction,
     changeMode,
   };

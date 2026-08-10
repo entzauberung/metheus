@@ -2,12 +2,37 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
 import { ArrowDown, CheckCircle2, FileDiff, FileText, History, Layers, Milestone, Tags } from "lucide-react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import type { ChangeHistoryEntry, ConstitutionChangeHistory, ExecutionHistoryEntry, GitTagTree, PipelineState, RecoveryPresentation, TestLog, VerificationStage } from "./types";
+import type {
+  ChangeHistoryEntry,
+  ConstitutionChangeHistory,
+  ExecutionHistoryEntry,
+  GitTagTree,
+  PipelineState,
+  Project,
+  RecoveryPresentation,
+  Subtask,
+  TestLog,
+  VerificationStage,
+} from "./types";
 import {
   currentLogDuplicatesTimeline,
   mergeExecutionLogs,
   normalizeCurrentExecutionLog,
 } from "./logPolicy";
+import {
+  LOG_FILTER_CATEGORIES,
+  LOG_FILTER_PRESENTATION,
+  areAllLogFiltersSelected,
+  clearAllLogFilters,
+  createDefaultLogFilters,
+  emptyLogFilterMessage,
+  filterExecutionLogs,
+  logCategory,
+  matchesLogFilters,
+  selectAllLogFilters,
+  toggleLogFilter,
+  type LogFilterCategory,
+} from "./logFilterPolicy";
 import { getVerificationStageLabel } from "./autopilotPolicy";
 
 const LOG_LEVEL_ICON: Record<string, string> = {
@@ -18,20 +43,43 @@ const LOG_LEVEL_ICON: Record<string, string> = {
   debug: "·",
 };
 
-const LOG_FILTERS = [
-  ["info", "信息"],
-  ["success", "成功"],
-  ["error", "错误"],
-  ["pause", "暂停"],
-  ["debug", "调试"],
-] as const;
-
 const OPERATION_SOURCE_LABEL = {
   User: "用户",
   Autopilot: "自动驾驶",
   Recovery: "恢复器",
   System: "系统历史",
 } as const;
+
+export function collectProjectTestLogs(project: Project): TestLog[] {
+  const logs: TestLog[] = [];
+  const visited = new Set<string>();
+  const collectTask = (task: Subtask) => {
+    if (visited.has(task.id)) return;
+    visited.add(task.id);
+    if (task.test_result) {
+      const result = task.test_result;
+      const reason = result.test_output_summary
+        || (result.issues ?? []).join("；")
+        || result.suggestion
+        || task.test_report
+        || (result.passed ? "测试通过" : "测试未通过");
+      logs.push({
+        subtask_title: task.title || task.id,
+        status: result.passed ? "passed" : "rejected",
+        reason,
+        files: task.execution_result?.file_changes,
+        full_report: task.test_report || undefined,
+      });
+    }
+    (task.child_tasks ?? []).forEach(collectTask);
+  };
+
+  project.milestones.forEach(milestone => {
+    milestone.subtasks.forEach(collectTask);
+    milestone.mid_stages.forEach(midStage => midStage.subtasks.forEach(collectTask));
+  });
+  return logs;
+}
 
 function formatLogTime(iso: string): string {
   try {
@@ -104,8 +152,8 @@ export default function TaskConsole({
   const [gitTagTree, setGitTagTree] = useState<GitTagTree | null>(null);
   const [loading, setLoading] = useState(false);
   const [stickToBottom, setStickToBottom] = useState(true);
-  const [visibleLevels, setVisibleLevels] = useState<Set<string>>(
-    () => new Set(["info", "success", "error", "pause"]),
+  const [visibleCategories, setVisibleCategories] = useState<Set<LogFilterCategory>>(
+    createDefaultLogFilters,
   );
   const logRef = useRef<HTMLDivElement>(null);
 
@@ -161,11 +209,11 @@ export default function TaskConsole({
     executionStatus?.log_history,
     testLogs,
   );
-  const filteredLogs = mergedLogs.filter((entry) => visibleLevels.has(entry.level));
+  const filteredLogs = filterExecutionLogs(mergedLogs, visibleCategories);
   const currentLog = normalizeCurrentExecutionLog(executionStatus);
   const showCurrentLog = executionStatus?.status === "Running"
     && Boolean(currentLog)
-    && visibleLevels.has(currentLog?.level ?? "")
+    && matchesLogFilters(currentLog!, visibleCategories)
     && !currentLogDuplicatesTimeline(currentLog!, mergedLogs);
   const hasAnyLog = filteredLogs.length > 0 || showCurrentLog;
   const recovery = recoveryPresentation?.kind !== "None" ? recoveryPresentation : null;
@@ -182,7 +230,7 @@ export default function TaskConsole({
 
   return (
     <div className="task-console task-console-readonly">
-      <Tabs.Root value={activeTab} onValueChange={setActiveTab}>
+      <Tabs.Root className="task-console-tabs-root" value={activeTab} onValueChange={setActiveTab}>
         <Tabs.List className="task-tabs" aria-label="项目检查信息">
           <Tabs.Trigger className="task-tab" value="logs"><History size={15} />执行日志</Tabs.Trigger>
           <Tabs.Trigger className="task-tab" value="diff"><FileDiff size={15} />代码变更</Tabs.Trigger>
@@ -192,20 +240,37 @@ export default function TaskConsole({
 
         <Tabs.Content className="task-tab-content" value="logs">
           <div className="execution-log-panel">
-            <div className="execution-log-filters" aria-label="日志级别筛选">
-              {LOG_FILTERS.map(([level, label]) => (
+            <div className="execution-log-filters" aria-label="日志分类筛选">
+              <button
+                aria-pressed={areAllLogFiltersSelected(visibleCategories)}
+                className="log-filter-all"
+                data-log-filter="all"
+                onClick={() => setVisibleCategories(selectAllLogFilters())}
+                type="button"
+              >全部</button>
+              {LOG_FILTER_CATEGORIES.map((category) => {
+                const presentation = LOG_FILTER_PRESENTATION[category];
+                return (
                 <button
-                  aria-pressed={visibleLevels.has(level)}
-                  key={level}
-                  onClick={() => setVisibleLevels((current) => {
-                    const next = new Set(current);
-                    if (next.has(level)) next.delete(level);
-                    else next.add(level);
-                    return next;
-                  })}
+                  aria-pressed={visibleCategories.has(category)}
+                  className={`log-filter-tone-${presentation.tone}`}
+                  data-log-filter={category}
+                  key={category}
+                  onClick={() => setVisibleCategories((current) => toggleLogFilter(current, category))}
                   type="button"
-                >{label}</button>
-              ))}
+                >{presentation.label}</button>
+                );
+              })}
+              <button
+                aria-pressed={visibleCategories.size === 0}
+                className="log-filter-clear"
+                data-log-filter="clear"
+                onClick={() => setVisibleCategories(clearAllLogFilters())}
+                type="button"
+              >清空</button>
+            </div>
+            <div className="task-console-test-summary" role="status" aria-live="polite">
+              {testLogs.length === 0 ? "暂无测试记录" : `测试记录：${testLogs.length} 条`}
             </div>
             {displayedValidationStage && (
               <div className="task-console-validation-strip">
@@ -223,10 +288,12 @@ export default function TaskConsole({
               className="execution-log-list"
               onScroll={handleLogScroll}
             >
-              {filteredLogs.map((entry) => (
-                <div
+              {filteredLogs.map((entry) => {
+                const category = logCategory(entry);
+                return <div
                   key={entry.key}
-                  className={`execution-log-entry log-${entry.level}${entry.timelineSource === "runtime" ? " log-runtime" : ""}${entry.taskId ? " has-task-link" : ""}`}
+                  className={`execution-log-entry log-${entry.level}${category ? ` log-category-${category}` : ""}${entry.timelineSource === "runtime" ? " log-runtime" : ""}${entry.taskId ? " has-task-link" : ""}`}
+                  data-log-category={category ?? "unknown"}
                   role={entry.taskId ? "button" : undefined}
                   tabIndex={entry.taskId ? 0 : undefined}
                   aria-current={entry.taskId && entry.taskId === selectedTaskId ? "true" : undefined}
@@ -241,7 +308,7 @@ export default function TaskConsole({
                   }}
                 >
                   <span className="execution-log-time">{formatLogTime(entry.timestamp)}</span>
-                  <span className="execution-log-level">{LOG_LEVEL_ICON[entry.level] || (entry.timelineSource === "runtime" ? "⚡" : "")}</span>
+                  <span className="execution-log-level">{category === "test" ? "T" : LOG_LEVEL_ICON[entry.level] || (entry.timelineSource === "runtime" ? "⚡" : "")}</span>
                   <span className={`execution-log-source source-${entry.operationSource.toLowerCase()}`}>
                     {OPERATION_SOURCE_LABEL[entry.operationSource]}
                   </span>
@@ -254,14 +321,17 @@ export default function TaskConsole({
                       {entry.modelCallId ? ` · 调用 ${entry.modelCallId}` : ""}
                     </span>
                   )}
-                </div>
-              ))}
+                </div>;
+              })}
               {!hasAnyLog && (
-                <p className="execution-log-empty">暂无执行日志。执行操作后将在此显示历史记录。</p>
+                <p className="execution-log-empty">{emptyLogFilterMessage(visibleCategories)}</p>
               )}
               {/* 当前阶段状态（执行中 / 测试中） */}
               {showCurrentLog && currentLog && (
-                <div className="execution-log-entry log-live">
+                <div
+                  className={`execution-log-entry log-live log-category-${logCategory(currentLog) ?? "unknown"}`}
+                  data-log-category={logCategory(currentLog) ?? "unknown"}
+                >
                   <span className="execution-log-time">现在</span>
                   <span className="execution-log-level">{LOG_LEVEL_ICON[currentLog.level] || "⚡"}</span>
                   <span className="execution-log-source source-system">系统历史</span>

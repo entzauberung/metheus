@@ -96,15 +96,7 @@ pub(crate) enum EngineHealthStatus {
 
 impl EngineHealthStatus {
     pub(crate) fn blocks_execution(&self) -> bool {
-        matches!(
-            self,
-            Self::NotInstalled
-                | Self::Unauthenticated
-                | Self::UnsupportedVersion
-                | Self::Disabled
-                | Self::VerificationRequired
-                | Self::VerificationFailed
-        )
+        !matches!(self, Self::Available)
     }
 }
 
@@ -154,6 +146,26 @@ pub(crate) enum EngineAuthVerificationMethod {
     OnlineModelList,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) enum EngineConfigurationEvidenceSource {
+    Confirmed,
+    ProviderDefault,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct EngineRuntimeConfigurationEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub model_source: EngineConfigurationEvidenceSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort_source: EngineConfigurationEvidenceSource,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EngineAuthenticationResult {
     pub local_state: EngineLocalAuthState,
@@ -162,6 +174,8 @@ pub(crate) struct EngineAuthenticationResult {
     pub verified_at: Option<String>,
     pub expires_at: Option<String>,
     pub failure_kind: Option<EngineFailureKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_configuration: Option<EngineRuntimeConfigurationEvidence>,
     pub message: String,
 }
 
@@ -174,6 +188,7 @@ impl EngineAuthenticationResult {
             verified_at: None,
             expires_at: None,
             failure_kind: None,
+            runtime_configuration: None,
             message: message.into(),
         }
     }

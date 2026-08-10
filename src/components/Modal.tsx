@@ -37,16 +37,14 @@ export function Modal({
   lockClose = false,
   isSubmitting = false,
 }: ModalProps) {
-  const handleClose = lockClose ? () => {} : onClose;
-
   return (
     <Dialog.Root open={isOpen} onOpenChange={(open) => { if (!open && !lockClose) onClose(); }}>
       <Dialog.Portal>
         <Dialog.Overlay className="modal-overlay" />
         <Dialog.Content
           className="modal-content"
-          onEscapeKeyDown={handleClose}
-          onInteractOutside={handleClose}
+          onEscapeKeyDown={(event) => { if (lockClose) event.preventDefault(); }}
+          onInteractOutside={(event) => { if (lockClose) event.preventDefault(); }}
         >
           <Dialog.Title className={`modal-title ${isDanger ? 'modal-title-danger' : ''}`}>
             {title}

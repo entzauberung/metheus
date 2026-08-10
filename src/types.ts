@@ -586,6 +586,18 @@ export type EngineAuthVerificationMethod =
   | "OnlineMinimalRequest"
   | "OnlineModelList";
 
+export type EngineConfigurationEvidenceSource =
+  | "Confirmed"
+  | "ProviderDefault"
+  | "Unknown";
+
+export interface EngineRuntimeConfigurationEvidence {
+  model?: string;
+  model_source: EngineConfigurationEvidenceSource;
+  reasoning_effort?: string;
+  reasoning_effort_source: EngineConfigurationEvidenceSource;
+}
+
 export interface EngineAuthenticationResult {
   local_state: EngineLocalAuthState;
   online_state: EngineOnlineAuthState;
@@ -593,6 +605,7 @@ export interface EngineAuthenticationResult {
   verified_at?: string;
   expires_at?: string;
   failure_kind?: EngineFailureKind;
+  runtime_configuration?: EngineRuntimeConfigurationEvidence;
   message: string;
 }
 
@@ -1805,6 +1818,15 @@ export interface FileEntry {
   path: string;
   is_dir: boolean;
   file_type: string;
+}
+
+export interface FilePreviewResult {
+  path: string;
+  content: string;
+  file_type: string;
+  truncated: boolean;
+  binary: boolean;
+  error?: string | null;
 }
 
 // ========== 测试日志 + 视图模式 ==========

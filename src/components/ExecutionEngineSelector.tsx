@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Bot, CheckCircle2, CircleAlert, LoaderCircle, PlugZap } from "lucide-react";
+import { Bot, CheckCircle2, CircleHelp, CircleX, LoaderCircle, PlugZap, ShieldAlert } from "lucide-react";
 import { invokeWithTimeout } from "../utils/invokeWithTimeout";
 import { EngineHealth, ExecutionProfile, ExecutionProvider } from "../types";
 import { PLUGIN_EXECUTION_PROVIDERS } from "../enginePolicy";
+import { presentEngineHealth, type PluginHealthTone } from "../engineHealthPresentation";
 import {
   matchesEngineHealthTarget,
   subscribeEngineHealthInvalidation,
@@ -27,9 +28,11 @@ const PROVIDER_LABELS: Record<ExecutionProvider, string> = {
   GrokBuild: "Grok Build CLI（本机）",
 };
 
-function statusClass(health: EngineHealth | null): string {
-  if (!health || health.status === "Unknown") return "unknown";
-  return health.status === "Available" ? "available" : "unavailable";
+function HealthStatusIcon({ tone }: { tone: PluginHealthTone }) {
+  if (tone === "success") return <CheckCircle2 size={16} />;
+  if (tone === "warning") return <ShieldAlert size={16} />;
+  if (tone === "danger") return <CircleX size={16} />;
+  return <CircleHelp size={16} />;
 }
 
 export function ExecutionEngineSelector({ value, onChange, disabled = false, onHealthChange }: Props) {
@@ -111,6 +114,7 @@ export function ExecutionEngineSelector({ value, onChange, disabled = false, onH
       permission_profile: "Unattended",
     });
   };
+  const healthPresentation = presentEngineHealth(health, value.runtime);
 
   return (
     <div className="engine-selector">
@@ -156,16 +160,18 @@ export function ExecutionEngineSelector({ value, onChange, disabled = false, onH
         ))}
       </div>
 
-      <div className={`engine-health ${statusClass(health)}`} aria-live="polite">
+      <div className={`engine-health tone-${healthPresentation.tone}`} aria-live="polite">
         {checking ? (
           <><LoaderCircle className="engine-health-spinner" size={15} /> 正在检查...</>
-        ) : health?.status === "Available" ? (
-          <>
-            <CheckCircle2 size={15} />
-            <span>{health.message}{health.version ? ` · ${health.version}` : ""}{health.source_revision ? ` · ${health.source_revision.slice(0, 8)}` : ""}</span>
-          </>
         ) : (
-          <><CircleAlert size={15} /> <span>{health?.message || "尚未检查"}</span></>
+          <>
+            <HealthStatusIcon tone={healthPresentation.tone} />
+            <span className="engine-health-copy">
+              <strong>{healthPresentation.label}</strong>
+              <span>{healthPresentation.summary}</span>
+              <small>{healthPresentation.detail} · 下一步：{healthPresentation.actionLabel}</small>
+            </span>
+          </>
         )}
       </div>
     </div>

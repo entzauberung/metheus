@@ -16,17 +16,8 @@ export function executionProviderAllowed(
     : PLUGIN_EXECUTION_PROVIDERS.includes(provider);
 }
 
-const BLOCKING_HEALTH_STATUSES = new Set<EngineHealth["status"]>([
-  "NotInstalled",
-  "Unauthenticated",
-  "UnsupportedVersion",
-  "Disabled",
-  "VerificationRequired",
-  "VerificationFailed",
-]);
-
 export function engineHealthBlocksExecution(health: EngineHealth | null): boolean {
-  return health !== null && BLOCKING_HEALTH_STATUSES.has(health.status);
+  return health !== null && health.status !== "Available";
 }
 
 export function engineChangeBlockedReason(

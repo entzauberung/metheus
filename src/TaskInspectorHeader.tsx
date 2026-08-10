@@ -1,6 +1,7 @@
 import {
   Pause,
   Play,
+  Eye,
   RefreshCw,
   RotateCcw,
   ShieldCheck,
@@ -10,6 +11,7 @@ import {
 } from "lucide-react";
 import { useState } from "react";
 import { Modal } from "./components/Modal";
+import { findTaskControlNode } from "./taskTreePolicy";
 import {
   getModeTransitionImpact,
   getTaskControlModeDescription,
@@ -22,6 +24,7 @@ import type {
   TaskControlSnapshot,
   TaskTreeNodeView,
 } from "./types";
+import type { TaskSelectionMode } from "./taskSelectionPolicy";
 
 interface Props {
   snapshot: TaskControlSnapshot | null;
@@ -32,6 +35,8 @@ interface Props {
   onRefresh: () => void;
   onAction: (name: string) => void;
   onChangeMode: (mode: TaskControlMode, reason?: string) => void;
+  selectionMode: TaskSelectionMode;
+  onFollowCurrentTask: () => void;
 }
 
 export default function TaskInspectorHeader({
@@ -43,11 +48,15 @@ export default function TaskInspectorHeader({
   onRefresh,
   onAction,
   onChangeMode,
+  selectionMode,
+  onFollowCurrentTask,
 }: Props) {
   const [pendingMode, setPendingMode] = useState<TaskControlMode | null>(null);
   const [fallbackReason, setFallbackReason] = useState("");
   const capabilities = snapshot?.control_capabilities ?? [];
   const isCurrent = !!selectedNode && selectedNode.id === snapshot?.current_task_id;
+  const currentTaskAvailable = !!snapshot?.current_task_id
+    && !!findTaskControlNode(snapshot.nodes, snapshot.current_task_id);
   const hasCapability = (name: string) => hasControlCapability(capabilities, name);
   const canUseTaskAction = (name: string) => !writesDisabled
     && (selectedNode?.capabilities ?? []).includes(name);
@@ -86,6 +95,25 @@ export default function TaskInspectorHeader({
         {selectedNode && <span>风险 {selectedNode.risk}</span>}
         {snapshot?.current_action && <span>动作 {snapshot.current_action.kind}</span>}
       </div>
+
+      {selectionMode === "pinned" && selectedNode && (
+        <div className="task-inspector-selection-state" role="status">
+          <span>
+            <Eye size={13} aria-hidden="true" />
+            {isCurrent ? "固定查看当前任务" : "正在查看历史任务"}
+          </span>
+          {currentTaskAvailable && (
+            <button
+              type="button"
+              className="task-inspector-follow-button"
+              onClick={onFollowCurrentTask}
+              aria-label="跟随当前任务"
+            >
+              <Play size={13} aria-hidden="true" />跟随当前任务
+            </button>
+          )}
+        </div>
+      )}
 
       <div className="task-inspector-mode">
         <label htmlFor="task-control-mode">当前项目实际控制模式</label>

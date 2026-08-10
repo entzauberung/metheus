@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Project, Subtask } from "./types";
+import type { TaskSelectionMode } from "./taskSelectionPolicy";
 import ExecutionTree from "./ExecutionTree";
 
 function task(id: string, children: Subtask[] = [], autoTag?: string): Subtask {
@@ -80,7 +81,11 @@ describe("ExecutionTree recursive subtasks", () => {
     vi.restoreAllMocks();
   });
 
-  function render(project: Project, onOpenTask = vi.fn()) {
+  function render(
+    project: Project,
+    onOpenTask = vi.fn(),
+    selection: { selectedTaskId?: string; currentTaskId?: string; selectionMode?: TaskSelectionMode } = {},
+  ) {
     act(() => {
       root.render(
         <ExecutionTree
@@ -88,6 +93,9 @@ describe("ExecutionTree recursive subtasks", () => {
           projectPath="/tmp/project"
           onSelectMilestone={vi.fn(async () => undefined)}
           onSelectMidStage={vi.fn(async () => undefined)}
+          selectedTaskId={selection.selectedTaskId}
+          currentTaskId={selection.currentTaskId}
+          selectionMode={selection.selectionMode}
           onOpenTask={onOpenTask}
         />,
       );
@@ -101,7 +109,7 @@ describe("ExecutionTree recursive subtasks", () => {
       expect(host.textContent).toContain(`任务 ${id}`);
     }
     expect(host.textContent).toContain("v1.2.3-task");
-    expect(host.querySelector("[aria-current='true']")?.textContent).toContain("任务 level-4");
+    expect(host.querySelector("[aria-current='step']")?.textContent).toContain("任务 level-4");
     expect(host.querySelectorAll("button[aria-expanded]")).toHaveLength(3);
   });
 
@@ -134,7 +142,7 @@ describe("ExecutionTree recursive subtasks", () => {
     render(treeProject("level-4"));
 
     expect(host.textContent).toContain("任务 level-4");
-    expect(host.querySelector("[aria-current='true']")?.textContent).toContain("任务 level-4");
+    expect(host.querySelector("[aria-current='step']")?.textContent).toContain("任务 level-4");
   });
 
   it("renders a Quick milestone with direct tasks and no synthetic mid-stage", () => {
@@ -144,5 +152,24 @@ describe("ExecutionTree recursive subtasks", () => {
     expect(host.textContent).toContain("任务 direct-task");
     expect(host.querySelectorAll(".tree-mid-stage")).toHaveLength(0);
     expect(host.querySelectorAll(".tree-subtask-select")).toHaveLength(1);
+  });
+
+  it("marks the backend current task separately from a pinned viewed task", () => {
+    render(treeProject(), vi.fn(), {
+      currentTaskId: "level-4",
+      selectedTaskId: "level-3",
+      selectionMode: "pinned",
+    });
+
+    const currentButton = [...host.querySelectorAll<HTMLButtonElement>(".tree-subtask-select")]
+      .find(button => button.textContent?.includes("任务 level-4"));
+    const viewedButton = [...host.querySelectorAll<HTMLButtonElement>(".tree-subtask-select")]
+      .find(button => button.textContent?.includes("任务 level-3"));
+    expect(currentButton?.getAttribute("aria-current")).toBe("step");
+    expect(currentButton?.getAttribute("aria-pressed")).toBe("false");
+    expect(currentButton?.parentElement?.textContent).toContain("当前");
+    expect(viewedButton?.getAttribute("aria-current")).toBeNull();
+    expect(viewedButton?.getAttribute("aria-pressed")).toBe("true");
+    expect(viewedButton?.parentElement?.textContent).toContain("查看");
   });
 });

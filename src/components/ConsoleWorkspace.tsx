@@ -66,3 +66,16 @@ export function ConsoleWorkspace({ commandBar, navigator, bottom, children }: Co
 export function ConsoleCommandBar({ children }: { children: ReactNode }) {
   return <div className="console-command-bar" aria-label="Console 命令栏">{children}</div>;
 }
+
+export function ConsoleRuntimeRow({ children }: { children: ReactNode }) {
+  return (
+    <div
+      className="console-runtime-row"
+      data-console-region="runtime"
+      role="region"
+      aria-label="Console 运行控制"
+    >
+      {children}
+    </div>
+  );
+}

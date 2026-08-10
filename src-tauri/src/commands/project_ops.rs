@@ -1,5 +1,29 @@
 use crate::{project, AppState};
 use serde_json;
+use std::io::Read;
+use std::path::{Component, Path};
+
+const FILE_PREVIEW_MAX_BYTES: usize = 256 * 1024;
+const FILE_TREE_SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "__pycache__",
+    "dist",
+    ".next",
+    "build",
+    "coverage",
+];
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(crate) struct FilePreviewResult {
+    pub path: String,
+    pub content: String,
+    pub file_type: String,
+    pub truncated: bool,
+    pub binary: bool,
+    pub error: Option<String>,
+}
 
 #[tauri::command]
 pub(crate) async fn validate_project_path(
@@ -16,51 +40,83 @@ pub(crate) async fn validate_project_path(
 pub(crate) async fn get_project_files(
     project_path: String,
 ) -> Result<Vec<project::FileEntry>, String> {
-    let project = std::path::Path::new(&project_path);
-    if !project.exists() || !project.is_dir() {
-        return Ok(vec![]);
+    collect_project_files(Path::new(&project_path))
+}
+
+fn should_descend_file_tree_entry(entry: &walkdir::DirEntry) -> bool {
+    if entry.depth() == 0 || !entry.file_type().is_dir() {
+        return true;
+    }
+    let Some(file_name) = entry.file_name().to_str() else {
+        return true;
+    };
+    !FILE_TREE_SKIP_DIRS.contains(&file_name)
+        && (!file_name.starts_with('.') || file_name.starts_with(".env"))
+}
+
+fn describe_file_tree_walk_error(project_root: &Path, error: &walkdir::Error) -> String {
+    let detail = error
+        .io_error()
+        .map(|io_error| io_error.to_string())
+        .unwrap_or_else(|| "无法读取目录项".to_string());
+    let relative_path = error
+        .path()
+        .and_then(|path| path.strip_prefix(project_root).ok())
+        .filter(|path| !path.as_os_str().is_empty());
+    match relative_path {
+        Some(path) => format!(
+            "读取项目目录项「{}」失败：{}",
+            path.to_string_lossy(),
+            detail
+        ),
+        None => format!("读取项目目录失败：{}", detail),
+    }
+}
+
+fn collect_project_files(project_root: &Path) -> Result<Vec<project::FileEntry>, String> {
+    let metadata = std::fs::metadata(project_root).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "项目路径不存在，无法读取文件列表".to_string()
+        } else {
+            format!("无法访问项目路径：{}", error)
+        }
+    })?;
+    if !metadata.is_dir() {
+        return Err("项目路径不是目录，无法读取文件列表".to_string());
     }
 
-    // 需要跳过的目录名
-    const SKIP_DIRS: &[&str] = &[
-        ".git",
-        "node_modules",
-        "target",
-        "__pycache__",
-        "dist",
-        ".next",
-        "build",
-        "coverage",
-    ];
-
-    let mut entries: Vec<project::FileEntry> = Vec::new();
-
-    for entry in walkdir::WalkDir::new(&project_path)
+    let walker = walkdir::WalkDir::new(project_root)
         .max_depth(5)
         .follow_links(false)
         .into_iter()
-        .filter_map(|e| e.ok())
-    {
+        .filter_entry(should_descend_file_tree_entry);
+    collect_project_file_entries(project_root, walker)
+}
+
+fn collect_project_file_entries<I>(
+    project_root: &Path,
+    entry_results: I,
+) -> Result<Vec<project::FileEntry>, String>
+where
+    I: IntoIterator<Item = Result<walkdir::DirEntry, walkdir::Error>>,
+{
+    let mut entries: Vec<project::FileEntry> = Vec::new();
+
+    for entry_result in entry_results {
+        let entry = entry_result
+            .map_err(|error| describe_file_tree_walk_error(project_root, &error))?;
         // 跳过根目录自身
-        if entry.path() == project {
+        if entry.path() == project_root {
             continue;
         }
 
         // 计算相对路径
         let rel_path = entry
             .path()
-            .strip_prefix(&project_path)
-            .unwrap_or(entry.path())
+            .strip_prefix(project_root)
+            .map_err(|_| "文件列表包含项目目录之外的路径".to_string())?
             .to_string_lossy()
             .to_string();
-
-        // 检查路径的每一级是否在排除目录中
-        let is_skipped = rel_path
-            .split('/')
-            .any(|component| SKIP_DIRS.contains(&component));
-        if is_skipped {
-            continue;
-        }
 
         // 跳过隐藏文件/目录（以 . 开头），但保留 .env.example 等 .env* 文件
         if let Some(file_name) = entry.file_name().to_str() {
@@ -89,6 +145,128 @@ pub(crate) async fn get_project_files(
     }
 
     Ok(entries)
+}
+
+fn file_preview_type(path: &Path) -> String {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn preview_path_is_relative_file(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path.components().all(|component| {
+            !matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+}
+
+fn looks_binary(bytes: &[u8]) -> bool {
+    if bytes.iter().any(|byte| *byte == 0) {
+        return true;
+    }
+    if bytes.is_empty() {
+        return false;
+    }
+    let suspicious_controls = bytes
+        .iter()
+        .filter(|byte| matches!(**byte, 0x01..=0x08 | 0x0b | 0x0e..=0x1f | 0x7f))
+        .count();
+    suspicious_controls >= 3
+        || suspicious_controls.saturating_mul(100) >= bytes.len().saturating_mul(10)
+}
+
+fn read_project_file_preview_from_paths(
+    project_path: &Path,
+    relative_path: &Path,
+) -> Result<FilePreviewResult, String> {
+    if !preview_path_is_relative_file(relative_path) {
+        return Err("预览路径必须是项目内的相对文件路径".to_string());
+    }
+
+    let project_root = project_path
+        .canonicalize()
+        .map_err(|error| format!("无法解析项目目录：{error}"))?;
+    if !project_root.is_dir() {
+        return Err("项目路径不是目录".to_string());
+    }
+
+    let requested_path = project_root.join(relative_path);
+    let canonical_target = requested_path
+        .canonicalize()
+        .map_err(|error| format!("文件不存在或无法访问：{error}"))?;
+    if !canonical_target.starts_with(&project_root) {
+        return Err("拒绝读取项目目录之外的文件".to_string());
+    }
+
+    let metadata = canonical_target
+        .metadata()
+        .map_err(|error| format!("无法读取文件信息：{error}"))?;
+    if !metadata.is_file() {
+        return Err("预览目标不是文件".to_string());
+    }
+
+    let mut file = std::fs::File::open(&canonical_target)
+        .map_err(|error| format!("无法打开预览文件：{error}"))?;
+    let mut bytes = Vec::with_capacity(FILE_PREVIEW_MAX_BYTES.saturating_add(1));
+    file.by_ref()
+        .take((FILE_PREVIEW_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("无法读取预览文件：{error}"))?;
+
+    let truncated = bytes.len() > FILE_PREVIEW_MAX_BYTES;
+    bytes.truncate(FILE_PREVIEW_MAX_BYTES);
+    let path = relative_path.to_string_lossy().to_string();
+    let file_type = file_preview_type(relative_path);
+
+    if looks_binary(&bytes) {
+        return Ok(FilePreviewResult {
+            path,
+            content: String::new(),
+            file_type,
+            truncated,
+            binary: true,
+            error: Some("该文件包含二进制内容，无法预览".to_string()),
+        });
+    }
+
+    let content = match std::str::from_utf8(&bytes) {
+        Ok(content) => content.to_string(),
+        Err(error) if truncated && error.error_len().is_none() => {
+            String::from_utf8_lossy(&bytes[..error.valid_up_to()]).to_string()
+        }
+        Err(_) => {
+            return Ok(FilePreviewResult {
+                path,
+                content: String::new(),
+                file_type,
+                truncated,
+                binary: true,
+                error: Some("该文件不是有效的 UTF-8 文本，无法预览".to_string()),
+            });
+        }
+    };
+
+    Ok(FilePreviewResult {
+        path,
+        content,
+        file_type,
+        truncated,
+        binary: false,
+        error: None,
+    })
+}
+
+#[tauri::command]
+pub(crate) async fn read_project_file_preview(
+    project_path: String,
+    path: String,
+) -> Result<FilePreviewResult, String> {
+    read_project_file_preview_from_paths(Path::new(&project_path), Path::new(&path))
 }
 
 /// 项目入口结果
@@ -794,6 +972,293 @@ fn clean_stale_autopilot_state(proj: &mut project::Project) -> bool {
     }
 
     should_clean
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod file_preview {
+        use super::*;
+        use std::path::PathBuf;
+
+        struct PreviewFixture {
+            base: PathBuf,
+            root: PathBuf,
+        }
+
+        impl PreviewFixture {
+            fn new() -> Self {
+                let base = std::env::temp_dir().join(format!(
+                    "metheus-file-preview-{}",
+                    uuid::Uuid::new_v4()
+                ));
+                let root = base.join("project");
+                std::fs::create_dir_all(&root).expect("create preview project root");
+                Self { base, root }
+            }
+
+            fn write(&self, relative_path: &str, bytes: &[u8]) {
+                let path = self.root.join(relative_path);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).expect("create preview fixture parent");
+                }
+                std::fs::write(path, bytes).expect("write preview fixture");
+            }
+        }
+
+        impl Drop for PreviewFixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.base);
+            }
+        }
+
+        #[test]
+        fn file_preview_reads_small_project_text() {
+            let fixture = PreviewFixture::new();
+            fixture.write("src/main.rs", b"fn main() {}\n");
+
+            let result = read_project_file_preview_from_paths(
+                &fixture.root,
+                Path::new("src/main.rs"),
+            )
+            .expect("read project text");
+
+            assert_eq!(result.path, "src/main.rs");
+            assert_eq!(result.content, "fn main() {}\n");
+            assert_eq!(result.file_type, "rs");
+            assert!(!result.truncated);
+            assert!(!result.binary);
+            assert_eq!(result.error, None);
+        }
+
+        #[test]
+        fn file_preview_rejects_absolute_escape_directory_and_missing_paths() {
+            let fixture = PreviewFixture::new();
+            std::fs::create_dir_all(fixture.root.join("src")).expect("create directory fixture");
+            let outside = fixture.base.join("outside.txt");
+            std::fs::write(&outside, b"outside").expect("write outside fixture");
+
+            let absolute = read_project_file_preview_from_paths(&fixture.root, &outside)
+                .expect_err("absolute path must fail");
+            assert!(absolute.contains("相对文件路径"));
+
+            let escape = read_project_file_preview_from_paths(
+                &fixture.root,
+                Path::new("../outside.txt"),
+            )
+            .expect_err("parent escape must fail");
+            assert!(escape.contains("相对文件路径"));
+
+            let directory = read_project_file_preview_from_paths(
+                &fixture.root,
+                Path::new("src"),
+            )
+            .expect_err("directory must fail");
+            assert!(directory.contains("不是文件"));
+
+            let missing = read_project_file_preview_from_paths(
+                &fixture.root,
+                Path::new("missing.txt"),
+            )
+            .expect_err("missing file must fail");
+            assert!(missing.contains("不存在或无法访问"));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn file_preview_rejects_symlink_escape() {
+            use std::os::unix::fs::symlink;
+
+            let fixture = PreviewFixture::new();
+            let outside = fixture.base.join("outside.txt");
+            std::fs::write(&outside, b"outside").expect("write outside fixture");
+            symlink(&outside, fixture.root.join("linked.txt")).expect("create escape symlink");
+
+            let error = read_project_file_preview_from_paths(
+                &fixture.root,
+                Path::new("linked.txt"),
+            )
+            .expect_err("symlink escape must fail");
+            assert!(error.contains("项目目录之外"));
+        }
+
+        #[test]
+        fn file_preview_marks_binary_and_invalid_utf8_as_unsupported() {
+            let fixture = PreviewFixture::new();
+            fixture.write("image.bin", &[0, 1, 2, 3]);
+            fixture.write("control.dat", b"ABC\x01\x02\x03DEF");
+            fixture.write("invalid.txt", &[0xff, 0xfe, 0xfd]);
+
+            let binary = read_project_file_preview_from_paths(
+                &fixture.root,
+                Path::new("image.bin"),
+            )
+            .expect("classify binary file");
+            assert!(binary.binary);
+            assert!(binary.content.is_empty());
+            assert!(binary.error.expect("binary reason").contains("二进制"));
+
+            let control_bytes = read_project_file_preview_from_paths(
+                &fixture.root,
+                Path::new("control.dat"),
+            )
+            .expect("classify UTF-8 control-byte file");
+            assert!(control_bytes.binary);
+            assert!(control_bytes.content.is_empty());
+            assert!(control_bytes.error.expect("control-byte reason").contains("二进制"));
+
+            let invalid = read_project_file_preview_from_paths(
+                &fixture.root,
+                Path::new("invalid.txt"),
+            )
+            .expect("classify invalid UTF-8 file");
+            assert!(invalid.binary);
+            assert!(invalid.content.is_empty());
+            assert!(invalid.error.expect("encoding reason").contains("UTF-8"));
+        }
+
+        #[test]
+        fn file_preview_truncates_without_reading_unbounded_content() {
+            let fixture = PreviewFixture::new();
+            fixture.write("large.txt", &vec![b'a'; FILE_PREVIEW_MAX_BYTES + 64]);
+
+            let result = read_project_file_preview_from_paths(
+                &fixture.root,
+                Path::new("large.txt"),
+            )
+            .expect("read bounded preview");
+
+            assert!(result.truncated);
+            assert!(!result.binary);
+            assert_eq!(result.content.len(), FILE_PREVIEW_MAX_BYTES);
+            assert_eq!(result.error, None);
+        }
+    }
+
+    mod file_tree {
+        use super::*;
+        use std::path::PathBuf;
+
+        struct FileTreeFixture {
+            base: PathBuf,
+            root: PathBuf,
+        }
+
+        impl FileTreeFixture {
+            fn new() -> Self {
+                let base = std::env::temp_dir().join(format!(
+                    "metheus-file-tree-{}",
+                    uuid::Uuid::new_v4()
+                ));
+                let root = base.join("project");
+                std::fs::create_dir_all(&root).expect("create file tree project root");
+                Self { base, root }
+            }
+
+            fn write(&self, relative_path: &str, bytes: &[u8]) {
+                let path = self.root.join(relative_path);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).expect("create file tree fixture parent");
+                }
+                std::fs::write(path, bytes).expect("write file tree fixture");
+            }
+        }
+
+        impl Drop for FileTreeFixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.base);
+            }
+        }
+
+        #[test]
+        fn file_tree_returns_success_for_an_empty_directory() {
+            let fixture = FileTreeFixture::new();
+            let entries = collect_project_files(&fixture.root).expect("read empty project");
+            assert!(entries.is_empty());
+        }
+
+        #[test]
+        fn file_tree_rejects_missing_and_non_directory_roots() {
+            let fixture = FileTreeFixture::new();
+            let missing = fixture.base.join("missing");
+            assert!(collect_project_files(&missing)
+                .expect_err("missing root must fail")
+                .contains("不存在"));
+
+            let file_root = fixture.base.join("not-a-directory.txt");
+            std::fs::write(&file_root, b"not a directory").expect("write file root");
+            assert!(collect_project_files(&file_root)
+                .expect_err("file root must fail")
+                .contains("不是目录"));
+        }
+
+        #[test]
+        fn file_tree_lists_nested_entries_with_the_existing_shape() {
+            let fixture = FileTreeFixture::new();
+            fixture.write("src/main.rs", b"fn main() {}\n");
+
+            let entries = collect_project_files(&fixture.root).expect("read nested project");
+            assert!(entries.iter().any(|entry| {
+                entry.path == "src" && entry.is_dir && entry.file_type.is_empty()
+            }));
+            assert!(entries.iter().any(|entry| {
+                entry.path == "src/main.rs" && !entry.is_dir && entry.file_type == "rs"
+            }));
+        }
+
+        #[test]
+        fn file_tree_prunes_skipped_and_hidden_directories() {
+            let fixture = FileTreeFixture::new();
+            fixture.write("src/lib.rs", b"pub fn ready() {}\n");
+            fixture.write(".env.example", b"KEY=value\n");
+            fixture.write(".git/config", b"[core]\n");
+            fixture.write("node_modules/pkg/index.js", b"module.exports = {};\n");
+            fixture.write("target/debug/artifact", b"artifact");
+            fixture.write(".secret/hidden.txt", b"hidden");
+
+            let entries = collect_project_files(&fixture.root).expect("read pruned project");
+            assert!(entries.iter().any(|entry| entry.path == "src/lib.rs"));
+            assert!(entries.iter().any(|entry| entry.path == ".env.example"));
+            assert!(!entries.iter().any(|entry| {
+                entry.path.split(std::path::MAIN_SEPARATOR).any(|component| {
+                    [".git", "node_modules", "target", ".secret"].contains(&component)
+                })
+            }));
+        }
+
+        #[test]
+        fn file_tree_keeps_the_maximum_depth_at_five() {
+            let fixture = FileTreeFixture::new();
+            fixture.write("one/two/three/four/visible.txt", b"visible");
+            fixture.write("one/two/three/four/five/hidden.txt", b"too deep");
+
+            let entries = collect_project_files(&fixture.root).expect("read bounded project");
+            assert!(entries
+                .iter()
+                .any(|entry| entry.path.ends_with("four/visible.txt")));
+            assert!(!entries.iter().any(|entry| entry.path.ends_with("hidden.txt")));
+        }
+
+        #[test]
+        fn file_tree_propagates_unexcluded_traversal_errors() {
+            let fixture = FileTreeFixture::new();
+            let missing = fixture.root.join("missing");
+            let walk_error = walkdir::WalkDir::new(&missing)
+                .into_iter()
+                .next()
+                .expect("missing path must produce a WalkDir result");
+            assert!(walk_error.is_err(), "missing path must produce a real WalkDir error");
+
+            let error = collect_project_file_entries(
+                &fixture.root,
+                std::iter::once(walk_error),
+            )
+            .expect_err("unexcluded traversal error must fail");
+            assert!(error.contains("读取项目目录项"));
+            assert!(error.contains("missing"));
+        }
+    }
 }
 
 #[cfg(test)]

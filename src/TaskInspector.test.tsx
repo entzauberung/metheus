@@ -9,6 +9,7 @@ import type {
   TaskControlSnapshot,
   TaskTreeNodeView,
 } from "./types";
+import type { TaskSelectionMode } from "./taskSelectionPolicy";
 import TaskInspector from "./TaskInspector";
 
 const TASK_CAPABILITIES = ["revalidate", "accept_deviation"];
@@ -157,6 +158,8 @@ describe("TaskInspector", () => {
     currentTaskId = "selected",
     syncState: { error?: string; detailsSyncing?: boolean } = {},
     recoveryPresentation: RecoveryPresentation | null = null,
+    selectionMode: TaskSelectionMode = "follow",
+    onFollowCurrentTask = vi.fn(),
   ) {
     const onClose = vi.fn();
     const onAction = vi.fn();
@@ -179,10 +182,12 @@ describe("TaskInspector", () => {
           onRefresh={vi.fn()}
           onAction={onAction}
           onChangeMode={vi.fn()}
+          selectionMode={selectionMode}
+          onFollowCurrentTask={onFollowCurrentTask}
         />,
       );
     });
-    return { onClose, onAction };
+    return { onClose, onAction, onFollowCurrentTask };
   }
 
   it("offers four focused pages and keeps a non-current task read-only", () => {
@@ -337,6 +342,22 @@ describe("TaskInspector", () => {
     act(() => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" })));
     expect(onClose).toHaveBeenCalledTimes(2);
     expect(host.textContent).toContain("任务 selected");
+  });
+
+  it("shows pinned history state and restores follow mode", () => {
+    const onFollowCurrentTask = vi.fn();
+    render("other-task", {}, null, "pinned", onFollowCurrentTask);
+    expect(host.textContent).toContain("正在查看历史任务");
+    const follow = host.querySelector<HTMLButtonElement>("button[aria-label='跟随当前任务']");
+    expect(follow).not.toBeNull();
+    act(() => follow?.click());
+    expect(onFollowCurrentTask).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps follow mode concise", () => {
+    render();
+    expect(host.querySelector(".task-inspector-selection-state")).toBeNull();
+    expect(host.querySelector("button[aria-label='跟随当前任务']")).toBeNull();
   });
 
   it("keeps detailed snapshot failure non-blocking and visibly retrying", () => {

@@ -4,7 +4,7 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 // ...
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
 import { FileEntry } from "./types";
 
@@ -20,6 +20,14 @@ interface TreeNode {
 interface Props {
   projectPath: string;
   onFileSelect?: (path: string) => void;
+}
+
+type FileTreeStatus = "loading" | "error" | "empty" | "ready";
+
+function describeFileTreeError(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) return error.message;
+  if (typeof error === "string" && error.trim()) return error;
+  return "无法读取项目文件，请重试";
 }
 
 /** 将平铺文件列表转换为树状结构 */
@@ -133,30 +141,54 @@ function getFileIcon(fileType: string, isDir: boolean): string {
 
 function FileTree({ projectPath, onFileSelect }: Props) {
   const [tree, setTree] = useState<TreeNode[]>([]);
-  const [pinned, setPinned] = useState(false);
-  const [isHovered, setIsHovered] = useState(false);
+  const [status, setStatus] = useState<FileTreeStatus>(projectPath ? "loading" : "empty");
+  const [errorMessage, setErrorMessage] = useState("");
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const requestIdRef = useRef(0);
 
-  // 获取文件列表
-  useEffect(() => {
-    if (!projectPath) return;
-    const fetchFiles = async () => {
-      try {
-        const result = await invokeWithTimeout<FileEntry[]>("get_project_files", {
-          projectPath,
-        });
-        const treeData = buildTree(result, projectPath);
-        setTree(treeData);
-        // 默认展开根目录
-        setExpandedDirs(new Set([projectPath]));
-      } catch (e) {
-        console.error("获取文件列表失败:", e);
-        setTree([]);
+  const fetchFiles = useCallback(async () => {
+    const requestId = ++requestIdRef.current;
+    setTree([]);
+    setErrorMessage("");
+    setSelectedPath(null);
+    if (!projectPath) {
+      setStatus("empty");
+      setExpandedDirs(new Set());
+      return;
+    }
+
+    setStatus("loading");
+    try {
+      const result = await invokeWithTimeout<FileEntry[]>("get_project_files", {
+        projectPath,
+      });
+      if (requestId !== requestIdRef.current) return;
+      if (result.length === 0) {
+        setStatus("empty");
+        setExpandedDirs(new Set());
+        return;
       }
-    };
-    fetchFiles();
+      setTree(buildTree(result, projectPath));
+      setExpandedDirs(new Set([projectPath]));
+      setStatus("ready");
+    } catch (error) {
+      if (requestId !== requestIdRef.current) return;
+      console.error("获取文件列表失败:", error);
+      setTree([]);
+      setExpandedDirs(new Set());
+      setErrorMessage(describeFileTreeError(error));
+      setStatus("error");
+    }
   }, [projectPath]);
+
+  // 获取文件列表；失效的旧请求不能覆盖新项目的状态。
+  useEffect(() => {
+    void fetchFiles();
+    return () => {
+      requestIdRef.current += 1;
+    };
+  }, [fetchFiles]);
 
   const toggleDir = useCallback((path: string) => {
     setExpandedDirs((prev) => {
@@ -182,9 +214,6 @@ function FileTree({ projectPath, onFileSelect }: Props) {
     [toggleDir, onFileSelect]
   );
 
-  const isExpanded = pinned || isHovered;
-  const panelWidth = isExpanded ? 220 : 4;
-
   // 渲染单个树节点（递归）
   const renderNode = useCallback(
     (node: TreeNode): React.ReactNode => {
@@ -194,10 +223,11 @@ function FileTree({ projectPath, onFileSelect }: Props) {
 
       return (
         <div key={node.path}>
-          <div
+          <button
             className={`tree-node ${node.isDir ? "dir-node" : "file-node"}${isSelected ? " selected" : ""}`}
             style={{ paddingLeft: `${paddingLeft}px` }}
             onClick={() => handleNodeClick(node)}
+            type="button"
           >
             <span className="tree-node-icon">
               {node.isDir ? (isDirExpanded ? "\u{1F4C2}" : "\u{1F4C1}") : getFileIcon(node.fileType, false)}
@@ -205,7 +235,7 @@ function FileTree({ projectPath, onFileSelect }: Props) {
             <span className="tree-node-name" title={node.name}>
               {node.name}
             </span>
-          </div>
+          </button>
           {node.isDir && isDirExpanded && node.children.length > 0 && (
             <div className="tree-children">
               {node.children.map((child) => renderNode(child))}
@@ -217,60 +247,50 @@ function FileTree({ projectPath, onFileSelect }: Props) {
     [selectedPath, expandedDirs, handleNodeClick]
   );
 
-  if (!projectPath) {
-    return (
-      <div className="file-tree-container" style={{ width: 4 }}>
-        <div className="file-tree-indicator" />
-      </div>
-    );
-  }
-
   return (
-    <div
-      className={`file-tree-container${pinned ? " pinned" : ""}`}
-      style={{ width: panelWidth }}
-      onMouseEnter={() => setIsHovered(true)}
-      onMouseLeave={() => setIsHovered(false)}
-    >
-      {/* 触发指示条 */}
-      <div
-        className="file-tree-indicator"
-        onClick={() => setPinned(!pinned)}
-        title={pinned ? "点击取消固定" : "点击固定文件树"}
-      />
-
-      {/* 文件树内容 */}
-      {isExpanded && (
-        <div className="file-tree-content">
-          <div className="file-tree-header">
+    <div className="file-tree-container file-tree" aria-label="项目文件">
+      <div className="file-tree-content">
+        <div className="file-tree-header">
+          <div className="file-tree-heading">
             <span className="file-tree-title">📂 项目文件</span>
-            <button
-              className="file-tree-refresh"
-              onClick={async () => {
-                try {
-                  const result = await invokeWithTimeout<FileEntry[]>(
-                    "get_project_files",
-                    { projectPath }
-                  );
-                  setTree(buildTree(result, projectPath));
-                } catch (_) {
-                  /* ignore */
-                }
-              }}
-              title="刷新文件列表"
-            >
-              🔄
-            </button>
+            <span className="file-tree-path" title={projectPath || "未选择项目"}>
+              {projectPath || "未选择项目"}
+            </span>
           </div>
-          {tree.length === 0 ? (
-            <div className="file-tree-empty">当前项目为空目录</div>
-          ) : (
-            <div className="file-tree-scroll">
-              {tree.map((node) => renderNode(node))}
-            </div>
-          )}
+          <button
+            className="file-tree-refresh"
+            type="button"
+            disabled={status === "loading" || !projectPath}
+            onClick={() => { void fetchFiles(); }}
+            title={status === "error" ? "重试读取文件列表" : "刷新文件列表"}
+          >
+            {status === "error" ? "重试" : "刷新"}
+          </button>
         </div>
-      )}
+
+        {status === "loading" && (
+          <div className="file-tree-state file-tree-loading" role="status" aria-live="polite">
+            正在读取项目文件…
+          </div>
+        )}
+        {status === "error" && (
+          <div className="file-tree-state file-tree-error" role="alert" aria-live="assertive">
+            <strong>文件列表读取失败</strong>
+            <span>{errorMessage}</span>
+            <button type="button" onClick={() => { void fetchFiles(); }}>重试</button>
+          </div>
+        )}
+        {status === "empty" && (
+          <div className="file-tree-state file-tree-empty" role="status" aria-live="polite">
+            {projectPath ? "当前项目为空目录" : "请先选择项目目录"}
+          </div>
+        )}
+        {status === "ready" && (
+          <div className="file-tree-scroll" aria-label="项目文件列表">
+            {tree.map((node) => renderNode(node))}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

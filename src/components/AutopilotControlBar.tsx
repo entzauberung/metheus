@@ -3,6 +3,7 @@ import {
   AlertTriangle,
   Clock3,
   FileQuestion,
+  MoreHorizontal,
   Pause,
   Play,
   RotateCcw,
@@ -11,7 +12,7 @@ import {
   TestTube2,
   WandSparkles,
 } from "lucide-react";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import type {
   PipelineState,
   Project,
@@ -27,6 +28,15 @@ import {
 } from "../autopilotPolicy";
 import { getManagedFlowPresentation } from "../managedFlowPolicy";
 import { findProjectSubtaskById, isSubtaskLeaf } from "../taskTreePolicy";
+import {
+  compactAutopilotSummary,
+  partitionAutopilotActions,
+  resolveAutopilotRuntimePresentation,
+  resolveManagedActionSlots,
+  type AutopilotActionId,
+  type AutopilotActionSlots,
+  type AutopilotBarState,
+} from "../autopilotBarPresentation";
 import {
   RecoveryDecisionDialog,
   type RecoveryDecisionSubmission,
@@ -79,6 +89,86 @@ const AUTOPILOT_ACTION_LABELS: Record<string, string> = {
   prepare_execution_workspace: "准备 Git 工作区",
   refresh_execution_workspace: "刷新 Git 工作区",
 };
+
+interface AutopilotBarShellProps {
+  state: AutopilotBarState;
+  className?: string;
+  status: ReactNode;
+  summary: string;
+  details?: ReactNode;
+  actions: AutopilotActionSlots<ReactNode>;
+  recoveryKind?: string;
+  recoveryFingerprint?: string;
+}
+
+function AutopilotBarActionSlots({ actions }: { actions: AutopilotActionSlots<ReactNode> }) {
+  return (
+    <>
+      <div className="ap-action-slot" data-action-slot="primary">{actions.primary}</div>
+      <div className="ap-action-slot" data-action-slot="secondary">{actions.secondary}</div>
+      <div className="ap-action-slot" data-action-slot="overflow">
+        {actions.overflow.length > 0 && (
+          <details className="ap-action-overflow">
+            <summary aria-label="更多自动驾驶操作">
+              <MoreHorizontal size={15} aria-hidden="true" />
+              <span>更多</span>
+            </summary>
+            <div className="ap-action-overflow-menu">
+              {actions.overflow}
+            </div>
+          </details>
+        )}
+      </div>
+    </>
+  );
+}
+
+function renderActionSlots(
+  actions: AutopilotActionSlots,
+  renderAction: (action: AutopilotActionId) => ReactNode,
+): AutopilotActionSlots<ReactNode> {
+  return {
+    primary: actions.primary ? renderAction(actions.primary) : null,
+    secondary: actions.secondary ? renderAction(actions.secondary) : null,
+    overflow: actions.overflow.map(renderAction),
+  };
+}
+
+function AutopilotBarShell({
+  state,
+  className = "",
+  status,
+  summary,
+  details,
+  actions,
+  recoveryKind,
+  recoveryFingerprint,
+}: AutopilotBarShellProps) {
+  return (
+    <div
+      className={`autopilot-control-bar ${className}`.trim()}
+      data-ap-state={state}
+      data-action-layout="fixed-slots"
+      data-detail-layout="flow-bounded"
+      data-recovery-kind={recoveryKind}
+      data-recovery-fingerprint={recoveryFingerprint}
+    >
+      <div className="ap-bar-status-region" role="status" aria-label="自动驾驶状态">{status}</div>
+      <div className="ap-bar-summary-region" role="group" aria-label="执行摘要">
+        <span className="ap-bar-summary" title={summary}>{summary}</span>
+        {details && (
+          <details className="ap-bar-details">
+            <summary>查看详情</summary>
+            <div className="ap-bar-detail-content">{details}</div>
+          </details>
+        )}
+      </div>
+      <div className="ap-bar-actions-region ap-bar-right" role="group" aria-label="自动驾驶操作">
+        <AutopilotBarActionSlots actions={actions} />
+      </div>
+    </div>
+  );
+}
 
 function formatStateTime(value: string | undefined): string {
   if (!value) return "";
@@ -196,15 +286,32 @@ export function AutopilotControlBar({
   };
 
   if (recovery) {
+    const recoverySummary = compactAutopilotSummary([
+      recovery.affected_task_label ? `任务：${recovery.affected_task_label}` : null,
+      recovery.phase_label ? `阶段：${recovery.phase_label}` : null,
+    ], recovery.title || "需要处理恢复状态");
+    const recoverySecondaryActions: ReactNode[] = [];
+    for (const action of recovery.secondary_actions) {
+      const rendered = renderRecoveryAction(action, false);
+      if (rendered) recoverySecondaryActions.push(rendered);
+    }
+    const recoveryActionSlots = partitionAutopilotActions<ReactNode>(
+      recovery.primary_action ? renderRecoveryAction(recovery.primary_action, true) : null,
+      recoverySecondaryActions,
+    );
     return (
       <>
-        <div
-          className={`autopilot-control-bar ${recovery.severity === "Error" ? "ap-error" : ""}`}
-          data-recovery-kind={recovery.kind}
-          data-recovery-fingerprint={recovery.state_fingerprint}
-        >
-          <div className="ap-bar-left">
+        <AutopilotBarShell
+          state={recovery.severity === "Error" ? "Error" : "Recovery"}
+          className={recovery.severity === "Error" ? "ap-error" : ""}
+          recoveryKind={recovery.kind}
+          recoveryFingerprint={recovery.state_fingerprint}
+          status={(
             <span className="ap-bar-status"><AlertTriangle size={16} /> {recovery.title}</span>
+          )}
+          summary={recoverySummary}
+          details={(
+            <>
             {recovery.reason && <span className="ap-bar-error" title={recovery.reason}>{recovery.reason}</span>}
             {recovery.affected_task_label && <span className="ap-bar-target">任务：{recovery.affected_task_label}</span>}
             {recovery.phase_label && <span className="ap-bar-action">阶段：{recovery.phase_label}</span>}
@@ -251,12 +358,10 @@ export function AutopilotControlBar({
             {recovery.primary_action && !recovery.primary_action.enabled && recovery.primary_action.disabled_reason && (
               <span className="ap-bar-hint">{recovery.primary_action.disabled_reason}</span>
             )}
-          </div>
-          <div className="ap-bar-right">
-            {recovery.secondary_actions.map(action => renderRecoveryAction(action, false))}
-            {recovery.primary_action && renderRecoveryAction(recovery.primary_action, true)}
-          </div>
-        </div>
+            </>
+          )}
+          actions={recoveryActionSlots}
+        />
         <RecoveryDecisionDialog
           isOpen={decisionOpen}
           project={project}
@@ -286,10 +391,52 @@ export function AutopilotControlBar({
         project.workflow_state.current_step,
         project.milestone_draft,
       );
+      const managedState: AutopilotBarState = managed.run_status === "Running"
+        ? "Running"
+        : managed.run_status === "Paused"
+          ? "Paused"
+          : "Waiting";
+      const managedActionSlots = renderActionSlots(
+        resolveManagedActionSlots(
+          presentation.canPause && !!onPauseManagedFlow,
+          presentation.canResume && !!onResumeManagedFlow,
+        ),
+        actionId => {
+          switch (actionId) {
+            case "pause-managed":
+              return (
+                <button key={actionId} className="ap-bar-btn ap-bar-btn-primary" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onPauseManagedFlow}>
+                  <Pause size={14} /> 暂停托管
+                </button>
+              );
+            case "resume-managed":
+              return (
+                <button key={actionId} className="ap-bar-btn ap-bar-btn-primary" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onResumeManagedFlow}>
+                  <Play size={14} /> {presentation.resumeLabel}
+                </button>
+              );
+            case "stop-managed":
+              return (
+                <button key={actionId} className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onStopManagedFlow}>
+                  <Square size={14} /> 停止托管
+                </button>
+              );
+            default:
+              return null;
+          }
+        },
+      );
       return (
-        <div className="autopilot-control-bar">
-          <div className="ap-bar-left">
+        <AutopilotBarShell
+          state={managedState}
+          status={(
             <span className="ap-bar-status"><WandSparkles size={16} /> {presentation.statusLabel}</span>
+          )}
+          summary={compactAutopilotSummary([
+            `目标：${presentation.targetLabel}`,
+          ], "托管流程等待后端状态")}
+          details={(
+            <>
             {managed.last_action && <span className="ap-bar-action">{managed.last_action}</span>}
             <span className="ap-bar-target">目标：{presentation.targetLabel}</span>
             <span className="ap-bar-target">动作：{presentation.actionLabel}</span>
@@ -297,51 +444,92 @@ export function AutopilotControlBar({
             {presentation.detail && presentation.detail !== managed.last_action && (
               <span className="ap-bar-error" title={presentation.detail}>{presentation.detail}</span>
             )}
-          </div>
-          <div className="ap-bar-right">
-            <button className="ap-bar-btn" disabled={busy} onClick={onSync}>
-              <RotateCcw size={14} /> 同步
-            </button>
-            {presentation.canPause && onPauseManagedFlow && (
-              <button className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onPauseManagedFlow}>
-                <Pause size={14} /> 暂停托管
-              </button>
-            )}
-            {presentation.canResume && onResumeManagedFlow && (
-              <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onResumeManagedFlow}>
-                <Play size={14} /> {presentation.resumeLabel}
-              </button>
-            )}
-            <button className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onStopManagedFlow}>
-              <Square size={14} /> 停止托管
-            </button>
-          </div>
-        </div>
+            </>
+          )}
+          actions={managedActionSlots}
+        />
       );
     }
     if (project.workflow_state.top_level_phase !== "Console") return null;
     return (
-      <div className="autopilot-control-bar">
-        <span className="ap-bar-status"><Play size={16} /> {canActivate ? "自动驾驶未激活" : "请先完成大阶段批准"}</span>
-        <button
-          className="ap-bar-btn ap-bar-btn-primary"
-          disabled={busy || writeDisabled || !canActivate}
-          title={writeDisabled ? writeDisabledReason : undefined}
-          onClick={() => { void onToggle(true); }}
-        >
-          <WandSparkles size={14} /> 激活自动驾驶
-        </button>
-      </div>
+      <AutopilotBarShell
+        state="Waiting"
+        status={<span className="ap-bar-status"><Play size={16} /> {canActivate ? "自动驾驶未激活" : "请先完成大阶段批准"}</span>}
+        summary={canActivate ? "已具备激活条件，等待用户启动" : "完成当前批准步骤后可激活"}
+        actions={{
+          primary: <button
+            className="ap-bar-btn ap-bar-btn-primary"
+            disabled={busy || writeDisabled || !canActivate}
+            title={writeDisabled ? writeDisabledReason : undefined}
+            onClick={() => { void onToggle(true); }}
+          >
+            <WandSparkles size={14} /> 激活自动驾驶
+          </button>,
+          secondary: null,
+          overflow: [],
+        }}
+      />
     );
   }
 
+  const runtimePresentation = resolveAutopilotRuntimePresentation(
+    runStatus,
+    isExecuting,
+    targetLabel,
+  );
+  const runtimeActionSlots = renderActionSlots(
+    runtimePresentation.actions,
+    actionId => {
+      switch (actionId) {
+        case "pause-now":
+          return (
+            <button
+              key={actionId}
+              className={`ap-bar-btn ${isExecuting ? "ap-bar-btn-danger" : "ap-bar-btn-primary"}`}
+              disabled={busy || writeDisabled}
+              title={writeDisabled ? writeDisabledReason : undefined}
+              onClick={onPauseNow}
+            >
+              {isExecuting ? <Square size={14} /> : <Pause size={14} />}
+              {isExecuting ? "立即暂停" : "暂停自动驾驶"}
+            </button>
+          );
+        case "pause-after-current":
+          return (
+            <button key={actionId} className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onPauseAfterCurrent}>
+              <Pause size={14} /> 完成后暂停
+            </button>
+          );
+        case "resume":
+          return (
+            <button key={actionId} className="ap-bar-btn ap-bar-btn-primary" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onResume}>
+              <Play size={14} /> 恢复
+            </button>
+          );
+        case "close":
+          return (
+            <button key={actionId} className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={() => { void onToggle(false); }}>
+              <Square size={14} /> 关闭
+            </button>
+          );
+        default:
+          return null;
+      }
+    },
+  );
   return (
-    <div className={`autopilot-control-bar ${runStatus === "Running" || isExecuting ? "ap-running" : ""}`}>
-      <div className="ap-bar-left">
+    <AutopilotBarShell
+      state={runtimePresentation.state}
+      className={runtimePresentation.state === "Running" ? "ap-running" : runtimePresentation.state === "Error" ? "ap-error" : ""}
+      status={(
         <span className="ap-bar-status">
           {runStatus === "Running" || isExecuting ? <WandSparkles size={16} /> : <Pause size={16} />}
-          {" "}{isExecuting ? "执行中" : runStatus === "Running" ? "自动推进中" : runStatus === "Paused" ? "已暂停" : "等待人工处理"}
+          {" "}{runtimePresentation.statusLabel}
         </span>
+      )}
+      summary={runtimePresentation.summary}
+      details={(
+        <>
         {targetLabel && <span className="ap-bar-target">目标：{targetLabel}</span>}
         {currentAction && <span className="ap-bar-action">当前：{currentAction}</span>}
         {retryAt && <span className="ap-bar-warning"><Clock3 size={13} /> 重试 {retryCount}/3 · {retryAt}</span>}
@@ -369,25 +557,9 @@ export function AutopilotControlBar({
           </span>
         ))}
         {autopilot?.last_action && <span className="ap-bar-target">{autopilot.last_action}</span>}
-      </div>
-      <div className="ap-bar-right">
-        <button className="ap-bar-btn" disabled={busy} onClick={onSync}><RotateCcw size={14} /> 同步</button>
-        {isExecuting && (
-          <>
-            <button className="ap-bar-btn ap-bar-btn-danger" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onPauseNow}><Square size={14} /> 立即暂停</button>
-            <button className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onPauseAfterCurrent}><Pause size={14} /> 完成后暂停</button>
-          </>
-        )}
-        {!isExecuting && runStatus === "Running" && (
-          <button className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onPauseNow}><Pause size={14} /> 暂停自动驾驶</button>
-        )}
-        {!isExecuting && runStatus === "Paused" && (
-          <button className="ap-bar-btn ap-bar-btn-primary" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={onResume}><Play size={14} /> 恢复</button>
-        )}
-        {runStatus !== "Running" && (
-          <button className="ap-bar-btn" disabled={busy || writeDisabled} title={writeDisabled ? writeDisabledReason : undefined} onClick={() => { void onToggle(false); }}><Square size={14} /> 关闭</button>
-        )}
-      </div>
-    </div>
+        </>
+      )}
+      actions={runtimeActionSlots}
+    />
   );
 }
