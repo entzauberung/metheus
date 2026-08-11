@@ -1047,6 +1047,29 @@ describe("ApplicationSettings runtime self-test health invalidation", () => {
     await flushPromises();
   });
 
+  it("keeps a failed settings load inside the selected visible panel", async () => {
+    const loadError = new Error("设置读取失败：测试错误");
+    invokeMock.mockImplementation((command: string) => {
+      if (command === "get_app_settings") return Promise.reject(loadError);
+      return Promise.reject(new Error(`未预期命令：${command}`));
+    });
+    act(() => root.render(<ApplicationSettings />));
+    act(() => findButton("应用设置").click());
+    await flushPromises();
+
+    const activeTab = document.querySelector<HTMLButtonElement>(".settings-tabs [role='tab'][aria-selected='true']");
+    const activePanel = document.getElementById(activeTab?.getAttribute("aria-controls") ?? "");
+    expect(activeTab).not.toBeNull();
+    expect(activePanel).not.toBeNull();
+    expect((activePanel as HTMLElement).hidden).toBe(false);
+    expect(activePanel?.getAttribute("role")).toBe("tabpanel");
+    expect(activePanel?.getAttribute("aria-labelledby")).toBe(activeTab?.id);
+    expect(activePanel?.querySelector('[role="alert"]')?.textContent).toContain(loadError.message);
+    expect(document.querySelectorAll('[role="tabpanel"]:not([hidden])')).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "get_app_settings")).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "check_engine_health")).toHaveLength(0);
+  });
+
   it("moves the primary settings tabs with keyboard without shifting focus to the model subnavigation", async () => {
     invokeMock.mockImplementation((command: string) => {
       if (command === "get_app_settings") return Promise.resolve(settingsView());
@@ -1058,6 +1081,8 @@ describe("ApplicationSettings runtime self-test health invalidation", () => {
     act(() => root.render(<ApplicationSettings project={project(true)} />));
     act(() => findButton("应用设置").click());
     await flushPromises();
+    expect(invokeMock.mock.calls.filter(([command]) => command === "get_app_settings")).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "check_engine_health")).toHaveLength(4);
 
     const tabs = () => [...document.body.querySelectorAll<HTMLButtonElement>(".settings-tabs [role='tab']")];
     const press = (tab: HTMLButtonElement, key: string) => {
@@ -1085,12 +1110,21 @@ describe("ApplicationSettings runtime self-test health invalidation", () => {
     expect(event.defaultPrevented).toBe(true);
     await flushPromises();
     expectPrimaryTab(0);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "get_app_settings")).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "check_engine_health")).toHaveLength(8);
 
     event = press(tabs()[0], "ArrowRight");
     expect(event.defaultPrevented).toBe(true);
     expectPrimaryTab(1);
 
-    event = press(tabs()[1], "End");
+    event = press(tabs()[1], "ArrowRight");
+    expect(event.defaultPrevented).toBe(true);
+    await flushPromises();
+    expectPrimaryTab(2);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "get_app_settings")).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "check_engine_health")).toHaveLength(8);
+
+    event = press(tabs()[2], "End");
     expect(event.defaultPrevented).toBe(true);
     expectPrimaryTab(2);
 
@@ -1105,6 +1139,8 @@ describe("ApplicationSettings runtime self-test health invalidation", () => {
     expect(event.defaultPrevented).toBe(true);
     await flushPromises();
     expectPrimaryTab(0);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "get_app_settings")).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "check_engine_health")).toHaveLength(12);
 
     event = press(tabs()[0], "PageDown");
     expect(event.defaultPrevented).toBe(false);

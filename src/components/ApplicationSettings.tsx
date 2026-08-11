@@ -850,11 +850,7 @@ export function ApplicationSettings({ project, pipeline, className, writeBlocked
             ))}
           </div>
 
-          {TABS.filter((item) => (
-            item.id !== tab
-            || (!loading && item.id === "engine" && !draft)
-            || (!loading && item.id === "models" && (!draft || !view))
-          )).map((item) => (
+          {TABS.filter((item) => item.id !== tab).map((item) => (
             <div
               id={`settings-panel-${item.id}`}
               role="tabpanel"
@@ -872,6 +868,17 @@ export function ApplicationSettings({ project, pipeline, className, writeBlocked
               aria-labelledby={`settings-tab-${tab}`}
             >
               正在读取设置...
+            </div>
+          )}
+          {!loading && !view && error && (
+            <div
+              className="settings-state"
+              id={`settings-panel-${tab}`}
+              role="tabpanel"
+              aria-labelledby={`settings-tab-${tab}`}
+            >
+              <strong>设置读取失败</strong>
+              <p className="project-entry-error" role="alert">{error}</p>
             </div>
           )}
           {!loading && draft && view && tab === "models" && (
@@ -1123,7 +1130,7 @@ export function ApplicationSettings({ project, pipeline, className, writeBlocked
           {view?.load_warning && <div className="settings-warning">{view.load_warning}</div>}
           {blockedReason && <div className="settings-warning">{blockedReason}</div>}
           <div className={`settings-save-state ${saveState}`}>{saveState === "saving" ? "Saving…" : saveState === "error" ? "保存失败" : saveState === "dirty" ? "有未保存更改" : saveState === "saved" ? "Saved" : "未修改"}</div>
-          {error && <div className="project-entry-error">{error}</div>}
+          {error && view && <div className="project-entry-error">{error}</div>}
         </div>
       </Modal>
     </>
