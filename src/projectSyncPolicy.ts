@@ -1,5 +1,6 @@
 import type {
   ProjectStateChangedEvent,
+  RecoveryPresentation,
   RuntimeSnapshot,
   TaskControlDetailStatus,
 } from "./types";
@@ -8,15 +9,37 @@ export const TASK_CONTROL_DETAIL_STALE_AFTER_MS = 45_000;
 export const TASK_CONTROL_FALLBACK_INTERVAL_MS = 30_000;
 export const TASK_CONTROL_MAX_SYNC_FAILURES = 3;
 export const PROJECT_SYNC_CONNECTED_FALLBACK_MS = 60_000;
+export const PROJECT_SYNC_ACTIVE_RECOVERY_FALLBACK_MS = 5_000;
 export const PROJECT_SYNC_DISCONNECTED_FALLBACK_MS = 15_000;
+
+export function recoveryPresentationIsActive(
+  presentation: RecoveryPresentation,
+): boolean {
+  switch (presentation.progress_status) {
+    case "queued":
+    case "scheduled":
+    case "running":
+    case "warning":
+    case "stalled":
+      return true;
+    case "inactive":
+    case "waiting_human":
+      return false;
+    default:
+      return presentation.background_retry_active === true;
+  }
+}
 
 export function projectSyncFallbackIntervalMs(
   subscriptionStatus: "idle" | "connected" | "reconnecting",
   runtimeSyncStatus: "idle" | "syncing" | "synced" | "delayed" | "disconnected",
   connectedIntervalMs = PROJECT_SYNC_CONNECTED_FALLBACK_MS,
+  activeRecovery = false,
 ): number {
   if (subscriptionStatus === "connected" && runtimeSyncStatus !== "disconnected") {
-    return connectedIntervalMs;
+    return activeRecovery
+      ? Math.min(connectedIntervalMs, PROJECT_SYNC_ACTIVE_RECOVERY_FALLBACK_MS)
+      : connectedIntervalMs;
   }
   return Math.min(connectedIntervalMs, PROJECT_SYNC_DISCONNECTED_FALLBACK_MS);
 }

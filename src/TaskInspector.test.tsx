@@ -369,6 +369,82 @@ describe("TaskInspector", () => {
     expect(host.textContent).toContain("主状态已更新，正在后台重试");
   });
 
+  it("shows stalled recovery action, progress, deadlines, and baseline as separate facts", () => {
+    render("selected", {}, {
+      kind: "AutomaticRecovery",
+      title: "自动恢复",
+      reason: "五分钟没有业务进展",
+      severity: "Error",
+      primary_action: null,
+      secondary_actions: [],
+      preserve_current_code: true,
+      requires_baseline_restore: false,
+      supports_preview: false,
+      automatic_retry: true,
+      capabilities: [],
+      decision_options: [],
+      state_fingerprint: "stalled-progress",
+      progress_status: "stalled",
+      current_action: "run_error_recovery_with_a_long_structured_action_name",
+      action_started_at: "2026-08-11T11:50:00Z",
+      elapsed_seconds: 605,
+      last_progress_at: "2026-08-11T11:54:00Z",
+      warning_at: "2026-08-11T11:55:30Z",
+      hard_deadline_at: "2026-08-11T12:02:00Z",
+      next_retry_at: null,
+      next_validation_retry_at: null,
+      code_impact_summary: "未提交改动已暂存，工作区已恢复到执行基线。",
+      heartbeat_status: "正常，最后更新 2026-08-11T12:00:00Z",
+      background_retry_active: true,
+      background_retry_summary: "后台恢复动作已停滞，将在超时边界停止",
+    } as RecoveryPresentation);
+    const recoveryTab = host.querySelector('[role="tab"][title="决策与恢复"]');
+    act(() => recoveryTab?.dispatchEvent(new MouseEvent("mousedown", {
+      bubbles: true,
+      button: 0,
+    })));
+
+    const details = host.querySelector<HTMLElement>(".task-recovery-details");
+    expect(details?.querySelector("[data-recovery-progress='stalled']")?.textContent)
+      .toContain("恢复已停滞");
+    expect(details?.textContent).toContain("run_error_recovery_with_a_long_structured_action_name");
+    expect(details?.textContent).toContain("10 分 5 秒");
+    expect(details?.textContent).toContain("最后业务进展");
+    expect(details?.textContent).toContain("最迟终止");
+    expect(details?.textContent).toContain("未提交改动已暂存");
+    expect(details?.textContent).toContain("心跳正常");
+  });
+
+  it("shows explicit unrecorded values for an old recovery DTO", () => {
+    render("selected", {}, {
+      kind: "AutomaticRecovery",
+      title: "旧恢复状态",
+      reason: "",
+      severity: "Warning",
+      primary_action: null,
+      secondary_actions: [],
+      preserve_current_code: true,
+      requires_baseline_restore: false,
+      supports_preview: false,
+      automatic_retry: false,
+      capabilities: [],
+      decision_options: [],
+      state_fingerprint: "legacy-recovery",
+    });
+    const recoveryTab = host.querySelector('[role="tab"][title="决策与恢复"]');
+    act(() => recoveryTab?.dispatchEvent(new MouseEvent("mousedown", {
+      bubbles: true,
+      button: 0,
+    })));
+
+    const details = host.querySelector<HTMLElement>(".task-recovery-details");
+    expect(details?.textContent).toContain("恢复进度未记录");
+    expect(details?.textContent).toContain("动作未记录");
+    expect(details?.textContent).toContain("最后业务进展未记录");
+    expect(details?.textContent).toContain("基线未记录");
+    expect(details?.textContent).toContain("心跳未记录");
+  });
+
   it("shows stale control-lock facts without offering a recovery decision", () => {
     render("selected", {}, staleControlLockPresentation());
     const recoveryTab = host.querySelector('[role="tab"][title="决策与恢复"]');

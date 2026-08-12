@@ -169,6 +169,8 @@ pub(crate) fn write_execution_history(
         | project::ExecutionEventType::ReplanStarted
         | project::ExecutionEventType::ReplanCompleted
         | project::ExecutionEventType::ReplanExecutionStarted
+        | project::ExecutionEventType::RecoveryWarning
+        | project::ExecutionEventType::RecoveryStalled
         | project::ExecutionEventType::RecoverySucceeded
         | project::ExecutionEventType::RecoveryExhausted
         | project::ExecutionEventType::ReviewRequested

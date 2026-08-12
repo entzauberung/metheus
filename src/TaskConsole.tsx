@@ -50,6 +50,21 @@ const OPERATION_SOURCE_LABEL = {
   System: "系统历史",
 } as const;
 
+const RECOVERY_EVENT_LABEL: Record<string, string> = {
+  ReplanStarted: "恢复重规划开始",
+  RecoveryWarning: "恢复进展警告",
+  RecoveryStalled: "恢复已停滞",
+  RecoveryExhausted: "自动恢复已停止",
+  RecoverySucceeded: "自动恢复完成",
+  Recovered: "自动恢复完成",
+};
+
+function historyLogIdentity(
+  entry: Pick<ExecutionHistoryEntry, "timestamp" | "level" | "text" | "subtask_id">,
+): string {
+  return [entry.timestamp, entry.level, entry.text, entry.subtask_id ?? ""].join("\u0000");
+}
+
 export function collectProjectTestLogs(project: Project): TestLog[] {
   const logs: TestLog[] = [];
   const visited = new Set<string>();
@@ -209,6 +224,9 @@ export default function TaskConsole({
     executionStatus?.log_history,
     testLogs,
   );
+  const historyEventTypes = new Map(
+    (executionHistory ?? []).map(entry => [historyLogIdentity(entry), entry.event_type] as const),
+  );
   const filteredLogs = filterExecutionLogs(mergedLogs, visibleCategories);
   const currentLog = normalizeCurrentExecutionLog(executionStatus);
   const showCurrentLog = executionStatus?.status === "Running"
@@ -290,6 +308,15 @@ export default function TaskConsole({
             >
               {filteredLogs.map((entry) => {
                 const category = logCategory(entry);
+                const eventType = entry.timelineSource === "history"
+                  ? historyEventTypes.get(historyLogIdentity({
+                    timestamp: entry.timestamp,
+                    level: entry.level,
+                    text: entry.text,
+                    subtask_id: entry.taskId,
+                  }))
+                  : undefined;
+                const recoveryEventLabel = eventType ? RECOVERY_EVENT_LABEL[eventType] : undefined;
                 return <div
                   key={entry.key}
                   className={`execution-log-entry log-${entry.level}${category ? ` log-category-${category}` : ""}${entry.timelineSource === "runtime" ? " log-runtime" : ""}${entry.taskId ? " has-task-link" : ""}`}
@@ -313,6 +340,14 @@ export default function TaskConsole({
                     {OPERATION_SOURCE_LABEL[entry.operationSource]}
                   </span>
                   <span className="execution-log-channel">{entry.source || entry.timelineSource}</span>
+                  {recoveryEventLabel && (
+                    <strong
+                      className="execution-log-event"
+                      data-execution-event={eventType}
+                    >
+                      {recoveryEventLabel}
+                    </strong>
+                  )}
                   <span className="execution-log-text">{entry.text}</span>
                   {(entry.criterionIndex || entry.actionId || entry.modelCallId) && (
                     <span className="execution-log-links">

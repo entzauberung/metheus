@@ -1,4 +1,8 @@
-import type { AutopilotRunStatus } from "./types";
+import type {
+  AutopilotRunStatus,
+  RecoveryPresentation,
+  RecoveryProgressStatus,
+} from "./types";
 
 export type AutopilotBarState = "Running" | "Paused" | "Waiting" | "Recovery" | "Error";
 
@@ -23,6 +27,78 @@ export interface AutopilotRuntimePresentation {
   statusLabel: string;
   summary: string;
   actions: AutopilotActionSlots;
+}
+
+export type RecoveryBarProgressStatus = RecoveryProgressStatus | "unknown";
+
+export interface RecoveryBarProgressPresentation {
+  status: RecoveryBarProgressStatus;
+  statusLabel: string;
+  summary: string;
+  tone: "neutral" | "active" | "warning" | "error";
+}
+
+export function resolveRecoveryBarProgress(
+  recovery: RecoveryPresentation,
+): RecoveryBarProgressPresentation {
+  switch (recovery.progress_status) {
+    case "inactive":
+      return {
+        status: "inactive",
+        statusLabel: "恢复未运行",
+        summary: "当前没有恢复动作",
+        tone: "neutral",
+      };
+    case "queued":
+      return {
+        status: "queued",
+        statusLabel: "自动恢复已排队",
+        summary: "等待恢复 worker 领取",
+        tone: "active",
+      };
+    case "scheduled":
+      return {
+        status: "scheduled",
+        statusLabel: "恢复重试已安排",
+        summary: "等待计划重试",
+        tone: "active",
+      };
+    case "running":
+      return {
+        status: "running",
+        statusLabel: "自动恢复执行中",
+        summary: "恢复动作正在执行",
+        tone: "active",
+      };
+    case "warning":
+      return {
+        status: "warning",
+        statusLabel: "恢复进展延迟",
+        summary: "worker 存活，但业务进展延迟",
+        tone: "warning",
+      };
+    case "stalled":
+      return {
+        status: "stalled",
+        statusLabel: "恢复已停滞",
+        summary: "等待后端有界超时收口",
+        tone: "error",
+      };
+    case "waiting_human":
+      return {
+        status: "waiting_human",
+        statusLabel: "自动恢复已停止",
+        summary: "等待人工处理",
+        tone: "error",
+      };
+    default:
+      return {
+        status: "unknown",
+        statusLabel: "恢复进度未记录",
+        summary: "进度未记录",
+        tone: "neutral",
+      };
+  }
 }
 
 export function resolveAutopilotBarState(

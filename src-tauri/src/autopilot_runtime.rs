@@ -281,6 +281,74 @@ fn persist_heartbeat(project: &mut project::Project) -> Result<(), String> {
     crate::save_project(project)
 }
 
+fn write_recovery_progress_history(
+    project: &mut project::Project,
+    event_type: project::ExecutionEventType,
+    level: &str,
+    text: String,
+) {
+    let (milestone_id, mid_stage_id) = project
+        .execution_session
+        .as_ref()
+        .map(|session| (session.milestone_id.clone(), session.mid_stage_id.clone()))
+        .unwrap_or_default();
+    let subtask_id = project
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .map(|recovery| recovery.subtask_id.clone())
+        .or_else(|| {
+            project
+                .execution_session
+                .as_ref()
+                .map(|session| session.subtask_id.clone())
+        });
+    crate::pipeline::write_execution_history_with_source(
+        project,
+        level,
+        event_type,
+        project::OperationSource::Recovery,
+        text,
+        (!milestone_id.is_empty()).then_some(milestone_id.as_str()),
+        (!mid_stage_id.is_empty()).then_some(mid_stage_id.as_str()),
+        subtask_id.as_deref(),
+    );
+}
+
+fn update_recovery_progress_state(
+    project: &mut project::Project,
+    gate: RecoveryProgressGate,
+) -> Option<(project::ExecutionEventType, &'static str, String)> {
+    let state = project.workflow_state.autopilot_state.as_mut()?;
+    let (marker, event_type, level, message) = match gate {
+        RecoveryProgressGate::Warning => (
+            "（警告）",
+            project::ExecutionEventType::RecoveryWarning,
+            "pause",
+            format!(
+                "恢复动作存活但超过 {} 秒无业务进展（警告）",
+                RECOVERY_PROGRESS_WARNING_SECS
+            ),
+        ),
+        RecoveryProgressGate::Stalled => (
+            "（停滞）",
+            project::ExecutionEventType::RecoveryStalled,
+            "error",
+            format!(
+                "恢复动作存活但超过 {} 秒无业务进展（停滞）",
+                RECOVERY_PROGRESS_STALLED_SECS
+            ),
+        ),
+        RecoveryProgressGate::Running | RecoveryProgressGate::HardTimeout => return None,
+    };
+    if state.last_action.contains(marker) {
+        return None;
+    }
+    state.last_action = message.clone();
+    state.last_action_at = chrono::Utc::now().to_rfc3339();
+    Some((event_type, level, message))
+}
+
 fn validation_retry_waiting(project: &project::Project) -> Option<String> {
     let recovery = project.workflow_state.recovery_state.as_ref()?;
     if !crate::recovery::validation_retry_can_resume(recovery)
@@ -407,28 +475,10 @@ async fn dispatch_action_with_heartbeat_limited(
                         );
                         return DispatchOutcome::TimedOut { elapsed_secs };
                     }
-                    if let Some(state) = latest.workflow_state.autopilot_state.as_mut() {
-                        match gate {
-                            RecoveryProgressGate::Warning => {
-                                if !state.last_action.contains("无进展警告") {
-                                    state.last_action = format!(
-                                        "恢复动作存活但超过 {} 秒无业务进展（警告）",
-                                        RECOVERY_PROGRESS_WARNING_SECS
-                                    );
-                                    state.last_action_at = chrono::Utc::now().to_rfc3339();
-                                }
-                            }
-                            RecoveryProgressGate::Stalled => {
-                                if !state.last_action.contains("无进展停滞") {
-                                    state.last_action = format!(
-                                        "恢复动作存活但超过 {} 秒无业务进展（停滞）",
-                                        RECOVERY_PROGRESS_STALLED_SECS
-                                    );
-                                    state.last_action_at = chrono::Utc::now().to_rfc3339();
-                                }
-                            }
-                            _ => {}
-                        }
+                    if let Some((event_type, level, message)) =
+                        update_recovery_progress_state(&mut latest, gate)
+                    {
+                        write_recovery_progress_history(&mut latest, event_type, level, message);
                     }
                 }
                 if persist_heartbeat(&mut latest).is_err() {
@@ -990,6 +1040,40 @@ mod tests {
             classify_recovery_progress(ts(720), Some(ts(719)), Some(started)),
             RecoveryProgressGate::HardTimeout
         );
+    }
+
+    #[test]
+    fn recovery_progress_events_are_emitted_once_per_boundary() {
+        let mut project = active_project(project::AutopilotRunStatus::Running);
+        project.workflow_state.autopilot_state.as_mut().unwrap().last_action =
+            "恢复动作正在执行".to_string();
+        project.workflow_state.recovery_state = Some(project::RecoveryState {
+            subtask_id: "sub-1".to_string(),
+            ..Default::default()
+        });
+
+        let warning = update_recovery_progress_state(&mut project, RecoveryProgressGate::Warning)
+            .expect("warning event");
+        assert_eq!(warning.0, project::ExecutionEventType::RecoveryWarning);
+        write_recovery_progress_history(&mut project, warning.0, warning.1, warning.2);
+        assert_eq!(project.execution_history.len(), 1);
+        assert_eq!(
+            project.execution_history[0].event_type,
+            project::ExecutionEventType::RecoveryWarning
+        );
+
+        assert!(update_recovery_progress_state(&mut project, RecoveryProgressGate::Warning).is_none());
+
+        let stalled = update_recovery_progress_state(&mut project, RecoveryProgressGate::Stalled)
+            .expect("stalled event");
+        assert_eq!(stalled.0, project::ExecutionEventType::RecoveryStalled);
+        write_recovery_progress_history(&mut project, stalled.0, stalled.1, stalled.2);
+        assert_eq!(project.execution_history.len(), 2);
+        assert_eq!(
+            project.execution_history[1].event_type,
+            project::ExecutionEventType::RecoveryStalled
+        );
+        assert!(update_recovery_progress_state(&mut project, RecoveryProgressGate::Stalled).is_none());
     }
 
     #[test]

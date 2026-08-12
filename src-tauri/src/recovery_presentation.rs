@@ -4,7 +4,7 @@ use crate::project::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const RECOVERY_PRESENTATION_VERSION: &str = "recovery-presentation-v4";
+pub const RECOVERY_PRESENTATION_VERSION: &str = "recovery-presentation-v5";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RecoveryPresentationKind {
@@ -29,6 +29,19 @@ pub enum RecoverySeverity {
     Info,
     Warning,
     Error,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryProgressStatus {
+    #[default]
+    Inactive,
+    Queued,
+    Scheduled,
+    Running,
+    Warning,
+    Stalled,
+    WaitingHuman,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,6 +111,20 @@ pub struct RecoveryPresentation {
     pub phase_label: String,
     pub background_retry_active: bool,
     pub background_retry_summary: String,
+    #[serde(default)]
+    pub progress_status: RecoveryProgressStatus,
+    #[serde(default)]
+    pub current_action: Option<String>,
+    #[serde(default)]
+    pub action_started_at: Option<String>,
+    #[serde(default)]
+    pub last_progress_at: Option<String>,
+    #[serde(default)]
+    pub elapsed_seconds: Option<u64>,
+    #[serde(default)]
+    pub warning_at: Option<String>,
+    #[serde(default)]
+    pub hard_deadline_at: Option<String>,
     pub post_action_expectation: String,
     pub stale_risk: bool,
     pub sync_risk_summary: String,
@@ -145,6 +172,13 @@ impl RecoveryPresentation {
             phase_label: String::new(),
             background_retry_active: false,
             background_retry_summary: String::new(),
+            progress_status: RecoveryProgressStatus::Inactive,
+            current_action: None,
+            action_started_at: None,
+            last_progress_at: None,
+            elapsed_seconds: None,
+            warning_at: None,
+            hard_deadline_at: None,
             post_action_expectation: String::new(),
             stale_risk: false,
             sync_risk_summary: String::new(),
@@ -335,6 +369,113 @@ fn fingerprint(project: &Project, kind: &RecoveryPresentationKind) -> String {
     format!("{:x}", digest)
 }
 
+struct RecoveryProgressPresentation {
+    status: RecoveryProgressStatus,
+    current_action: Option<String>,
+    action_started_at: Option<String>,
+    last_progress_at: Option<String>,
+    elapsed_seconds: Option<u64>,
+    warning_at: Option<String>,
+    hard_deadline_at: Option<String>,
+}
+
+fn recovery_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
+}
+
+fn recovery_progress_at(
+    project: &Project,
+    now: chrono::DateTime<chrono::Utc>,
+    automatic_retry: bool,
+) -> RecoveryProgressPresentation {
+    let recovery = project.workflow_state.recovery_state.as_ref();
+    let autopilot = project.workflow_state.autopilot_state.as_ref();
+    let waiting_human = recovery
+        .map(|state| state.phase == RecoveryPhase::WaitingHuman)
+        .unwrap_or(false)
+        || autopilot
+            .map(|state| {
+                state.run_status == crate::project::AutopilotRunStatus::ErrorStopped
+                    || state.recovery_action == AutopilotRecoveryAction::WaitHumanDecision
+            })
+            .unwrap_or(false);
+    let claimed = autopilot
+        .filter(|state| {
+            !waiting_human
+                && !state.current_action_id.is_empty()
+                && state.current_action_kind == "run_error_recovery"
+        });
+    let action_started_at = claimed
+        .map(|state| state.action_started_at.clone())
+        .filter(|value| !value.is_empty());
+    let action_started = action_started_at
+        .as_deref()
+        .and_then(recovery_timestamp);
+    let last_progress_at = recovery
+        .map(|state| state.updated_at.clone())
+        .filter(|value| !value.is_empty());
+    let last_progress = last_progress_at
+        .as_deref()
+        .and_then(recovery_timestamp);
+    let scheduled = !waiting_human
+        && autopilot
+            .and_then(|state| state.next_retry_at.as_deref())
+            .and_then(recovery_timestamp)
+            .into_iter()
+            .chain(
+                recovery
+                    .and_then(|state| state.next_validation_retry_at.as_deref())
+                    .and_then(recovery_timestamp),
+            )
+            .any(|deadline| deadline > now);
+
+    let status = if waiting_human {
+        RecoveryProgressStatus::WaitingHuman
+    } else if claimed.is_some() {
+        let idle_seconds = last_progress
+            .map(|progress| now.signed_duration_since(progress).num_seconds().max(0))
+            .unwrap_or(0);
+        if idle_seconds >= crate::autopilot_runtime::RECOVERY_PROGRESS_STALLED_SECS {
+            RecoveryProgressStatus::Stalled
+        } else if idle_seconds >= crate::autopilot_runtime::RECOVERY_PROGRESS_WARNING_SECS {
+            RecoveryProgressStatus::Warning
+        } else {
+            RecoveryProgressStatus::Running
+        }
+    } else if scheduled {
+        RecoveryProgressStatus::Scheduled
+    } else if automatic_retry && recovery.is_some() {
+        RecoveryProgressStatus::Queued
+    } else {
+        RecoveryProgressStatus::Inactive
+    };
+
+    RecoveryProgressPresentation {
+        status,
+        current_action: claimed.map(|state| state.current_action_kind.clone()),
+        action_started_at,
+        last_progress_at,
+        elapsed_seconds: action_started
+            .map(|started| now.signed_duration_since(started).num_seconds().max(0) as u64),
+        warning_at: last_progress.map(|progress| {
+            (progress
+                + chrono::Duration::seconds(
+                    crate::autopilot_runtime::RECOVERY_PROGRESS_WARNING_SECS as i64,
+                ))
+            .to_rfc3339()
+        }),
+        hard_deadline_at: action_started.map(|started| {
+            (started
+                + chrono::Duration::seconds(
+                    crate::autopilot_runtime::RECOVERY_ACTION_HARD_TIMEOUT_SECS as i64,
+                ))
+            .to_rfc3339()
+        }),
+    }
+}
+
 fn finish(
     project: &Project,
     kind: RecoveryPresentationKind,
@@ -364,22 +505,10 @@ fn finish(
     let phase_label = recovery_phase_label(project, &kind);
     let post_action_expectation = post_action_expectation(&kind, primary_action.as_ref());
     let sync_needed = kind == RecoveryPresentationKind::SyncAndClose;
-    let background_retry_summary = if automatic_retry {
-        "后台重试进行中".to_string()
-    } else {
-        String::new()
-    };
     let sync_risk_summary = if sync_needed {
         "最终状态可能延迟，请等待统一同步。".to_string()
     } else {
         String::new()
-    };
-    let code_impact_summary = if requires_baseline_restore {
-        "恢复前将先展示影响范围。".to_string()
-    } else if preserve_current_code {
-        "当前代码会保留，不会恢复执行基线。".to_string()
-    } else {
-        "当前动作可能影响执行代码。".to_string()
     };
     let recovery = project.workflow_state.recovery_state.as_ref();
     let autopilot = project.workflow_state.autopilot_state.as_ref();
@@ -390,6 +519,25 @@ fn finish(
         .unwrap_or_default();
     let (automated_test_status, code_review_status, review_protocol_status) =
         quality_statuses(test);
+    let progress = recovery_progress_at(project, chrono::Utc::now(), automatic_retry);
+    let background_retry_active = matches!(
+        progress.status,
+        RecoveryProgressStatus::Scheduled
+            | RecoveryProgressStatus::Running
+            | RecoveryProgressStatus::Warning
+            | RecoveryProgressStatus::Stalled
+    );
+    let background_retry_summary = match progress.status {
+        RecoveryProgressStatus::Scheduled => "后台重试已安排",
+        RecoveryProgressStatus::Running => "后台恢复动作进行中",
+        RecoveryProgressStatus::Warning => "后台恢复仍在运行，但业务进展延迟",
+        RecoveryProgressStatus::Stalled => "后台恢复动作已停滞，将在超时边界停止",
+        RecoveryProgressStatus::Inactive
+        | RecoveryProgressStatus::Queued
+        | RecoveryProgressStatus::WaitingHuman => "",
+    }
+    .to_string();
+    let code_impact_summary = baseline_impact_summary(project);
     RecoveryPresentation {
         presentation_version: RECOVERY_PRESENTATION_VERSION.to_string(),
         kind,
@@ -406,8 +554,15 @@ fn finish(
         decision_options,
         state_fingerprint,
         phase_label,
-        background_retry_active: automatic_retry,
+        background_retry_active,
         background_retry_summary,
+        progress_status: progress.status,
+        current_action: progress.current_action,
+        action_started_at: progress.action_started_at,
+        last_progress_at: progress.last_progress_at,
+        elapsed_seconds: progress.elapsed_seconds,
+        warning_at: progress.warning_at,
+        hard_deadline_at: progress.hard_deadline_at,
         post_action_expectation,
         stale_risk: sync_needed,
         sync_risk_summary,
@@ -492,6 +647,32 @@ fn baseline_reference(project: &Project) -> String {
     value.chars().take(12).collect()
 }
 
+fn baseline_impact_summary(project: &Project) -> String {
+    let Some(recovery) = project.workflow_state.recovery_state.as_ref() else {
+        return "执行基线恢复结果未记录。".to_string();
+    };
+    match recovery.baseline_status {
+        crate::project::RecoveryBaselineStatus::Unknown => {
+            "执行基线恢复结果未记录。".to_string()
+        }
+        crate::project::RecoveryBaselineStatus::NotRequired => {
+            "本轮恢复不需要恢复执行基线。".to_string()
+        }
+        crate::project::RecoveryBaselineStatus::Pending => {
+            "执行基线恢复尚未完成。".to_string()
+        }
+        crate::project::RecoveryBaselineStatus::Restored if recovery.baseline_stash_created => {
+            "未提交改动已暂存，工作区已恢复到执行基线。".to_string()
+        }
+        crate::project::RecoveryBaselineStatus::Restored => {
+            "工作区已恢复到执行基线。".to_string()
+        }
+        crate::project::RecoveryBaselineStatus::RestoreFailed => {
+            "执行基线恢复失败，需要人工检查工作区。".to_string()
+        }
+    }
+}
+
 fn validation_phase_label(project: &Project, test: Option<&crate::project::TestResult>) -> String {
     use crate::project::VerificationStage;
     let session_stage = project
@@ -517,10 +698,25 @@ fn validation_phase_label(project: &Project, test: Option<&crate::project::TestR
     .to_string()
 }
 
-fn heartbeat_status(project: &Project) -> String {
+fn heartbeat_status_at(project: &Project, now: chrono::DateTime<chrono::Utc>) -> String {
     let Some(autopilot) = project.workflow_state.autopilot_state.as_ref() else {
         return "未启动".to_string();
     };
+    let waiting_human = project
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .map(|state| state.phase == RecoveryPhase::WaitingHuman)
+        .unwrap_or(false)
+        || autopilot.run_status == crate::project::AutopilotRunStatus::ErrorStopped
+        || autopilot.recovery_action == AutopilotRecoveryAction::WaitHumanDecision;
+    if waiting_human {
+        return if autopilot.heartbeat_at.is_empty() {
+            "已停止".to_string()
+        } else {
+            format!("已停止，最后更新 {}", autopilot.heartbeat_at)
+        };
+    }
     if autopilot.heartbeat_at.is_empty() {
         return "未记录".to_string();
     }
@@ -529,7 +725,7 @@ fn heartbeat_status(project: &Project) -> String {
         .is_some_and(|heartbeat| {
             autopilot.active
                 && autopilot.run_status == crate::project::AutopilotRunStatus::Running
-                && chrono::Utc::now().signed_duration_since(heartbeat.with_timezone(&chrono::Utc))
+                && now.signed_duration_since(heartbeat.with_timezone(&chrono::Utc))
                     > chrono::Duration::seconds(15)
         });
     if stale {
@@ -537,6 +733,10 @@ fn heartbeat_status(project: &Project) -> String {
     } else {
         format!("正常，最后更新 {}", autopilot.heartbeat_at)
     }
+}
+
+fn heartbeat_status(project: &Project) -> String {
+    heartbeat_status_at(project, chrono::Utc::now())
 }
 
 fn quality_statuses(test: Option<&crate::project::TestResult>) -> (String, String, String) {
@@ -1311,7 +1511,10 @@ mod tests {
         );
         assert!(presentation.requires_baseline_restore);
         assert!(presentation.supports_preview);
-        assert_eq!(presentation.code_impact_summary, "恢复前将先展示影响范围。");
+        assert_eq!(
+            presentation.code_impact_summary,
+            "执行基线恢复结果未记录。"
+        );
     }
 
     #[test]
@@ -1378,7 +1581,8 @@ mod tests {
         );
         assert!(validation_view.automatic_retry);
         assert!(!validation_view.requires_baseline_restore);
-        assert_eq!(validation_view.background_retry_summary, "后台重试进行中");
+        assert!(!validation_view.background_retry_active);
+        assert!(validation_view.background_retry_summary.is_empty());
 
         let mut evidence = Project::new("evidence-recovery");
         evidence.workflow_state.recovery_state = Some(RecoveryState {
@@ -1527,5 +1731,170 @@ mod tests {
         assert_eq!(presentation.kind, RecoveryPresentationKind::None);
         assert!(presentation.primary_action.is_none());
         assert!(presentation.decision_options.is_empty());
+    }
+
+    #[test]
+    fn recovery_progress_truth_table_is_truthful() {
+        let now = chrono::Utc::now();
+        let recovery_state = |updated_at: String| RecoveryState {
+            phase: RecoveryPhase::Replanning,
+            error_kind: RecoveryErrorKind::PlanFailure,
+            subtask_id: "sub-1".to_string(),
+            updated_at,
+            ..RecoveryState::default()
+        };
+        let autopilot_state = || AutopilotState {
+            active: true,
+            run_status: crate::project::AutopilotRunStatus::Running,
+            recovery_action: AutopilotRecoveryAction::RunAutomaticRecovery,
+            ..AutopilotState::default()
+        };
+
+        let mut queued = Project::new("progress-queued");
+        queued.workflow_state.recovery_state =
+            Some(recovery_state((now - chrono::Duration::seconds(10)).to_rfc3339()));
+        queued.workflow_state.autopilot_state = Some(autopilot_state());
+        assert_eq!(
+            recovery_progress_at(&queued, now, true).status,
+            RecoveryProgressStatus::Queued
+        );
+        assert!(!present_recovery(&queued).background_retry_active);
+
+        let mut scheduled = queued.clone();
+        scheduled.name = "progress-scheduled".to_string();
+        scheduled
+            .workflow_state
+            .autopilot_state
+            .as_mut()
+            .expect("autopilot")
+            .next_retry_at = Some((now + chrono::Duration::seconds(60)).to_rfc3339());
+        assert_eq!(
+            recovery_progress_at(&scheduled, now, true).status,
+            RecoveryProgressStatus::Scheduled
+        );
+        assert!(present_recovery(&scheduled).background_retry_active);
+
+        let claimed_project = |name: &str, progress_age: i64, action_age: i64| {
+            let mut project = Project::new(name);
+            project.workflow_state.recovery_state = Some(recovery_state(
+                (now - chrono::Duration::seconds(progress_age)).to_rfc3339(),
+            ));
+            project.workflow_state.autopilot_state = Some(AutopilotState {
+                current_action_id: format!("{name}-claim"),
+                current_action_kind: "run_error_recovery".to_string(),
+                action_started_at: (now - chrono::Duration::seconds(action_age)).to_rfc3339(),
+                heartbeat_at: now.to_rfc3339(),
+                ..autopilot_state()
+            });
+            project
+        };
+
+        let running = claimed_project("progress-running", 10, 30);
+        let running_progress = recovery_progress_at(&running, now, true);
+        assert_eq!(running_progress.status, RecoveryProgressStatus::Running);
+        assert_eq!(running_progress.elapsed_seconds, Some(30));
+        assert!(running_progress.warning_at.is_some());
+        assert!(running_progress.hard_deadline_at.is_some());
+        assert!(present_recovery(&running).background_retry_active);
+
+        let warning = claimed_project("progress-warning", 91, 120);
+        assert_eq!(
+            recovery_progress_at(&warning, now, true).status,
+            RecoveryProgressStatus::Warning
+        );
+        assert!(present_recovery(&warning).background_retry_active);
+
+        let stalled = claimed_project("progress-stalled", 301, 400);
+        assert_eq!(
+            recovery_progress_at(&stalled, now, true).status,
+            RecoveryProgressStatus::Stalled
+        );
+        assert!(present_recovery(&stalled).background_retry_active);
+
+        let mut waiting = claimed_project("progress-waiting-human", 10, 30);
+        waiting.workflow_state.recovery_state = Some(RecoveryState {
+            phase: RecoveryPhase::WaitingHuman,
+            error_kind: RecoveryErrorKind::HumanRequired,
+            baseline_status: crate::project::RecoveryBaselineStatus::Unknown,
+            subtask_id: "sub-1".to_string(),
+            updated_at: now.to_rfc3339(),
+            ..RecoveryState::default()
+        });
+        let waiting_autopilot = waiting
+            .workflow_state
+            .autopilot_state
+            .as_mut()
+            .expect("autopilot");
+        waiting_autopilot.run_status = crate::project::AutopilotRunStatus::ErrorStopped;
+        waiting_autopilot.recovery_action = AutopilotRecoveryAction::WaitHumanDecision;
+        assert_eq!(
+            recovery_progress_at(&waiting, now, false).status,
+            RecoveryProgressStatus::WaitingHuman
+        );
+        let waiting_view = present_recovery(&waiting);
+        assert!(!waiting_view.background_retry_active);
+        assert!(waiting_view.heartbeat_status.starts_with("已停止"));
+        assert_eq!(
+            waiting_view.code_impact_summary,
+            "执行基线恢复结果未记录。"
+        );
+
+        let recovery = waiting
+            .workflow_state
+            .recovery_state
+            .as_mut()
+            .expect("recovery");
+        recovery.baseline_status = crate::project::RecoveryBaselineStatus::Restored;
+        recovery.baseline_stash_created = true;
+        assert_eq!(
+            present_recovery(&waiting).code_impact_summary,
+            "未提交改动已暂存，工作区已恢复到执行基线。"
+        );
+        waiting
+            .workflow_state
+            .recovery_state
+            .as_mut()
+            .expect("recovery")
+            .baseline_status = crate::project::RecoveryBaselineStatus::RestoreFailed;
+        assert_eq!(
+            present_recovery(&waiting).code_impact_summary,
+            "执行基线恢复失败，需要人工检查工作区。"
+        );
+
+        let inactive = present_recovery(&Project::new("progress-inactive"));
+        assert_eq!(inactive.progress_status, RecoveryProgressStatus::Inactive);
+        assert!(!inactive.background_retry_active);
+    }
+
+    #[test]
+    fn recovery_progress_dto_is_backward_compatible() {
+        let project = Project::new("recovery-progress-compatibility");
+        let presentation = present_recovery(&project);
+        let mut legacy = serde_json::to_value(&presentation).expect("serialize presentation");
+        let object = legacy.as_object_mut().expect("presentation object");
+        for field in [
+            "progress_status",
+            "current_action",
+            "action_started_at",
+            "last_progress_at",
+            "elapsed_seconds",
+            "warning_at",
+            "hard_deadline_at",
+        ] {
+            object.remove(field);
+        }
+
+        let restored: RecoveryPresentation =
+            serde_json::from_value(legacy).expect("legacy presentation remains readable");
+        assert_eq!(restored.progress_status, RecoveryProgressStatus::Inactive);
+        assert!(restored.current_action.is_none());
+        assert!(restored.action_started_at.is_none());
+        assert!(restored.last_progress_at.is_none());
+        assert!(restored.elapsed_seconds.is_none());
+        assert!(restored.warning_at.is_none());
+        assert!(restored.hard_deadline_at.is_none());
+
+        let current = serde_json::to_value(presentation).expect("serialize current presentation");
+        assert_eq!(current["progress_status"], "inactive");
     }
 }

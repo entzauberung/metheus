@@ -794,7 +794,11 @@ pub(crate) fn reconcile_stalled_recovery(
             StalledRecoveryDisposition::EnterHumanBoundary
         }
         crate::autopilot_runtime::RecoveryProgressGate::Stalled => {
-            StalledRecoveryDisposition::MarkStalled
+            if claimed {
+                StalledRecoveryDisposition::Wait
+            } else {
+                StalledRecoveryDisposition::MarkStalled
+            }
         }
         crate::autopilot_runtime::RecoveryProgressGate::Warning
         | crate::autopilot_runtime::RecoveryProgressGate::Running => {
@@ -855,8 +859,11 @@ pub(crate) fn apply_stalled_recovery_reconciliation(
                 crate::autopilot_runtime::RECOVERY_PROGRESS_STALLED_SECS
             );
             if let Some(state) = proj.workflow_state.recovery_state.as_mut() {
+                state.phase = project::RecoveryPhase::WaitingHuman;
+                state.error_kind = project::RecoveryErrorKind::HumanRequired;
                 state.last_repair_summary = truncate_chars(&message, 4_000);
                 state.updated_at = now.to_rfc3339();
+                state.next_validation_retry_at = None;
             }
             if let Some(ap) = proj.workflow_state.autopilot_state.as_mut() {
                 ap.current_action_id.clear();
@@ -871,7 +878,16 @@ pub(crate) fn apply_stalled_recovery_reconciliation(
             }
             write_recovery_history(
                 proj,
-                "warn",
+                "error",
+                project::ExecutionEventType::RecoveryStalled,
+                format!("RecoveryNoProgress：{}", message),
+                None,
+                None,
+                Some(recovery.subtask_id.as_str()),
+            );
+            write_recovery_history(
+                proj,
+                "error",
                 project::ExecutionEventType::RecoveryExhausted,
                 format!("RecoveryNoProgress：{}", message),
                 None,
@@ -4587,6 +4603,24 @@ mod tests {
             StalledRecoveryDisposition::Wait
         );
 
+        // A live owner may report stalled progress, but keeps its claim until
+        // the hard timeout so reconciliation cannot supersede the worker.
+        let stalled_claimed = StalledRecoveryInput {
+            phase: &project::RecoveryPhase::Repairing,
+            updated_at: "2026-08-11T11:54:30Z",
+            replan_execution_attempted: false,
+            next_validation_retry_at: None,
+            is_validation_recovery: false,
+            action_id: "live-stalled",
+            action_kind: "run_error_recovery",
+            action_started_at: "2026-08-11T11:50:00Z",
+            now,
+        };
+        assert_eq!(
+            reconcile_stalled_recovery(stalled_claimed),
+            StalledRecoveryDisposition::Wait
+        );
+
         // Apply path: MarkStalled mutates project and blocks auto claim
         let mut proj = project::Project::new("stalled-reconciliation");
         proj.workflow_state.autopilot_active = true;
@@ -4649,6 +4683,78 @@ mod tests {
                 .map(|r| r.phase.clone()),
             Some(project::RecoveryPhase::WaitingHuman)
         );
+    }
+
+    #[test]
+    fn stalled_recovery_enters_waiting_human_boundary() {
+        let now = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 8, 11, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let mut proj = project::Project::new("stalled-waiting-human");
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            run_status: project::AutopilotRunStatus::Running,
+            recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+            current_action_id: String::new(),
+            current_action_kind: String::new(),
+            action_started_at: String::new(),
+            next_retry_at: Some("2026-08-11T12:01:00Z".to_string()),
+            ..Default::default()
+        });
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            phase: project::RecoveryPhase::Replanning,
+            error_kind: project::RecoveryErrorKind::PlanFailure,
+            subtask_id: "sub-1".to_string(),
+            execution_id: "exec-1".to_string(),
+            updated_at: "2026-08-11T11:54:00Z".to_string(),
+            started_at: "2026-08-11T11:50:00Z".to_string(),
+            next_validation_retry_at: Some("2026-08-11T12:01:00Z".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            apply_stalled_recovery_reconciliation(&mut proj, now),
+            StalledRecoveryDisposition::MarkStalled
+        );
+
+        let recovery = proj
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .expect("recovery state");
+        assert_eq!(recovery.phase, project::RecoveryPhase::WaitingHuman);
+        assert_eq!(
+            recovery.error_kind,
+            project::RecoveryErrorKind::HumanRequired
+        );
+        assert!(recovery.next_validation_retry_at.is_none());
+
+        let autopilot = proj
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .expect("autopilot state");
+        assert_eq!(
+            autopilot.recovery_action,
+            project::AutopilotRecoveryAction::WaitHumanDecision
+        );
+        assert_eq!(
+            autopilot.run_status,
+            project::AutopilotRunStatus::ErrorStopped
+        );
+        assert!(autopilot.current_action_id.is_empty());
+        assert!(autopilot.current_action_kind.is_empty());
+        assert!(autopilot.action_started_at.is_empty());
+        assert!(autopilot.next_retry_at.is_none());
+        assert!(proj.execution_history.iter().any(|entry| {
+            entry.event_type == project::ExecutionEventType::RecoveryExhausted
+                && entry.subtask_id.as_deref() == Some("sub-1")
+        }));
+        assert!(proj.execution_history.iter().any(|entry| {
+            entry.event_type == project::ExecutionEventType::RecoveryStalled
+                && entry.subtask_id.as_deref() == Some("sub-1")
+        }));
     }
 
     #[test]

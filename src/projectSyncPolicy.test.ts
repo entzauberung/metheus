@@ -4,6 +4,7 @@ import {
   advanceProjectSyncCursor,
   mergePendingProjectEvent,
   projectSyncFallbackIntervalMs,
+  recoveryPresentationIsActive,
   shouldAcceptProjectStateEvent,
   shouldAcceptRuntimeSnapshot,
   shouldRequestRuntimeSnapshot,
@@ -120,6 +121,22 @@ describe("projectSyncPolicy", () => {
     expect(projectSyncFallbackIntervalMs("connected", "synced")).toBe(60_000);
     expect(projectSyncFallbackIntervalMs("reconnecting", "delayed")).toBe(15_000);
     expect(projectSyncFallbackIntervalMs("connected", "disconnected")).toBe(15_000);
+  });
+
+  it("bounds active recovery sync without changing normal or disconnected fallback", () => {
+    expect(projectSyncFallbackIntervalMs("connected", "synced", 60_000, true)).toBe(5_000);
+    expect(projectSyncFallbackIntervalMs("connected", "synced", 60_000, false)).toBe(60_000);
+    expect(projectSyncFallbackIntervalMs("reconnecting", "delayed", 60_000, true)).toBe(15_000);
+    expect(recoveryPresentationIsActive({
+      ...snapshot(1).recovery_presentation,
+      progress_status: "stalled",
+      background_retry_active: true,
+    })).toBe(true);
+    expect(recoveryPresentationIsActive({
+      ...snapshot(1).recovery_presentation,
+      progress_status: "waiting_human",
+      background_retry_active: false,
+    })).toBe(false);
   });
 
   it("rejects a snapshot older than the latest invalidation event", () => {

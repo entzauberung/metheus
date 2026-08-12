@@ -158,12 +158,66 @@ describe("AutopilotControlBar recovery presentation", () => {
     render(presentation("ValidationRetry", null, {
       title: "等待验证重试",
       automatic_retry: true,
+      progress_status: "scheduled",
       background_retry_active: true,
       background_retry_summary: "后台重试进行中",
+      next_retry_at: "2026-07-31T05:00:00Z",
     }));
     const buttons = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
     expect(host.textContent).toContain("后台重试进行中");
     expect(buttons).toEqual(["同步状态"]);
+  });
+
+  it.each([
+    ["inactive", "恢复未运行"],
+    ["queued", "自动恢复已排队"],
+    ["scheduled", "恢复重试已安排"],
+    ["running", "自动恢复执行中"],
+    ["warning", "恢复进展延迟"],
+    ["stalled", "恢复已停滞"],
+    ["waiting_human", "自动恢复已停止"],
+  ] as const)("renders structured %s recovery progress", (status, label) => {
+    render(presentation("AutomaticRecovery", null, {
+      severity: status === "stalled" || status === "waiting_human" ? "Error" : "Warning",
+      progress_status: status,
+      current_action: status === "running" || status === "warning" || status === "stalled"
+        ? "run_error_recovery"
+        : null,
+      action_started_at: "2026-07-31T04:55:00Z",
+      elapsed_seconds: 305,
+      last_progress_at: "2026-07-31T04:56:00Z",
+      hard_deadline_at: "2026-07-31T05:07:00Z",
+      next_retry_at: status === "scheduled" ? "2026-07-31T05:00:00Z" : null,
+      background_retry_active: ["scheduled", "running", "warning", "stalled"].includes(status),
+    }));
+
+    const bar = host.querySelector<HTMLElement>(".autopilot-control-bar");
+    const statusRegion = bar?.querySelector<HTMLElement>(".ap-bar-status-region");
+    expect(bar?.dataset.recoveryProgress).toBe(status);
+    expect(statusRegion?.textContent).toContain(label);
+    expect(statusRegion?.querySelector("svg")).not.toBeNull();
+    expect(statusRegion?.getAttribute("aria-label")).toBe("恢复进展");
+    expect(statusRegion?.getAttribute("aria-live")).toBe("polite");
+    expect(statusRegion?.getAttribute("aria-atomic")).toBe("true");
+    if (status === "stalled") {
+      expect(bar?.querySelector(".ap-bar-summary")?.textContent).toContain("恢复质量错误");
+      expect(bar?.querySelector(".ap-bar-detail-content")?.textContent).toContain("已持续：5 分 5 秒");
+      expect(bar?.querySelector(".ap-bar-detail-content")?.textContent).toContain("最后业务进展");
+      expect(bar?.querySelector(".ap-bar-detail-content")?.textContent).toContain("最迟终止");
+    }
+  });
+
+  it("uses a safe compatibility label for an old DTO without claiming background work", () => {
+    render(presentation("AutomaticRecovery", null, {
+      automatic_retry: true,
+      background_retry_active: true,
+      background_retry_summary: "后台重试进行中",
+    }));
+
+    expect(host.textContent).toContain("恢复进度未记录");
+    expect(host.textContent).not.toContain("后台重试进行中");
+    expect(host.querySelector<HTMLElement>(".autopilot-control-bar")?.dataset.recoveryProgress)
+      .toBe("unknown");
   });
 
   it("renders no recovery UI for None", () => {
@@ -191,7 +245,7 @@ describe("AutopilotControlBar recovery presentation", () => {
       .toEqual(["primary", "secondary", "overflow"]);
     expect(recoveryBar?.dataset.apState).toBe("Error");
     expect(recoveryBar?.querySelector(".ap-bar-summary")?.getAttribute("title"))
-      .toBe("GitReconfirmation 标题");
+      .toBe("进度未记录");
     expect(recoveryBar?.querySelector(".ap-bar-details")).not.toBeNull();
     expect(recoveryBar?.querySelector(".ap-bar-detail-content")?.textContent)
       .toContain("恢复诊断说明");

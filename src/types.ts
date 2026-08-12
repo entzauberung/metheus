@@ -478,6 +478,15 @@ export interface RecoveryDecisionOption {
   preview_message?: string;
 }
 
+export type RecoveryProgressStatus =
+  | "inactive"
+  | "queued"
+  | "scheduled"
+  | "running"
+  | "warning"
+  | "stalled"
+  | "waiting_human";
+
 export interface RecoveryPresentation {
   presentation_version?: string;
   kind: RecoveryPresentationKind;
@@ -496,6 +505,13 @@ export interface RecoveryPresentation {
   phase_label?: string;
   background_retry_active?: boolean;
   background_retry_summary?: string;
+  progress_status?: RecoveryProgressStatus;
+  current_action?: string | null;
+  action_started_at?: string | null;
+  last_progress_at?: string | null;
+  elapsed_seconds?: number | null;
+  warning_at?: string | null;
+  hard_deadline_at?: string | null;
   post_action_expectation?: string;
   stale_risk?: boolean;
   sync_risk_summary?: string;
@@ -1647,6 +1663,8 @@ export type ExecutionEventType =
   | "EvidenceRebuildStarted"
   | "EvidenceRebuildCompleted"
   | "EvidenceStillInsufficient"
+  | "RecoveryWarning"
+  | "RecoveryStalled"
   | "RecoverySucceeded"
   | "RecoveryExhausted"
   | "ReviewRequested"

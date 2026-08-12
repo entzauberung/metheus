@@ -13,6 +13,7 @@ import {
   mergePendingProjectEvent,
   PROJECT_SYNC_CONNECTED_FALLBACK_MS,
   projectSyncFallbackIntervalMs,
+  recoveryPresentationIsActive,
   shouldAcceptProjectStateEvent,
   shouldAcceptRuntimeSnapshot,
   shouldRequestRuntimeSnapshot,
@@ -131,6 +132,7 @@ export function useProjectStateSync({
   transport = defaultTransport,
 }: UseProjectStateSyncOptions): ProjectStateSyncController {
   const [state, setState] = useState<ProjectSyncState>(initialState);
+  const [activeRecovery, setActiveRecovery] = useState(false);
   const scopeRef = useRef({ generation: 0, projectName: "", enabled: false });
   const cursorRef = useRef<ProjectSyncCursor>({
     projectName: "",
@@ -221,6 +223,7 @@ export function useProjectStateSync({
                 snapshot.task_control_mode,
               );
               pendingEventRef.current = null;
+              setActiveRecovery(recoveryPresentationIsActive(snapshot.recovery_presentation));
               onSnapshotRef.current(snapshot);
               latest = snapshot;
               setState(current => {
@@ -366,6 +369,7 @@ export function useProjectStateSync({
     completedSyncRef.current = 0;
     subscriptionIdRef.current = "";
     setState(initialState);
+    setActiveRecovery(false);
     if (!enabled || !projectName) return;
 
     let cancelled = false;
@@ -439,12 +443,20 @@ export function useProjectStateSync({
       state.subscriptionStatus,
       state.status,
       fallbackIntervalMs,
+      activeRecovery,
     );
     const fallbackTimer = setInterval(() => {
       void syncNowRef.current();
     }, intervalMs);
     return () => clearInterval(fallbackTimer);
-  }, [enabled, fallbackIntervalMs, projectName, state.status, state.subscriptionStatus]);
+  }, [
+    activeRecovery,
+    enabled,
+    fallbackIntervalMs,
+    projectName,
+    state.status,
+    state.subscriptionStatus,
+  ]);
 
   useEffect(() => {
     const previous = previousIncludeTaskControlSnapshotRef.current;

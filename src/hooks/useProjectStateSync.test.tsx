@@ -217,6 +217,58 @@ describe("useProjectStateSync", () => {
     expect(getSnapshot).toHaveBeenCalledTimes(2);
   });
 
+  it("switches active recovery fallback to five seconds and restores sixty seconds at WaitingHuman", async () => {
+    const active = snapshot("alpha", 0, "recovery-stalled");
+    active.recovery_presentation = {
+      ...recovery("recovery-stalled"),
+      progress_status: "stalled",
+      background_retry_active: true,
+      current_action: "run_error_recovery",
+    };
+    const waitingHuman = snapshot("alpha", 1, "recovery-waiting-human");
+    waitingHuman.recovery_presentation = {
+      ...recovery("recovery-waiting-human"),
+      progress_status: "waiting_human",
+      background_retry_active: false,
+      current_action: null,
+    };
+    getSnapshot
+      .mockResolvedValueOnce(active)
+      .mockResolvedValueOnce(waitingHuman)
+      .mockResolvedValue(snapshot("alpha", 2, "recovery-waiting-human"));
+
+    render("alpha");
+    await flush();
+
+    await act(async () => {
+      vi.advanceTimersByTime(4_999);
+      await Promise.resolve();
+    });
+    expect(getSnapshot).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(1);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getSnapshot).toHaveBeenCalledTimes(2);
+    expect(lastAppliedSnapshot()?.recovery_presentation.progress_status)
+      .toBe("waiting_human");
+
+    await act(async () => {
+      vi.advanceTimersByTime(59_999);
+      await Promise.resolve();
+    });
+    expect(getSnapshot).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      vi.advanceTimersByTime(1);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getSnapshot).toHaveBeenCalledTimes(3);
+  });
+
   it("requests a same-cursor detailed snapshot only while the inspector asks for it", async () => {
     getSnapshot.mockImplementation(async (_projectName: string, includeDetail: boolean) => {
       const next = snapshot("alpha", 0);

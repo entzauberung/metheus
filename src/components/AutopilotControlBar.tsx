@@ -32,6 +32,7 @@ import {
   compactAutopilotSummary,
   partitionAutopilotActions,
   resolveAutopilotRuntimePresentation,
+  resolveRecoveryBarProgress,
   resolveManagedActionSlots,
   type AutopilotActionId,
   type AutopilotActionSlots,
@@ -99,6 +100,8 @@ interface AutopilotBarShellProps {
   actions: AutopilotActionSlots<ReactNode>;
   recoveryKind?: string;
   recoveryFingerprint?: string;
+  recoveryProgress?: string;
+  statusAriaLabel?: string;
 }
 
 function AutopilotBarActionSlots({ actions }: { actions: AutopilotActionSlots<ReactNode> }) {
@@ -143,6 +146,8 @@ function AutopilotBarShell({
   actions,
   recoveryKind,
   recoveryFingerprint,
+  recoveryProgress,
+  statusAriaLabel = "自动驾驶状态",
 }: AutopilotBarShellProps) {
   return (
     <div
@@ -152,8 +157,17 @@ function AutopilotBarShell({
       data-detail-layout="flow-bounded"
       data-recovery-kind={recoveryKind}
       data-recovery-fingerprint={recoveryFingerprint}
+      data-recovery-progress={recoveryProgress}
     >
-      <div className="ap-bar-status-region" role="status" aria-label="自动驾驶状态">{status}</div>
+      <div
+        className="ap-bar-status-region"
+        role="status"
+        aria-label={statusAriaLabel}
+        aria-live="polite"
+        aria-atomic="true"
+      >
+        {status}
+      </div>
       <div className="ap-bar-summary-region" role="group" aria-label="执行摘要">
         <span className="ap-bar-summary" title={summary}>{summary}</span>
         {details && (
@@ -175,6 +189,33 @@ function formatStateTime(value: string | undefined): string {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
   return parsed.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function formatElapsedSeconds(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "";
+  const seconds = Math.max(0, Math.floor(value));
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return remainder > 0 ? `${minutes} 分 ${remainder} 秒` : `${minutes} 分`;
+}
+
+function recoveryProgressIcon(status: ReturnType<typeof resolveRecoveryBarProgress>["status"]) {
+  switch (status) {
+    case "queued":
+    case "scheduled":
+      return <Clock3 size={16} aria-hidden="true" />;
+    case "running":
+      return <Activity size={16} aria-hidden="true" />;
+    case "warning":
+    case "stalled":
+      return <AlertTriangle size={16} aria-hidden="true" />;
+    case "waiting_human":
+      return <Square size={15} aria-hidden="true" />;
+    case "inactive":
+    case "unknown":
+      return <FileQuestion size={16} aria-hidden="true" />;
+  }
 }
 
 export function AutopilotControlBar({
@@ -286,10 +327,31 @@ export function AutopilotControlBar({
   };
 
   if (recovery) {
+    const progress = resolveRecoveryBarProgress(recovery);
+    const recoveryAction = recovery.current_action
+      ? AUTOPILOT_ACTION_LABELS[recovery.current_action] ?? recovery.current_action
+      : "";
+    const elapsed = formatElapsedSeconds(recovery.elapsed_seconds);
+    const lastProgressAt = formatStateTime(recovery.last_progress_at ?? undefined);
+    const nextRecoveryAt = formatStateTime(
+      recovery.next_validation_retry_at ?? recovery.next_retry_at ?? undefined,
+    );
+    const progressHasBackground = recovery.background_retry_active === true && (
+      progress.status === "scheduled"
+      || progress.status === "running"
+      || progress.status === "warning"
+      || progress.status === "stalled"
+    );
     const recoverySummary = compactAutopilotSummary([
       recovery.affected_task_label ? `任务：${recovery.affected_task_label}` : null,
-      recovery.phase_label ? `阶段：${recovery.phase_label}` : null,
-    ], recovery.title || "需要处理恢复状态");
+      progress.summary,
+      recoveryAction ? `动作：${recoveryAction}` : null,
+      elapsed ? `已持续：${elapsed}` : null,
+      progress.status === "scheduled" && nextRecoveryAt ? `下次重试：${nextRecoveryAt}` : null,
+      (progress.status === "warning" || progress.status === "stalled") && lastProgressAt
+        ? `最后进展：${lastProgressAt}`
+        : null,
+    ], progress.summary);
     const recoverySecondaryActions: ReactNode[] = [];
     for (const action of recovery.secondary_actions) {
       const rendered = renderRecoveryAction(action, false);
@@ -299,15 +361,22 @@ export function AutopilotControlBar({
       recovery.primary_action ? renderRecoveryAction(recovery.primary_action, true) : null,
       recoverySecondaryActions,
     );
+    const recoveryIsError = progress.tone === "error"
+      || (progress.status === "unknown" && recovery.severity === "Error");
     return (
       <>
         <AutopilotBarShell
-          state={recovery.severity === "Error" ? "Error" : "Recovery"}
-          className={recovery.severity === "Error" ? "ap-error" : ""}
+          state={recoveryIsError ? "Error" : "Recovery"}
+          className={recoveryIsError ? "ap-error" : ""}
           recoveryKind={recovery.kind}
           recoveryFingerprint={recovery.state_fingerprint}
+          recoveryProgress={progress.status}
+          statusAriaLabel="恢复进展"
           status={(
-            <span className="ap-bar-status"><AlertTriangle size={16} /> {recovery.title}</span>
+            <span className="ap-bar-status">
+              {recoveryProgressIcon(progress.status)}
+              {progress.statusLabel}
+            </span>
           )}
           summary={recoverySummary}
           details={(
@@ -315,6 +384,25 @@ export function AutopilotControlBar({
             {recovery.reason && <span className="ap-bar-error" title={recovery.reason}>{recovery.reason}</span>}
             {recovery.affected_task_label && <span className="ap-bar-target">任务：{recovery.affected_task_label}</span>}
             {recovery.phase_label && <span className="ap-bar-action">阶段：{recovery.phase_label}</span>}
+            {recoveryAction && <span className="ap-bar-action ap-recovery-fact">动作：{recoveryAction}</span>}
+            {recovery.action_started_at && (
+              <span className="ap-bar-target">开始：{formatStateTime(recovery.action_started_at)}</span>
+            )}
+            {elapsed && <span className="ap-bar-target">已持续：{elapsed}</span>}
+            {lastProgressAt && <span className="ap-bar-target">最后业务进展：{lastProgressAt}</span>}
+            {recovery.warning_at && (
+              <span className="ap-bar-warning ap-recovery-fact">
+                进展警告时间：{formatStateTime(recovery.warning_at)}
+              </span>
+            )}
+            {recovery.hard_deadline_at && (
+              <span className="ap-bar-warning ap-recovery-fact">
+                最迟终止：{formatStateTime(recovery.hard_deadline_at)}
+              </span>
+            )}
+            {progress.status === "scheduled" && nextRecoveryAt && (
+              <span className="ap-bar-action ap-recovery-fact">下次重试：{nextRecoveryAt}</span>
+            )}
             {recovery.validation_phase_label && <span className="ap-bar-action">验证：{recovery.validation_phase_label}</span>}
             {recovery.retry_count !== undefined && recovery.retry_count > 0 && (
               <span className="ap-bar-warning">
@@ -346,7 +434,7 @@ export function AutopilotControlBar({
             {recovery.code_impact_summary && (
               <span className="ap-bar-warning">{recovery.code_impact_summary}</span>
             )}
-            {recovery.background_retry_summary && (
+            {progressHasBackground && recovery.background_retry_summary && (
               <span className="ap-bar-action">{recovery.background_retry_summary}</span>
             )}
             {recovery.post_action_expectation && (

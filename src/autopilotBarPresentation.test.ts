@@ -1,11 +1,43 @@
 import { describe, expect, it } from "vitest";
 import {
   partitionAutopilotActions,
+  resolveRecoveryBarProgress,
   resolveAutopilotRuntimePresentation,
   resolveManagedActionSlots,
 } from "./autopilotBarPresentation";
 
 describe("autopilot bar presentation", () => {
+  it.each([
+    ["inactive", "恢复未运行", "当前没有恢复动作", "neutral"],
+    ["queued", "自动恢复已排队", "等待恢复 worker 领取", "active"],
+    ["scheduled", "恢复重试已安排", "等待计划重试", "active"],
+    ["running", "自动恢复执行中", "恢复动作正在执行", "active"],
+    ["warning", "恢复进展延迟", "worker 存活，但业务进展延迟", "warning"],
+    ["stalled", "恢复已停滞", "等待后端有界超时收口", "error"],
+    ["waiting_human", "自动恢复已停止", "等待人工处理", "error"],
+  ] as const)("maps %s recovery progress without parsing title or reason", (
+    status,
+    statusLabel,
+    summary,
+    tone,
+  ) => {
+    const view = resolveRecoveryBarProgress({
+      progress_status: status,
+      title: "不可用于推断",
+      reason: "不可用于推断",
+    } as never);
+    expect(view).toEqual({ status, statusLabel, summary, tone });
+  });
+
+  it("uses a neutral compatibility state for an old recovery DTO", () => {
+    expect(resolveRecoveryBarProgress({ title: "自动恢复中" } as never)).toEqual({
+      status: "unknown",
+      statusLabel: "恢复进度未记录",
+      summary: "进度未记录",
+      tone: "neutral",
+    });
+  });
+
   it("keeps Running in one primary slot with a low-volatility summary", () => {
     const view = resolveAutopilotRuntimePresentation("Running", false, "交付设置体验");
     expect(view).toEqual({

@@ -205,6 +205,67 @@ describe("TaskConsole task navigation", () => {
     expect(entry?.getAttribute("data-log-category")).toBe("info");
   });
 
+  it("labels backend recovery milestones without changing source, level, or text", () => {
+    const history = [
+      ["ReplanStarted", "info", "开始受限重规划"],
+      ["RecoveryWarning", "pause", "业务进展超过九十秒未更新"],
+      ["RecoveryStalled", "error", "业务进展超过五分钟未更新"],
+      ["RecoveryExhausted", "error", "恢复动作已达到有界终止条件，需要人工处理这段很长的原因"],
+      ["Recovered", "success", "恢复完成并继续执行"],
+    ].map(([event_type, level, text], index) => ({
+      timestamp: `2026-08-11T12:00:0${index}Z`,
+      level,
+      event_type,
+      source: "Recovery",
+      text,
+      subtask_id: "sub-1",
+    })) as unknown as ExecutionHistoryEntry[];
+    act(() => root.render(
+      <TaskConsole
+        projectPath="/tmp/project"
+        executionStatus={null}
+        executionHistory={history}
+        testLogs={[]}
+      />,
+    ));
+
+    expect([...host.querySelectorAll(".execution-log-event")].map(entry => entry.textContent))
+      .toEqual([
+        "恢复重规划开始",
+        "恢复进展警告",
+        "恢复已停滞",
+        "自动恢复已停止",
+        "自动恢复完成",
+      ]);
+    const exhausted = host.querySelector<HTMLElement>(
+      "[data-execution-event='RecoveryExhausted']",
+    )?.closest(".execution-log-entry");
+    expect(exhausted?.classList.contains("log-error")).toBe(true);
+    expect(exhausted?.textContent).toContain("恢复器");
+    expect(exhausted?.textContent).toContain("需要人工处理这段很长的原因");
+    expect(host.textContent).not.toContain("RecoveryNoProgress");
+  });
+
+  it("labels the current RecoverySucceeded event as recovered", () => {
+    act(() => root.render(
+      <TaskConsole
+        projectPath="/tmp/project"
+        executionStatus={null}
+        executionHistory={[{
+          timestamp: "2026-08-11T12:00:00Z",
+          level: "success",
+          event_type: "RecoverySucceeded",
+          source: "Recovery",
+          text: "自动恢复完成",
+        }]}
+        testLogs={[]}
+      />,
+    ));
+
+    expect(host.querySelector("[data-execution-event='RecoverySucceeded']")?.textContent)
+      .toBe("自动恢复完成");
+  });
+
   it("filters test source independently and restores an empty selection from All", () => {
     const history: ExecutionHistoryEntry[] = [
       {

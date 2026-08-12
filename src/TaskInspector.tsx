@@ -1,9 +1,11 @@
 import * as Tabs from "@radix-ui/react-tabs";
 import {
   Activity,
+  AlertTriangle,
   CheckCircle2,
   ClipboardList,
   Coins,
+  Square,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import AcceptanceLedgerPanel from "./AcceptanceLedgerPanel";
@@ -11,6 +13,7 @@ import ControlDecisionPanel from "./ControlDecisionPanel";
 import TaskContractPanel from "./TaskContractPanel";
 import TaskCostPanel from "./TaskCostPanel";
 import TaskInspectorHeader from "./TaskInspectorHeader";
+import { resolveRecoveryBarProgress } from "./autopilotBarPresentation";
 import { findProjectSubtaskById } from "./taskTreePolicy";
 import type { TaskSelectionMode } from "./taskSelectionPolicy";
 import type {
@@ -51,6 +54,22 @@ const EMPTY_COST = {
   effective_calls: 0,
   no_progress_calls: 0,
 };
+
+function formatRecoveryTime(value: string | null | undefined): string {
+  if (!value) return "未记录";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString();
+}
+
+function formatRecoveryElapsed(value: number | null | undefined): string {
+  if (value === null || value === undefined) return "未记录";
+  const seconds = Math.max(0, Math.floor(value));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  if (minutes === 0) return `${remainder} 秒`;
+  return remainder > 0 ? `${minutes} 分 ${remainder} 秒` : `${minutes} 分`;
+}
 
 export default function TaskInspector({
   project,
@@ -98,6 +117,7 @@ export default function TaskInspector({
   ));
   const isCurrentTask = !!selectedNode && selectedNode.id === snapshot?.current_task_id;
   const recovery = recoveryPresentation?.kind !== "None" ? recoveryPresentation : null;
+  const recoveryProgress = recovery ? resolveRecoveryBarProgress(recovery) : null;
   const snapshotStale = !!snapshot
     && expectedEventSequence > 0
     && snapshot.source_event_sequence < expectedEventSequence;
@@ -238,15 +258,42 @@ export default function TaskInspector({
               <p className="task-control-muted">当前任务没有活动恢复流程。</p>
             ) : (
               <dl className="task-recovery-details">
-                <div><dt>状态</dt><dd>{recovery.title}</dd></div>
-                {recovery.phase_label && <div><dt>阶段</dt><dd>{recovery.phase_label}</dd></div>}
+                <div data-recovery-progress={recoveryProgress?.status}>
+                  <dt>进度</dt>
+                  <dd className="task-recovery-status">
+                    {recoveryProgress?.status === "stalled"
+                      || recoveryProgress?.status === "warning"
+                      ? <AlertTriangle size={14} aria-hidden="true" />
+                      : recoveryProgress?.status === "waiting_human"
+                        ? <Square size={13} aria-hidden="true" />
+                        : <Activity size={14} aria-hidden="true" />}
+                    {recoveryProgress?.statusLabel ?? "恢复进度未记录"}
+                  </dd>
+                </div>
+                <div><dt>恢复类型</dt><dd>{recovery.title || "未记录"}</dd></div>
+                <div><dt>阶段</dt><dd>{recovery.phase_label || "未记录"}</dd></div>
                 {recovery.validation_phase_label && <div><dt>验证</dt><dd>{recovery.validation_phase_label}</dd></div>}
-                <div><dt>原因</dt><dd>{recovery.reason}</dd></div>
+                <div><dt>原因</dt><dd>{recovery.reason || "未记录"}</dd></div>
                 {recovery.affected_task_label && <div><dt>任务</dt><dd>{recovery.affected_task_label}</dd></div>}
-                {recovery.background_retry_summary && <div><dt>后台重试</dt><dd>{recovery.background_retry_summary}</dd></div>}
+                <div><dt>动作</dt><dd>{recovery.current_action || "未记录"}</dd></div>
+                <div><dt>开始时间</dt><dd>{formatRecoveryTime(recovery.action_started_at)}</dd></div>
+                <div><dt>已持续</dt><dd>{formatRecoveryElapsed(recovery.elapsed_seconds)}</dd></div>
+                <div><dt>最后业务进展</dt><dd>{formatRecoveryTime(recovery.last_progress_at)}</dd></div>
+                <div><dt>进展警告</dt><dd>{formatRecoveryTime(recovery.warning_at)}</dd></div>
+                <div><dt>最迟终止</dt><dd>{formatRecoveryTime(recovery.hard_deadline_at)}</dd></div>
+                <div>
+                  <dt>下一重试</dt>
+                  <dd>{formatRecoveryTime(
+                    recovery.next_validation_retry_at ?? recovery.next_retry_at,
+                  )}</dd>
+                </div>
+                <div><dt>基线</dt><dd>{recovery.code_impact_summary || "未记录"}</dd></div>
+                {recovery.background_retry_active && recovery.background_retry_summary && (
+                  <div><dt>后台重试</dt><dd>{recovery.background_retry_summary}</dd></div>
+                )}
                 {(recovery.retry_limit ?? 0) > 0 && <div><dt>重试计数</dt><dd>{recovery.retry_count}/{recovery.retry_limit}</dd></div>}
                 {(recovery.validation_retry_limit ?? 0) > 0 && <div><dt>验证重试</dt><dd>{recovery.validation_retry_count}/{recovery.validation_retry_limit}</dd></div>}
-                {recovery.heartbeat_status && <div><dt>心跳</dt><dd>{recovery.heartbeat_status}</dd></div>}
+                <div><dt>心跳</dt><dd>{recovery.heartbeat_status || "未记录"}</dd></div>
                 {recovery.control_action_description && <div><dt>控制占用</dt><dd>{recovery.control_action_description}</dd></div>}
                 {recovery.kind === "ControlActionOccupied" && <div><dt>已持续</dt><dd>{recovery.control_action_elapsed_seconds ?? 0} 秒</dd></div>}
                 {recovery.control_lock_failure_reason && <div><dt>失效原因</dt><dd>{recovery.control_lock_failure_reason}</dd></div>}

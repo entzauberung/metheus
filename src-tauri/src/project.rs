@@ -3039,6 +3039,10 @@ pub enum ExecutionEventType {
     ReplanStarted,
     ReplanCompleted,
     ReplanExecutionStarted,
+    /// 恢复 worker 存活但业务进展超过警告阈值未更新
+    RecoveryWarning,
+    /// 恢复 worker 存活但业务进展超过停滞阈值未更新
+    RecoveryStalled,
     RecoverySucceeded,
     RecoveryExhausted,
     ReviewRequested,
