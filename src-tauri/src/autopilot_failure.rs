@@ -118,4 +118,14 @@ mod tests {
             assert!(!is_transient(&failure));
         }
     }
+
+    #[test]
+    fn output_truncated_is_permanent_not_transport_retry() {
+        // Permanent means no 1/3 transport/transient backoff. Automatic recovery still
+        // proceeds via RunAutomaticRecovery + Replanning (current-subtask replan only).
+        let failure = from_engine_failure(&project::EngineFailureKind::OutputTruncated);
+        assert_eq!(failure, project::AutopilotFailureKind::Permanent);
+        assert!(!is_transient(&failure));
+        assert_eq!(retry_delay_secs(1), Some(5)); // schedule exists for true transients only
+    }
 }

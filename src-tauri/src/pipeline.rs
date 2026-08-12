@@ -1327,21 +1327,27 @@ async fn finalize_background_execution_failure(
         failure.execution_result.clone(),
         failure.kind != project::RecoveryErrorKind::StateConflict,
     );
-    let effective_message = if engine_blocked {
+    let baseline_outcome = if engine_blocked {
         let target = if baseline.is_empty() {
             "HEAD"
         } else {
             &baseline
         };
-        match restore_git_execution_baseline(&proj.project_path, target) {
-            Ok(()) => format!("{}；执行引擎阻断后已恢复任务基线", failure.message),
-            Err(error) => format!(
-                "{}；执行引擎阻断后恢复任务基线失败：{}",
-                failure.message, error
-            ),
-        }
+        Some(restore_git_execution_baseline(&proj.project_path, target))
     } else {
-        failure.message.clone()
+        None
+    };
+    let effective_message = match baseline_outcome.as_ref() {
+        Some(Ok(outcome)) => format!(
+            "{}；执行引擎阻断后已恢复任务基线（{}）",
+            failure.message, outcome.target_summary
+        ),
+        Some(Err(outcome)) => format!(
+            "{}；执行引擎阻断后恢复任务基线失败：{}",
+            failure.message,
+            outcome.error_message()
+        ),
+        None => failure.message.clone(),
     };
     crate::recovery::begin_execution_recovery(
         &mut proj,
@@ -1360,6 +1366,14 @@ async fn finalize_background_execution_failure(
         recovery.engine_failure_kind = failure.engine_failure_kind.clone();
         if let Some((_, phase)) = engine_boundary.as_ref() {
             recovery.phase = phase.clone();
+        }
+        match baseline_outcome.as_ref() {
+            Some(Ok(outcome)) | Some(Err(outcome)) => {
+                apply_baseline_restore_outcome(recovery, outcome);
+            }
+            None => {
+                recovery.baseline_status = project::RecoveryBaselineStatus::NotRequired;
+            }
         }
     }
     if engine_blocked {
@@ -1399,10 +1413,14 @@ async fn finalize_background_execution_failure(
                 autopilot.next_retry_at = None;
                 if failure.engine_failure_kind == Some(project::EngineFailureKind::OutputTruncated)
                 {
+                    // Single entry only: current-subtask replan via run_error_recovery.
+                    // Never set RegenerateExecutionPlan (whole-stage plan regen is illegal here).
+                    // Permanent failure facts stay; transport/transient retry stays 0/3.
+                    autopilot.run_status = project::AutopilotRunStatus::Running;
                     autopilot.last_action =
                         "内置执行续执行后仍被截断，正在进入受限重规划".to_string();
                     autopilot.recovery_action =
-                        project::AutopilotRecoveryAction::RegenerateExecutionPlan;
+                        project::AutopilotRecoveryAction::RunAutomaticRecovery;
                 } else {
                     autopilot.last_action =
                         if crate::autopilot_failure::is_transient(&autopilot.last_failure_kind) {
@@ -2860,7 +2878,12 @@ pub(crate) async fn retry_current_subtask(
         .or(last_passed_tag)
         .unwrap_or_else(|| "HEAD".to_string());
     restore_git_execution_baseline(&project_path, &restore_target)
-        .map_err(|error| format!("Git 基线恢复失败：{}。失败证据已保留。", error))?;
+        .map_err(|outcome| {
+            format!(
+                "Git 基线恢复失败：{}。失败证据已保留。",
+                outcome.error_message()
+            )
+        })?;
 
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -3406,26 +3429,110 @@ fn get_execution_workspace_status_for_project(
 // V1 暂停与回退命令
 // ===================================================================
 
+/// Structured baseline restore facts. Never includes stash contents or secrets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BaselineRestoreOutcome {
+    pub status: project::RecoveryBaselineStatus,
+    pub target_summary: String,
+    pub stash_created: bool,
+    pub error: Option<String>,
+}
+
+impl BaselineRestoreOutcome {
+    pub(crate) fn is_restored(&self) -> bool {
+        self.status == project::RecoveryBaselineStatus::Restored
+    }
+
+    pub(crate) fn error_message(&self) -> String {
+        self.error
+            .clone()
+            .unwrap_or_else(|| "基线恢复失败".to_string())
+    }
+
+    pub(crate) fn into_unit_result(self) -> Result<(), String> {
+        if self.is_restored() {
+            Ok(())
+        } else {
+            Err(self.error_message())
+        }
+    }
+}
+
+pub(crate) fn summarize_baseline_target(target: &str) -> String {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return "HEAD".to_string();
+    }
+    let looks_like_full_sha = trimmed.len() >= 40
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit());
+    if looks_like_full_sha {
+        trimmed.chars().take(12).collect()
+    } else {
+        trimmed.chars().take(64).collect()
+    }
+}
+
+pub(crate) fn apply_baseline_restore_outcome(
+    recovery: &mut project::RecoveryState,
+    outcome: &BaselineRestoreOutcome,
+) {
+    recovery.baseline_status = outcome.status.clone();
+    recovery.baseline_target_summary = outcome.target_summary.clone();
+    recovery.baseline_stash_created = outcome.stash_created;
+}
+
+fn baseline_failed(
+    target_summary: &str,
+    stash_created: bool,
+    error: String,
+) -> BaselineRestoreOutcome {
+    BaselineRestoreOutcome {
+        status: project::RecoveryBaselineStatus::RestoreFailed,
+        target_summary: target_summary.to_string(),
+        stash_created,
+        error: Some(error),
+    }
+}
+
+/// Restore execution baseline with stash-include-untracked then reset --hard.
+/// Returns structured Restored/RestoreFailed facts; never returns stash contents.
 pub(crate) fn restore_git_execution_baseline(
     project_path: &str,
     target: &str,
-) -> Result<(), String> {
-    let status_output = std::process::Command::new("git")
+) -> Result<BaselineRestoreOutcome, BaselineRestoreOutcome> {
+    let target_summary = summarize_baseline_target(target);
+    let status_output = match std::process::Command::new("git")
         .args(["status", "--porcelain", "--untracked-files=all"])
         .current_dir(project_path)
         .output()
-        .map_err(|error| format!("git status 失败：{}", error))?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(baseline_failed(
+                &target_summary,
+                false,
+                format!("git status 失败：{}", error),
+            ));
+        }
+    };
     if !status_output.status.success() {
-        return Err(format!(
-            "git status 失败：{}",
-            String::from_utf8_lossy(&status_output.stderr).trim()
+        return Err(baseline_failed(
+            &target_summary,
+            false,
+            format!(
+                "git status 失败：{}",
+                String::from_utf8_lossy(&status_output.stderr).trim()
+            ),
         ));
     }
     let has_changes = !String::from_utf8_lossy(&status_output.stdout)
         .trim()
         .is_empty();
+    let mut stash_created = false;
     if has_changes {
-        let stash_output = std::process::Command::new("git")
+        let stash_output = match std::process::Command::new("git")
             .args([
                 "stash",
                 "push",
@@ -3435,52 +3542,104 @@ pub(crate) fn restore_git_execution_baseline(
             ])
             .current_dir(project_path)
             .output()
-            .map_err(|error| format!("git stash 失败：{}", error))?;
+        {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(baseline_failed(
+                    &target_summary,
+                    false,
+                    format!("git stash 失败：{}", error),
+                ));
+            }
+        };
         if !stash_output.status.success() {
-            return Err(format!(
-                "git stash 失败：{}",
-                String::from_utf8_lossy(&stash_output.stderr).trim()
+            return Err(baseline_failed(
+                &target_summary,
+                false,
+                format!(
+                    "git stash 失败：{}",
+                    String::from_utf8_lossy(&stash_output.stderr).trim()
+                ),
             ));
         }
+        stash_created = true;
     }
 
-    let reset_output = std::process::Command::new("git")
+    let reset_output = match std::process::Command::new("git")
         .args(["reset", "--hard", target])
         .current_dir(project_path)
         .output()
-        .map_err(|error| format!("git reset --hard {} 失败：{}", target, error))?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(baseline_failed(
+                &target_summary,
+                stash_created,
+                format!("git reset --hard {} 失败：{}", target_summary, error),
+            ));
+        }
+    };
     if !reset_output.status.success() {
         let reset_error = String::from_utf8_lossy(&reset_output.stderr)
             .trim()
             .to_string();
-        if has_changes {
-            let pop_output = std::process::Command::new("git")
+        if stash_created {
+            let pop_output = match std::process::Command::new("git")
                 .args(["stash", "pop"])
                 .current_dir(project_path)
                 .output()
-                .map_err(|error| {
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    return Err(baseline_failed(
+                        &target_summary,
+                        stash_created,
+                        format!(
+                            "回退到 {} 失败：{}；恢复安全暂存也失败：{}",
+                            target_summary, reset_error, error
+                        ),
+                    ));
+                }
+            };
+            if !pop_output.status.success() {
+                return Err(baseline_failed(
+                    &target_summary,
+                    stash_created,
                     format!(
                         "回退到 {} 失败：{}；恢复安全暂存也失败：{}",
-                        target, reset_error, error
-                    )
-                })?;
-            if !pop_output.status.success() {
-                return Err(format!(
-                    "回退到 {} 失败：{}；恢复安全暂存也失败：{}",
-                    target,
-                    reset_error,
-                    String::from_utf8_lossy(&pop_output.stderr).trim()
+                        target_summary,
+                        reset_error,
+                        String::from_utf8_lossy(&pop_output.stderr).trim()
+                    ),
                 ));
             }
         }
-        return Err(format!("回退到 {} 失败：{}", target, reset_error));
+        return Err(baseline_failed(
+            &target_summary,
+            stash_created,
+            format!("回退到 {} 失败：{}", target_summary, reset_error),
+        ));
     }
 
-    let workspace = get_execution_workspace_status_inner(project_path)?;
+    let workspace = match get_execution_workspace_status_inner(project_path) {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return Err(baseline_failed(&target_summary, stash_created, error));
+        }
+    };
     if !workspace.working_tree_clean {
-        return Err("Git 回退后工作区仍有残留修改，安全基线验证失败。".to_string());
+        return Err(baseline_failed(
+            &target_summary,
+            stash_created,
+            "Git 回退后工作区仍有残留修改，安全基线验证失败。".to_string(),
+        ));
     }
-    Ok(())
+    Ok(BaselineRestoreOutcome {
+        status: project::RecoveryBaselineStatus::Restored,
+        target_summary,
+        stash_created,
+        error: None,
+    })
 }
 
 fn recoverable_execution_session(
@@ -3939,7 +4098,8 @@ pub(crate) async fn perform_in_stop_with_pipeline_state(
             .and_then(|last| last.auto_tag)
             .unwrap_or_else(|| "HEAD".to_string())
     };
-    if let Err(error) = restore_git_execution_baseline(&proj.project_path, &restore_target) {
+    if let Err(outcome) = restore_git_execution_baseline(&proj.project_path, &restore_target) {
+        let error = outcome.error_message();
         let persisted_error = persist_in_stop_failure(&pipeline_state, proj, &error).await;
         return Err(persisted_error);
     }
@@ -5077,10 +5237,10 @@ async fn acknowledge_execution_recovery_detailed(
     }
 
     // Git 恢复失败：保留失败会话、基线和错误证据，自动驾驶保持 ErrorStopped
-    restore_git_execution_baseline(&project_path, &restore_target).map_err(|error| {
+    restore_git_execution_baseline(&project_path, &restore_target).map_err(|outcome| {
         format!(
             "Git 基线恢复失败：{}。失败证据已保留，请勿认为已恢复到安全状态。",
-            error
+            outcome.error_message()
         )
     })?;
 
@@ -6103,7 +6263,10 @@ mod tests {
             .wait()
             .map_err(|error| format!("等待 In Stop 测试进程退出失败：{}", error))?;
 
-        restore_git_execution_baseline(&repo.path_string(), &baseline)?;
+        let outcome = restore_git_execution_baseline(&repo.path_string(), &baseline)
+            .map_err(|outcome| outcome.error_message())?;
+        assert!(outcome.is_restored());
+        assert!(outcome.stash_created);
         assert_eq!(repo.head()?, baseline);
         let workspace = get_execution_workspace_status_inner(&repo.path_string())?;
         assert!(workspace.working_tree_clean);
@@ -7897,6 +8060,282 @@ mod tests {
             .execution_session
             .as_ref()
             .is_some_and(|session| session.failure_message.contains("已恢复任务基线")));
+        assert_eq!(
+            recovery.baseline_status,
+            project::RecoveryBaselineStatus::Restored
+        );
+        assert!(recovery.baseline_stash_created);
+        assert!(!recovery.baseline_target_summary.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn baseline_restore_outcome_is_persisted() -> Result<(), String> {
+        // Old RecoveryState JSON without baseline fields deserializes as Unknown.
+        let legacy = serde_json::json!({
+            "error_kind": "ExecutionError",
+            "phase": "Diagnosing",
+            "attempt": 0,
+            "max_attempts": 2,
+            "error_signature": "sig",
+            "subtask_id": "subtask-1",
+            "execution_id": "exec-1",
+            "started_at": "2026-08-11T00:00:00Z",
+            "updated_at": "2026-08-11T00:00:00Z"
+        });
+        let legacy_state: project::RecoveryState =
+            serde_json::from_value(legacy).map_err(|e| e.to_string())?;
+        assert_eq!(
+            legacy_state.baseline_status,
+            project::RecoveryBaselineStatus::Unknown
+        );
+        assert!(legacy_state.baseline_target_summary.is_empty());
+        assert!(!legacy_state.baseline_stash_created);
+
+        // Clean tree → Restored, stash_created=false
+        let clean_repo = TempGitRepo::new("baseline-clean")?;
+        let clean_head = clean_repo.head()?;
+        let clean_outcome = restore_git_execution_baseline(&clean_repo.path_string(), &clean_head)
+            .map_err(|o| o.error_message())?;
+        assert_eq!(
+            clean_outcome.status,
+            project::RecoveryBaselineStatus::Restored
+        );
+        assert!(!clean_outcome.stash_created);
+        assert_eq!(
+            clean_outcome.target_summary,
+            summarize_baseline_target(&clean_head)
+        );
+
+        // Dirty tree success → Restored, stash_created=true
+        let dirty_repo = TempGitRepo::new("baseline-dirty")?;
+        let dirty_head = dirty_repo.head()?;
+        std::fs::write(dirty_repo.path.join("tracked.txt"), "dirty work\n")
+            .map_err(|e| e.to_string())?;
+        std::fs::write(dirty_repo.path.join("untracked-new.txt"), "new\n")
+            .map_err(|e| e.to_string())?;
+        let dirty_outcome =
+            restore_git_execution_baseline(&dirty_repo.path_string(), &dirty_head)
+                .map_err(|o| o.error_message())?;
+        assert_eq!(
+            dirty_outcome.status,
+            project::RecoveryBaselineStatus::Restored
+        );
+        assert!(dirty_outcome.stash_created);
+        assert_eq!(
+            std::fs::read_to_string(dirty_repo.path.join("tracked.txt")).unwrap(),
+            "baseline\n"
+        );
+        assert!(!dirty_repo.path.join("untracked-new.txt").exists());
+
+        // Engine-blocked path persists structured facts on RecoveryState
+        let project_name = unique_project_name("baseline-persisted");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let persist_repo = TempGitRepo::new("baseline-persisted")?;
+        let persist_head = persist_repo.head()?;
+        std::fs::write(persist_repo.path.join("tracked.txt"), "partial\n")
+            .map_err(|e| e.to_string())?;
+        let mut proj = execution_project(
+            &project_name,
+            &persist_repo.path,
+            project::SubtaskStatus::Executing,
+            Some(execution_session(
+                "executing",
+                "execution-baseline-fact",
+                &persist_head,
+            )),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::Running,
+            ..Default::default()
+        });
+        crate::save_project(&proj)?;
+        let pipeline = Arc::new(Mutex::new(Some(pipeline_state(
+            "execution-baseline-fact",
+            PipelineStatus::Running,
+        ))));
+        let failure = BackgroundExecutionFailure::engine(
+            project::RecoveryErrorKind::ExecutionError,
+            project::EngineFailureKind::OutputTruncated,
+            "truncated".to_string(),
+            Some(project::ExecutionResult {
+                success: false,
+                engine_failure_kind: Some(project::EngineFailureKind::OutputTruncated),
+                ..Default::default()
+            }),
+        );
+        finalize_background_execution_failure(
+            &project_name,
+            "milestone-1",
+            "mid-1",
+            "subtask-1",
+            "测试小阶段",
+            0,
+            1,
+            "execution-baseline-fact",
+            &failure,
+            pipeline,
+            project::OperationSource::Autopilot,
+        )
+        .await?;
+        let persisted = crate::load_project(&project_name)?;
+        let recovery = persisted
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .expect("recovery");
+        assert_eq!(
+            recovery.baseline_status,
+            project::RecoveryBaselineStatus::Restored
+        );
+        assert!(recovery.baseline_stash_created);
+        assert_eq!(
+            recovery.baseline_target_summary,
+            summarize_baseline_target(&persist_head)
+        );
+        assert_eq!(
+            recovery.engine_failure_kind,
+            Some(project::EngineFailureKind::OutputTruncated)
+        );
+
+        // Failed restore → RestoreFailed facts (invalid target ref)
+        let fail_repo = TempGitRepo::new("baseline-fail")?;
+        let fail_outcome = restore_git_execution_baseline(
+            &fail_repo.path_string(),
+            "definitely-not-a-valid-ref-zzzz",
+        );
+        assert!(fail_outcome.is_err());
+        let failed = fail_outcome.err().unwrap();
+        assert_eq!(
+            failed.status,
+            project::RecoveryBaselineStatus::RestoreFailed
+        );
+        assert!(failed.error.is_some());
+        assert!(!failed.target_summary.is_empty());
+        // Round-trip apply to recovery state
+        let mut applied = project::RecoveryState::default();
+        apply_baseline_restore_outcome(&mut applied, &failed);
+        assert_eq!(
+            applied.baseline_status,
+            project::RecoveryBaselineStatus::RestoreFailed
+        );
+        assert_eq!(applied.baseline_target_summary, failed.target_summary);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn output_truncation_uses_single_recovery_entry() -> Result<(), String> {
+        let repo = TempGitRepo::new("output-truncation-single-entry")?;
+        let baseline = repo.head()?;
+        std::fs::write(repo.path.join("tracked.txt"), "partial truncated output\n")
+            .map_err(|error| error.to_string())?;
+
+        let project_name = unique_project_name("output-truncation-single-entry");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = execution_project(
+            &project_name,
+            &repo.path,
+            project::SubtaskStatus::Executing,
+            Some(execution_session(
+                "executing",
+                "execution-truncated",
+                &baseline,
+            )),
+        );
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            target_milestone_id: "milestone-1".to_string(),
+            run_status: project::AutopilotRunStatus::Running,
+            transient_retry_count: 0,
+            ..Default::default()
+        });
+        crate::save_project(&proj)?;
+
+        let pipeline = Arc::new(Mutex::new(Some(pipeline_state(
+            "execution-truncated",
+            PipelineStatus::Running,
+        ))));
+        let failure = BackgroundExecutionFailure::engine(
+            project::RecoveryErrorKind::ExecutionError,
+            project::EngineFailureKind::OutputTruncated,
+            "model output truncated after continuation".to_string(),
+            Some(project::ExecutionResult {
+                success: false,
+                stdout: "model output truncated after continuation".to_string(),
+                engine_failure_kind: Some(project::EngineFailureKind::OutputTruncated),
+                ..Default::default()
+            }),
+        );
+        finalize_background_execution_failure(
+            &project_name,
+            "milestone-1",
+            "mid-1",
+            "subtask-1",
+            "测试小阶段",
+            0,
+            1,
+            "execution-truncated",
+            &failure,
+            pipeline,
+            project::OperationSource::Autopilot,
+        )
+        .await?;
+
+        let updated = crate::load_project(&project_name)?;
+        let recovery = updated
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .expect("recovery started");
+        assert_eq!(recovery.error_kind, project::RecoveryErrorKind::PlanFailure);
+        assert_eq!(recovery.phase, project::RecoveryPhase::Replanning);
+        assert_eq!(
+            recovery.engine_failure_kind,
+            Some(project::EngineFailureKind::OutputTruncated)
+        );
+
+        let autopilot = updated
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .expect("autopilot present");
+        assert_eq!(autopilot.run_status, project::AutopilotRunStatus::Running);
+        assert_eq!(
+            autopilot.recovery_action,
+            project::AutopilotRecoveryAction::RunAutomaticRecovery
+        );
+        assert_ne!(
+            autopilot.recovery_action,
+            project::AutopilotRecoveryAction::RegenerateExecutionPlan
+        );
+        assert_eq!(
+            autopilot.last_failure_kind,
+            project::AutopilotFailureKind::Permanent
+        );
+        assert_eq!(autopilot.transient_retry_count, 0);
+        assert!(autopilot.next_retry_at.is_none());
+        assert!(
+            autopilot
+                .last_action
+                .contains("受限重规划")
+                || autopilot.last_action.contains("诊断")
+        );
+
+        let decision = crate::autopilot_policy::decide_next_step(
+            &updated,
+            &project_name,
+            &crate::autopilot_policy::AutopilotPolicyFacts {
+                precondition_block: None,
+                quality_gate: crate::autopilot_policy::QualityGateFact::NotApplicable,
+                needs_calibration: false,
+            },
+        );
+        assert_eq!(decision.next.command, "run_error_recovery");
+        assert_ne!(decision.next.command, "regenerate_execution_plan");
         Ok(())
     }
 

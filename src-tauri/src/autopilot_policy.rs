@@ -430,6 +430,49 @@ pub(crate) fn decide_next_step(
             {
                 return waiting("错误恢复任务仍在运行，等待当前修复完成");
             }
+            // Persistent recovery without a live worker is bounded.
+            let autopilot = proj.workflow_state.autopilot_state.as_ref();
+            let disposition = crate::recovery::reconcile_stalled_recovery(
+                crate::recovery::StalledRecoveryInput {
+                    phase: &recovery.phase,
+                    updated_at: &recovery.updated_at,
+                    replan_execution_attempted: recovery.replan_execution_attempted,
+                    next_validation_retry_at: recovery.next_validation_retry_at.as_deref(),
+                    is_validation_recovery: crate::recovery::is_review_validation_recovery(recovery),
+                    action_id: autopilot
+                        .map(|s| s.current_action_id.as_str())
+                        .unwrap_or(""),
+                    action_kind: autopilot
+                        .map(|s| s.current_action_kind.as_str())
+                        .unwrap_or(""),
+                    action_started_at: autopilot
+                        .map(|s| s.action_started_at.as_str())
+                        .unwrap_or(""),
+                    now: chrono::Utc::now(),
+                },
+            );
+            match disposition {
+                crate::recovery::StalledRecoveryDisposition::AllowAutomaticClaim => {}
+                crate::recovery::StalledRecoveryDisposition::Wait => {
+                    return waiting(if recovery_action_is_claimed {
+                        "错误恢复任务仍在运行，等待当前修复完成"
+                    } else {
+                        "自动恢复等待中"
+                    });
+                }
+                crate::recovery::StalledRecoveryDisposition::MarkStalled
+                | crate::recovery::StalledRecoveryDisposition::EnterHumanBoundary => {
+                    let detail = if recovery.last_repair_summary.is_empty() {
+                        format!("{:?}", recovery.phase)
+                    } else {
+                        recovery.last_repair_summary.clone()
+                    };
+                    return permanent_block(
+                        format!("自动恢复已停滞或进入人工边界：{}", detail),
+                        project::AutopilotRecoveryAction::WaitHumanDecision,
+                    );
+                }
+            }
             return next_step(
                 "run_error_recovery",
                 serde_json::json!({ "projectName": project_name }),

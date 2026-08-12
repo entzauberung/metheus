@@ -9,12 +9,66 @@ use tokio::time::{interval, sleep, Duration};
 
 const MAX_GIT_CONFIRMATION_RETRIES: u32 = 2;
 
+/// Business progress idle → warning (does not cancel the future).
+pub(crate) const RECOVERY_PROGRESS_WARNING_SECS: i64 = 90;
+/// Business progress idle → stalled (alive but no progress).
+pub(crate) const RECOVERY_PROGRESS_STALLED_SECS: i64 = 300;
+/// Hard action wall-clock cap for recovery dispatch (≤ control-action 12 min).
+pub(crate) const RECOVERY_ACTION_HARD_TIMEOUT_SECS: u64 = 12 * 60;
+
 fn git_confirmation_retry_delay(completed_retries: u32) -> Option<i64> {
     match completed_retries {
         0 => Some(5),
         1 => Some(15),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryProgressGate {
+    Running,
+    Warning,
+    Stalled,
+    HardTimeout,
+}
+
+/// Pure time policy for recovery progress. Uses injected `now`; never sleeps.
+/// - Hard timeout is based on action_started_at.
+/// - Warning/stalled use last_progress_at (business), falling back to action start.
+/// Heartbeat must never be passed as last_progress_at.
+pub(crate) fn classify_recovery_progress(
+    now: chrono::DateTime<chrono::Utc>,
+    last_progress_at: Option<chrono::DateTime<chrono::Utc>>,
+    action_started_at: Option<chrono::DateTime<chrono::Utc>>,
+) -> RecoveryProgressGate {
+    if let Some(started) = action_started_at {
+        let action_elapsed = now.signed_duration_since(started).num_seconds();
+        if action_elapsed >= RECOVERY_ACTION_HARD_TIMEOUT_SECS as i64 {
+            return RecoveryProgressGate::HardTimeout;
+        }
+    }
+    let progress_anchor = last_progress_at.or(action_started_at);
+    let Some(anchor) = progress_anchor else {
+        return RecoveryProgressGate::Running;
+    };
+    let idle = now.signed_duration_since(anchor).num_seconds();
+    if idle >= RECOVERY_PROGRESS_STALLED_SECS {
+        RecoveryProgressGate::Stalled
+    } else if idle >= RECOVERY_PROGRESS_WARNING_SECS {
+        RecoveryProgressGate::Warning
+    } else {
+        RecoveryProgressGate::Running
+    }
+}
+
+fn parse_rfc3339(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+fn is_recovery_dispatch_command(command: &str) -> bool {
+    command == "run_error_recovery"
 }
 
 #[derive(Default)]
@@ -109,11 +163,38 @@ impl AutopilotRuntime {
 /// Tauri 进程重启后，为仍可安全续跑的活动项目创建新一代作业身份。
 /// 返回 true 表示调用方应在项目落盘并释放流水线锁后启动运行器。
 pub(crate) fn reconcile_startup_job(project: &mut project::Project) -> bool {
+    // Bound persistent recovery before deciding to resume the runtime job.
+    let now = chrono::Utc::now();
+    let stalled = crate::recovery::apply_stalled_recovery_reconciliation(project, now);
+    if matches!(
+        stalled,
+        crate::recovery::StalledRecoveryDisposition::EnterHumanBoundary
+            | crate::recovery::StalledRecoveryDisposition::MarkStalled
+    ) {
+        if let Some(state) = project.workflow_state.autopilot_state.as_mut() {
+            state.job_owner = project::AutopilotJobOwner::None;
+            state.current_action_id.clear();
+            state.current_action_kind.clear();
+            state.action_started_at.clear();
+        }
+        return false;
+    }
+
     let resumable_validation_recovery = project
         .workflow_state
         .recovery_state
         .as_ref()
         .is_some_and(crate::recovery::validation_retry_can_resume);
+    let fresh_recovery_queue = project.workflow_state.recovery_state.as_ref().is_some_and(|recovery| {
+        matches!(
+            recovery.phase,
+            project::RecoveryPhase::Diagnosing
+                | project::RecoveryPhase::Repairing
+                | project::RecoveryPhase::Retesting
+                | project::RecoveryPhase::Replanning
+        ) && !recovery.replan_execution_attempted
+            && crate::recovery::recovery_allows_automatic_claim(project, now)
+    });
     let Some(state) = project.workflow_state.autopilot_state.as_mut() else {
         return false;
     };
@@ -126,14 +207,14 @@ pub(crate) fn reconcile_startup_job(project: &mut project::Project) -> bool {
         == project::AutopilotRecoveryAction::RestoreExecutionBaseline
         && crate::autopilot_failure::is_transient(&state.last_failure_kind))
         || (state.recovery_action == project::AutopilotRecoveryAction::RunAutomaticRecovery
-            && resumable_validation_recovery);
+            && (resumable_validation_recovery || fresh_recovery_queue));
     let should_run = project.workflow_state.autopilot_active
         && state.active
         && (state.run_status == project::AutopilotRunStatus::Running
             || (state.run_status == project::AutopilotRunStatus::ErrorStopped
                 && automatically_recoverable));
     if should_run {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now.to_rfc3339();
         state.job_id = uuid::Uuid::new_v4().to_string();
         state.job_generation = state.job_generation.saturating_add(1);
         state.job_owner = project::AutopilotJobOwner::BackendRuntime;
@@ -234,6 +315,8 @@ fn action_claim_matches(
 enum DispatchOutcome {
     Completed(Result<(), String>),
     Superseded,
+    /// Recovery (or other bounded) action hit hard wall-clock timeout.
+    TimedOut { elapsed_secs: u64 },
 }
 
 async fn dispatch_action_with_heartbeat(
@@ -244,12 +327,50 @@ async fn dispatch_action_with_heartbeat(
     generation: u64,
     action_id: &str,
 ) -> DispatchOutcome {
+    dispatch_action_with_heartbeat_limited(
+        pipeline_state,
+        project_name,
+        next,
+        job_id,
+        generation,
+        action_id,
+        if is_recovery_dispatch_command(&next.command) {
+            Some(Duration::from_secs(RECOVERY_ACTION_HARD_TIMEOUT_SECS))
+        } else {
+            None
+        },
+    )
+    .await
+}
+
+async fn dispatch_action_with_heartbeat_limited(
+    pipeline_state: &Arc<Mutex<Option<PipelineState>>>,
+    project_name: &str,
+    next: &workflow::AutopilotNextStep,
+    job_id: &str,
+    generation: u64,
+    action_id: &str,
+    hard_timeout: Option<Duration>,
+) -> DispatchOutcome {
     let dispatch = dispatch_action(pipeline_state, project_name, next);
     tokio::pin!(dispatch);
     let mut heartbeat = interval(Duration::from_secs(1));
+    // Non-recovery actions keep the historical unbounded wait; recovery uses ≤720s.
+    let bound = hard_timeout.unwrap_or(Duration::from_secs(u64::MAX / 4));
+    let hard_deadline = sleep(bound);
+    tokio::pin!(hard_deadline);
+    let started = std::time::Instant::now();
+    let bounded = hard_timeout.is_some();
     loop {
         tokio::select! {
             result = &mut dispatch => return DispatchOutcome::Completed(result),
+            _ = &mut hard_deadline, if bounded => {
+                let elapsed_secs = started
+                    .elapsed()
+                    .as_secs()
+                    .max(hard_timeout.map(|d| d.as_secs()).unwrap_or(0));
+                return DispatchOutcome::TimedOut { elapsed_secs };
+            }
             _ = heartbeat.tick() => {
                 let mut latest = match crate::load_project(project_name) {
                     Ok(project) => project,
@@ -263,6 +384,52 @@ async fn dispatch_action_with_heartbeat(
                     &next.command,
                 ) {
                     return DispatchOutcome::Superseded;
+                }
+                if is_recovery_dispatch_command(&next.command) {
+                    let action_started = latest
+                        .workflow_state
+                        .autopilot_state
+                        .as_ref()
+                        .and_then(|state| parse_rfc3339(&state.action_started_at));
+                    let last_progress = latest
+                        .workflow_state
+                        .recovery_state
+                        .as_ref()
+                        .and_then(|recovery| parse_rfc3339(&recovery.updated_at));
+                    let gate = classify_recovery_progress(
+                        chrono::Utc::now(),
+                        last_progress,
+                        action_started,
+                    );
+                    if gate == RecoveryProgressGate::HardTimeout {
+                        let elapsed_secs = started.elapsed().as_secs().max(
+                            RECOVERY_ACTION_HARD_TIMEOUT_SECS
+                        );
+                        return DispatchOutcome::TimedOut { elapsed_secs };
+                    }
+                    if let Some(state) = latest.workflow_state.autopilot_state.as_mut() {
+                        match gate {
+                            RecoveryProgressGate::Warning => {
+                                if !state.last_action.contains("无进展警告") {
+                                    state.last_action = format!(
+                                        "恢复动作存活但超过 {} 秒无业务进展（警告）",
+                                        RECOVERY_PROGRESS_WARNING_SECS
+                                    );
+                                    state.last_action_at = chrono::Utc::now().to_rfc3339();
+                                }
+                            }
+                            RecoveryProgressGate::Stalled => {
+                                if !state.last_action.contains("无进展停滞") {
+                                    state.last_action = format!(
+                                        "恢复动作存活但超过 {} 秒无业务进展（停滞）",
+                                        RECOVERY_PROGRESS_STALLED_SECS
+                                    );
+                                    state.last_action_at = chrono::Utc::now().to_rfc3339();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 if persist_heartbeat(&mut latest).is_err() {
                     return DispatchOutcome::Completed(Err(
@@ -305,6 +472,31 @@ async fn recover_stopped_action(
             crate::pipeline::prepare_execution_workspace_inner(project.name.clone()).await?;
         }
         project::AutopilotRecoveryAction::RegenerateExecutionPlan => {
+            // Defensive: OutputTruncated must never whole-stage regenerate.
+            // Only run_error_recovery → replan_current_subtask is legal.
+            if project
+                .workflow_state
+                .recovery_state
+                .as_ref()
+                .is_some_and(|recovery| {
+                    recovery.engine_failure_kind
+                        == Some(project::EngineFailureKind::OutputTruncated)
+                })
+            {
+                let mut latest = crate::load_project(&project.name)?;
+                if let Some(state) = latest.workflow_state.autopilot_state.as_mut() {
+                    state.run_status = project::AutopilotRunStatus::Running;
+                    state.recovery_action =
+                        project::AutopilotRecoveryAction::RunAutomaticRecovery;
+                    state.next_retry_at = None;
+                    state.last_action =
+                        "内置执行截断已收敛到当前任务受限重规划".to_string();
+                    state.last_action_at = chrono::Utc::now().to_rfc3339();
+                    clear_action_claim(state);
+                }
+                crate::save_project(&latest)?;
+                return Ok(true);
+            }
             let scope = crate::plan_scope::PlanScope::resolve(project)?;
             let source =
                 if project.workflow_state.current_step == project::WorkflowStep::PlanApproving {
@@ -571,6 +763,29 @@ async fn drive_project(
                     workflow::autopilot_mark_error(project_name.clone(), next.description, error)
                         .await;
             }
+            DispatchOutcome::TimedOut { elapsed_secs } => {
+                let mut latest = match crate::load_project(&project_name) {
+                    Ok(project) => project,
+                    Err(_) => break,
+                };
+                if !action_claim_matches(
+                    &latest,
+                    &job_id,
+                    generation,
+                    &action_id,
+                    &next.command,
+                ) {
+                    // Stale generation/action must not overwrite a newer owner.
+                    break;
+                }
+                crate::recovery::apply_recovery_dispatch_timeout(
+                    &mut latest,
+                    &next.command,
+                    elapsed_secs,
+                );
+                let _ = crate::save_project(&latest);
+                break;
+            }
             DispatchOutcome::Superseded => break,
         }
         sleep(Duration::from_secs(1)).await;
@@ -733,6 +948,124 @@ mod tests {
             ..Default::default()
         });
         value
+    }
+
+    fn ts(offset_secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 8, 11, 12, 0, 0)
+            .single()
+            .expect("fixed test time")
+            + chrono::Duration::seconds(offset_secs)
+    }
+
+    #[test]
+    fn recovery_progress_gates_use_injected_time_boundaries() {
+        let started = ts(0);
+        // 89s idle: still running
+        assert_eq!(
+            classify_recovery_progress(ts(89), Some(started), Some(started)),
+            RecoveryProgressGate::Running
+        );
+        // 90s: warning
+        assert_eq!(
+            classify_recovery_progress(ts(90), Some(started), Some(started)),
+            RecoveryProgressGate::Warning
+        );
+        // 299s: still warning
+        assert_eq!(
+            classify_recovery_progress(ts(299), Some(started), Some(started)),
+            RecoveryProgressGate::Warning
+        );
+        // 300s: stalled
+        assert_eq!(
+            classify_recovery_progress(ts(300), Some(started), Some(started)),
+            RecoveryProgressGate::Stalled
+        );
+        // 719s action elapsed with recent progress: still running on progress, not hard yet
+        assert_eq!(
+            classify_recovery_progress(ts(719), Some(ts(700)), Some(started)),
+            RecoveryProgressGate::Running
+        );
+        // 720s action elapsed: hard timeout even if progress was recent
+        assert_eq!(
+            classify_recovery_progress(ts(720), Some(ts(719)), Some(started)),
+            RecoveryProgressGate::HardTimeout
+        );
+    }
+
+    #[test]
+    fn recovery_dispatch_timeout_enters_human_boundary() {
+        let mut project = active_project(project::AutopilotRunStatus::Running);
+        {
+            let state = project.workflow_state.autopilot_state.as_mut().unwrap();
+            state.current_action_id = "action-timeout".to_string();
+            state.current_action_kind = "run_error_recovery".to_string();
+            state.action_started_at = "2026-08-11T12:00:00Z".to_string();
+            state.heartbeat_at = "2026-08-11T12:11:59Z".to_string();
+            state.recovery_action = project::AutopilotRecoveryAction::RunAutomaticRecovery;
+        }
+        project.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::PlanFailure,
+            phase: project::RecoveryPhase::Replanning,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "exec-timeout".to_string(),
+            engine_failure_kind: Some(project::EngineFailureKind::OutputTruncated),
+            updated_at: "2026-08-11T12:00:00Z".to_string(),
+            started_at: "2026-08-11T12:00:00Z".to_string(),
+            ..Default::default()
+        });
+        project.execution_history = vec![];
+
+        crate::recovery::apply_recovery_dispatch_timeout(
+            &mut project,
+            "run_error_recovery",
+            RECOVERY_ACTION_HARD_TIMEOUT_SECS,
+        );
+
+        let recovery = project.workflow_state.recovery_state.as_ref().unwrap();
+        assert_eq!(recovery.phase, project::RecoveryPhase::WaitingHuman);
+        assert_eq!(
+            recovery.error_kind,
+            project::RecoveryErrorKind::HumanRequired
+        );
+        assert!(recovery.last_repair_summary.contains("超时"));
+        assert!(recovery.last_repair_summary.contains("run_error_recovery"));
+
+        let autopilot = project.workflow_state.autopilot_state.as_ref().unwrap();
+        assert_eq!(
+            autopilot.run_status,
+            project::AutopilotRunStatus::ErrorStopped
+        );
+        assert_eq!(
+            autopilot.recovery_action,
+            project::AutopilotRecoveryAction::WaitHumanDecision
+        );
+        assert!(autopilot.current_action_id.is_empty());
+        assert!(autopilot.current_action_kind.is_empty());
+        assert!(autopilot.action_started_at.is_empty());
+        // Last heartbeat preserved for diagnosis; not cleared.
+        assert_eq!(autopilot.heartbeat_at, "2026-08-11T12:11:59Z");
+        assert!(autopilot.next_retry_at.is_none());
+
+        assert!(
+            project
+                .execution_history
+                .iter()
+                .any(|event| event.event_type == project::ExecutionEventType::RecoveryExhausted)
+        );
+
+        // Stale action must not be applied by caller when claim mismatches — policy after
+        // timeout must not auto-dispatch run_error_recovery.
+        let decision = crate::autopilot_policy::decide_next_step(
+            &project,
+            "autopilot-runtime-test",
+            &crate::autopilot_policy::AutopilotPolicyFacts {
+                precondition_block: None,
+                quality_gate: crate::autopilot_policy::QualityGateFact::NotApplicable,
+                needs_calibration: false,
+            },
+        );
+        assert_ne!(decision.next.command, "run_error_recovery");
+        assert!(decision.next.is_error || decision.next.command.is_empty());
     }
 
     #[test]

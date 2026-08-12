@@ -571,6 +571,9 @@ fn create_recovery_state(
         subtask_id,
         execution_id,
         baseline_commit,
+        baseline_status: project::RecoveryBaselineStatus::Unknown,
+        baseline_target_summary: String::new(),
+        baseline_stash_created: false,
         last_diagnosis: String::new(),
         last_repair_summary: String::new(),
         original_test_failure: initial_failure.clone(),
@@ -619,6 +622,335 @@ fn set_autopilot_waiting(proj: &mut project::Project, description: &str) {
         autopilot.error_message = description.to_string();
         autopilot.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
     }
+}
+
+/// Hard-timeout terminal for a recovery dispatch. Caller must verify
+/// job/generation/action claim still matches before invoking.
+/// Clears action claim, freezes last heartbeat for diagnosis, and blocks
+/// further automatic reclaim of the same recovery execution.
+pub(crate) fn apply_recovery_dispatch_timeout(
+    proj: &mut project::Project,
+    action_kind: &str,
+    elapsed_secs: u64,
+) {
+    let now = chrono::Utc::now().to_rfc3339();
+    let (milestone_id, mid_stage_id, subtask_id, execution_id) = proj
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .map(|recovery| {
+            (
+                proj.execution_session
+                    .as_ref()
+                    .map(|s| s.milestone_id.clone())
+                    .unwrap_or_default(),
+                proj.execution_session
+                    .as_ref()
+                    .map(|s| s.mid_stage_id.clone())
+                    .unwrap_or_default(),
+                recovery.subtask_id.clone(),
+                recovery.execution_id.clone(),
+            )
+        })
+        .unwrap_or_default();
+
+    let summary = format!(
+        "恢复动作超时（action={}，已持续约 {} 秒，上限 {} 秒）；已停止自动重试并等待人工处理",
+        if action_kind.is_empty() {
+            "unknown"
+        } else {
+            action_kind
+        },
+        elapsed_secs,
+        12 * 60
+    );
+
+    if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
+        recovery.phase = project::RecoveryPhase::WaitingHuman;
+        recovery.error_kind = project::RecoveryErrorKind::HumanRequired;
+        recovery.last_repair_summary = truncate_chars(&summary, 4_000);
+        recovery.updated_at = now.clone();
+        // Keep execution_id so the same lost action cannot be silently reclaimed
+        // as a fresh automatic recovery without human acknowledgment.
+        let _ = execution_id;
+    }
+
+    if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+        // Preserve last heartbeat_at for diagnosis; stop further updates by clearing claim.
+        autopilot.current_action_id.clear();
+        autopilot.current_action_kind.clear();
+        autopilot.action_started_at.clear();
+        autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
+        autopilot.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+        autopilot.last_action = summary.clone();
+        autopilot.last_action_at = now.clone();
+        autopilot.error_message = summary.clone();
+        autopilot.next_retry_at = None;
+    }
+
+    write_recovery_history(
+        proj,
+        "error",
+        project::ExecutionEventType::RecoveryExhausted,
+        summary,
+        if milestone_id.is_empty() {
+            None
+        } else {
+            Some(milestone_id.as_str())
+        },
+        if mid_stage_id.is_empty() {
+            None
+        } else {
+            Some(mid_stage_id.as_str())
+        },
+        if subtask_id.is_empty() {
+            None
+        } else {
+            Some(subtask_id.as_str())
+        },
+    );
+    touch(proj);
+}
+
+/// Pure stalled-recovery reconciliation inputs (injected `now`, no sleep).
+#[derive(Debug, Clone)]
+pub(crate) struct StalledRecoveryInput<'a> {
+    pub phase: &'a project::RecoveryPhase,
+    pub updated_at: &'a str,
+    pub replan_execution_attempted: bool,
+    pub next_validation_retry_at: Option<&'a str>,
+    pub is_validation_recovery: bool,
+    pub action_id: &'a str,
+    pub action_kind: &'a str,
+    pub action_started_at: &'a str,
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StalledRecoveryDisposition {
+    /// Fresh queued recovery may be claimed once by runtime.
+    AllowAutomaticClaim,
+    /// Active claim still healthy, or validation retry not due.
+    Wait,
+    /// No worker / no business progress ≥5 minutes.
+    MarkStalled,
+    /// Hard cap, lost replan execution, or unparseable progress → human.
+    EnterHumanBoundary,
+}
+
+fn parse_recovery_time(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if value.trim().is_empty() {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+fn is_active_recovery_phase(phase: &project::RecoveryPhase) -> bool {
+    matches!(
+        phase,
+        project::RecoveryPhase::Diagnosing
+            | project::RecoveryPhase::Repairing
+            | project::RecoveryPhase::Retesting
+            | project::RecoveryPhase::Replanning
+    )
+}
+
+/// Bounded reconciliation for persistent Replanning/Repairing without a live worker.
+pub(crate) fn reconcile_stalled_recovery(
+    input: StalledRecoveryInput<'_>,
+) -> StalledRecoveryDisposition {
+    if !is_active_recovery_phase(input.phase) {
+        return StalledRecoveryDisposition::Wait;
+    }
+    if input.replan_execution_attempted {
+        return StalledRecoveryDisposition::EnterHumanBoundary;
+    }
+    if input.is_validation_recovery {
+        if let Some(next_at) = input.next_validation_retry_at.and_then(parse_recovery_time) {
+            if next_at > input.now {
+                return StalledRecoveryDisposition::Wait;
+            }
+        }
+    }
+
+    let updated_at = parse_recovery_time(input.updated_at);
+    // Invalid/empty updated_at is conservative Unknown: do not auto-repeat.
+    let Some(progress_at) = updated_at else {
+        return StalledRecoveryDisposition::EnterHumanBoundary;
+    };
+
+    let action_started = parse_recovery_time(input.action_started_at);
+    let claimed = !input.action_id.is_empty() && input.action_kind == "run_error_recovery";
+
+    let gate = crate::autopilot_runtime::classify_recovery_progress(
+        input.now,
+        Some(progress_at),
+        action_started.or(Some(progress_at)),
+    );
+    match gate {
+        crate::autopilot_runtime::RecoveryProgressGate::HardTimeout => {
+            StalledRecoveryDisposition::EnterHumanBoundary
+        }
+        crate::autopilot_runtime::RecoveryProgressGate::Stalled => {
+            StalledRecoveryDisposition::MarkStalled
+        }
+        crate::autopilot_runtime::RecoveryProgressGate::Warning
+        | crate::autopilot_runtime::RecoveryProgressGate::Running => {
+            if claimed {
+                StalledRecoveryDisposition::Wait
+            } else {
+                StalledRecoveryDisposition::AllowAutomaticClaim
+            }
+        }
+    }
+}
+
+/// Apply stalled reconciliation to a project. Returns true if state changed.
+pub(crate) fn apply_stalled_recovery_reconciliation(
+    proj: &mut project::Project,
+    now: chrono::DateTime<chrono::Utc>,
+) -> StalledRecoveryDisposition {
+    let Some(recovery) = proj.workflow_state.recovery_state.clone() else {
+        return StalledRecoveryDisposition::Wait;
+    };
+    if !is_active_recovery_phase(&recovery.phase) {
+        return StalledRecoveryDisposition::Wait;
+    }
+    let action_id = proj
+        .workflow_state
+        .autopilot_state
+        .as_ref()
+        .map(|s| s.current_action_id.clone())
+        .unwrap_or_default();
+    let action_kind = proj
+        .workflow_state
+        .autopilot_state
+        .as_ref()
+        .map(|s| s.current_action_kind.clone())
+        .unwrap_or_default();
+    let action_started_at = proj
+        .workflow_state
+        .autopilot_state
+        .as_ref()
+        .map(|s| s.action_started_at.clone())
+        .unwrap_or_default();
+    let input = StalledRecoveryInput {
+        phase: &recovery.phase,
+        updated_at: &recovery.updated_at,
+        replan_execution_attempted: recovery.replan_execution_attempted,
+        next_validation_retry_at: recovery.next_validation_retry_at.as_deref(),
+        is_validation_recovery: is_review_validation_recovery(&recovery),
+        action_id: &action_id,
+        action_kind: &action_kind,
+        action_started_at: &action_started_at,
+        now,
+    };
+    let disposition = reconcile_stalled_recovery(input);
+    match disposition {
+        StalledRecoveryDisposition::MarkStalled => {
+            let message = format!(
+                "恢复无进展停滞（超过 {} 秒无业务更新）；心跳不代表进展，已停止自动重派发",
+                crate::autopilot_runtime::RECOVERY_PROGRESS_STALLED_SECS
+            );
+            if let Some(state) = proj.workflow_state.recovery_state.as_mut() {
+                state.last_repair_summary = truncate_chars(&message, 4_000);
+                state.updated_at = now.to_rfc3339();
+            }
+            if let Some(ap) = proj.workflow_state.autopilot_state.as_mut() {
+                ap.current_action_id.clear();
+                ap.current_action_kind.clear();
+                ap.action_started_at.clear();
+                ap.last_action = message.clone();
+                ap.last_action_at = now.to_rfc3339();
+                ap.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+                ap.run_status = project::AutopilotRunStatus::ErrorStopped;
+                ap.error_message = message.clone();
+                ap.next_retry_at = None;
+            }
+            write_recovery_history(
+                proj,
+                "warn",
+                project::ExecutionEventType::RecoveryExhausted,
+                format!("RecoveryNoProgress：{}", message),
+                None,
+                None,
+                Some(recovery.subtask_id.as_str()),
+            );
+            touch(proj);
+        }
+        StalledRecoveryDisposition::EnterHumanBoundary => {
+            let elapsed_hint = parse_recovery_time(&recovery.updated_at)
+                .map(|progress| now.signed_duration_since(progress).num_seconds().max(0) as u64)
+                .unwrap_or(0);
+            if recovery.replan_execution_attempted {
+                mark_waiting_human(
+                    proj,
+                    project::RecoveryErrorKind::HumanRequired,
+                    "重规划后的任务执行已失联或曾启动，禁止自动重复启动",
+                );
+                write_recovery_history(
+                    proj,
+                    "error",
+                    project::ExecutionEventType::RecoveryExhausted,
+                    "重规划执行失联，进入人工边界".to_string(),
+                    None,
+                    None,
+                    Some(recovery.subtask_id.as_str()),
+                );
+                touch(proj);
+            } else {
+                let kind = if action_kind.is_empty() {
+                    "run_error_recovery"
+                } else {
+                    action_kind.as_str()
+                };
+                apply_recovery_dispatch_timeout(
+                    proj,
+                    kind,
+                    elapsed_hint.max(crate::autopilot_runtime::RECOVERY_ACTION_HARD_TIMEOUT_SECS),
+                );
+            }
+        }
+        StalledRecoveryDisposition::AllowAutomaticClaim
+        | StalledRecoveryDisposition::Wait => {}
+    }
+    disposition
+}
+
+/// Whether policy may dispatch run_error_recovery after stalled reconciliation.
+pub(crate) fn recovery_allows_automatic_claim(
+    proj: &project::Project,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(recovery) = proj.workflow_state.recovery_state.as_ref() else {
+        return false;
+    };
+    if !is_active_recovery_phase(&recovery.phase) {
+        return false;
+    }
+    let autopilot = proj.workflow_state.autopilot_state.as_ref();
+    matches!(
+        reconcile_stalled_recovery(StalledRecoveryInput {
+            phase: &recovery.phase,
+            updated_at: &recovery.updated_at,
+            replan_execution_attempted: recovery.replan_execution_attempted,
+            next_validation_retry_at: recovery.next_validation_retry_at.as_deref(),
+            is_validation_recovery: is_review_validation_recovery(recovery),
+            action_id: autopilot
+                .map(|s| s.current_action_id.as_str())
+                .unwrap_or(""),
+            action_kind: autopilot
+                .map(|s| s.current_action_kind.as_str())
+                .unwrap_or(""),
+            action_started_at: autopilot
+                .map(|s| s.action_started_at.as_str())
+                .unwrap_or(""),
+            now,
+        }),
+        StalledRecoveryDisposition::AllowAutomaticClaim
+    )
 }
 
 pub(crate) fn enter_human_review_boundary(
@@ -1282,12 +1614,26 @@ async fn replan_current_subtask(
     );
 
     let target = if recovery.baseline_commit.is_empty() {
-        "HEAD"
+        "HEAD".to_string()
     } else {
-        &recovery.baseline_commit
+        recovery.baseline_commit.clone()
     };
-    pipeline::restore_git_execution_baseline(&proj.project_path, target)
-        .map_err(|error| format!("当前任务重规划前恢复执行基线失败：{}", error))?;
+    match pipeline::restore_git_execution_baseline(&proj.project_path, &target) {
+        Ok(outcome) => {
+            if let Some(recovery_state) = proj.workflow_state.recovery_state.as_mut() {
+                pipeline::apply_baseline_restore_outcome(recovery_state, &outcome);
+            }
+        }
+        Err(outcome) => {
+            if let Some(recovery_state) = proj.workflow_state.recovery_state.as_mut() {
+                pipeline::apply_baseline_restore_outcome(recovery_state, &outcome);
+            }
+            return Err(format!(
+                "当前任务重规划前恢复执行基线失败：{}",
+                outcome.error_message()
+            ));
+        }
+    }
 
     let current_facts = crate::project_facts::capture_with_identifiers(
         &proj.project_path,
@@ -2020,15 +2366,23 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             } else {
                 &recovery.baseline_commit
             };
-            if let Err(error) = pipeline::restore_git_execution_baseline(&proj.project_path, target)
-            {
-                mark_waiting_human(
-                    &mut proj,
-                    project::RecoveryErrorKind::WorkspaceError,
-                    &format!("范围越界且基线恢复失败：{}", error),
-                );
-                crate::save_project(&proj)?;
-                return crate::load_project(&project_name);
+            match pipeline::restore_git_execution_baseline(&proj.project_path, target) {
+                Ok(outcome) => {
+                    pipeline::apply_baseline_restore_outcome(&mut recovery, &outcome);
+                }
+                Err(outcome) => {
+                    pipeline::apply_baseline_restore_outcome(&mut recovery, &outcome);
+                    mark_waiting_human(
+                        &mut proj,
+                        project::RecoveryErrorKind::WorkspaceError,
+                        &format!("范围越界且基线恢复失败：{}", outcome.error_message()),
+                    );
+                    if let Some(state) = proj.workflow_state.recovery_state.as_mut() {
+                        pipeline::apply_baseline_restore_outcome(state, &outcome);
+                    }
+                    crate::save_project(&proj)?;
+                    return crate::load_project(&project_name);
+                }
             }
             reset_subtask_to_pending(&mut proj, &session);
             preserve_recovery_session(&mut proj, &session, &recovery.execution_id);
@@ -2058,15 +2412,21 @@ pub(crate) async fn run_error_recovery_with_pipeline(
         } else {
             &recovery.baseline_commit
         };
-        if let Err(error) = pipeline::restore_git_execution_baseline(&proj.project_path, target) {
-            proj.workflow_state.recovery_state = Some(recovery);
-            mark_waiting_human(
-                &mut proj,
-                project::RecoveryErrorKind::WorkspaceError,
-                &format!("执行基线恢复失败：{}", error),
-            );
-            crate::save_project(&proj)?;
-            return crate::load_project(&project_name);
+        match pipeline::restore_git_execution_baseline(&proj.project_path, target) {
+            Ok(outcome) => {
+                pipeline::apply_baseline_restore_outcome(&mut recovery, &outcome);
+            }
+            Err(outcome) => {
+                pipeline::apply_baseline_restore_outcome(&mut recovery, &outcome);
+                proj.workflow_state.recovery_state = Some(recovery);
+                mark_waiting_human(
+                    &mut proj,
+                    project::RecoveryErrorKind::WorkspaceError,
+                    &format!("执行基线恢复失败：{}", outcome.error_message()),
+                );
+                crate::save_project(&proj)?;
+                return crate::load_project(&project_name);
+            }
         }
         reset_subtask_to_pending(&mut proj, &session);
     }
@@ -2308,18 +2668,26 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             &recovery.baseline_commit
         };
         let restore = pipeline::restore_git_execution_baseline(&proj.project_path, target);
+        if let Some(recovery_state) = proj.workflow_state.recovery_state.as_mut() {
+            match &restore {
+                Ok(outcome) | Err(outcome) => {
+                    pipeline::apply_baseline_restore_outcome(recovery_state, outcome);
+                }
+            }
+        }
         finish_repair_checkpoint(&mut proj, restore.is_err())?;
         reset_subtask_to_pending(&mut proj, &session);
         preserve_recovery_session(&mut proj, &session, &recovery_execution_id);
         let message = match restore {
-            Ok(()) => format!(
-                "自动修复修改了范围外文件并已恢复基线：{}",
+            Ok(outcome) => format!(
+                "自动修复修改了范围外文件并已恢复基线（{}）：{}",
+                outcome.target_summary,
                 out_of_scope.join("、")
             ),
-            Err(error) => format!(
+            Err(outcome) => format!(
                 "自动修复修改了范围外文件且基线恢复失败：{}；{}",
                 out_of_scope.join("、"),
-                error
+                outcome.error_message()
             ),
         };
         mark_waiting_human(
@@ -2448,9 +2816,16 @@ fn handle_repair_engine_block(
         }
     }
     preserve_recovery_session(proj, session, execution_id);
-    let detail = match restore_result {
-        Ok(()) => format!("执行引擎阻断，已恢复任务基线：{}", message),
-        Err(error) => format!("执行引擎阻断且任务基线恢复失败：{}；{}", message, error),
+    let detail = match &restore_result {
+        Ok(outcome) => format!(
+            "执行引擎阻断，已恢复任务基线（{}）：{}",
+            outcome.target_summary, message
+        ),
+        Err(outcome) => format!(
+            "执行引擎阻断且任务基线恢复失败：{}；{}",
+            message,
+            outcome.error_message()
+        ),
     };
     if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
         recovery.attempt = recovery.attempt.saturating_sub(1);
@@ -2459,6 +2834,11 @@ fn handle_repair_engine_block(
         recovery.phase = phase;
         recovery.last_repair_summary = truncate_chars(&detail, 4_000);
         recovery.updated_at = chrono::Utc::now().to_rfc3339();
+        match &restore_result {
+            Ok(outcome) | Err(outcome) => {
+                pipeline::apply_baseline_restore_outcome(recovery, outcome);
+            }
+        }
     }
     if let Some(current_session) = proj.execution_session.as_mut() {
         current_session.failure_message = truncate_chars(&detail, 2_048);
@@ -2497,6 +2877,13 @@ fn handle_repair_execution_failure(
         &baseline
     };
     let restore_result = pipeline::restore_git_execution_baseline(&proj.project_path, target);
+    if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
+        match &restore_result {
+            Ok(outcome) | Err(outcome) => {
+                pipeline::apply_baseline_restore_outcome(recovery, outcome);
+            }
+        }
+    }
     finish_repair_checkpoint(proj, restore_result.is_err())?;
     reset_subtask_to_pending(proj, session);
     preserve_recovery_session(proj, session, execution_id);
@@ -2507,9 +2894,16 @@ fn handle_repair_execution_failure(
         .as_ref()
         .map(|state| (state.attempt, state.max_attempts))
         .unwrap_or((DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS));
-    let detail = match restore_result {
-        Ok(()) => format!("自动修复执行失败，已恢复基线：{}", message),
-        Err(ref error) => format!("自动修复执行失败且基线恢复失败：{}；{}", message, error),
+    let detail = match &restore_result {
+        Ok(outcome) => format!(
+            "自动修复执行失败，已恢复基线（{}）：{}",
+            outcome.target_summary, message
+        ),
+        Err(outcome) => format!(
+            "自动修复执行失败且基线恢复失败：{}；{}",
+            message,
+            outcome.error_message()
+        ),
     };
     let replanned = proj
         .workflow_state
@@ -3238,7 +3632,8 @@ pub(crate) async fn resolve_human_recovery(
                 .as_ref()
                 .ok_or_else(|| "恢复基线缺少已验证的影响预览。".to_string())?
                 .baseline_commit;
-            pipeline::restore_git_execution_baseline(&proj.project_path, target)?;
+            pipeline::restore_git_execution_baseline(&proj.project_path, target)
+                .map_err(|outcome| outcome.error_message())?;
             reset_subtask_to_pending(&mut proj, &session);
             proj.execution_session = None;
             proj.workflow_state.recovery_state = None;
@@ -3356,7 +3751,8 @@ pub(crate) async fn resolve_human_recovery(
                 .as_ref()
                 .ok_or_else(|| "跳过任务缺少已验证的影响预览。".to_string())?
                 .baseline_commit;
-            pipeline::restore_git_execution_baseline(&proj.project_path, baseline)?;
+            pipeline::restore_git_execution_baseline(&proj.project_path, baseline)
+                .map_err(|outcome| outcome.error_message())?;
             let execution_result_fingerprint = subtask
                 .execution_result
                 .as_ref()
@@ -4047,6 +4443,211 @@ mod tests {
                 project::RecoveryErrorKind::PlanFailure,
                 project::RecoveryPhase::Replanning,
             )
+        );
+        // OutputTruncated boundary is the sole recovery phase entry for truncation;
+        // whole-stage RegenerateExecutionPlan is not produced here.
+    }
+
+    #[test]
+    fn output_truncation_boundary_is_current_task_replan_only() {
+        let (kind, phase) =
+            engine_block_boundary(&project::EngineFailureKind::OutputTruncated);
+        assert_eq!(kind, project::RecoveryErrorKind::PlanFailure);
+        assert_eq!(phase, project::RecoveryPhase::Replanning);
+        assert!(!crate::engine::requires_human_recovery(
+            &project::EngineFailureKind::OutputTruncated
+        ));
+        assert!(crate::engine::blocks_code_recovery(
+            &project::EngineFailureKind::OutputTruncated
+        ));
+    }
+
+    #[test]
+    fn stalled_recovery_reconciliation_is_bounded() {
+        let now = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 8, 11, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+
+        // Fresh queued Replanning (updated just now, no claim) → allow one claim.
+        let fresh = StalledRecoveryInput {
+            phase: &project::RecoveryPhase::Replanning,
+            updated_at: "2026-08-11T11:59:50Z",
+            replan_execution_attempted: false,
+            next_validation_retry_at: None,
+            is_validation_recovery: false,
+            action_id: "",
+            action_kind: "",
+            action_started_at: "",
+            now,
+        };
+        assert_eq!(
+            reconcile_stalled_recovery(fresh),
+            StalledRecoveryDisposition::AllowAutomaticClaim
+        );
+
+        // No claim, idle ≥300s → MarkStalled
+        let stale_unclaimed = StalledRecoveryInput {
+            phase: &project::RecoveryPhase::Replanning,
+            updated_at: "2026-08-11T11:54:00Z",
+            replan_execution_attempted: false,
+            next_validation_retry_at: None,
+            is_validation_recovery: false,
+            action_id: "",
+            action_kind: "",
+            action_started_at: "",
+            now,
+        };
+        assert_eq!(
+            reconcile_stalled_recovery(stale_unclaimed),
+            StalledRecoveryDisposition::MarkStalled
+        );
+
+        // Hard cap from action start ≥720s → human
+        let hard = StalledRecoveryInput {
+            phase: &project::RecoveryPhase::Replanning,
+            updated_at: "2026-08-11T11:59:00Z",
+            replan_execution_attempted: false,
+            next_validation_retry_at: None,
+            is_validation_recovery: false,
+            action_id: "a1",
+            action_kind: "run_error_recovery",
+            action_started_at: "2026-08-11T11:47:00Z",
+            now,
+        };
+        assert_eq!(
+            reconcile_stalled_recovery(hard),
+            StalledRecoveryDisposition::EnterHumanBoundary
+        );
+
+        // replan_execution_attempted lost → human, never auto repeat
+        let lost_replan = StalledRecoveryInput {
+            phase: &project::RecoveryPhase::Replanning,
+            updated_at: "2026-08-11T11:59:50Z",
+            replan_execution_attempted: true,
+            next_validation_retry_at: None,
+            is_validation_recovery: false,
+            action_id: "",
+            action_kind: "",
+            action_started_at: "",
+            now,
+        };
+        assert_eq!(
+            reconcile_stalled_recovery(lost_replan),
+            StalledRecoveryDisposition::EnterHumanBoundary
+        );
+
+        // Validation scheduled retry not due → Wait
+        let validation_wait = StalledRecoveryInput {
+            phase: &project::RecoveryPhase::Retesting,
+            updated_at: "2026-08-11T11:59:50Z",
+            replan_execution_attempted: false,
+            next_validation_retry_at: Some("2026-08-11T12:05:00Z"),
+            is_validation_recovery: true,
+            action_id: "",
+            action_kind: "",
+            action_started_at: "",
+            now,
+        };
+        assert_eq!(
+            reconcile_stalled_recovery(validation_wait),
+            StalledRecoveryDisposition::Wait
+        );
+
+        // Empty updated_at → conservative human (no auto repeat)
+        let unknown = StalledRecoveryInput {
+            phase: &project::RecoveryPhase::Replanning,
+            updated_at: "",
+            replan_execution_attempted: false,
+            next_validation_retry_at: None,
+            is_validation_recovery: false,
+            action_id: "",
+            action_kind: "",
+            action_started_at: "",
+            now,
+        };
+        assert_eq!(
+            reconcile_stalled_recovery(unknown),
+            StalledRecoveryDisposition::EnterHumanBoundary
+        );
+
+        // Healthy claim with recent progress → Wait (do not supersede)
+        let claimed = StalledRecoveryInput {
+            phase: &project::RecoveryPhase::Repairing,
+            updated_at: "2026-08-11T11:59:30Z",
+            replan_execution_attempted: false,
+            next_validation_retry_at: None,
+            is_validation_recovery: false,
+            action_id: "live",
+            action_kind: "run_error_recovery",
+            action_started_at: "2026-08-11T11:59:00Z",
+            now,
+        };
+        assert_eq!(
+            reconcile_stalled_recovery(claimed),
+            StalledRecoveryDisposition::Wait
+        );
+
+        // Apply path: MarkStalled mutates project and blocks auto claim
+        let mut proj = project::Project::new("stalled-reconciliation");
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            run_status: project::AutopilotRunStatus::Running,
+            recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+            current_action_id: String::new(),
+            ..Default::default()
+        });
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            phase: project::RecoveryPhase::Replanning,
+            error_kind: project::RecoveryErrorKind::PlanFailure,
+            subtask_id: "sub-1".to_string(),
+            execution_id: "exec-1".to_string(),
+            updated_at: "2026-08-11T11:54:00Z".to_string(),
+            started_at: "2026-08-11T11:50:00Z".to_string(),
+            ..Default::default()
+        });
+        // Only pure reconcile test for MarkStalled
+        assert_eq!(
+            reconcile_stalled_recovery(StalledRecoveryInput {
+                phase: &project::RecoveryPhase::Replanning,
+                updated_at: "2026-08-11T11:54:00Z",
+                replan_execution_attempted: false,
+                next_validation_retry_at: None,
+                is_validation_recovery: false,
+                action_id: "",
+                action_kind: "",
+                action_started_at: "",
+                now,
+            }),
+            StalledRecoveryDisposition::MarkStalled
+        );
+
+        // Restart: replan_execution_attempted must not resume automatic job
+        let mut restart = project::Project::new("restart-replan-lost");
+        restart.workflow_state.autopilot_active = true;
+        restart.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            run_status: project::AutopilotRunStatus::Running,
+            job_id: "old".to_string(),
+            job_generation: 3,
+            recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+            ..Default::default()
+        });
+        restart.workflow_state.recovery_state = Some(project::RecoveryState {
+            phase: project::RecoveryPhase::Replanning,
+            replan_execution_attempted: true,
+            updated_at: now.to_rfc3339(),
+            subtask_id: "sub-1".to_string(),
+            ..Default::default()
+        });
+        assert!(!crate::autopilot_runtime::reconcile_startup_job(&mut restart));
+        assert_eq!(
+            restart
+                .workflow_state
+                .recovery_state
+                .as_ref()
+                .map(|r| r.phase.clone()),
+            Some(project::RecoveryPhase::WaitingHuman)
         );
     }
 

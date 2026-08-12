@@ -386,6 +386,24 @@ pub enum RecoveryPhase {
     WaitingHuman,
 }
 
+/// 执行基线恢复的结构化事实；旧项目缺字段时默认为 Unknown。
+/// 不得持久化 stash 内容、secret 或完整敏感外部路径。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryBaselineStatus {
+    /// 旧项目或尚未记录基线事实。
+    #[default]
+    Unknown,
+    /// 本轮恢复不需要执行基线恢复。
+    NotRequired,
+    /// 已决定恢复基线但尚未完成（极少跨进程保留）。
+    Pending,
+    /// stash（如有）+ reset hard 成功且工作树干净。
+    Restored,
+    /// stash/reset/clean 校验失败；不得伪造 Restored。
+    RestoreFailed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ReviewIssueSeverity {
     Blocking,
@@ -775,6 +793,15 @@ pub struct RecoveryState {
     pub execution_id: String,
     #[serde(default)]
     pub baseline_commit: String,
+    /// 结构化基线恢复状态；旧项目默认 Unknown。
+    #[serde(default)]
+    pub baseline_status: RecoveryBaselineStatus,
+    /// 短 commit/ref 摘要（非完整路径、非 stash 内容）。
+    #[serde(default)]
+    pub baseline_target_summary: String,
+    /// 本次恢复是否创建了安全 stash（不含 stash 内容）。
+    #[serde(default)]
+    pub baseline_stash_created: bool,
     #[serde(default)]
     pub last_diagnosis: String,
     #[serde(default)]
@@ -852,6 +879,9 @@ impl Default for RecoveryState {
             subtask_id: String::new(),
             execution_id: String::new(),
             baseline_commit: String::new(),
+            baseline_status: RecoveryBaselineStatus::Unknown,
+            baseline_target_summary: String::new(),
+            baseline_stash_created: false,
             last_diagnosis: String::new(),
             last_repair_summary: String::new(),
             original_test_failure: String::new(),
