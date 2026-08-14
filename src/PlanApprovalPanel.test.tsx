@@ -3,7 +3,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Project } from "./types";
+import type { ManagedFlowState, Project } from "./types";
 import { PlanApprovalPanel } from "./PlanApprovalPanel";
 
 function projectWithProfile(): Project {
@@ -52,6 +52,25 @@ function projectWithProfile(): Project {
   } as unknown as Project;
 }
 
+function errorStoppedManaged(): ManagedFlowState {
+  return {
+    active: true,
+    managed_state: "ErrorStopped",
+    managed_target: "MilestoneSelection",
+    last_action: "模型连接失败",
+    last_action_at: "2026-08-13T00:00:00Z",
+    run_status: "ErrorStopped",
+    error_message: "provider unavailable",
+    job_id: "job-1",
+    job_generation: 2,
+    current_action: "",
+    current_action_id: "",
+    heartbeat_at: "2026-08-13T00:00:00Z",
+    retry_count: 0,
+    last_completed_action: "generate_version_plan",
+  };
+}
+
 describe("PlanApprovalPanel workload binding", () => {
   let host: HTMLDivElement;
   let root: Root;
@@ -69,7 +88,16 @@ describe("PlanApprovalPanel workload binding", () => {
     host.remove();
   });
 
-  function render(project: Project) {
+  function render(
+    project: Project,
+    extras?: {
+      managedFlowState?: ManagedFlowState;
+      onResumeManagedFlow?: () => void;
+      onStopManagedFlow?: () => void;
+      onStartManagedFlow?: () => void;
+      onPauseManagedFlow?: () => void;
+    },
+  ) {
     act(() => {
       root.render(
         <PlanApprovalPanel
@@ -79,6 +107,11 @@ describe("PlanApprovalPanel workload binding", () => {
           onReject={vi.fn()}
           onEnterConsole={vi.fn()}
           isSubmitting={false}
+          managedFlowState={extras?.managedFlowState}
+          onResumeManagedFlow={extras?.onResumeManagedFlow}
+          onStopManagedFlow={extras?.onStopManagedFlow}
+          onStartManagedFlow={extras?.onStartManagedFlow}
+          onPauseManagedFlow={extras?.onPauseManagedFlow}
         />,
       );
     });
@@ -120,5 +153,60 @@ describe("PlanApprovalPanel workload binding", () => {
     approve = [...host.querySelectorAll("button")]
       .find(button => button.textContent?.includes("批准项目方案"));
     expect(approve?.disabled).toBe(true);
+  });
+
+  it("keeps ErrorStopped managed controls with restart and stop handlers", () => {
+    const onResume = vi.fn();
+    const onStop = vi.fn();
+    const project = projectWithProfile();
+    project.workflow_state = {
+      managed_flow_state: errorStoppedManaged(),
+    } as Project["workflow_state"];
+
+    render(project, {
+      managedFlowState: errorStoppedManaged(),
+      onResumeManagedFlow: onResume,
+      onStopManagedFlow: onStop,
+    });
+
+    expect(host.textContent).toContain("托管层因错误停止");
+    expect(host.textContent).toContain("provider unavailable");
+    expect(host.textContent).toContain("重新启动托管");
+    expect(host.textContent).toContain("停止托管并转人工");
+    expect(host.querySelector("[data-testid=\"plan-approval-managed-controls\"]")).not.toBeNull();
+
+    const restart = [...host.querySelectorAll("button")]
+      .find(button => button.textContent?.includes("重新启动托管"));
+    const stop = [...host.querySelectorAll("button")]
+      .find(button => button.textContent?.includes("停止托管并转人工"));
+    expect(restart).toBeTruthy();
+    expect(stop).toBeTruthy();
+
+    act(() => {
+      restart?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      stop?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(onResume).toHaveBeenCalledTimes(1);
+    expect(onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows ErrorStopped controls on approved plan view", () => {
+    const project = projectWithProfile();
+    project.plan_draft!.draft_status = "Approved";
+    project.plan_draft!.approved = true;
+    project.plan_draft!.approved_at = "2026-08-13T01:00:00Z";
+    project.workflow_state = {
+      managed_flow_state: errorStoppedManaged(),
+    } as Project["workflow_state"];
+
+    render(project, {
+      managedFlowState: errorStoppedManaged(),
+      onResumeManagedFlow: vi.fn(),
+      onStopManagedFlow: vi.fn(),
+    });
+
+    expect(host.textContent).toContain("项目方案已批准");
+    expect(host.textContent).toContain("重新启动托管");
+    expect(host.textContent).toContain("停止托管并转人工");
   });
 });

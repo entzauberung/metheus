@@ -768,24 +768,57 @@ pub(crate) async fn start_managed_flow_state(
         return Err("自动驾驶已激活，无法同时启动托管层。请先关闭自动驾驶。".to_string());
     }
 
+    if let Some(existing) = proj.workflow_state.managed_flow_state.as_mut() {
+        match (existing.active, &existing.run_status) {
+            (true, project::ManagedRunStatus::Running) => {
+                return Err("托管层已在运行，不能重复启动。".to_string());
+            }
+            (true, project::ManagedRunStatus::Paused)
+            | (true, project::ManagedRunStatus::WaitingHuman) => {
+                return Err("托管层当前已暂停或等待人工，请使用恢复动作。".to_string());
+            }
+            (true, project::ManagedRunStatus::ErrorStopped) => {
+                crate::managed_runtime::assign_new_job_identity(
+                    existing,
+                    "托管层已显式重启，后端开始新的作业代次",
+                );
+                existing.run_status = project::ManagedRunStatus::Running;
+            }
+            (false, _) => {}
+        }
+    }
+
     let now = chrono::Utc::now().to_rfc3339();
     let current_step_str = format!("{:?}", proj.workflow_state.current_step);
 
-    let mut managed_state = project::ManagedFlowState {
-        active: true,
-        managed_state: current_step_str,
-        managed_target: "MilestoneSelection".to_string(),
-        last_action: "托管层已激活，开始自动推进".to_string(),
-        last_action_at: now.clone(),
-        run_status: project::ManagedRunStatus::Running,
-        error_message: String::new(),
-        ..Default::default()
-    };
-    crate::managed_runtime::assign_new_job_identity(
-        &mut managed_state,
-        "托管层已激活，后端开始自动推进",
-    );
-    proj.workflow_state.managed_flow_state = Some(managed_state);
+    if let Some(existing) = proj.workflow_state.managed_flow_state.as_mut() {
+        if !existing.active {
+            existing.active = true;
+            existing.run_status = project::ManagedRunStatus::Running;
+            existing.managed_state = current_step_str;
+            existing.managed_target = "MilestoneSelection".to_string();
+            crate::managed_runtime::assign_new_job_identity(
+                existing,
+                "托管层已激活，后端开始自动推进",
+            );
+        }
+    } else {
+        let mut managed_state = project::ManagedFlowState {
+            active: true,
+            managed_state: current_step_str,
+            managed_target: "MilestoneSelection".to_string(),
+            last_action: "托管层已激活，开始自动推进".to_string(),
+            last_action_at: now.clone(),
+            run_status: project::ManagedRunStatus::Running,
+            error_message: String::new(),
+            ..Default::default()
+        };
+        crate::managed_runtime::assign_new_job_identity(
+            &mut managed_state,
+            "托管层已激活，后端开始自动推进",
+        );
+        proj.workflow_state.managed_flow_state = Some(managed_state);
+    }
 
     proj.workflow_state.data_revision += 1;
     proj.workflow_state.last_transition_at = now;
@@ -4086,6 +4119,82 @@ mod tests {
                 .map(|managed| &managed.run_status),
             Some(&project::ManagedRunStatus::Running)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_start_rejects_duplicate_running_job() -> Result<(), String> {
+        let project_name = unique_project_name("managed-start-running");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = active_managed_plan_project(
+            &project_name,
+            project::WorkflowStep::ProjectPlanGeneration,
+        );
+        let state = proj
+            .workflow_state
+            .managed_flow_state
+            .as_mut()
+            .ok_or("托管状态缺失".to_string())?;
+        crate::managed_runtime::assign_new_job_identity(state, "已有作业");
+        let job_id = state.job_id.clone();
+        let generation = state.job_generation;
+        let revision = proj.workflow_state.data_revision;
+        crate::save_project(&proj)?;
+
+        let error = start_managed_flow_state(project_name.clone())
+            .await
+            .expect_err("运行中的托管不能重复启动");
+        assert!(error.contains("已在运行"));
+        let stored = crate::load_project(&project_name)?;
+        let state = stored
+            .workflow_state
+            .managed_flow_state
+            .ok_or("托管状态缺失")?;
+        assert_eq!(state.job_id, job_id);
+        assert_eq!(state.job_generation, generation);
+        assert_eq!(stored.workflow_state.data_revision, revision);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_start_restarts_error_stopped_with_new_job_generation() -> Result<(), String> {
+        let project_name = unique_project_name("managed-start-error-stopped");
+        let _guard = ProjectDataGuard::new(&project_name)?;
+        let mut proj = active_managed_plan_project(
+            &project_name,
+            project::WorkflowStep::ProjectPlanGeneration,
+        );
+        let state = proj
+            .workflow_state
+            .managed_flow_state
+            .as_mut()
+            .ok_or("托管状态缺失")?;
+        state.run_status = project::ManagedRunStatus::ErrorStopped;
+        state.error_message = "模型连接失败".to_string();
+        state.current_action = "generate_version_plan".to_string();
+        state.current_action_id = "old-action".to_string();
+        crate::managed_runtime::assign_new_job_identity(state, "错误停止前的代次");
+        state.run_status = project::ManagedRunStatus::ErrorStopped;
+        state.error_message = "模型连接失败".to_string();
+        state.current_action = "generate_version_plan".to_string();
+        state.current_action_id = "old-action".to_string();
+        let old_job_id = state.job_id.clone();
+        let old_generation = state.job_generation;
+        crate::save_project(&proj)?;
+
+        let restarted = start_managed_flow_state(project_name).await?;
+        let state = restarted
+            .workflow_state
+            .managed_flow_state
+            .ok_or("托管状态缺失")?;
+        assert!(state.active);
+        assert_eq!(state.run_status, project::ManagedRunStatus::Running);
+        assert_ne!(state.job_id, old_job_id);
+        assert_eq!(state.job_generation, old_generation + 1);
+        assert!(state.error_message.is_empty());
+        assert!(state.current_action.is_empty());
+        assert!(state.current_action_id.is_empty());
+        assert!(state.last_action.contains("显式重启"));
         Ok(())
     }
 

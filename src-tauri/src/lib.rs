@@ -275,15 +275,76 @@ pub struct AppState {
     pub(crate) managed_runtime: Arc<crate::managed_runtime::ManagedRuntime>,
 }
 
+/// WO-004-ST-001 冻结的窗口关闭策略。
+///
+/// 策略 B：允许窗口/应用退出；不拦截关闭；不在关闭路径上强杀 PID。
+/// 进程内 Tokio task 随应用退出；执行子进程 PID 保留在快照中，由下次启动
+/// `cleanup_orphan_processes_at_startup` + `reconcile_on_startup` 对账。
+/// 父终端、Vite、Cargo 与未知进程永远不在关闭路径上被终止。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowClosePolicy {
+    /// 保留后台可重开（当前默认）
+    PreserveBackgroundForReopen,
+}
+
+/// 当前冻结的窗口关闭策略（WO-004-ST-001 策略 B）。
+pub(crate) fn window_close_policy() -> WindowClosePolicy {
+    WindowClosePolicy::PreserveBackgroundForReopen
+}
+
+/// 关闭路径是否应终止给定 PID。
+///
+/// 策略 B 恒为 false：关闭时不杀执行子进程、不杀开发监督器、不杀未知 PID。
+/// 仅启动对账在确认归属后清理快照中的孤儿执行 PID。
+pub(crate) fn should_terminate_pid_on_window_close(
+    policy: WindowClosePolicy,
+    _pid_is_owned_execution: bool,
+    _pid_is_dev_supervisor_or_unknown: bool,
+) -> bool {
+    match policy {
+        WindowClosePolicy::PreserveBackgroundForReopen => false,
+    }
+}
+
+/// 关闭路径是否应拦截窗口关闭（隐藏/托盘等）。
+/// 策略 B 不拦截，允许默认退出。
+pub(crate) fn should_prevent_window_close(policy: WindowClosePolicy) -> bool {
+    match policy {
+        WindowClosePolicy::PreserveBackgroundForReopen => false,
+    }
+}
+
+/// 应用退出时的生命周期决策摘要（可测纯函数，供日志与审查引用）。
+pub(crate) fn window_close_lifecycle_decision(policy: WindowClosePolicy) -> &'static str {
+    match policy {
+        WindowClosePolicy::PreserveBackgroundForReopen => {
+            "strategy_b_preserve_background: allow_exit; no_pid_kill_on_close; startup_reconcile_owns_orphan_execution_pids; never_kill_parent_terminal_or_dev_supervisors"
+        }
+    }
+}
+
+fn handle_window_close_lifecycle(policy: WindowClosePolicy) {
+    let decision = window_close_lifecycle_decision(policy);
+    eprintln!("[lifecycle] window close: {decision}");
+    // 策略 B：不 prevent_close、不在此路径 kill 任何 PID。
+    // 执行子进程若仍存活，由下次启动 cleanup_orphan_processes_at_startup 处理。
+    let _ = should_terminate_pid_on_window_close(policy, true, false);
+}
+
+fn handle_app_exit_lifecycle(policy: WindowClosePolicy) {
+    let decision = window_close_lifecycle_decision(policy);
+    eprintln!("[lifecycle] app exit: {decision}");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     load_env();
     if let Err(error) = crate::settings::initialize_settings() {
         eprintln!("初始化应用设置失败：{error}");
     }
-    // 启动时清理上次异常退出遗留的孤儿进程
+    // 启动时清理上次异常退出遗留的孤儿进程（策略 B 重开对账兜底）
     crate::snapshot::cleanup_orphan_processes_at_startup();
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState {
             pipeline_state: Arc::new(Mutex::new(None)),
@@ -462,13 +523,61 @@ pub fn run() {
             crate::snapshot::save_snapshot_event,
             crate::snapshot::restore_snapshot
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // WO-004-ST-002：显式接入窗口/应用生命周期（策略 B）。
+    // CloseRequested 不拦截；Exit 不杀未知/开发监督器 PID；启动对账仍是孤儿清理兜底。
+    app.run(|_app_handle, event| {
+        let policy = window_close_policy();
+        match event {
+            tauri::RunEvent::WindowEvent {
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } => {
+                handle_window_close_lifecycle(policy);
+                if should_prevent_window_close(policy) {
+                    api.prevent_close();
+                }
+                // 策略 B：不调用 prevent_close，允许窗口关闭并最终退出应用。
+            }
+            tauri::RunEvent::Exit => {
+                handle_app_exit_lifecycle(policy);
+            }
+            tauri::RunEvent::ExitRequested { .. } => {
+                // 策略 B：不 prevent_exit；进程内 task 随退出结束。
+                handle_app_exit_lifecycle(policy);
+            }
+            _ => {}
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_close_policy_is_strategy_b_preserve_background() {
+        assert_eq!(
+            window_close_policy(),
+            WindowClosePolicy::PreserveBackgroundForReopen
+        );
+        assert!(!should_prevent_window_close(window_close_policy()));
+        assert!(!should_terminate_pid_on_window_close(
+            window_close_policy(),
+            true,
+            false
+        ));
+        assert!(!should_terminate_pid_on_window_close(
+            window_close_policy(),
+            false,
+            true
+        ));
+        assert!(window_close_lifecycle_decision(window_close_policy()).contains("strategy_b"));
+        assert!(window_close_lifecycle_decision(window_close_policy())
+            .contains("never_kill_parent_terminal_or_dev_supervisors"));
+    }
 
     #[test]
     fn adaptive_execution_contract_loads_v1_snapshot_without_profile_and_preserves_task_facts() {

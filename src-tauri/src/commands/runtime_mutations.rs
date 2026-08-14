@@ -68,6 +68,79 @@ fn background_job_active(project: &crate::project::Project) -> bool {
             .is_some_and(|value| value.active)
 }
 
+fn managed_action(
+    project_name: &str,
+    pipeline: Option<PipelineState>,
+    action: &str,
+    background_job_started: bool,
+) -> Result<RuntimeMutationResult, String> {
+    let latest = crate::load_project(project_name)?;
+    let Some(managed) = latest.workflow_state.managed_flow_state.as_ref() else {
+        return mutation_result(
+            project_name,
+            pipeline,
+            recovery_action(
+                action,
+                "托管已停止",
+                "托管控制权已释放，当前没有后台托管状态。",
+                None,
+                Vec::new(),
+                false,
+                "请在人工模式下选择下一步。".to_string(),
+            ),
+            false,
+        );
+    };
+
+    let actual_job_started = background_job_started
+        && managed.active
+        && managed.run_status == crate::project::ManagedRunStatus::Running;
+    let (title, message, next_step) = match managed.run_status {
+        crate::project::ManagedRunStatus::Running => (
+            "托管已运行",
+            format!(
+                "托管状态为 Running，job_id={}，job_generation={}。",
+                managed.job_id, managed.job_generation
+            ),
+            if actual_job_started {
+                "后台托管作业已启动或继续运行。"
+            } else {
+                "后台托管作业未自动启动，请人工检查作业状态。"
+            },
+        ),
+        crate::project::ManagedRunStatus::Paused => (
+            "托管已暂停",
+            "托管状态为 Paused，当前动作不会继续执行。".to_string(),
+            "使用恢复托管或停止托管回到人工模式。",
+        ),
+        crate::project::ManagedRunStatus::WaitingHuman => (
+            "托管等待人工",
+            format!("{}。", managed.last_action),
+            "请处理人工决策，或停止托管回到人工模式。",
+        ),
+        crate::project::ManagedRunStatus::ErrorStopped => (
+            "托管因错误停止",
+            if managed.error_message.is_empty() {
+                "托管已停止，但没有新的错误摘要。".to_string()
+            } else {
+                format!("托管已停止：{}", managed.error_message)
+            },
+            "请重新启动托管、停止托管或转人工处理。",
+        ),
+    };
+
+    let action_summary = recovery_action(
+        action,
+        title,
+        &message,
+        None,
+        Vec::new(),
+        actual_job_started,
+        next_step.to_string(),
+    );
+    mutation_result(project_name, pipeline, action_summary, false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,7 +574,7 @@ pub(crate) async fn pause_managed_flow_runtime(
     let pipeline_state = state.pipeline_state.clone();
     crate::commands::workflow::pause_managed_flow(project_name.clone()).await?;
     let pipeline = pipeline_state.lock().await.clone();
-    finish(&project_name, pipeline, "pause_managed_flow")
+    managed_action(&project_name, pipeline, "pause_managed_flow", false)
 }
 
 #[tauri::command]
@@ -512,7 +585,7 @@ pub(crate) async fn resume_managed_flow_runtime(
     let pipeline_state = state.pipeline_state.clone();
     crate::commands::workflow::resume_managed_flow(state, project_name.clone()).await?;
     let pipeline = pipeline_state.lock().await.clone();
-    finish(&project_name, pipeline, "resume_managed_flow")
+    managed_action(&project_name, pipeline, "resume_managed_flow", true)
 }
 
 #[tauri::command]
@@ -523,7 +596,7 @@ pub(crate) async fn start_managed_flow_runtime(
     let pipeline_state = state.pipeline_state.clone();
     crate::commands::workflow::start_managed_flow(state, project_name.clone()).await?;
     let pipeline = pipeline_state.lock().await.clone();
-    finish(&project_name, pipeline, "start_managed_flow")
+    managed_action(&project_name, pipeline, "start_managed_flow", true)
 }
 
 #[tauri::command]
@@ -534,7 +607,7 @@ pub(crate) async fn stop_managed_flow_runtime(
     let pipeline_state = state.pipeline_state.clone();
     crate::commands::workflow::stop_managed_flow(state, project_name.clone()).await?;
     let pipeline = pipeline_state.lock().await.clone();
-    finish(&project_name, pipeline, "stop_managed_flow")
+    managed_action(&project_name, pipeline, "stop_managed_flow", false)
 }
 
 #[tauri::command]

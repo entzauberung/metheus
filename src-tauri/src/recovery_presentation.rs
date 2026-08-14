@@ -401,24 +401,19 @@ fn recovery_progress_at(
                     || state.recovery_action == AutopilotRecoveryAction::WaitHumanDecision
             })
             .unwrap_or(false);
-    let claimed = autopilot
-        .filter(|state| {
-            !waiting_human
-                && !state.current_action_id.is_empty()
-                && state.current_action_kind == "run_error_recovery"
-        });
+    let claimed = autopilot.filter(|state| {
+        !waiting_human
+            && !state.current_action_id.is_empty()
+            && state.current_action_kind == "run_error_recovery"
+    });
     let action_started_at = claimed
         .map(|state| state.action_started_at.clone())
         .filter(|value| !value.is_empty());
-    let action_started = action_started_at
-        .as_deref()
-        .and_then(recovery_timestamp);
+    let action_started = action_started_at.as_deref().and_then(recovery_timestamp);
     let last_progress_at = recovery
         .map(|state| state.updated_at.clone())
         .filter(|value| !value.is_empty());
-    let last_progress = last_progress_at
-        .as_deref()
-        .and_then(recovery_timestamp);
+    let last_progress = last_progress_at.as_deref().and_then(recovery_timestamp);
     let scheduled = !waiting_human
         && autopilot
             .and_then(|state| state.next_retry_at.as_deref())
@@ -652,21 +647,15 @@ fn baseline_impact_summary(project: &Project) -> String {
         return "执行基线恢复结果未记录。".to_string();
     };
     match recovery.baseline_status {
-        crate::project::RecoveryBaselineStatus::Unknown => {
-            "执行基线恢复结果未记录。".to_string()
-        }
+        crate::project::RecoveryBaselineStatus::Unknown => "执行基线恢复结果未记录。".to_string(),
         crate::project::RecoveryBaselineStatus::NotRequired => {
             "本轮恢复不需要恢复执行基线。".to_string()
         }
-        crate::project::RecoveryBaselineStatus::Pending => {
-            "执行基线恢复尚未完成。".to_string()
-        }
+        crate::project::RecoveryBaselineStatus::Pending => "执行基线恢复尚未完成。".to_string(),
         crate::project::RecoveryBaselineStatus::Restored if recovery.baseline_stash_created => {
             "未提交改动已暂存，工作区已恢复到执行基线。".to_string()
         }
-        crate::project::RecoveryBaselineStatus::Restored => {
-            "工作区已恢复到执行基线。".to_string()
-        }
+        crate::project::RecoveryBaselineStatus::Restored => "工作区已恢复到执行基线。".to_string(),
         crate::project::RecoveryBaselineStatus::RestoreFailed => {
             "执行基线恢复失败，需要人工检查工作区。".to_string()
         }
@@ -1511,10 +1500,7 @@ mod tests {
         );
         assert!(presentation.requires_baseline_restore);
         assert!(presentation.supports_preview);
-        assert_eq!(
-            presentation.code_impact_summary,
-            "执行基线恢复结果未记录。"
-        );
+        assert_eq!(presentation.code_impact_summary, "执行基线恢复结果未记录。");
     }
 
     #[test]
@@ -1751,8 +1737,9 @@ mod tests {
         };
 
         let mut queued = Project::new("progress-queued");
-        queued.workflow_state.recovery_state =
-            Some(recovery_state((now - chrono::Duration::seconds(10)).to_rfc3339()));
+        queued.workflow_state.recovery_state = Some(recovery_state(
+            (now - chrono::Duration::seconds(10)).to_rfc3339(),
+        ));
         queued.workflow_state.autopilot_state = Some(autopilot_state());
         assert_eq!(
             recovery_progress_at(&queued, now, true).status,
@@ -1834,10 +1821,7 @@ mod tests {
         let waiting_view = present_recovery(&waiting);
         assert!(!waiting_view.background_retry_active);
         assert!(waiting_view.heartbeat_status.starts_with("已停止"));
-        assert_eq!(
-            waiting_view.code_impact_summary,
-            "执行基线恢复结果未记录。"
-        );
+        assert_eq!(waiting_view.code_impact_summary, "执行基线恢复结果未记录。");
 
         let recovery = waiting
             .workflow_state

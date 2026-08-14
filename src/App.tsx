@@ -71,6 +71,7 @@ import {
 import { resolvePlanTarget } from "./planTargetPolicy";
 import { getConsoleWritePolicy, type ConsoleWritePolicy } from "./consoleWritePolicy";
 import { shouldCollapseConsolePanel } from "./consolePanelPolicy";
+import { getManagedFlowPresentation } from "./managedFlowPolicy";
 
 const WORKFLOW_STEPS = new Set<WorkflowStep>([
   "WaitingEntry", "ExistingAnalysis", "BaselineApproval", "Discussion", "ThreeChecks",
@@ -818,6 +819,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
           return null; // 阻止后续 .then() 执行
         }
 
+        projectRef.current = project;
         setProject(project);
 
         // Build a sequential chain: migration → managed-state reconcile → execution reconcile → snapshot
@@ -832,10 +834,11 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
             }).then((result) => {
               applyRuntimeMutation(result);
               return result.runtime_snapshot.project;
-            }).catch((err) => {
-              console.error("迁移旧项目工作流失败:", err);
-              return p;
-            })
+          }).catch((err) => {
+            console.error("迁移旧项目工作流失败:", err);
+            setFeedbackMsg({ type: "warning", message: "启动迁移未完成，已保留项目并等待状态同步：" + String(err) });
+            return p;
+          })
           );
         }
 
@@ -848,6 +851,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
             return result.runtime_snapshot.project;
           }).catch((err) => {
             console.error("大阶段托管状态对账失败:", err);
+            setFeedbackMsg({ type: "warning", message: "托管状态对账未完成，已保留项目并等待状态同步：" + String(err) });
             return p;
           })
         );
@@ -861,6 +865,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
             return result.runtime_snapshot.project;
           }).catch((err) => {
             console.error("启动执行状态对账失败:", err);
+            setFeedbackMsg({ type: "warning", message: "启动执行状态对账未完成，已保留项目并等待状态同步：" + String(err) });
             return p;
           })
         );
@@ -884,7 +889,12 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
         if (project && project.project_path) {
           setProjectPath(project.project_path);
         }
-        return invokeWithTimeout<any>("restore_snapshot", { projectId: project.name });
+        return invokeWithTimeout<any>("restore_snapshot", { projectId: project.name })
+          .catch((err) => {
+            console.error("恢复 UI 快照失败:", err);
+            setFeedbackMsg({ type: "warning", message: "UI 快照恢复失败，已保留业务状态并使用默认布局：" + String(err) });
+            return undefined;
+          });
       })
       .then((snapshot) => {
         // null means the previous .then() bailed out — don't continue
@@ -1366,11 +1376,16 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
 
   const handleResumeManagedFlow = async () => {
     if (!project || !beginConsoleAction("managed_resume")) return;
+    const errorStopped = project.workflow_state.managed_flow_state?.run_status === "ErrorStopped";
+    const command = errorStopped ? "start_managed_flow_runtime" : "resume_managed_flow_runtime";
     try {
-      await invokeRuntimeMutation("resume_managed_flow_runtime", {
+      await invokeRuntimeMutation(command, {
         projectName: project.name,
       });
-      setFeedbackMsg({ type: "info", message: "托管层已恢复。" });
+      setFeedbackMsg({
+        type: "info",
+        message: errorStopped ? "托管层已重新启动。" : "托管层已恢复。",
+      });
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "恢复托管失败：" + String(err) });
     } finally {
@@ -1721,6 +1736,10 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   // Determine which main panel to show based on workflow_state
   const phase = project.workflow_state.top_level_phase;
   const step = project.workflow_state.current_step;
+  const managedFlowState = project.workflow_state.managed_flow_state;
+  const managedFlowPresentation = managedFlowState
+    ? getManagedFlowPresentation(managedFlowState, step)
+    : null;
 
   // Before phase: show ExistingBaselinePanel for Half Project analysis
   if (phase === "Before" && (step === "ExistingAnalysis" || step === "BaselineApproval")) {
@@ -1816,7 +1835,10 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                 onRestartChecks={handleRestartChecks}
                 isSubmitting={isDecisionSubmitting}
                 onStartManagedFlow={handleStartManagedFlow}
-                managedFlowActive={project.workflow_state.managed_flow_state?.active === true}
+                onResumeManagedFlow={handleResumeManagedFlow}
+                onPauseManagedFlow={handlePauseManagedFlow}
+                onStopManagedFlow={handleStopManagedFlow}
+                managedFlowState={project.workflow_state.managed_flow_state}
               />
             )}
 
@@ -1839,7 +1861,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                   >
                     返回讨论
                   </ActionButton>
-                  {!project.workflow_state.managed_flow_state?.active && (
+                  {!managedFlowState?.active && (
                     <ActionButton
                       icon={<Bot size={16} />}
                       variant="secondary"
@@ -1848,6 +1870,45 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                     >
                       启动托管
                     </ActionButton>
+                  )}
+                  {managedFlowState && managedFlowPresentation && (
+                    <div style={{ marginTop: "12px", color: managedFlowState.run_status === "ErrorStopped" ? "#cf222e" : "#6e40c9", fontSize: "13px", flexBasis: "100%" }}>
+                      <p style={{ margin: "0 0 4px" }}>状态：{managedFlowPresentation.statusLabel}</p>
+                      <p style={{ margin: "0 0 4px" }}>错误原因：{managedFlowState.error_message || "暂无"}</p>
+                      <p style={{ margin: "0 0 8px" }}>下一步：{managedFlowPresentation.nextStepLabel}</p>
+                    </div>
+                  )}
+                  {managedFlowState?.active && managedFlowPresentation && (
+                    <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+                      {managedFlowPresentation.canResume && (
+                        <ActionButton
+                          icon={<Bot size={16} />}
+                          variant="secondary"
+                          onClick={handleResumeManagedFlow}
+                          disabled={isDecisionSubmitting || isConsoleBusy}
+                        >
+                          {managedFlowPresentation.resumeLabel}
+                        </ActionButton>
+                      )}
+                      {managedFlowPresentation.canPause && (
+                        <ActionButton
+                          icon={<Bot size={16} />}
+                          variant="ghost"
+                          onClick={handlePauseManagedFlow}
+                          disabled={isDecisionSubmitting || isConsoleBusy}
+                        >
+                          暂停托管
+                        </ActionButton>
+                      )}
+                      <ActionButton
+                        icon={<ArrowLeft size={16} />}
+                        variant="ghost"
+                        onClick={handleStopManagedFlow}
+                        disabled={isDecisionSubmitting || isConsoleBusy}
+                      >
+                        停止托管并转人工
+                      </ActionButton>
+                    </div>
                   )}
                 </div>
               </div>
@@ -1863,6 +1924,11 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                 onEnterConsole={handleEnterConsole}
                 onReDiscuss={handleReDiscussApprovedPlan}
                 isSubmitting={isDecisionSubmitting}
+                managedFlowState={project.workflow_state.managed_flow_state}
+                onStartManagedFlow={handleStartManagedFlow}
+                onResumeManagedFlow={handleResumeManagedFlow}
+                onPauseManagedFlow={handlePauseManagedFlow}
+                onStopManagedFlow={handleStopManagedFlow}
               />
             )}
 
@@ -2066,6 +2132,9 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                   onFeedback={setFeedbackMsg}
                   workspaceStatus={workspaceStatus}
                   onPrepareWorkspace={handlePrepareExecutionWorkspace}
+                  onPauseManagedFlow={handlePauseManagedFlow}
+                  onResumeManagedFlow={handleResumeManagedFlow}
+                  onStopManagedFlow={handleStopManagedFlow}
                 />
               )}
               {/* V1 执行阶段 UI — 仅在 Execution 步骤渲染 */}

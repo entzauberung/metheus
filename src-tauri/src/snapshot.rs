@@ -303,27 +303,29 @@ pub(crate) fn cleanup_orphan_processes_at_startup() {
         };
 
         if let Some(pid) = snapshot.running_pid {
-            if is_pid_alive(pid) {
+            let should_clear_pid = if is_pid_alive(pid) {
                 eprintln!(
                     "[snapshot] 发现孤儿进程 PID={} (项目={})，正在终止...",
                     pid, snapshot.project_id
                 );
                 if kill_pid(pid) {
                     eprintln!("[snapshot] 孤儿进程 PID={} 已终止", pid);
+                    true
                 } else {
                     eprintln!(
                         "[snapshot] 警告: 无法终止孤儿进程 PID={}（权限不足或进程已退出）",
                         pid
                     );
-                }
-                // 清除快照中的 running_pid
-                if let Err(e) = update_snapshot_pid(&snapshot.project_id, None) {
-                    eprintln!("[snapshot] 清除快照 PID 失败: {}", e);
+                    false
                 }
             } else {
                 // PID 不存活 → 进程已自然结束，清理快照中的残留 PID
+                true
+            };
+
+            if should_clear_pid {
                 if let Err(e) = update_snapshot_pid(&snapshot.project_id, None) {
-                    eprintln!("[snapshot] 清除残留 PID 失败: {}", e);
+                    eprintln!("[snapshot] 清除快照 PID 失败，保留阻断证据: {}", e);
                 }
             }
         }

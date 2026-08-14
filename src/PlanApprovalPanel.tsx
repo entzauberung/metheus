@@ -1,10 +1,11 @@
 // src/PlanApprovalPanel.tsx — 方案审批页面（根据 draft_status 分发四种视图）
 import { useState } from "react";
-import { Project } from "./types";
+import { ManagedFlowState, Project } from "./types";
 import { ArrowLeft, FileText, ShieldCheck, CheckCircle, XCircle, Clock } from "lucide-react";
 import { Modal } from "./components/Modal";
 import { ActionButton } from "./components/ActionButton";
 import { IconButton } from "./components/IconButton";
+import { getManagedFlowPresentation } from "./managedFlowPolicy";
 
 interface PlanApprovalPanelProps {
   project: Project;
@@ -14,6 +15,12 @@ interface PlanApprovalPanelProps {
   onEnterConsole: () => void;
   onReDiscuss?: () => void;
   isSubmitting: boolean;
+  /** 托管状态；有持久化事实时展示统一入口，ErrorStopped 不得消失 */
+  managedFlowState?: ManagedFlowState | null;
+  onStartManagedFlow?: () => void;
+  onResumeManagedFlow?: () => void;
+  onPauseManagedFlow?: () => void;
+  onStopManagedFlow?: () => void;
 }
 
 export function PlanApprovalPanel({
@@ -24,11 +31,88 @@ export function PlanApprovalPanel({
   onEnterConsole,
   onReDiscuss,
   isSubmitting,
+  managedFlowState,
+  onStartManagedFlow,
+  onResumeManagedFlow,
+  onPauseManagedFlow,
+  onStopManagedFlow,
 }: PlanApprovalPanelProps) {
   const draft = project.plan_draft;
   const [showApproveConfirm, setShowApproveConfirm] = useState(false);
   const [showRejectDialog, setShowRejectDialog] = useState(false);
   const [rejectFeedback, setRejectFeedback] = useState("");
+
+  const managedState = managedFlowState ?? project.workflow_state.managed_flow_state;
+  const managedPresentation = managedState
+    ? getManagedFlowPresentation(managedState, "PlanApproval")
+    : null;
+  const managedActive = managedState?.active === true;
+  const managedCanStart = managedPresentation?.canStart ?? !managedState;
+
+  const managedControls = managedState && managedPresentation ? (
+    <div
+      data-testid="plan-approval-managed-controls"
+      style={{
+        marginTop: "16px",
+        marginBottom: "12px",
+        padding: "12px 14px",
+        borderRadius: "8px",
+        border: `1px solid ${managedState.run_status === "ErrorStopped" ? "#cf222e" : "#6e40c9"}`,
+        background: managedState.run_status === "ErrorStopped" ? "#fff1f0" : "#f0e6ff",
+        color: managedState.run_status === "ErrorStopped" ? "#cf222e" : "#6e40c9",
+        fontSize: "13px",
+        textAlign: "left",
+      }}
+    >
+      <p style={{ margin: "0 0 4px" }}>
+        状态：{managedPresentation.statusLabel}
+      </p>
+      <p style={{ margin: "0 0 4px" }}>
+        错误原因：{managedState.error_message || "暂无"}
+      </p>
+      <p style={{ margin: "0 0 8px" }}>
+        下一步：{managedPresentation.nextStepLabel}
+      </p>
+      <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+        {managedCanStart && onStartManagedFlow && (
+          <ActionButton
+            onClick={onStartManagedFlow}
+            disabled={isSubmitting}
+            variant="secondary"
+          >
+            启动托管
+          </ActionButton>
+        )}
+        {managedPresentation.canResume && onResumeManagedFlow && (
+          <ActionButton
+            onClick={onResumeManagedFlow}
+            disabled={isSubmitting}
+            variant="secondary"
+          >
+            {managedPresentation.resumeLabel}
+          </ActionButton>
+        )}
+        {managedPresentation.canPause && onPauseManagedFlow && (
+          <ActionButton
+            onClick={onPauseManagedFlow}
+            disabled={isSubmitting}
+            variant="ghost"
+          >
+            暂停托管
+          </ActionButton>
+        )}
+        {managedActive && onStopManagedFlow && (
+          <ActionButton
+            onClick={onStopManagedFlow}
+            disabled={isSubmitting}
+            variant="ghost"
+          >
+            停止托管并转人工
+          </ActionButton>
+        )}
+      </div>
+    </div>
+  ) : null;
 
   // 无草稿的异常状态
   if (!draft) {
@@ -37,6 +121,7 @@ export function PlanApprovalPanel({
         <p style={{ color: "#cf222e" }}>
           当前没有方案草稿。请返回讨论并重新生成。
         </p>
+        {managedControls}
         <ActionButton onClick={onReturnToDiscussion} variant="secondary">返回继续讨论</ActionButton>
       </div>
     );
@@ -168,6 +253,8 @@ export function PlanApprovalPanel({
           </ActionButton>
         </div>
 
+        {managedControls}
+
         <p style={{ textAlign: "center", color: "#656d76", fontSize: "12px", marginTop: "12px" }}>
           返回讨论本身不会删除草稿；但只要发送新的需求消息，草稿和检查就会过期。
         </p>
@@ -246,14 +333,8 @@ export function PlanApprovalPanel({
 
   // === 已批准视图 ===
   if (isApproved) {
-    const managedActive = project.workflow_state.managed_flow_state?.active === true;
     return (
       <div className="plan-approval-panel" style={{ padding: "24px" }}>
-        {managedActive && (
-          <div style={{ padding: "10px 14px", background: "#f0e6ff", border: "1px solid #6e40c9", borderRadius: "6px", fontSize: "13px", marginBottom: "12px", color: "#6e40c9" }}>
-            🤖 <strong>托管层运行中</strong> — 方案已批准，托管层将自动进入控制台并推进大阶段审批。
-          </div>
-        )}
         <div className="plan-approved-banner" style={{
           background: "#dafbe1", border: "1px solid #1a7f37", borderRadius: "8px",
           padding: "16px", marginBottom: "16px",
@@ -280,6 +361,8 @@ export function PlanApprovalPanel({
             {draft.plan_content}
           </pre>
         </div>
+
+        {managedControls}
 
         <div style={{ textAlign: "center" }}>
           <ActionButton
@@ -336,6 +419,7 @@ export function PlanApprovalPanel({
           请返回讨论，重新检查并生成新方案。
         </p>
       </div>
+      {managedControls}
       <ActionButton
         onClick={onReturnToDiscussion}
         variant="secondary"

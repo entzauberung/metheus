@@ -63,6 +63,17 @@ describe("managed flow presentation", () => {
     )).toMatchObject({ canResume: true, resumeLabel: "继续托管并批准" });
   });
 
+  it("keeps ErrorStopped actionable through an explicit restart", () => {
+    const state = managed("ErrorStopped");
+    state.error_message = "模型连接失败";
+    expect(getManagedFlowPresentation(state, "ProjectPlanGeneration")).toMatchObject({
+      canResume: true,
+      resumeLabel: "重新启动托管",
+      detail: "模型连接失败",
+      nextStepLabel: "确认错误原因后重新启动托管，或停止托管并转人工",
+    });
+  });
+
   it("exposes backend action, target, heartbeat, and waiting reason", () => {
     const state = managed("WaitingHuman");
     state.current_action = "generate_version_plan";

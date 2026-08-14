@@ -103,8 +103,8 @@ where
     let mut entries: Vec<project::FileEntry> = Vec::new();
 
     for entry_result in entry_results {
-        let entry = entry_result
-            .map_err(|error| describe_file_tree_walk_error(project_root, &error))?;
+        let entry =
+            entry_result.map_err(|error| describe_file_tree_walk_error(project_root, &error))?;
         // 跳过根目录自身
         if entry.path() == project_root {
             continue;
@@ -989,10 +989,8 @@ mod tests {
 
         impl PreviewFixture {
             fn new() -> Self {
-                let base = std::env::temp_dir().join(format!(
-                    "metheus-file-preview-{}",
-                    uuid::Uuid::new_v4()
-                ));
+                let base = std::env::temp_dir()
+                    .join(format!("metheus-file-preview-{}", uuid::Uuid::new_v4()));
                 let root = base.join("project");
                 std::fs::create_dir_all(&root).expect("create preview project root");
                 Self { base, root }
@@ -1018,11 +1016,9 @@ mod tests {
             let fixture = PreviewFixture::new();
             fixture.write("src/main.rs", b"fn main() {}\n");
 
-            let result = read_project_file_preview_from_paths(
-                &fixture.root,
-                Path::new("src/main.rs"),
-            )
-            .expect("read project text");
+            let result =
+                read_project_file_preview_from_paths(&fixture.root, Path::new("src/main.rs"))
+                    .expect("read project text");
 
             assert_eq!(result.path, "src/main.rs");
             assert_eq!(result.content, "fn main() {}\n");
@@ -1043,25 +1039,18 @@ mod tests {
                 .expect_err("absolute path must fail");
             assert!(absolute.contains("相对文件路径"));
 
-            let escape = read_project_file_preview_from_paths(
-                &fixture.root,
-                Path::new("../outside.txt"),
-            )
-            .expect_err("parent escape must fail");
+            let escape =
+                read_project_file_preview_from_paths(&fixture.root, Path::new("../outside.txt"))
+                    .expect_err("parent escape must fail");
             assert!(escape.contains("相对文件路径"));
 
-            let directory = read_project_file_preview_from_paths(
-                &fixture.root,
-                Path::new("src"),
-            )
-            .expect_err("directory must fail");
+            let directory = read_project_file_preview_from_paths(&fixture.root, Path::new("src"))
+                .expect_err("directory must fail");
             assert!(directory.contains("不是文件"));
 
-            let missing = read_project_file_preview_from_paths(
-                &fixture.root,
-                Path::new("missing.txt"),
-            )
-            .expect_err("missing file must fail");
+            let missing =
+                read_project_file_preview_from_paths(&fixture.root, Path::new("missing.txt"))
+                    .expect_err("missing file must fail");
             assert!(missing.contains("不存在或无法访问"));
         }
 
@@ -1075,11 +1064,9 @@ mod tests {
             std::fs::write(&outside, b"outside").expect("write outside fixture");
             symlink(&outside, fixture.root.join("linked.txt")).expect("create escape symlink");
 
-            let error = read_project_file_preview_from_paths(
-                &fixture.root,
-                Path::new("linked.txt"),
-            )
-            .expect_err("symlink escape must fail");
+            let error =
+                read_project_file_preview_from_paths(&fixture.root, Path::new("linked.txt"))
+                    .expect_err("symlink escape must fail");
             assert!(error.contains("项目目录之外"));
         }
 
@@ -1090,29 +1077,26 @@ mod tests {
             fixture.write("control.dat", b"ABC\x01\x02\x03DEF");
             fixture.write("invalid.txt", &[0xff, 0xfe, 0xfd]);
 
-            let binary = read_project_file_preview_from_paths(
-                &fixture.root,
-                Path::new("image.bin"),
-            )
-            .expect("classify binary file");
+            let binary =
+                read_project_file_preview_from_paths(&fixture.root, Path::new("image.bin"))
+                    .expect("classify binary file");
             assert!(binary.binary);
             assert!(binary.content.is_empty());
             assert!(binary.error.expect("binary reason").contains("二进制"));
 
-            let control_bytes = read_project_file_preview_from_paths(
-                &fixture.root,
-                Path::new("control.dat"),
-            )
-            .expect("classify UTF-8 control-byte file");
+            let control_bytes =
+                read_project_file_preview_from_paths(&fixture.root, Path::new("control.dat"))
+                    .expect("classify UTF-8 control-byte file");
             assert!(control_bytes.binary);
             assert!(control_bytes.content.is_empty());
-            assert!(control_bytes.error.expect("control-byte reason").contains("二进制"));
+            assert!(control_bytes
+                .error
+                .expect("control-byte reason")
+                .contains("二进制"));
 
-            let invalid = read_project_file_preview_from_paths(
-                &fixture.root,
-                Path::new("invalid.txt"),
-            )
-            .expect("classify invalid UTF-8 file");
+            let invalid =
+                read_project_file_preview_from_paths(&fixture.root, Path::new("invalid.txt"))
+                    .expect("classify invalid UTF-8 file");
             assert!(invalid.binary);
             assert!(invalid.content.is_empty());
             assert!(invalid.error.expect("encoding reason").contains("UTF-8"));
@@ -1123,11 +1107,9 @@ mod tests {
             let fixture = PreviewFixture::new();
             fixture.write("large.txt", &vec![b'a'; FILE_PREVIEW_MAX_BYTES + 64]);
 
-            let result = read_project_file_preview_from_paths(
-                &fixture.root,
-                Path::new("large.txt"),
-            )
-            .expect("read bounded preview");
+            let result =
+                read_project_file_preview_from_paths(&fixture.root, Path::new("large.txt"))
+                    .expect("read bounded preview");
 
             assert!(result.truncated);
             assert!(!result.binary);
@@ -1147,10 +1129,8 @@ mod tests {
 
         impl FileTreeFixture {
             fn new() -> Self {
-                let base = std::env::temp_dir().join(format!(
-                    "metheus-file-tree-{}",
-                    uuid::Uuid::new_v4()
-                ));
+                let base = std::env::temp_dir()
+                    .join(format!("metheus-file-tree-{}", uuid::Uuid::new_v4()));
                 let root = base.join("project");
                 std::fs::create_dir_all(&root).expect("create file tree project root");
                 Self { base, root }
@@ -1221,9 +1201,12 @@ mod tests {
             assert!(entries.iter().any(|entry| entry.path == "src/lib.rs"));
             assert!(entries.iter().any(|entry| entry.path == ".env.example"));
             assert!(!entries.iter().any(|entry| {
-                entry.path.split(std::path::MAIN_SEPARATOR).any(|component| {
-                    [".git", "node_modules", "target", ".secret"].contains(&component)
-                })
+                entry
+                    .path
+                    .split(std::path::MAIN_SEPARATOR)
+                    .any(|component| {
+                        [".git", "node_modules", "target", ".secret"].contains(&component)
+                    })
             }));
         }
 
@@ -1237,7 +1220,9 @@ mod tests {
             assert!(entries
                 .iter()
                 .any(|entry| entry.path.ends_with("four/visible.txt")));
-            assert!(!entries.iter().any(|entry| entry.path.ends_with("hidden.txt")));
+            assert!(!entries
+                .iter()
+                .any(|entry| entry.path.ends_with("hidden.txt")));
         }
 
         #[test]
@@ -1248,13 +1233,13 @@ mod tests {
                 .into_iter()
                 .next()
                 .expect("missing path must produce a WalkDir result");
-            assert!(walk_error.is_err(), "missing path must produce a real WalkDir error");
+            assert!(
+                walk_error.is_err(),
+                "missing path must produce a real WalkDir error"
+            );
 
-            let error = collect_project_file_entries(
-                &fixture.root,
-                std::iter::once(walk_error),
-            )
-            .expect_err("unexcluded traversal error must fail");
+            let error = collect_project_file_entries(&fixture.root, std::iter::once(walk_error))
+                .expect_err("unexcluded traversal error must fail");
             assert!(error.contains("读取项目目录项"));
             assert!(error.contains("missing"));
         }

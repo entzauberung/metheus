@@ -4,11 +4,13 @@ export interface ManagedFlowPresentation {
   statusLabel: string;
   canPause: boolean;
   canResume: boolean;
+  canStart: boolean;
   resumeLabel: string;
   actionLabel: string;
   targetLabel: string;
   heartbeatLabel: string;
   detail: string;
+  nextStepLabel: string;
 }
 
 const MANAGED_ACTION_LABELS: Record<string, string> = {
@@ -40,8 +42,11 @@ export function getManagedFlowPresentation(
   step: WorkflowStep,
   draft?: MilestoneDraft,
 ): ManagedFlowPresentation {
-  const canResume = managed.run_status === "Paused" || managed.run_status === "WaitingHuman";
-  const resumesIntoApproval = canResume
+  const canStart = !managed.active;
+  const canResume = managed.active && (managed.run_status === "Paused"
+    || managed.run_status === "WaitingHuman"
+    || managed.run_status === "ErrorStopped");
+  const resumesIntoApproval = managed.run_status !== "ErrorStopped" && canResume
     && step === "MilestoneApproval"
     && draft?.status === "CheckPassed";
   const statusLabels: Record<ManagedFlowState["run_status"], string> = {
@@ -52,10 +57,13 @@ export function getManagedFlowPresentation(
   };
 
   return {
-    statusLabel: statusLabels[managed.run_status],
-    canPause: managed.run_status === "Running",
+    statusLabel: managed.active ? statusLabels[managed.run_status] : "托管层未激活",
+    canPause: managed.active && managed.run_status === "Running",
     canResume,
-    resumeLabel: resumesIntoApproval ? "继续托管并批准" : "恢复托管",
+    canStart,
+    resumeLabel: managed.run_status === "ErrorStopped"
+      ? "重新启动托管"
+      : resumesIntoApproval ? "继续托管并批准" : "恢复托管",
     actionLabel: managed.current_action
       ? (MANAGED_ACTION_LABELS[managed.current_action] ?? managed.current_action)
       : (managed.last_completed_action
@@ -66,6 +74,15 @@ export function getManagedFlowPresentation(
     detail: managed.run_status === "ErrorStopped"
       ? (managed.error_message || managed.last_action)
       : managed.last_action,
+    nextStepLabel: !managed.active
+      ? "可启动托管，或继续当前步骤的人工处理"
+      : managed.run_status === "Running"
+        ? "等待托管动作完成；需要接管时可暂停或转人工"
+        : managed.run_status === "ErrorStopped"
+          ? "确认错误原因后重新启动托管，或停止托管并转人工"
+          : managed.run_status === "WaitingHuman"
+            ? "完成所需人工处理后恢复托管，或停止托管并转人工"
+            : "恢复托管继续推进，或停止托管并转人工",
   };
 }
 

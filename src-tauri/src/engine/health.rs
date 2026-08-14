@@ -459,8 +459,7 @@ fn unavailable_health(
     configuration_valid: bool,
     message: String,
 ) -> HealthCheckResult {
-    let mut authentication =
-        EngineAuthenticationResult::unknown("尚未获得执行引擎认证信息");
+    let mut authentication = EngineAuthenticationResult::unknown("尚未获得执行引擎认证信息");
     if profile.runtime == ExecutionRuntime::Plugin {
         authentication.runtime_configuration = Some(plugin_runtime_configuration_evidence());
     }

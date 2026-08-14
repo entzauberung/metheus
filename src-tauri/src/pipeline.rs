@@ -734,8 +734,10 @@ pub(crate) async fn execute_task_with_source(
     let failure_subtask_id = subtask_id.clone();
     let failure_subtask_title = subtask_title.clone();
     let failure_execution_id = execution_id.clone();
+    // Heap-allocate the background execution future: builtin-grok debug futures are large
+    // enough to overflow the default Tokio worker stack when polled on the stack.
     tauri::async_runtime::spawn(async move {
-        let result = execute_current_subtask_background(
+        let result = Box::pin(execute_current_subtask_background(
             project_name,
             project_path,
             milestone_id,
@@ -754,7 +756,7 @@ pub(crate) async fn execute_task_with_source(
             prepared_engine,
             background_pipeline_state.clone(),
             operation_source,
-        )
+        ))
         .await;
         if let Err(error) = result {
             if let Err(persist_error) = finalize_background_execution_failure(
@@ -2879,13 +2881,12 @@ pub(crate) async fn retry_current_subtask(
     let restore_target = session_base
         .or(last_passed_tag)
         .unwrap_or_else(|| "HEAD".to_string());
-    restore_git_execution_baseline(&project_path, &restore_target)
-        .map_err(|outcome| {
-            format!(
-                "Git 基线恢复失败：{}。失败证据已保留。",
-                outcome.error_message()
-            )
-        })?;
+    restore_git_execution_baseline(&project_path, &restore_target).map_err(|outcome| {
+        format!(
+            "Git 基线恢复失败：{}。失败证据已保留。",
+            outcome.error_message()
+        )
+    })?;
 
     let now = chrono::Utc::now().to_rfc3339();
 
@@ -3465,10 +3466,8 @@ pub(crate) fn summarize_baseline_target(target: &str) -> String {
     if trimmed.is_empty() {
         return "HEAD".to_string();
     }
-    let looks_like_full_sha = trimmed.len() >= 40
-        && trimmed
-            .chars()
-            .all(|ch| ch.is_ascii_hexdigit());
+    let looks_like_full_sha =
+        trimmed.len() >= 40 && trimmed.chars().all(|ch| ch.is_ascii_hexdigit());
     if looks_like_full_sha {
         trimmed.chars().take(12).collect()
     } else {
@@ -8116,9 +8115,8 @@ mod tests {
             .map_err(|e| e.to_string())?;
         std::fs::write(dirty_repo.path.join("untracked-new.txt"), "new\n")
             .map_err(|e| e.to_string())?;
-        let dirty_outcome =
-            restore_git_execution_baseline(&dirty_repo.path_string(), &dirty_head)
-                .map_err(|o| o.error_message())?;
+        let dirty_outcome = restore_git_execution_baseline(&dirty_repo.path_string(), &dirty_head)
+            .map_err(|o| o.error_message())?;
         assert_eq!(
             dirty_outcome.status,
             project::RecoveryBaselineStatus::Restored
@@ -8321,10 +8319,7 @@ mod tests {
         assert_eq!(autopilot.transient_retry_count, 0);
         assert!(autopilot.next_retry_at.is_none());
         assert!(
-            autopilot
-                .last_action
-                .contains("受限重规划")
-                || autopilot.last_action.contains("诊断")
+            autopilot.last_action.contains("受限重规划") || autopilot.last_action.contains("诊断")
         );
 
         let decision = crate::autopilot_policy::decide_next_step(

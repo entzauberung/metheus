@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Activity, Clock3, Target } from "lucide-react";
+import { Activity, Clock3, Pause, Play, Square, Target } from "lucide-react";
 import { ExecutionWorkspaceStatus, Project, RuntimeMutationResult } from "./types";
 import { invokeWithTimeout, isInvokeTimeoutError } from "./utils/invokeWithTimeout";
 import { ConsoleFeedback } from "./components/ConsoleStepShell";
@@ -18,6 +18,9 @@ interface Props {
   onFeedback: (feedback: ConsoleFeedback | null) => void;
   workspaceStatus: ExecutionWorkspaceStatus | null;
   onPrepareWorkspace: () => Promise<void>;
+  onPauseManagedFlow?: () => Promise<void>;
+  onResumeManagedFlow?: () => Promise<void>;
+  onStopManagedFlow?: () => Promise<void>;
 }
 
 type RegenerationSource = "check_failed" | "approval_rejected";
@@ -25,6 +28,7 @@ type RegenerationSource = "check_failed" | "approval_rejected";
 export function ConsoleWorkflowPanel({
   project, onRuntimeMutation, externalBusy, onActionStart, onActionEnd, onFeedback,
   workspaceStatus, onPrepareWorkspace,
+  onPauseManagedFlow, onResumeManagedFlow, onStopManagedFlow,
 }: Props) {
   const step = project.workflow_state.current_step;
   const busy = externalBusy;
@@ -183,8 +187,8 @@ export function ConsoleWorkflowPanel({
     ? getManagedFlowPresentation(managedState, step, project.milestone_draft)
     : null;
 
-  // Managed flow banner (shown during any Console step when managed flow is active)
-  const managedBanner = managedActive ? (
+  // Managed flow banner (shown during any Console step when a persisted state exists)
+  const managedBanner = managedState ? (
     <div className={`managed-flow-banner managed-${managedState?.run_status.toLowerCase()}`}>
       <div className="managed-flow-summary">
         <div className="managed-flow-facts">
@@ -192,7 +196,30 @@ export function ConsoleWorkflowPanel({
           <span><Target size={14} />目标：{managedPresentation?.targetLabel}</span>
           <span><Activity size={14} />动作：{managedPresentation?.actionLabel}</span>
           <span><Clock3 size={14} />心跳：{managedPresentation?.heartbeatLabel}</span>
-          {managedPresentation?.detail && <span className="managed-flow-detail">{managedPresentation.detail}</span>}
+          <span className="managed-flow-detail">错误原因：{managedState.error_message || "暂无"}</span>
+          {managedPresentation?.detail && managedPresentation.detail !== managedState.error_message && (
+            <span className="managed-flow-detail">最近动作：{managedPresentation.detail}</span>
+          )}
+        </div>
+        <div className="managed-flow-actions" style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "8px" }}>
+          {managedPresentation?.canPause && onPauseManagedFlow && (
+            <button type="button" className="ap-bar-btn" disabled={busy} onClick={() => { void onPauseManagedFlow(); }}>
+              <Pause size={14} /> 暂停托管
+            </button>
+          )}
+          {managedPresentation?.canResume && onResumeManagedFlow && (
+            <button type="button" className="ap-bar-btn ap-bar-btn-primary" disabled={busy} onClick={() => { void onResumeManagedFlow(); }}>
+              <Play size={14} /> {managedPresentation.resumeLabel}
+            </button>
+          )}
+          {managedActive && onStopManagedFlow && (
+            <button type="button" className="ap-bar-btn" disabled={busy} onClick={() => { void onStopManagedFlow(); }}>
+              <Square size={14} /> 停止托管并转人工
+            </button>
+          )}
+          {managedPresentation?.nextStepLabel && (
+            <span className="managed-flow-next-step">下一步：{managedPresentation.nextStepLabel}</span>
+          )}
         </div>
       </div>
     </div>

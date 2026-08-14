@@ -1,9 +1,10 @@
 // src/PreflightPanel.tsx — 三项显式检查面板（后端事实驱动，无本地业务状态）
 import { useMemo } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import { PreflightCheckResult, RuntimeMutationResult } from "./types";
+import { ManagedFlowState, PreflightCheckResult, RuntimeMutationResult } from "./types";
 import { CheckCircle, XCircle, Clock, ArrowRight, ArrowLeft } from "lucide-react";
 import { useState } from "react";
+import { getManagedFlowPresentation } from "./managedFlowPolicy";
 
 interface PreflightPanelProps {
   projectName: string;
@@ -25,8 +26,11 @@ interface PreflightPanelProps {
   isSubmitting?: boolean;
   /** 启动托管层（ThreeChecks 后自动推进到大阶段批准） */
   onStartManagedFlow?: () => void;
-  /** 托管层是否激活 */
-  managedFlowActive?: boolean;
+  /** 托管层完整持久化状态，用于区分错误停止与正常运行 */
+  managedFlowState?: ManagedFlowState;
+  onResumeManagedFlow?: () => void;
+  onPauseManagedFlow?: () => void;
+  onStopManagedFlow?: () => void;
 }
 
 const CHECK_ORDER = ["goal_completeness", "reality_consistency", "task_executability"] as const;
@@ -57,7 +61,10 @@ export function PreflightPanel({
   onRestartChecks,
   isSubmitting,
   onStartManagedFlow,
-  managedFlowActive,
+  managedFlowState,
+  onResumeManagedFlow,
+  onPauseManagedFlow,
+  onStopManagedFlow,
 }: PreflightPanelProps) {
   // 仅保留 UI 状态：当前正在加载的检查类型、错误信息
   const [loadingType, setLoadingType] = useState<string | null>(null);
@@ -92,6 +99,12 @@ export function PreflightPanel({
     (t) => resultMap[t]?.passed && !resultMap[t]?.stale && resultMap[t]?.discussion_revision === discussionRevision
   );
   const isRunning = loadingType !== null;
+  const managedPresentation = managedFlowState
+    ? getManagedFlowPresentation(managedFlowState, "ThreeChecks")
+    : null;
+  // 缺少持久化 managed state 时保留手动启动入口。
+  const managedActive = managedFlowState?.active === true;
+  const managedCanStart = managedPresentation?.canStart ?? !managedFlowState;
 
   const handleRunCheck = async (checkType: string) => {
     setLoadingType(checkType);
@@ -270,7 +283,7 @@ export function PreflightPanel({
             >
               生成项目方案草稿
             </button>
-            {onStartManagedFlow && !managedFlowActive && (
+            {onStartManagedFlow && managedCanStart && (
               <button
                 className="project-entry-submit"
                 onClick={onStartManagedFlow}
@@ -281,10 +294,35 @@ export function PreflightPanel({
               </button>
             )}
           </div>
-          {managedFlowActive && (
-            <p style={{ color: "#6e40c9", fontSize: "13px", marginTop: "8px" }}>
-              🤖 托管层已激活，正在自动推进…
-            </p>
+          {managedFlowState && managedPresentation && (
+            <div style={{ marginTop: "12px", color: managedFlowState.run_status === "ErrorStopped" ? "#cf222e" : "#6e40c9", fontSize: "13px" }}>
+              <p style={{ margin: "0 0 4px" }}>
+                状态：{managedPresentation.statusLabel}
+              </p>
+              <p style={{ margin: "0 0 4px" }}>
+                错误原因：{managedFlowState.error_message || "暂无"}
+              </p>
+              <p style={{ margin: "0 0 8px" }}>
+                下一步：{managedPresentation.nextStepLabel}
+              </p>
+              <div style={{ display: "flex", gap: "8px", justifyContent: "center", flexWrap: "wrap" }}>
+                {managedPresentation.canResume && onResumeManagedFlow && (
+                  <button className="project-entry-submit" onClick={onResumeManagedFlow} disabled={isSubmitting || isRunning}>
+                    {managedPresentation.resumeLabel}
+                  </button>
+                )}
+                {managedPresentation.canPause && onPauseManagedFlow && (
+                  <button className="project-entry-submit" onClick={onPauseManagedFlow} disabled={isSubmitting || isRunning}>
+                    暂停托管
+                  </button>
+                )}
+                {managedActive && onStopManagedFlow && (
+                  <button className="preflight-restart-btn" onClick={onStopManagedFlow} disabled={isSubmitting || isRunning}>
+                    停止托管并转人工
+                  </button>
+                )}
+              </div>
+            </div>
           )}
         </div>
       )}

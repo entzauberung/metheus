@@ -929,8 +929,7 @@ pub(crate) fn apply_stalled_recovery_reconciliation(
                 );
             }
         }
-        StalledRecoveryDisposition::AllowAutomaticClaim
-        | StalledRecoveryDisposition::Wait => {}
+        StalledRecoveryDisposition::AllowAutomaticClaim | StalledRecoveryDisposition::Wait => {}
     }
     disposition
 }
@@ -4466,8 +4465,7 @@ mod tests {
 
     #[test]
     fn output_truncation_boundary_is_current_task_replan_only() {
-        let (kind, phase) =
-            engine_block_boundary(&project::EngineFailureKind::OutputTruncated);
+        let (kind, phase) = engine_block_boundary(&project::EngineFailureKind::OutputTruncated);
         assert_eq!(kind, project::RecoveryErrorKind::PlanFailure);
         assert_eq!(phase, project::RecoveryPhase::Replanning);
         assert!(!crate::engine::requires_human_recovery(
@@ -4674,7 +4672,9 @@ mod tests {
             subtask_id: "sub-1".to_string(),
             ..Default::default()
         });
-        assert!(!crate::autopilot_runtime::reconcile_startup_job(&mut restart));
+        assert!(!crate::autopilot_runtime::reconcile_startup_job(
+            &mut restart
+        ));
         assert_eq!(
             restart
                 .workflow_state

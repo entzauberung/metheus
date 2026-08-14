@@ -467,6 +467,37 @@ describe("AutopilotControlBar recovery presentation", () => {
     expect(handlers.resumeManaged).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps ErrorStopped managed flow actionable with restart and stop buttons", () => {
+    const value = project();
+    value.workflow_state.autopilot_active = false;
+    value.workflow_state.managed_flow_state = {
+      active: true,
+      managed_state: "error",
+      managed_target: "MilestoneSelection",
+      last_action: "托管动作重试耗尽，已停止",
+      last_action_at: "2026-07-31T05:00:00Z",
+      run_status: "ErrorStopped",
+      error_message: "模型连接失败，请检查 API 配置",
+      job_id: "job-error-1",
+      job_generation: 3,
+      current_action: "",
+      current_action_id: "",
+      heartbeat_at: "2026-07-31T05:00:00Z",
+      retry_count: 3,
+      last_completed_action: "",
+    };
+
+    const handlers = render(null, value);
+    const labels = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
+    expect(labels).toEqual(["重新启动托管", "停止托管"]);
+    expect(host.textContent).toContain("托管层因错误停止");
+    expect(host.textContent).toContain("模型连接失败，请检查 API 配置");
+    const restart = [...host.querySelectorAll<HTMLButtonElement>("button")]
+      .find(button => button.textContent?.includes("重新启动托管"));
+    act(() => restart?.click());
+    expect(handlers.resumeManaged).toHaveBeenCalledTimes(1);
+  });
+
   it("preserves the responsive region contract while switching Running, Paused, and Recovery", () => {
     const value = project();
     value.workflow_state.autopilot_state!.run_status = "Running";

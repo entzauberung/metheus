@@ -438,7 +438,9 @@ pub(crate) fn decide_next_step(
                     updated_at: &recovery.updated_at,
                     replan_execution_attempted: recovery.replan_execution_attempted,
                     next_validation_retry_at: recovery.next_validation_retry_at.as_deref(),
-                    is_validation_recovery: crate::recovery::is_review_validation_recovery(recovery),
+                    is_validation_recovery: crate::recovery::is_review_validation_recovery(
+                        recovery,
+                    ),
                     action_id: autopilot
                         .map(|s| s.current_action_id.as_str())
                         .unwrap_or(""),

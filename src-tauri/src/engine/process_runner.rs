@@ -84,11 +84,45 @@ fn normalize_stdout(protocol: OutputProtocol, stdout: String) -> String {
     }
 }
 
-async fn clear_child_pid(state: &Arc<Mutex<Option<PipelineState>>>, execution_id: &str) {
+async fn sync_child_pid_snapshot(
+    state: &Arc<Mutex<Option<PipelineState>>>,
+    execution_id: &str,
+    child_pid: Option<u32>,
+) -> Result<(), EngineError> {
+    let project_name = {
+        let mut guard = state.lock().await;
+        let Some(pipeline) = guard.as_mut() else {
+            return Ok(());
+        };
+        if !execution_id.is_empty() && pipeline.execution_id != execution_id {
+            return Ok(());
+        }
+        pipeline.child_pid = child_pid;
+        pipeline.project_name.clone()
+    };
+
+    if project_name.is_empty() {
+        return Ok(());
+    }
+
+    crate::snapshot::update_snapshot_pid(&project_name, child_pid).map_err(|error| {
+        EngineError::ProcessFailed(format!(
+            "执行 {} 的子进程快照同步失败（PID={:?}）：{}",
+            execution_id, child_pid, error
+        ))
+    })
+}
+
+async fn record_snapshot_sync_failure(
+    state: &Arc<Mutex<Option<PipelineState>>>,
+    execution_id: &str,
+    error: &EngineError,
+) {
     let mut guard = state.lock().await;
     if let Some(pipeline) = guard.as_mut() {
         if execution_id.is_empty() || pipeline.execution_id == execution_id {
-            pipeline.child_pid = None;
+            pipeline.last_error = Some(error.to_string());
+            append_runtime_log(pipeline, "error", format!("子进程快照收口失败：{}", error));
         }
     }
 }
@@ -454,13 +488,18 @@ pub(super) async fn run_process(
         .await
     });
 
-    {
-        let mut guard = state.lock().await;
-        if let Some(pipeline) = guard.as_mut() {
-            if execution_id.is_empty() || pipeline.execution_id == execution_id {
-                pipeline.child_pid = child.id();
-            }
+    if let Err(error) = sync_child_pid_snapshot(&state, execution_id, child.id()).await {
+        record_snapshot_sync_failure(&state, execution_id, &error).await;
+        let termination = terminate_child(&mut child, spec.display_name, "快照同步失败").await;
+        let _ = collect_pipe(stdout_reader, "stdout").await;
+        let _ = collect_pipe(stderr_reader, "stderr").await;
+        if let Err(termination_error) = termination {
+            return Err(EngineError::ProcessFailed(format!(
+                "{}；同时无法终止子进程：{}",
+                error, termination_error
+            )));
         }
+        return Err(error);
     }
 
     let started_at = std::time::Instant::now();
@@ -469,7 +508,11 @@ pub(super) async fn run_process(
             Ok(Some(status)) => {
                 let stdout = collect_pipe(stdout_reader, "stdout").await;
                 let stderr = collect_pipe(stderr_reader, "stderr").await;
-                clear_child_pid(&state, execution_id).await;
+                let clear_result = sync_child_pid_snapshot(&state, execution_id, None).await;
+                if let Err(error) = &clear_result {
+                    record_snapshot_sync_failure(&state, execution_id, error).await;
+                }
+                clear_result?;
                 return Ok(ProcessOutput {
                     stdout: String::from_utf8_lossy(&stdout).to_string(),
                     stderr: String::from_utf8_lossy(&stderr).to_string(),
@@ -500,8 +543,12 @@ pub(super) async fn run_process(
                         terminate_child(&mut child, spec.display_name, "受控停止").await;
                     let _ = collect_pipe(stdout_reader, "stdout").await;
                     let _ = collect_pipe(stderr_reader, "stderr").await;
-                    clear_child_pid(&state, execution_id).await;
+                    let clear_result = sync_child_pid_snapshot(&state, execution_id, None).await;
+                    if let Err(error) = &clear_result {
+                        record_snapshot_sync_failure(&state, execution_id, error).await;
+                    }
                     termination?;
+                    clear_result?;
                     return if stop_state == PipelineStatus::Failed {
                         Err(EngineError::ProcessFailed("用户停止执行".to_string()))
                     } else {
@@ -514,8 +561,12 @@ pub(super) async fn run_process(
                         terminate_child(&mut child, spec.display_name, "执行超时").await;
                     let _ = collect_pipe(stdout_reader, "stdout").await;
                     let _ = collect_pipe(stderr_reader, "stderr").await;
-                    clear_child_pid(&state, execution_id).await;
+                    let clear_result = sync_child_pid_snapshot(&state, execution_id, None).await;
+                    if let Err(error) = &clear_result {
+                        record_snapshot_sync_failure(&state, execution_id, error).await;
+                    }
                     termination?;
+                    clear_result?;
                     return Err(EngineError::timeout());
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -525,8 +576,12 @@ pub(super) async fn run_process(
                     terminate_child(&mut child, spec.display_name, "进程状态检查失败").await;
                 let _ = collect_pipe(stdout_reader, "stdout").await;
                 let _ = collect_pipe(stderr_reader, "stderr").await;
-                clear_child_pid(&state, execution_id).await;
+                let clear_result = sync_child_pid_snapshot(&state, execution_id, None).await;
+                if let Err(clear_error) = &clear_result {
+                    record_snapshot_sync_failure(&state, execution_id, clear_error).await;
+                }
                 termination?;
+                clear_result?;
                 return Err(EngineError::ProcessFailed(format!(
                     "{} 进程异常：{error}",
                     spec.display_name

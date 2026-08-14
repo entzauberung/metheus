@@ -85,7 +85,7 @@ impl ManagedRuntime {
         let task_project = project_name.clone();
         let task_job_id = job_id.clone();
         let handle = tokio::spawn(async move {
-            drive_project(task_project, task_job_id, generation).await;
+            Box::pin(drive_project(task_project, task_job_id, generation)).await;
         });
         jobs.insert(
             project_name,
@@ -323,6 +323,20 @@ fn persist_failure(project_name: &str, error: &str) -> Result<bool, String> {
     Ok(retry)
 }
 
+fn persist_terminal_failure(project_name: &str, error: &str) -> Result<(), String> {
+    let mut project = crate::load_project(project_name)?;
+    let Some(state) = project.workflow_state.managed_flow_state.as_mut() else {
+        return Ok(());
+    };
+    state.run_status = project::ManagedRunStatus::ErrorStopped;
+    state.error_message = error.chars().take(2_000).collect();
+    state.current_action.clear();
+    state.current_action_id.clear();
+    state.last_action = "托管流程无法继续，已停止，等待人工处理".to_string();
+    state.last_action_at = chrono::Utc::now().to_rfc3339();
+    crate::save_project(&project)
+}
+
 async fn drive_project(project_name: String, job_id: String, generation: u64) {
     loop {
         let mut project = match crate::load_project(&project_name) {
@@ -361,7 +375,7 @@ async fn drive_project(project_name: String, job_id: String, generation: u64) {
             } else {
                 next.error_message
             };
-            let _ = persist_failure(&project_name, &error);
+            let _ = persist_terminal_failure(&project_name, &error);
             break;
         }
         if next.command.is_empty() {
@@ -495,6 +509,46 @@ mod tests {
             .expect_err("缺少草稿时应由重生成分支返回业务错误");
         assert!(error.contains("没有可重新生成的大阶段草稿"));
         assert!(!error.contains("不支持动作"));
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn terminal_managed_failure_stops_without_leaving_running_state() -> Result<(), String> {
+        let project_name = format!("test-managed-terminal-failure-{}", uuid::Uuid::new_v4());
+        let path = crate::project_data_path(&project_name)?;
+        let mut project = project::Project::new(&project_name);
+        project.workflow_state.managed_flow_state = Some(project::ManagedFlowState {
+            active: true,
+            run_status: project::ManagedRunStatus::Running,
+            ..Default::default()
+        });
+        assign_new_job_identity(
+            project.workflow_state.managed_flow_state.as_mut().unwrap(),
+            "test",
+        );
+        let job_id = project
+            .workflow_state
+            .managed_flow_state
+            .as_ref()
+            .unwrap()
+            .job_id
+            .clone();
+        crate::save_project(&project)?;
+
+        persist_terminal_failure(&project_name, "模型连接失败：等待人工处理")?;
+
+        let stored = crate::load_project(&project_name)?;
+        let state = stored
+            .workflow_state
+            .managed_flow_state
+            .ok_or("托管状态缺失")?;
+        assert_eq!(state.run_status, project::ManagedRunStatus::ErrorStopped);
+        assert!(state.active);
+        assert_eq!(state.job_id, job_id);
+        assert_eq!(state.error_message, "模型连接失败：等待人工处理");
+        assert!(state.current_action.is_empty());
+        assert!(state.current_action_id.is_empty());
         let _ = std::fs::remove_file(path);
         Ok(())
     }

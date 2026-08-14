@@ -127,8 +127,16 @@ impl AutopilotRuntime {
         }
         let task_project = project_name.clone();
         let task_job_id = job_id.clone();
+        // Box the driver future so the large full-product state machine is heap-allocated
+        // instead of inflating the Tokio worker stack during poll.
         let handle = tokio::spawn(async move {
-            drive_project(pipeline_state, task_project, task_job_id, generation).await;
+            Box::pin(drive_project(
+                pipeline_state,
+                task_project,
+                task_job_id,
+                generation,
+            ))
+            .await;
         });
         let candidate = AutopilotJob {
             job_id,
@@ -185,16 +193,21 @@ pub(crate) fn reconcile_startup_job(project: &mut project::Project) -> bool {
         .recovery_state
         .as_ref()
         .is_some_and(crate::recovery::validation_retry_can_resume);
-    let fresh_recovery_queue = project.workflow_state.recovery_state.as_ref().is_some_and(|recovery| {
-        matches!(
-            recovery.phase,
-            project::RecoveryPhase::Diagnosing
-                | project::RecoveryPhase::Repairing
-                | project::RecoveryPhase::Retesting
-                | project::RecoveryPhase::Replanning
-        ) && !recovery.replan_execution_attempted
-            && crate::recovery::recovery_allows_automatic_claim(project, now)
-    });
+    let fresh_recovery_queue =
+        project
+            .workflow_state
+            .recovery_state
+            .as_ref()
+            .is_some_and(|recovery| {
+                matches!(
+                    recovery.phase,
+                    project::RecoveryPhase::Diagnosing
+                        | project::RecoveryPhase::Repairing
+                        | project::RecoveryPhase::Retesting
+                        | project::RecoveryPhase::Replanning
+                ) && !recovery.replan_execution_attempted
+                    && crate::recovery::recovery_allows_automatic_claim(project, now)
+            });
     let Some(state) = project.workflow_state.autopilot_state.as_mut() else {
         return false;
     };
@@ -384,7 +397,9 @@ enum DispatchOutcome {
     Completed(Result<(), String>),
     Superseded,
     /// Recovery (or other bounded) action hit hard wall-clock timeout.
-    TimedOut { elapsed_secs: u64 },
+    TimedOut {
+        elapsed_secs: u64,
+    },
 }
 
 async fn dispatch_action_with_heartbeat(
@@ -536,11 +551,9 @@ async fn recover_stopped_action(
                 let mut latest = crate::load_project(&project.name)?;
                 if let Some(state) = latest.workflow_state.autopilot_state.as_mut() {
                     state.run_status = project::AutopilotRunStatus::Running;
-                    state.recovery_action =
-                        project::AutopilotRecoveryAction::RunAutomaticRecovery;
+                    state.recovery_action = project::AutopilotRecoveryAction::RunAutomaticRecovery;
                     state.next_retry_at = None;
-                    state.last_action =
-                        "内置执行截断已收敛到当前任务受限重规划".to_string();
+                    state.last_action = "内置执行截断已收敛到当前任务受限重规划".to_string();
                     state.last_action_at = chrono::Utc::now().to_rfc3339();
                     clear_action_claim(state);
                 }
@@ -818,13 +831,7 @@ async fn drive_project(
                     Ok(project) => project,
                     Err(_) => break,
                 };
-                if !action_claim_matches(
-                    &latest,
-                    &job_id,
-                    generation,
-                    &action_id,
-                    &next.command,
-                ) {
+                if !action_claim_matches(&latest, &job_id, generation, &action_id, &next.command) {
                     // Stale generation/action must not overwrite a newer owner.
                     break;
                 }
@@ -1045,8 +1052,12 @@ mod tests {
     #[test]
     fn recovery_progress_events_are_emitted_once_per_boundary() {
         let mut project = active_project(project::AutopilotRunStatus::Running);
-        project.workflow_state.autopilot_state.as_mut().unwrap().last_action =
-            "恢复动作正在执行".to_string();
+        project
+            .workflow_state
+            .autopilot_state
+            .as_mut()
+            .unwrap()
+            .last_action = "恢复动作正在执行".to_string();
         project.workflow_state.recovery_state = Some(project::RecoveryState {
             subtask_id: "sub-1".to_string(),
             ..Default::default()
@@ -1062,7 +1073,9 @@ mod tests {
             project::ExecutionEventType::RecoveryWarning
         );
 
-        assert!(update_recovery_progress_state(&mut project, RecoveryProgressGate::Warning).is_none());
+        assert!(
+            update_recovery_progress_state(&mut project, RecoveryProgressGate::Warning).is_none()
+        );
 
         let stalled = update_recovery_progress_state(&mut project, RecoveryProgressGate::Stalled)
             .expect("stalled event");
@@ -1073,7 +1086,9 @@ mod tests {
             project.execution_history[1].event_type,
             project::ExecutionEventType::RecoveryStalled
         );
-        assert!(update_recovery_progress_state(&mut project, RecoveryProgressGate::Stalled).is_none());
+        assert!(
+            update_recovery_progress_state(&mut project, RecoveryProgressGate::Stalled).is_none()
+        );
     }
 
     #[test]
@@ -1130,12 +1145,10 @@ mod tests {
         assert_eq!(autopilot.heartbeat_at, "2026-08-11T12:11:59Z");
         assert!(autopilot.next_retry_at.is_none());
 
-        assert!(
-            project
-                .execution_history
-                .iter()
-                .any(|event| event.event_type == project::ExecutionEventType::RecoveryExhausted)
-        );
+        assert!(project
+            .execution_history
+            .iter()
+            .any(|event| event.event_type == project::ExecutionEventType::RecoveryExhausted));
 
         // Stale action must not be applied by caller when claim mismatches — policy after
         // timeout must not auto-dispatch run_error_recovery.
