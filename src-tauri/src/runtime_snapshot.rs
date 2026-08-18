@@ -14,6 +14,15 @@ pub struct RuntimeSnapshot {
     pub process_start_id: String,
     pub event_sequence: u64,
     pub recovery_presentation: RecoveryPresentation,
+    /// Startup child-process evidence is part of the same durable runtime fact.
+    #[serde(default)]
+    pub startup_process_observation: Option<crate::snapshot::StartupProcessObservation>,
+    /// Resource facts are exposed separately so consumers do not infer them from
+    /// recovery/error text or from a missing pipeline state.
+    #[serde(default)]
+    pub resource_observation: crate::project::ResourceObservationSummary,
+    #[serde(default)]
+    pub resource_failure_kind: Option<crate::project::ResourceFailureKind>,
     pub task_control_snapshot_version: String,
     pub task_control_tree_revision: u64,
     pub task_control_event_sequence: u64,
@@ -99,6 +108,21 @@ pub(crate) fn compose_runtime_snapshot(
 ) -> RuntimeSnapshot {
     let pipeline_state = pipeline_state.filter(|pipeline| pipeline.project_name == project.name);
     let recovery_presentation = present_recovery(&project);
+    let startup_process_observation = crate::snapshot::load_snapshot(&project.name)
+        .ok()
+        .flatten()
+        .and_then(|snapshot| snapshot.startup_process_observation);
+    let (resource_observation, resource_failure_kind) = project
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .map(|recovery| {
+            (
+                recovery.resource_observation.clone(),
+                recovery.resource_failure_kind,
+            )
+        })
+        .unwrap_or_default();
     let task_control_action_id = if !project.task_control.active_action_id.is_empty() {
         Some(project.task_control.active_action_id.clone())
     } else if !project.task_control.last_completed_action_id.is_empty() {
@@ -117,6 +141,9 @@ pub(crate) fn compose_runtime_snapshot(
         process_start_id: cursor.process_start_id,
         event_sequence: cursor.event_sequence,
         recovery_presentation,
+        startup_process_observation,
+        resource_observation,
+        resource_failure_kind,
         task_control_snapshot: None,
     }
 }
@@ -247,6 +274,40 @@ mod tests {
         assert_eq!(
             snapshot.recovery_presentation.kind,
             RecoveryPresentationKind::BaselineRecovery
+        );
+        assert!(snapshot.startup_process_observation.is_none());
+        assert_eq!(
+            snapshot.resource_observation.state,
+            crate::project::ResourceObservationState::Unknown
+        );
+        assert!(snapshot.resource_failure_kind.is_none());
+    }
+
+    #[test]
+    fn runtime_snapshot_preserves_resource_facts_and_failure_kind() {
+        let mut project = Project::new("runtime-resource-facts");
+        project.workflow_state.recovery_state = Some(crate::project::RecoveryState {
+            resource_observation: crate::project::ResourceObservationSummary {
+                state: crate::project::ResourceObservationState::HardStop,
+                peak_rss_bytes: Some(900),
+                headroom_bytes: Some(100),
+                ..Default::default()
+            },
+            resource_failure_kind: Some(crate::project::ResourceFailureKind::ResourcePressure),
+            ..Default::default()
+        });
+
+        let snapshot = compose_runtime_snapshot(project, None, cursor(8));
+
+        assert_eq!(
+            snapshot.resource_observation.state,
+            crate::project::ResourceObservationState::HardStop
+        );
+        assert_eq!(snapshot.resource_observation.peak_rss_bytes, Some(900));
+        assert_eq!(snapshot.resource_observation.headroom_bytes, Some(100));
+        assert_eq!(
+            snapshot.resource_failure_kind,
+            Some(crate::project::ResourceFailureKind::ResourcePressure)
         );
     }
 

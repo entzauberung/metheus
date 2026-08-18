@@ -3,6 +3,8 @@ use crate::pipeline::{
     append_runtime_log, append_runtime_log_with_context, set_runtime_debug_log, PipelineState,
     PipelineStatus,
 };
+use crate::runtime_resource::ResourceDecision;
+use crate::task_contract::{ExecutionGuard, ExecutionStopReason, TaskBudgetSummary};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -105,7 +107,7 @@ async fn sync_child_pid_snapshot(
         return Ok(());
     }
 
-    crate::snapshot::update_snapshot_pid(&project_name, child_pid).map_err(|error| {
+    crate::snapshot::update_snapshot_pid(&project_name, execution_id, child_pid).map_err(|error| {
         EngineError::ProcessFailed(format!(
             "执行 {} 的子进程快照同步失败（PID={:?}）：{}",
             execution_id, child_pid, error
@@ -395,12 +397,48 @@ async fn terminate_child(
     Ok(())
 }
 
+fn sample_child_resource(
+    guard: &ExecutionGuard,
+    pid: u32,
+    sampler: impl FnOnce(u32, Option<&str>) -> crate::runtime_resource::ResourceObservation,
+) {
+    let sampled_at = chrono::Utc::now().to_rfc3339();
+    let sample = sampler(pid, Some(sampled_at.as_str()));
+    guard.set_resource_observation(sample.summary);
+    guard.set_resource_decision(sample.decision);
+}
+
 pub(super) async fn run_process(
     spec: ProcessSpec,
     project_path: &str,
     execution_id: &str,
     state: Arc<Mutex<Option<PipelineState>>>,
 ) -> Result<ProcessOutput, EngineError> {
+    let max_wall_clock_secs = spec.timeout_secs;
+    let task_budget = TaskBudgetSummary {
+        max_wall_clock_secs,
+        ..TaskBudgetSummary::default()
+    };
+    run_process_with_budget(
+        spec,
+        project_path,
+        execution_id,
+        &task_budget,
+        ResourceDecision::Unknown,
+        state,
+    )
+    .await
+}
+
+pub(super) async fn run_process_with_budget(
+    spec: ProcessSpec,
+    project_path: &str,
+    execution_id: &str,
+    task_budget: &TaskBudgetSummary,
+    resource_decision: ResourceDecision,
+    state: Arc<Mutex<Option<PipelineState>>>,
+) -> Result<ProcessOutput, EngineError> {
+    let guard = ExecutionGuard::new(task_budget, resource_decision);
     let mut command = tokio::process::Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -445,6 +483,18 @@ pub(super) async fn run_process(
             }
         }
     };
+
+    let child_pid = child.id();
+    if let Some(pid) = child_pid {
+        sample_child_resource(&guard, pid, crate::runtime_resource::observe_process);
+        if guard.stop_reason() == Some(ExecutionStopReason::ResourceHardStop) {
+            terminate_child(&mut child, spec.display_name, "启动前资源 guard").await?;
+            return Err(EngineError::ResourceHardStop {
+                execution_result: None,
+                resource_observation: Some(guard.resource_observation()),
+            });
+        }
+    }
 
     if let Some(payload) = spec.stdin_payload {
         let mut stdin = child.stdin.take().ok_or_else(|| {
@@ -502,25 +552,38 @@ pub(super) async fn run_process(
         return Err(error);
     }
 
-    let started_at = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let stdout = collect_pipe(stdout_reader, "stdout").await;
                 let stderr = collect_pipe(stderr_reader, "stderr").await;
+                let stop_reason = guard.stop_reason();
                 let clear_result = sync_child_pid_snapshot(&state, execution_id, None).await;
                 if let Err(error) = &clear_result {
                     record_snapshot_sync_failure(&state, execution_id, error).await;
                 }
                 clear_result?;
-                return Ok(ProcessOutput {
-                    stdout: String::from_utf8_lossy(&stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&stderr).to_string(),
-                    exit_code: status.code(),
-                    success: status.success(),
-                });
+                return match stop_reason {
+                    Some(ExecutionStopReason::ResourceHardStop) => {
+                        Err(EngineError::ResourceHardStop {
+                            execution_result: None,
+                            resource_observation: Some(guard.resource_observation()),
+                        })
+                    }
+                    Some(ExecutionStopReason::WallClockExceeded) => Err(EngineError::timeout()),
+                    Some(ExecutionStopReason::Cancelled) => Err(EngineError::cancelled()),
+                    None => Ok(ProcessOutput {
+                        stdout: String::from_utf8_lossy(&stdout).to_string(),
+                        stderr: String::from_utf8_lossy(&stderr).to_string(),
+                        exit_code: status.code(),
+                        success: status.success(),
+                    }),
+                };
             }
             Ok(None) => {
+                if let Some(pid) = child.id() {
+                    sample_child_resource(&guard, pid, crate::runtime_resource::observe_process);
+                }
                 let stop_state = {
                     let guard = state.lock().await;
                     guard
@@ -539,6 +602,10 @@ pub(super) async fn run_process(
                         })
                 };
                 if let Some(stop_state) = stop_state {
+                    if stop_state == PipelineStatus::Paused {
+                        guard.request_cancel();
+                    }
+                    let stop_reason = guard.stop_reason();
                     let termination =
                         terminate_child(&mut child, spec.display_name, "受控停止").await;
                     let _ = collect_pipe(stdout_reader, "stdout").await;
@@ -549,16 +616,24 @@ pub(super) async fn run_process(
                     }
                     termination?;
                     clear_result?;
-                    return if stop_state == PipelineStatus::Failed {
-                        Err(EngineError::ProcessFailed("用户停止执行".to_string()))
-                    } else {
-                        Err(EngineError::cancelled())
+                    return match stop_reason {
+                        Some(ExecutionStopReason::ResourceHardStop) => {
+                            Err(EngineError::ResourceHardStop {
+                                execution_result: None,
+                                resource_observation: Some(guard.resource_observation()),
+                            })
+                        }
+                        Some(ExecutionStopReason::WallClockExceeded) => Err(EngineError::timeout()),
+                        _ if stop_state == PipelineStatus::Failed => {
+                            Err(EngineError::ProcessFailed("用户停止执行".to_string()))
+                        }
+                        _ => Err(EngineError::cancelled()),
                     };
                 }
 
-                if started_at.elapsed() > std::time::Duration::from_secs(spec.timeout_secs) {
+                if let Some(stop_reason) = guard.stop_reason() {
                     let termination =
-                        terminate_child(&mut child, spec.display_name, "执行超时").await;
+                        terminate_child(&mut child, spec.display_name, "执行 guard").await;
                     let _ = collect_pipe(stdout_reader, "stdout").await;
                     let _ = collect_pipe(stderr_reader, "stderr").await;
                     let clear_result = sync_child_pid_snapshot(&state, execution_id, None).await;
@@ -567,7 +642,16 @@ pub(super) async fn run_process(
                     }
                     termination?;
                     clear_result?;
-                    return Err(EngineError::timeout());
+                    return match stop_reason {
+                        ExecutionStopReason::ResourceHardStop => {
+                            Err(EngineError::ResourceHardStop {
+                                execution_result: None,
+                                resource_observation: Some(guard.resource_observation()),
+                            })
+                        }
+                        ExecutionStopReason::WallClockExceeded => Err(EngineError::timeout()),
+                        ExecutionStopReason::Cancelled => Err(EngineError::cancelled()),
+                    };
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -599,6 +683,38 @@ mod tests {
 
     struct TestDirectory {
         path: PathBuf,
+    }
+
+    #[test]
+    fn child_production_sampler_updates_warning_and_hard_stop_guard() {
+        let guard = ExecutionGuard::new(&TaskBudgetSummary::default(), ResourceDecision::Unknown);
+        sample_child_resource(&guard, 42, |pid, _| {
+            assert_eq!(pid, 42);
+            crate::runtime_resource::ResourceObservation {
+                summary: crate::project::ResourceObservationSummary {
+                    state: crate::project::ResourceObservationState::Warning,
+                    current_rss_bytes: Some(100),
+                    ..Default::default()
+                },
+                decision: ResourceDecision::Warning,
+            }
+        });
+        assert_eq!(guard.stop_reason(), None);
+        assert_eq!(guard.resource_observation().current_rss_bytes, Some(100));
+
+        sample_child_resource(&guard, 42, |_, _| {
+            crate::runtime_resource::ResourceObservation {
+                summary: crate::project::ResourceObservationSummary {
+                    state: crate::project::ResourceObservationState::HardStop,
+                    ..Default::default()
+                },
+                decision: ResourceDecision::HardStop,
+            }
+        });
+        assert_eq!(
+            guard.stop_reason(),
+            Some(ExecutionStopReason::ResourceHardStop)
+        );
     }
 
     impl TestDirectory {

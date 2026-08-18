@@ -15,6 +15,7 @@ pub(crate) const RECOVERY_PROGRESS_WARNING_SECS: i64 = 90;
 pub(crate) const RECOVERY_PROGRESS_STALLED_SECS: i64 = 300;
 /// Hard action wall-clock cap for recovery dispatch (≤ control-action 12 min).
 pub(crate) const RECOVERY_ACTION_HARD_TIMEOUT_SECS: u64 = 12 * 60;
+const RECOVERY_OWNER_STOP_GRACE_SECS: u64 = 2;
 
 fn git_confirmation_retry_delay(completed_retries: u32) -> Option<i64> {
     match completed_retries {
@@ -82,6 +83,38 @@ struct AutopilotJob {
     handle: JoinHandle<()>,
 }
 
+fn assign_new_job_identity(state: &mut project::AutopilotState, action: &str) {
+    let now = chrono::Utc::now().to_rfc3339();
+    state.job_id = uuid::Uuid::new_v4().to_string();
+    state.job_generation = state.job_generation.saturating_add(1);
+    state.job_owner = project::AutopilotJobOwner::BackendRuntime;
+    clear_action_claim(state);
+    state.heartbeat_at = now.clone();
+    state.last_action = action.to_string();
+    state.last_action_at = now;
+}
+
+fn converge_finished_job_state(
+    state: &mut project::AutopilotState,
+    job_id: &str,
+    generation: u64,
+) -> bool {
+    if state.job_id != job_id || state.job_generation != generation {
+        return false;
+    }
+    state.job_owner = project::AutopilotJobOwner::None;
+    clear_action_claim(state);
+    if state.run_status == project::AutopilotRunStatus::Running {
+        let message = "自动驾驶后台作业已结束且没有活跃 owner，已停止等待人工处理";
+        state.run_status = project::AutopilotRunStatus::ErrorStopped;
+        state.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+        state.error_message = message.to_string();
+        state.last_action = message.to_string();
+        state.last_action_at = chrono::Utc::now().to_rfc3339();
+    }
+    true
+}
+
 fn install_job(
     jobs: &mut HashMap<String, AutopilotJob>,
     project_name: String,
@@ -109,14 +142,46 @@ impl AutopilotRuntime {
         pipeline_state: Arc<Mutex<Option<PipelineState>>>,
         project_name: String,
     ) -> Result<(), String> {
-        let project = crate::load_project(&project_name)?;
-        let state = project
-            .workflow_state
-            .autopilot_state
-            .as_ref()
-            .ok_or("自动驾驶状态不存在。".to_string())?;
-        let job_id = state.job_id.clone();
-        let generation = state.job_generation;
+        let mut project = crate::load_project(&project_name)?;
+        let (state_active, run_status, job_id, generation, job_owner) = {
+            let state = project
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .ok_or("自动驾驶状态不存在。".to_string())?;
+            (
+                state.active,
+                state.run_status.clone(),
+                state.job_id.clone(),
+                state.job_generation,
+                state.job_owner.clone(),
+            )
+        };
+        if run_status == project::AutopilotRunStatus::Running
+            && (!project.workflow_state.autopilot_active
+                || !state_active
+                || job_id.is_empty()
+                || job_owner != project::AutopilotJobOwner::BackendRuntime)
+        {
+            let message = "自动驾驶处于 Running 但没有可证明的后端 owner，已停止等待人工处理";
+            let state = project
+                .workflow_state
+                .autopilot_state
+                .as_mut()
+                .expect("autopilot state checked above");
+            state.run_status = project::AutopilotRunStatus::ErrorStopped;
+            state.job_owner = project::AutopilotJobOwner::None;
+            state.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+            state.error_message = message.to_string();
+            state.last_action = message.to_string();
+            state.last_action_at = chrono::Utc::now().to_rfc3339();
+            clear_action_claim(state);
+            crate::save_project(&project)?;
+            return Err(message.to_string());
+        }
+        if !state_active || run_status != project::AutopilotRunStatus::Running {
+            return Ok(());
+        }
         let mut jobs = self.jobs.lock().await;
         if jobs.get(&project_name).is_some_and(|existing| {
             !existing.handle.is_finished()
@@ -125,6 +190,25 @@ impl AutopilotRuntime {
         }) {
             return Ok(());
         }
+        let finished_same_job = jobs.get(&project_name).is_some_and(|existing| {
+            existing.handle.is_finished()
+                && existing.job_id == job_id
+                && existing.generation == generation
+        });
+        let (job_id, generation) = if finished_same_job {
+            let state = project
+                .workflow_state
+                .autopilot_state
+                .as_mut()
+                .expect("autopilot state checked above");
+            assign_new_job_identity(state, "旧自动驾驶作业已结束，创建新的后端作业代次");
+            let claimed_job_id = state.job_id.clone();
+            let claimed_generation = state.job_generation;
+            crate::save_project(&project)?;
+            (claimed_job_id, claimed_generation)
+        } else {
+            (job_id, generation)
+        };
         let task_project = project_name.clone();
         let task_job_id = job_id.clone();
         // Box the driver future so the large full-product state machine is heap-allocated
@@ -166,6 +250,47 @@ impl AutopilotRuntime {
         }
         Ok(should_start)
     }
+
+    /// Abort registered in-process drivers without awaiting them during app exit.
+    /// Tokio will also tear down any task that races this bounded best-effort pass.
+    pub(crate) fn shutdown_nowait(&self) {
+        let Ok(mut jobs) = self.jobs.try_lock() else {
+            eprintln!("[lifecycle] 自动驾驶作业锁忙，交由 Tokio 退出收口");
+            return;
+        };
+        for (_, job) in jobs.drain() {
+            if !job.handle.is_finished() {
+                job.handle.abort();
+            }
+        }
+    }
+}
+
+/// Preserve an active backend owner fact before the application exits.
+/// The owner is intentionally not cleared; startup reconciliation owns the
+/// next decision and can distinguish this from a worker that vanished.
+pub(crate) fn record_intentional_exit(project: &mut project::Project) -> bool {
+    let Some(state) = project.workflow_state.autopilot_state.as_mut() else {
+        return false;
+    };
+    if !state.active
+        || state.job_id.is_empty()
+        || state.job_owner != project::AutopilotJobOwner::BackendRuntime
+        || state.last_action.starts_with("应用正常退出：")
+    {
+        return false;
+    }
+    let prior_action = if state.last_action.is_empty() {
+        "当前动作未知".to_string()
+    } else {
+        state.last_action.clone()
+    };
+    state.last_action = format!(
+        "应用正常退出：保留自动驾驶 owner={} generation={}；{}；重开时重新对账",
+        state.job_id, state.job_generation, prior_action
+    );
+    state.last_action_at = chrono::Utc::now().to_rfc3339();
+    true
 }
 
 /// Tauri 进程重启后，为仍可安全续跑的活动项目创建新一代作业身份。
@@ -173,6 +298,22 @@ impl AutopilotRuntime {
 pub(crate) fn reconcile_startup_job(project: &mut project::Project) -> bool {
     // Bound persistent recovery before deciding to resume the runtime job.
     let now = chrono::Utc::now();
+    if project
+        .workflow_state
+        .autopilot_state
+        .as_ref()
+        .is_some_and(|state| {
+            project.workflow_state.autopilot_active
+                && state.active
+                && state.run_status == project::AutopilotRunStatus::Running
+                && state.job_owner == project::AutopilotJobOwner::BackendRuntime
+                && state
+                    .last_action
+                    .starts_with("应用重启对账完成，后端自动驾驶继续运行")
+        })
+    {
+        return true;
+    }
     let stalled = crate::recovery::apply_stalled_recovery_reconciliation(project, now);
     if matches!(
         stalled,
@@ -184,6 +325,14 @@ pub(crate) fn reconcile_startup_job(project: &mut project::Project) -> bool {
             state.current_action_id.clear();
             state.current_action_kind.clear();
             state.action_started_at.clear();
+            if state.run_status == project::AutopilotRunStatus::Running {
+                let message = "自动驾驶启动对账未找到可续跑 owner，已停止等待人工处理";
+                state.run_status = project::AutopilotRunStatus::ErrorStopped;
+                state.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+                state.error_message = message.to_string();
+                state.last_action = message.to_string();
+                state.last_action_at = now.to_rfc3339();
+            }
         }
         return false;
     }
@@ -208,17 +357,22 @@ pub(crate) fn reconcile_startup_job(project: &mut project::Project) -> bool {
                 ) && !recovery.replan_execution_attempted
                     && crate::recovery::recovery_allows_automatic_claim(project, now)
             });
+    let replan_already_attempted = project
+        .workflow_state
+        .recovery_state
+        .as_ref()
+        .is_some_and(|recovery| recovery.replan_attempted || recovery.replan_execution_attempted);
     let Some(state) = project.workflow_state.autopilot_state.as_mut() else {
         return false;
     };
-    let automatically_recoverable = matches!(
+    let automatically_recoverable = (matches!(
         state.recovery_action,
         project::AutopilotRecoveryAction::PrepareExecutionWorkspace
             | project::AutopilotRecoveryAction::RegenerateExecutionPlan
             | project::AutopilotRecoveryAction::RetryGitConfirmation
-    ) || (state.recovery_action
-        == project::AutopilotRecoveryAction::RestoreExecutionBaseline
-        && crate::autopilot_failure::is_transient(&state.last_failure_kind))
+    ) && !replan_already_attempted)
+        || (state.recovery_action == project::AutopilotRecoveryAction::RestoreExecutionBaseline
+            && crate::autopilot_failure::is_transient(&state.last_failure_kind))
         || (state.recovery_action == project::AutopilotRecoveryAction::RunAutomaticRecovery
             && (resumable_validation_recovery || fresh_recovery_queue));
     let should_run = project.workflow_state.autopilot_active
@@ -228,21 +382,25 @@ pub(crate) fn reconcile_startup_job(project: &mut project::Project) -> bool {
                 && automatically_recoverable));
     if should_run {
         let now = now.to_rfc3339();
-        state.job_id = uuid::Uuid::new_v4().to_string();
-        state.job_generation = state.job_generation.saturating_add(1);
-        state.job_owner = project::AutopilotJobOwner::BackendRuntime;
+        assign_new_job_identity(state, "应用重启对账完成，后端自动驾驶继续运行");
         state.current_action_id.clear();
         state.current_action_kind.clear();
         state.action_started_at.clear();
         state.heartbeat_at = now.clone();
-        state.last_action = "应用重启对账完成，后端自动驾驶继续运行".to_string();
-        state.last_action_at = now;
         true
     } else {
         state.job_owner = project::AutopilotJobOwner::None;
         state.current_action_id.clear();
         state.current_action_kind.clear();
         state.action_started_at.clear();
+        if state.run_status == project::AutopilotRunStatus::Running {
+            let message = "自动驾驶处于 Running 但启动对账未找到可续跑 owner，已停止等待人工处理";
+            state.run_status = project::AutopilotRunStatus::ErrorStopped;
+            state.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+            state.error_message = message.to_string();
+            state.last_action = message.to_string();
+            state.last_action_at = now.to_rfc3339();
+        }
         false
     }
 }
@@ -255,6 +413,7 @@ fn job_matches(project: &project::Project, job_id: &str, generation: u64) -> boo
         .is_some_and(|state| {
             project.workflow_state.autopilot_active
                 && state.active
+                && state.job_owner == project::AutopilotJobOwner::BackendRuntime
                 && state.job_id == job_id
                 && state.job_generation == generation
         })
@@ -286,7 +445,14 @@ fn clear_action_claim(state: &mut project::AutopilotState) {
     state.action_started_at.clear();
 }
 
-fn persist_heartbeat(project: &mut project::Project) -> Result<(), String> {
+fn persist_heartbeat(
+    project: &mut project::Project,
+    job_id: &str,
+    generation: u64,
+) -> Result<(), String> {
+    if !job_matches(project, job_id, generation) {
+        return Err("自动驾驶 heartbeat 属于旧 owner，已拒绝回写。".to_string());
+    }
     if let Some(state) = project.workflow_state.autopilot_state.as_mut() {
         state.heartbeat_at = chrono::Utc::now().to_rfc3339();
         state.job_owner = project::AutopilotJobOwner::BackendRuntime;
@@ -402,6 +568,23 @@ enum DispatchOutcome {
     },
 }
 
+async fn request_pipeline_owner_stop(
+    pipeline_state: &Arc<Mutex<Option<PipelineState>>>,
+    project_name: &str,
+    execution_id: &str,
+    reason: &str,
+) {
+    let mut guard = pipeline_state.lock().await;
+    if let Some(pipeline) = guard.as_mut().filter(|pipeline| {
+        pipeline.project_name == project_name
+            && crate::pipeline::pipeline_owner_matches(Some(&**pipeline), execution_id)
+    }) {
+        pipeline.status = crate::pipeline::PipelineStatus::Failed;
+        pipeline.last_error = Some(reason.to_string());
+        crate::pipeline::append_log(pipeline, "error", reason.to_string());
+    }
+}
+
 async fn dispatch_action_with_heartbeat(
     pipeline_state: &Arc<Mutex<Option<PipelineState>>>,
     project_name: &str,
@@ -452,6 +635,33 @@ async fn dispatch_action_with_heartbeat_limited(
                     .elapsed()
                     .as_secs()
                     .max(hard_timeout.map(|d| d.as_secs()).unwrap_or(0));
+                let execution_id = crate::load_project(project_name)
+                    .ok()
+                    .filter(|project| {
+                        action_claim_matches(project, job_id, generation, action_id, &next.command)
+                    })
+                    .and_then(|project| {
+                        project
+                            .workflow_state
+                            .recovery_state
+                            .map(|recovery| recovery.execution_id)
+                    })
+                    .filter(|execution_id| !execution_id.is_empty());
+                let Some(execution_id) = execution_id else {
+                    return DispatchOutcome::Superseded;
+                };
+                request_pipeline_owner_stop(
+                    pipeline_state,
+                    project_name,
+                    &execution_id,
+                    "恢复动作达到总墙钟，正在终止执行 owner",
+                )
+                .await;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(RECOVERY_OWNER_STOP_GRACE_SECS),
+                    &mut dispatch,
+                )
+                .await;
                 return DispatchOutcome::TimedOut { elapsed_secs };
             }
             _ = heartbeat.tick() => {
@@ -488,6 +698,27 @@ async fn dispatch_action_with_heartbeat_limited(
                         let elapsed_secs = started.elapsed().as_secs().max(
                             RECOVERY_ACTION_HARD_TIMEOUT_SECS
                         );
+                        let execution_id = latest
+                            .workflow_state
+                            .recovery_state
+                            .as_ref()
+                            .map(|recovery| recovery.execution_id.as_str())
+                            .filter(|execution_id| !execution_id.is_empty());
+                        let Some(execution_id) = execution_id else {
+                            return DispatchOutcome::Superseded;
+                        };
+                        request_pipeline_owner_stop(
+                            pipeline_state,
+                            project_name,
+                            execution_id,
+                            "恢复动作无业务进展并达到总墙钟，正在终止执行 owner",
+                        )
+                        .await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(RECOVERY_OWNER_STOP_GRACE_SECS),
+                            &mut dispatch,
+                        )
+                        .await;
                         return DispatchOutcome::TimedOut { elapsed_secs };
                     }
                     if let Some((event_type, level, message)) =
@@ -496,7 +727,7 @@ async fn dispatch_action_with_heartbeat_limited(
                         write_recovery_progress_history(&mut latest, event_type, level, message);
                     }
                 }
-                if persist_heartbeat(&mut latest).is_err() {
+                if persist_heartbeat(&mut latest, job_id, generation).is_err() {
                     return DispatchOutcome::Completed(Err(
                         "自动驾驶动作心跳持久化失败。".to_string(),
                     ));
@@ -537,6 +768,16 @@ async fn recover_stopped_action(
             crate::pipeline::prepare_execution_workspace_inner(project.name.clone()).await?;
         }
         project::AutopilotRecoveryAction::RegenerateExecutionPlan => {
+            if project
+                .workflow_state
+                .recovery_state
+                .as_ref()
+                .is_some_and(|recovery| {
+                    recovery.replan_attempted || recovery.replan_execution_attempted
+                })
+            {
+                return Ok(false);
+            }
             // Defensive: OutputTruncated must never whole-stage regenerate.
             // Only run_error_recovery → replan_current_subtask is legal.
             if project
@@ -655,7 +896,7 @@ async fn drive_project(
                 .as_ref()
                 .is_some_and(retry_due);
             if !retry_is_due {
-                let _ = persist_heartbeat(&mut project);
+                let _ = persist_heartbeat(&mut project, &job_id, generation);
                 sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -700,19 +941,19 @@ async fn drive_project(
                     state.last_action_at = chrono::Utc::now().to_rfc3339();
                 }
             }
-            let _ = persist_heartbeat(&mut project);
+            let _ = persist_heartbeat(&mut project, &job_id, generation);
             sleep(Duration::from_secs(1)).await;
             continue;
         }
         if !retry_due(project.workflow_state.autopilot_state.as_ref().unwrap()) {
-            let _ = persist_heartbeat(&mut project);
+            let _ = persist_heartbeat(&mut project, &job_id, generation);
             sleep(Duration::from_secs(1)).await;
             continue;
         }
         if let Some(state) = project.workflow_state.autopilot_state.as_mut() {
             state.next_retry_at = None;
         }
-        if persist_heartbeat(&mut project).is_err() {
+        if persist_heartbeat(&mut project, &job_id, generation).is_err() {
             break;
         }
 
@@ -846,6 +1087,13 @@ async fn drive_project(
             DispatchOutcome::Superseded => break,
         }
         sleep(Duration::from_secs(1)).await;
+    }
+    if let Ok(mut project) = crate::load_project(&project_name) {
+        if let Some(state) = project.workflow_state.autopilot_state.as_mut() {
+            if converge_finished_job_state(state, &job_id, generation) {
+                let _ = crate::save_project(&project);
+            }
+        }
     }
 }
 
@@ -1058,6 +1306,12 @@ mod tests {
             .as_mut()
             .unwrap()
             .last_action = "恢复动作正在执行".to_string();
+        project
+            .workflow_state
+            .autopilot_state
+            .as_mut()
+            .unwrap()
+            .heartbeat_at = "2026-08-11T12:00:30Z".to_string();
         project.workflow_state.recovery_state = Some(project::RecoveryState {
             subtask_id: "sub-1".to_string(),
             ..Default::default()
@@ -1065,6 +1319,15 @@ mod tests {
 
         let warning = update_recovery_progress_state(&mut project, RecoveryProgressGate::Warning)
             .expect("warning event");
+        assert_eq!(
+            project
+                .workflow_state
+                .autopilot_state
+                .as_ref()
+                .unwrap()
+                .heartbeat_at,
+            "2026-08-11T12:00:30Z"
+        );
         assert_eq!(warning.0, project::ExecutionEventType::RecoveryWarning);
         write_recovery_progress_history(&mut project, warning.0, warning.1, warning.2);
         assert_eq!(project.execution_history.len(), 1);
@@ -1141,6 +1404,7 @@ mod tests {
         assert!(autopilot.current_action_id.is_empty());
         assert!(autopilot.current_action_kind.is_empty());
         assert!(autopilot.action_started_at.is_empty());
+        assert_eq!(autopilot.job_owner, project::AutopilotJobOwner::None);
         // Last heartbeat preserved for diagnosis; not cleared.
         assert_eq!(autopilot.heartbeat_at, "2026-08-11T12:11:59Z");
         assert!(autopilot.next_retry_at.is_none());
@@ -1169,13 +1433,108 @@ mod tests {
     fn startup_replaces_stale_running_job_identity() {
         let mut project = active_project(project::AutopilotRunStatus::Running);
         assert!(reconcile_startup_job(&mut project));
-        let state = project.workflow_state.autopilot_state.unwrap();
+        let state = project.workflow_state.autopilot_state.as_ref().unwrap();
         assert_ne!(state.job_id, "old-job");
         assert_eq!(state.job_generation, 8);
         assert_eq!(state.job_owner, project::AutopilotJobOwner::BackendRuntime);
         assert!(state.current_action_id.is_empty());
         assert!(state.current_action_kind.is_empty());
         assert!(!state.heartbeat_at.is_empty());
+
+        let job_id = state.job_id.clone();
+        let generation = state.job_generation;
+        assert!(reconcile_startup_job(&mut project));
+        let state = project.workflow_state.autopilot_state.unwrap();
+        assert_eq!(state.job_id, job_id);
+        assert_eq!(state.job_generation, generation);
+    }
+
+    #[test]
+    fn startup_does_not_rerun_an_attempted_replan() {
+        let mut project = active_project(project::AutopilotRunStatus::ErrorStopped);
+        let state = project.workflow_state.autopilot_state.as_mut().unwrap();
+        state.recovery_action = project::AutopilotRecoveryAction::RegenerateExecutionPlan;
+        project.workflow_state.recovery_state = Some(project::RecoveryState {
+            phase: project::RecoveryPhase::Diagnosing,
+            replan_attempted: true,
+            subtask_id: "subtask-1".to_string(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            ..Default::default()
+        });
+
+        assert!(!reconcile_startup_job(&mut project));
+        let state = project.workflow_state.autopilot_state.unwrap();
+        assert_eq!(state.run_status, project::AutopilotRunStatus::ErrorStopped);
+        assert_eq!(state.job_owner, project::AutopilotJobOwner::None);
+    }
+
+    #[test]
+    fn intentional_exit_keeps_autopilot_owner_and_generation() {
+        let mut project = active_project(project::AutopilotRunStatus::Running);
+        let before = project
+            .workflow_state
+            .autopilot_state
+            .as_ref()
+            .unwrap()
+            .job_id
+            .clone();
+
+        assert!(record_intentional_exit(&mut project));
+        assert!(!record_intentional_exit(&mut project));
+        let state = project.workflow_state.autopilot_state.unwrap();
+        assert_eq!(state.job_id, before);
+        assert_eq!(state.job_owner, project::AutopilotJobOwner::BackendRuntime);
+        assert!(state.last_action.starts_with("应用正常退出："));
+    }
+
+    #[test]
+    fn autopilot_job_match_requires_current_generation_and_backend_owner() {
+        let mut project = active_project(project::AutopilotRunStatus::Running);
+
+        assert!(job_matches(&project, "old-job", 7));
+        assert!(!job_matches(&project, "old-job", 6));
+        assert!(!job_matches(&project, "stale-job", 7));
+
+        project
+            .workflow_state
+            .autopilot_state
+            .as_mut()
+            .unwrap()
+            .job_owner = project::AutopilotJobOwner::None;
+        assert!(!job_matches(&project, "old-job", 7));
+
+        project
+            .workflow_state
+            .autopilot_state
+            .as_mut()
+            .unwrap()
+            .job_owner = project::AutopilotJobOwner::BackendRuntime;
+        project.workflow_state.autopilot_active = false;
+        assert!(!job_matches(&project, "old-job", 7));
+    }
+
+    #[test]
+    fn finished_job_converges_only_its_own_generation() {
+        let mut state = project::AutopilotState {
+            active: true,
+            run_status: project::AutopilotRunStatus::Running,
+            job_id: "job-new".to_string(),
+            job_generation: 2,
+            job_owner: project::AutopilotJobOwner::BackendRuntime,
+            current_action_id: "action-new".to_string(),
+            current_action_kind: "execute_current_subtask".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!converge_finished_job_state(&mut state, "job-old", 1));
+        assert_eq!(state.run_status, project::AutopilotRunStatus::Running);
+        assert_eq!(state.job_owner, project::AutopilotJobOwner::BackendRuntime);
+
+        assert!(converge_finished_job_state(&mut state, "job-new", 2));
+        assert_eq!(state.run_status, project::AutopilotRunStatus::ErrorStopped);
+        assert_eq!(state.job_owner, project::AutopilotJobOwner::None);
+        assert!(state.current_action_id.is_empty());
+        assert!(state.current_action_kind.is_empty());
     }
 
     #[test]

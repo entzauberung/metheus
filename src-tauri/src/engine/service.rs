@@ -2,7 +2,8 @@ use super::contract::{EngineError, EngineHealth, ExecutionRequest, ProgramSource
 use super::health::HealthCheckResult;
 use crate::pipeline::PipelineState;
 use crate::project::{
-    ExecutionProfile, ExecutionProvider, ExecutionResult, ExecutionRuntime, PermissionProfile,
+    EngineFailureKind, ExecutionProfile, ExecutionProvider, ExecutionResult, ExecutionRuntime,
+    PermissionProfile,
 };
 use crate::settings::EngineOperationSnapshot;
 use std::ffi::OsString;
@@ -70,6 +71,34 @@ pub(crate) async fn check_engine_health(profile: &ExecutionProfile) -> EngineHea
     }
 }
 
+fn interrupted_process_result(
+    prepared: &PreparedEngine,
+    request: &ExecutionRequest,
+    before_files: &crate::test_runner::FileSnapshot,
+    failure_kind: Option<EngineFailureKind>,
+    message: String,
+) -> ExecutionResult {
+    let after_files = crate::test_runner::get_file_snapshot(&request.project_path);
+    let file_changes =
+        crate::test_runner::detect_changes(before_files, &after_files, &request.project_path);
+    ExecutionResult {
+        success: false,
+        output: message.clone(),
+        error_log: message.clone(),
+        file_changes,
+        exit_code: None,
+        engine_provider: Some(prepared.profile.provider.clone()),
+        engine_runtime: prepared.profile.runtime.clone(),
+        engine_settings_revision: prepared.operation.settings.revision,
+        engine_source_revision: String::new(),
+        engine_api_backend: String::new(),
+        stdout: String::new(),
+        stderr: message,
+        engine_failure_kind: failure_kind,
+        token_usage: None,
+    }
+}
+
 pub(crate) async fn verify_engine_authentication(
     profile: &ExecutionProfile,
 ) -> Result<super::contract::EngineAuthenticationResult, String> {
@@ -114,7 +143,7 @@ pub(crate) async fn execute(
         request.prompt,
         request.authorized_paths.join("\n- ")
     );
-    let program = prepared.program.ok_or_else(|| {
+    let program = prepared.program.clone().ok_or_else(|| {
         EngineError::InvalidConfiguration("健康检查未解析出执行引擎程序路径".to_string())
     })?;
     let program_source = prepared.program_source.ok_or_else(|| {
@@ -145,13 +174,57 @@ pub(crate) async fn execute(
         }
     };
     let display_name = spec.display_name;
-    let output = super::process_runner::run_process(
+    let output = match super::process_runner::run_process_with_budget(
         spec,
         &request.project_path,
         &request.execution_id,
+        &request.task_budget,
+        crate::runtime_resource::ResourceDecision::Unknown,
         state,
     )
-    .await?;
+    .await
+    {
+        Ok(output) => output,
+        Err(EngineError::Timeout { .. }) => {
+            let result = interrupted_process_result(
+                &prepared,
+                &request,
+                &before_files,
+                Some(EngineFailureKind::Timeout),
+                "插件执行达到任务总墙钟上限".to_string(),
+            );
+            return Err(EngineError::timeout_with_result(result));
+        }
+        Err(EngineError::ResourceHardStop {
+            resource_observation,
+            ..
+        }) => {
+            let result = interrupted_process_result(
+                &prepared,
+                &request,
+                &before_files,
+                None,
+                "插件执行因资源压力达到硬停止阈值而终止".to_string(),
+            );
+            return Err(match resource_observation {
+                Some(observation) => {
+                    EngineError::resource_hard_stop_with_result_and_observation(result, observation)
+                }
+                None => EngineError::resource_hard_stop_with_result(result),
+            });
+        }
+        Err(EngineError::Cancelled { .. }) => {
+            let result = interrupted_process_result(
+                &prepared,
+                &request,
+                &before_files,
+                Some(EngineFailureKind::TaskExecutionError),
+                "插件执行已受控取消".to_string(),
+            );
+            return Err(EngineError::cancelled_with_result(result));
+        }
+        Err(error) => return Err(error),
+    };
     let after_files = crate::test_runner::get_file_snapshot(&request.project_path);
     let file_changes =
         crate::test_runner::detect_changes(&before_files, &after_files, &request.project_path);

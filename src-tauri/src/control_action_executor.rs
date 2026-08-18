@@ -232,7 +232,17 @@ fn has_persisted_action_completion(
         return crate::task_tree::find_task(project, task_id)
             .ok()
             .flatten()
-            .is_some_and(|task| task.status == project::SubtaskStatus::Passed);
+            .is_some_and(|task| {
+                matches!(
+                    task.status,
+                    project::SubtaskStatus::Passed | project::SubtaskStatus::AcceptedDeviation
+                ) && task.confirmed_by_user == Some(true)
+                    && task
+                        .auto_tag
+                        .as_deref()
+                        .map_or(false, |tag| !tag.is_empty())
+                    && crate::quality_gate::confirmation_prerequisites(task).is_ok()
+            });
     }
     made_progress
         && matches!(
@@ -783,6 +793,8 @@ fn validate_request(
             if task.status != project::SubtaskStatus::AwaitingConfirmation {
                 return Err("Git 确认只能作用于待确认叶子任务".to_string());
             }
+            crate::quality_gate::confirmation_prerequisites(task)
+                .map_err(|reason| format!("Git 确认前置阻断：{}", reason))?;
         }
         ControlActionKind::Wait | ControlActionKind::Human => {}
     }

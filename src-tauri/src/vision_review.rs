@@ -85,6 +85,30 @@ fn image_mime(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
+fn criteria_for_indexes(
+    task: &crate::project::Subtask,
+    criterion_indexes: &[u32],
+) -> Result<Vec<(u32, String)>, String> {
+    let mut seen = BTreeSet::new();
+    criterion_indexes
+        .iter()
+        .map(|index| {
+            if *index == 0 {
+                return Err("视觉审查验收项编号必须从 1 开始".to_string());
+            }
+            let criterion = task
+                .acceptance_criteria
+                .get(index.saturating_sub(1) as usize)
+                .cloned()
+                .ok_or_else(|| format!("视觉审查验收项编号越界：{index}"))?;
+            if !seen.insert(*index) {
+                return Err(format!("视觉审查验收项编号重复：{index}"));
+            }
+            Ok((*index, criterion))
+        })
+        .collect()
+}
+
 fn canonical_project_root(project_root: &str) -> Result<PathBuf, String> {
     let root = std::fs::canonicalize(project_root)
         .map_err(|error| format!("无法解析视觉证据项目根目录：{error}"))?;
@@ -531,6 +555,22 @@ async fn call_vision_model(
                 "视觉模型没有返回完整且唯一的逐验收项结论",
             ));
         }
+        if protocol.criteria.iter().any(|result| {
+            result.summary.trim().is_empty()
+                || result.status == crate::project::VisualReviewStatus::Conflict
+        }) {
+            return Err(record_vision_failure(
+                &call_id,
+                &context,
+                &settings.model,
+                decoded.id,
+                &started_at,
+                started,
+                usage,
+                crate::settings::ModelConnectionErrorKind::Protocol,
+                "视觉模型逐验收项结论缺少摘要或使用了后端专用状态",
+            ));
+        }
     }
     let call = metadata(
         call_id,
@@ -561,14 +601,7 @@ pub(crate) async fn review_task_images(
         return Err("任务没有明确声明 PNG、JPEG 或 WebP 视觉证据".to_string());
     }
     context.purpose = Some(crate::cost_ledger::ModelCallPurpose::VisionReview);
-    let criteria = criterion_indexes
-        .iter()
-        .filter_map(|index| {
-            task.acceptance_criteria
-                .get(index.saturating_sub(1) as usize)
-                .map(|criterion| (*index, criterion.clone()))
-        })
-        .collect::<Vec<_>>();
+    let criteria = criteria_for_indexes(task, criterion_indexes)?;
     let (protocol, metadata) = call_vision_model(
         &snapshot.settings,
         &snapshot.api_key,
@@ -967,6 +1000,21 @@ mod tests {
                 VisualReviewStatus::EvidenceInsufficient,
             ),
             VisualReviewStatus::EvidenceInsufficient
+        );
+    }
+
+    #[test]
+    fn visual_criteria_selection_rejects_missing_and_duplicate_indexes() {
+        let task = crate::project::Subtask {
+            acceptance_criteria: vec!["按钮可点击".to_string()],
+            ..Default::default()
+        };
+        assert!(criteria_for_indexes(&task, &[0]).is_err());
+        assert!(criteria_for_indexes(&task, &[2]).is_err());
+        assert!(criteria_for_indexes(&task, &[1, 1]).is_err());
+        assert_eq!(
+            criteria_for_indexes(&task, &[1]).unwrap(),
+            vec![(1, "按钮可点击".to_string())]
         );
     }
 }

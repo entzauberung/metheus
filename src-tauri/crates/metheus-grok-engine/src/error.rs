@@ -1,4 +1,6 @@
-use crate::config::TokenUsage;
+use crate::config::{
+    ResourceFailureKind, ResourceObservationSummary, TokenUsage,
+};
 use thiserror::Error;
 use xai_grok_sampling_types::SamplingError;
 
@@ -31,6 +33,8 @@ pub struct GrokBuildRuntimeError {
     pub token_usage: Option<TokenUsage>,
     pub files_written: Vec<String>,
     pub output_summary: String,
+    pub(crate) resource_observation: ResourceObservationSummary,
+    pub(crate) resource_failure_kind: Option<ResourceFailureKind>,
 }
 
 impl GrokBuildRuntimeError {
@@ -46,6 +50,8 @@ impl GrokBuildRuntimeError {
             token_usage: None,
             files_written: Vec::new(),
             output_summary: String::new(),
+            resource_observation: ResourceObservationSummary::default(),
+            resource_failure_kind: None,
         }
     }
 
@@ -60,6 +66,17 @@ impl GrokBuildRuntimeError {
         self.token_usage = token_usage;
         self.files_written = files_written;
         self.output_summary = truncate(&redact_bearer_tokens(&output_summary));
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_resource_facts(
+        mut self,
+        resource_observation: ResourceObservationSummary,
+        resource_failure_kind: Option<ResourceFailureKind>,
+    ) -> Self {
+        self.resource_observation = resource_observation;
+        self.resource_failure_kind = resource_failure_kind;
         self
     }
 
@@ -178,5 +195,19 @@ mod tests {
         );
         assert!(!error.message().contains("secret-value"));
         assert!(error.message().contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn max_tokens_truncation_maps_to_a_stable_runtime_kind() {
+        let error = GrokBuildRuntimeError::from_sampling(
+            SamplingError::MaxTokensTruncation,
+            "secret-value",
+        );
+        assert_eq!(error.kind, GrokBuildRuntimeErrorKind::OutputTruncated);
+        assert_eq!(
+            error.resource_observation.state,
+            crate::config::ResourceObservationState::Unknown
+        );
+        assert!(error.resource_failure_kind.is_none());
     }
 }

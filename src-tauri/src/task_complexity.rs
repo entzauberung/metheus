@@ -65,6 +65,7 @@ pub fn estimate_budget(
         max_executor_turns: workload.max_executor_turns,
         max_transport_retries: workload.max_transport_retries,
         max_doom_loop_retries: workload.max_doom_loop_retries,
+        max_wall_clock_secs: crate::workload_policy::wall_clock_budget_secs(workload.scale),
     }
 }
 
@@ -92,5 +93,6 @@ mod tests {
         assert_eq!(budget.max_executor_turns, 32);
         assert_eq!(budget.max_transport_retries, 3);
         assert_eq!(budget.max_doom_loop_retries, 2);
+        assert_eq!(budget.max_wall_clock_secs, 1_200);
     }
 }

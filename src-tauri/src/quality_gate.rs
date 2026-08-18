@@ -21,6 +21,16 @@ pub(crate) struct QualityGateEvaluation {
     pub(crate) message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompletionDecision {
+    /// Execution, quality and ledger facts are ready for the confirmation transaction.
+    AwaitingConfirmation,
+    /// The confirmation transaction has reached the required stage.
+    Completed,
+    /// Completion is forbidden until the reported reason is resolved.
+    Blocked(String),
+}
+
 impl QualityGateEvaluation {
     pub(crate) fn passed(&self) -> bool {
         self.outcome == QualityGateOutcome::Passed
@@ -217,6 +227,92 @@ pub(crate) fn evaluate_with_deferred(
         QualityGateOutcome::EvidenceInsufficient,
         "旧结果无法形成可靠的逐项质量结论",
     )
+}
+
+fn ledger_blocker(subtask: &project::Subtask) -> Option<&'static str> {
+    let criterion_count = subtask.acceptance_criteria.len();
+    if criterion_count != subtask.acceptance_ledger.len() {
+        return Some("验收账本未初始化或不完整");
+    }
+    if subtask
+        .acceptance_ledger
+        .iter()
+        .any(|item| item.status == project::AcceptanceStatus::Contradictory)
+    {
+        return Some("逐项结论与阻断证据互相冲突（Contradictory）");
+    }
+    if subtask
+        .acceptance_ledger
+        .iter()
+        .any(|item| item.status == project::AcceptanceStatus::Unknown)
+    {
+        return Some("验收账本不完整或存在未证明项（Unknown）");
+    }
+    if subtask
+        .acceptance_ledger
+        .iter()
+        .any(|item| item.status == project::AcceptanceStatus::Unsatisfied)
+    {
+        return Some("存在带有效阻断证据的未满足验收项（Unsatisfied）");
+    }
+    None
+}
+
+/// Single backend completion ruling shared by confirmation and scheduling paths.
+/// `confirmation_reached` is supplied only by the durable Git/confirmation transaction.
+pub(crate) fn decide_completion(
+    subtask: &project::Subtask,
+    quality: Option<&QualityGateEvaluation>,
+    confirmation_reached: bool,
+) -> CompletionDecision {
+    let Some(execution) = subtask.execution_result.as_ref() else {
+        return CompletionDecision::Blocked("缺少执行结果，禁止完成".to_string());
+    };
+    if !execution.success {
+        return CompletionDecision::Blocked("执行结果未成功，禁止完成".to_string());
+    }
+    if let Some(reason) = ledger_blocker(subtask) {
+        return CompletionDecision::Blocked(reason.to_string());
+    }
+    let Some(quality) = quality else {
+        return CompletionDecision::Blocked("缺少质量门结果，禁止完成".to_string());
+    };
+    if !quality.passed() {
+        return CompletionDecision::Blocked(quality.message.clone());
+    }
+    if !confirmation_reached {
+        return CompletionDecision::AwaitingConfirmation;
+    }
+    CompletionDecision::Completed
+}
+
+/// Cheap guard for dispatchers that may only schedule the confirmation action.
+/// It deliberately does not replace the full quality evaluation.
+pub(crate) fn confirmation_prerequisites(subtask: &project::Subtask) -> Result<(), String> {
+    let Some(execution) = subtask.execution_result.as_ref() else {
+        return Err("缺少执行结果，禁止进入确认事务".to_string());
+    };
+    if !execution.success {
+        return Err("执行结果未成功，禁止进入确认事务".to_string());
+    }
+    if let Some(reason) = ledger_blocker(subtask) {
+        return Err(reason.to_string());
+    }
+    if subtask.test_result.is_none()
+        && !subtask
+            .human_verification
+            .as_ref()
+            .is_some_and(|verification| {
+                matches!(
+                    verification.resolution,
+                    project::HumanResolution::ConfirmActualPass
+                        | project::HumanResolution::AcceptDeviation
+                )
+            })
+    {
+        return Err("缺少质量门结果，禁止进入确认事务".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -437,5 +533,101 @@ mod tests {
             .outcome,
             QualityGateOutcome::ReviewOscillation
         );
+    }
+
+    #[test]
+    fn completion_requires_execution_quality_ledger_and_confirmation() {
+        let test = reviewed_test();
+        let quality = evaluate(
+            Some(&test),
+            &ledger(project::AcceptanceStatus::Satisfied),
+            1,
+            false,
+        );
+        let mut subtask = project::Subtask::default();
+        subtask.acceptance_criteria = vec!["criterion".to_string()];
+        subtask.acceptance_ledger = ledger(project::AcceptanceStatus::Satisfied);
+        subtask.execution_result = Some(project::ExecutionResult {
+            success: true,
+            ..Default::default()
+        });
+
+        assert_eq!(
+            decide_completion(&subtask, Some(&quality), false),
+            CompletionDecision::AwaitingConfirmation
+        );
+        assert_eq!(
+            decide_completion(&subtask, Some(&quality), true),
+            CompletionDecision::Completed
+        );
+
+        subtask.execution_result.as_mut().unwrap().success = false;
+        assert!(matches!(
+            decide_completion(&subtask, Some(&quality), true),
+            CompletionDecision::Blocked(reason) if reason.contains("执行结果未成功")
+        ));
+    }
+
+    #[test]
+    fn completion_rejects_unknown_unsatisfied_contradictory_and_missing_ledger() {
+        let test = reviewed_test();
+        let quality = evaluate(
+            Some(&test),
+            &ledger(project::AcceptanceStatus::Satisfied),
+            1,
+            false,
+        );
+        for status in [
+            project::AcceptanceStatus::Unknown,
+            project::AcceptanceStatus::Unsatisfied,
+            project::AcceptanceStatus::Contradictory,
+        ] {
+            let mut subtask = project::Subtask::default();
+            subtask.acceptance_criteria = vec!["criterion".to_string()];
+            subtask.acceptance_ledger = ledger(status);
+            subtask.execution_result = Some(project::ExecutionResult {
+                success: true,
+                ..Default::default()
+            });
+            assert!(matches!(
+                decide_completion(&subtask, Some(&quality), true),
+                CompletionDecision::Blocked(_)
+            ));
+        }
+
+        let mut missing = project::Subtask::default();
+        missing.acceptance_criteria = vec!["criterion".to_string()];
+        missing.execution_result = Some(project::ExecutionResult {
+            success: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            decide_completion(&missing, Some(&quality), true),
+            CompletionDecision::Blocked(reason) if reason.contains("账本")
+        ));
+    }
+
+    #[test]
+    fn confirmation_prerequisites_require_execution_ledger_and_quality_facts() {
+        let mut subtask = project::Subtask::default();
+        subtask.acceptance_criteria = vec!["criterion".to_string()];
+        subtask.acceptance_ledger = ledger(project::AcceptanceStatus::Satisfied);
+        subtask.execution_result = Some(project::ExecutionResult {
+            success: true,
+            ..Default::default()
+        });
+
+        assert!(matches!(
+            confirmation_prerequisites(&subtask),
+            Err(reason) if reason.contains("质量门")
+        ));
+        subtask.test_result = Some(reviewed_test());
+        assert!(confirmation_prerequisites(&subtask).is_ok());
+
+        subtask.execution_result.as_mut().unwrap().success = false;
+        assert!(matches!(
+            confirmation_prerequisites(&subtask),
+            Err(reason) if reason.contains("执行结果")
+        ));
     }
 }

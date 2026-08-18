@@ -140,7 +140,7 @@ export default function TaskInspectorHeader({
         <button type="button" onClick={() => onAction("revalidate")} disabled={busy || !canUseTaskAction("revalidate")}><ShieldCheck size={14} />重新验证</button>
         <button type="button" onClick={() => onAction("split")} disabled={busy || !canUseTaskAction("split")}><Split size={14} />拆分</button>
         <button type="button" onClick={() => onAction("recompile")} disabled={busy || !canUseTaskAction("recompile")}><RotateCcw size={14} />重编译</button>
-        <button type="button" onClick={() => onAction("stop")} disabled={busy || writesDisabled || !hasCapability("stop")}><Square size={14} />停止</button>
+        <button type="button" onClick={() => onAction("stop")} disabled={busy || !hasCapability("stop")} title={writesDisabled ? "状态陈旧时仅允许停止或同步" : undefined}><Square size={14} />停止</button>
       </div>
       {!isCurrent && selectedNode && (
         <p className="task-inspector-history-note">

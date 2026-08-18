@@ -77,6 +77,15 @@ pub struct PipelineState {
     pub log_history: Vec<LogEntry>,
 }
 
+/// A running pipeline is owned only when it carries a non-empty execution identity.
+/// The identity is the backend claim shared with the persisted execution session.
+pub(crate) fn pipeline_owner_matches(pipeline: Option<&PipelineState>, execution_id: &str) -> bool {
+    !execution_id.is_empty()
+        && pipeline.is_some_and(|state| {
+            state.status == PipelineStatus::Running && state.execution_id == execution_id
+        })
+}
+
 /// 追加日志条目到 PipelineState，同时更新 current_log 并限制历史上限
 pub(crate) fn append_log(state: &mut PipelineState, level: &str, text: String) {
     append_log_with_context(state, level, "pipeline", None, text);
@@ -235,6 +244,64 @@ pub(crate) fn write_execution_history_with_source(
     }
 }
 
+fn session_has_in_process_owner(status: &str) -> bool {
+    matches!(
+        status,
+        "executing" | "recovering" | "replanning" | "replan_ready" | "confirming" | "rejecting"
+    )
+}
+
+/// Persist the fact that application shutdown intentionally ended in-process
+/// execution. The session remains active so startup can reconcile it; child
+/// PID evidence is handled separately by the snapshot layer.
+pub(crate) fn record_intentional_exit(
+    proj: &mut project::Project,
+    pipeline: Option<&PipelineState>,
+) -> bool {
+    let Some(session) = proj.execution_session.as_ref() else {
+        return false;
+    };
+    if !session.active || !session_has_in_process_owner(session.status.as_str()) {
+        return false;
+    }
+    let pipeline_matches = pipeline.is_some_and(|state| {
+        state.project_name == proj.name
+            && state.execution_id == session.execution_id
+            && state.status == PipelineStatus::Running
+    });
+    if pipeline.is_some() && !pipeline_matches {
+        return false;
+    }
+    let already_recorded = proj.execution_history.iter().rev().take(4).any(|entry| {
+        entry.subtask_id.as_deref() == Some(session.subtask_id.as_str())
+            && entry.text.starts_with("应用正常退出：执行会话保留")
+    });
+    if already_recorded {
+        return false;
+    }
+    let execution_id = session.execution_id.clone();
+    let milestone_id = session.milestone_id.clone();
+    let mid_stage_id = session.mid_stage_id.clone();
+    let subtask_id = session.subtask_id.clone();
+    let child_pid = pipeline.and_then(|state| state.child_pid);
+    write_execution_history(
+        proj,
+        "info",
+        project::ExecutionEventType::SystemAdvance,
+        format!(
+            "应用正常退出：执行会话保留，内置任务随应用结束；重开时对账 execution_id={} child_pid={}",
+            execution_id,
+            child_pid
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "未知".to_string())
+        ),
+        Some(&milestone_id),
+        Some(&mid_stage_id),
+        Some(&subtask_id),
+    );
+    true
+}
+
 fn execution_request_audit(
     source: project::OperationSource,
     position: usize,
@@ -351,13 +418,20 @@ pub(crate) fn persist_verification_progress(
 async fn acquire_pipeline_start<'a>(
     pipeline_state: &'a std::sync::Arc<tokio::sync::Mutex<Option<PipelineState>>>,
 ) -> Result<tokio::sync::MutexGuard<'a, Option<PipelineState>>, String> {
-    let guard = pipeline_state.lock().await;
-    if guard
-        .as_ref()
-        .map(|pipeline| pipeline.status == PipelineStatus::Running)
-        .unwrap_or(false)
-    {
-        return Err("已有小阶段正在执行，请等待当前任务结束。".to_string());
+    let mut guard = pipeline_state.lock().await;
+    if let Some(pipeline) = guard.as_mut() {
+        if pipeline.status != PipelineStatus::Running {
+            return Ok(guard);
+        }
+        let execution_id = pipeline.execution_id.clone();
+        if pipeline_owner_matches(Some(pipeline), &execution_id) {
+            return Err("已有小阶段正在执行，请等待当前任务结束。".to_string());
+        }
+        pipeline.status = PipelineStatus::Failed;
+        pipeline.last_error = Some(
+            "流水线处于 Running 但缺少有效 execution owner，已收敛为失败并允许重建。".to_string(),
+        );
+        pipeline.awaiting_confirmation = false;
     }
     Ok(guard)
 }
@@ -698,6 +772,7 @@ pub(crate) async fn execute_task_with_source(
         Some(&mid_stage_id),
         Some(&subtask_id),
     );
+    crate::snapshot::clear_startup_process_observation(&project_name)?;
     crate::save_project(&proj)?;
 
     // Initialize pipeline state, then return immediately after scheduling the background task.
@@ -805,6 +880,9 @@ fn interrupted_execution_cost_facts(
         crate::engine::EngineError::Timeout { execution_result } => {
             (execution_result.as_deref(), "Timeout")
         }
+        crate::engine::EngineError::ResourceHardStop {
+            execution_result, ..
+        } => (execution_result.as_deref(), "ResourceHardStop"),
         _ => return None,
     };
     Some((
@@ -912,6 +990,17 @@ async fn execute_current_subtask_background(
                 project::EngineFailureKind::Timeout,
                 "执行超时".to_string(),
                 execution_result.map(|result| *result),
+            ));
+        }
+        Err(crate::engine::EngineError::ResourceHardStop {
+            execution_result,
+            resource_observation,
+        }) => {
+            return Err(BackgroundExecutionFailure::resource(
+                project::RecoveryErrorKind::ExecutionError,
+                "执行因资源压力达到硬停止阈值而终止".to_string(),
+                execution_result.map(|result| *result),
+                resource_observation,
             ));
         }
         Err(error) => {
@@ -1030,12 +1119,7 @@ async fn execute_current_subtask_background(
 
     // 与暂停命令共用流水线锁，保证 execution_id 校验到项目保存之间不被旧任务穿透。
     let mut pipeline_guard = pipeline_state.lock().await;
-    let pipeline_matches = pipeline_guard
-        .as_ref()
-        .map(|pipeline| {
-            pipeline.execution_id == execution_id && pipeline.status == PipelineStatus::Running
-        })
-        .unwrap_or(false);
+    let pipeline_matches = pipeline_owner_matches(pipeline_guard.as_ref(), &execution_id);
     if !pipeline_matches {
         return Ok(());
     }
@@ -1239,6 +1323,8 @@ struct BackgroundExecutionFailure {
     message: String,
     engine_failure_kind: Option<project::EngineFailureKind>,
     execution_result: Option<project::ExecutionResult>,
+    resource_observation: project::ResourceObservationSummary,
+    resource_failure_kind: Option<project::ResourceFailureKind>,
 }
 
 impl BackgroundExecutionFailure {
@@ -1248,6 +1334,8 @@ impl BackgroundExecutionFailure {
             message,
             engine_failure_kind: None,
             execution_result: None,
+            resource_observation: project::ResourceObservationSummary::default(),
+            resource_failure_kind: None,
         }
     }
 
@@ -1262,6 +1350,29 @@ impl BackgroundExecutionFailure {
             message,
             engine_failure_kind: Some(engine_failure_kind),
             execution_result,
+            resource_observation: project::ResourceObservationSummary::default(),
+            resource_failure_kind: None,
+        }
+    }
+
+    fn resource(
+        kind: project::RecoveryErrorKind,
+        message: String,
+        execution_result: Option<project::ExecutionResult>,
+        resource_observation: Option<project::ResourceObservationSummary>,
+    ) -> Self {
+        Self {
+            kind,
+            message,
+            engine_failure_kind: None,
+            execution_result,
+            resource_observation: resource_observation.unwrap_or_else(|| {
+                project::ResourceObservationSummary {
+                    state: project::ResourceObservationState::HardStop,
+                    ..Default::default()
+                }
+            }),
+            resource_failure_kind: Some(project::ResourceFailureKind::ResourcePressure),
         }
     }
 
@@ -1288,12 +1399,7 @@ async fn finalize_background_execution_failure(
     operation_source: project::OperationSource,
 ) -> Result<(), String> {
     let mut pipeline_guard = pipeline_state.lock().await;
-    let pipeline_matches = pipeline_guard
-        .as_ref()
-        .map(|pipeline| {
-            pipeline.execution_id == execution_id && pipeline.status == PipelineStatus::Running
-        })
-        .unwrap_or(false);
+    let pipeline_matches = pipeline_owner_matches(pipeline_guard.as_ref(), execution_id);
     if !pipeline_matches {
         return Ok(());
     }
@@ -1309,10 +1415,12 @@ async fn finalize_background_execution_failure(
         return Ok(());
     }
 
+    let resource_blocked = failure.resource_failure_kind.is_some();
     let engine_blocked = failure
         .engine_failure_kind
         .as_ref()
-        .is_some_and(crate::engine::blocks_code_recovery);
+        .is_some_and(crate::engine::blocks_code_recovery)
+        || resource_blocked;
     let engine_boundary = failure
         .engine_failure_kind
         .as_ref()
@@ -1355,7 +1463,7 @@ async fn finalize_background_execution_failure(
     };
     crate::recovery::begin_execution_recovery(
         &mut proj,
-        if engine_blocked {
+        if engine_blocked && !resource_blocked {
             engine_boundary
                 .as_ref()
                 .map(|(error_kind, _)| error_kind.clone())
@@ -1379,6 +1487,14 @@ async fn finalize_background_execution_failure(
                 recovery.baseline_status = project::RecoveryBaselineStatus::NotRequired;
             }
         }
+    }
+    if let Some(resource_failure_kind) = failure.resource_failure_kind {
+        crate::recovery::record_resource_facts(
+            &mut proj,
+            failure.resource_observation.clone(),
+            Some(resource_failure_kind),
+            &failure.message,
+        );
     }
     if engine_blocked {
         if let Some(session) = proj.execution_session.as_mut() {
@@ -1524,24 +1640,19 @@ fn validate_subtask_quality_gate_with_session_statuses(
         return Err("任务合同已变化，旧执行会话不能确认。".to_string());
     }
 
-    // 校验执行结果存在
-    let exec_result = subtask
-        .execution_result
-        .as_ref()
-        .ok_or("缺少执行结果，无法确认。".to_string())?;
+    let quality = quality_evaluation_for_completion(proj, subtask)?;
 
-    // 校验执行结果成功
-    if !exec_result.success {
-        return Err(format!(
-            "执行未成功：{}。请先处理失败后再确认。",
-            if exec_result.error_log.is_empty() {
-                "无详细说明"
-            } else {
-                &exec_result.error_log
-            }
-        ));
+    match crate::quality_gate::decide_completion(subtask, Some(&quality), false) {
+        crate::quality_gate::CompletionDecision::AwaitingConfirmation
+        | crate::quality_gate::CompletionDecision::Completed => Ok(()),
+        crate::quality_gate::CompletionDecision::Blocked(reason) => Err(reason),
     }
+}
 
+fn quality_evaluation_for_completion(
+    proj: &project::Project,
+    subtask: &project::Subtask,
+) -> Result<crate::quality_gate::QualityGateEvaluation, String> {
     let human_override = subtask
         .human_verification
         .as_ref()
@@ -1552,31 +1663,25 @@ fn validate_subtask_quality_gate_with_session_statuses(
                     | project::HumanResolution::AcceptDeviation
             )
         });
-
-    // 人工核验是独立的通过通道；真实测试结果保持原值。
     if human_override {
+        // 人工核验是独立的通过通道；真实测试结果保持原值。
         crate::human_action_policy::validate_recorded_human_acceptance(proj, subtask)?;
-        return Ok(());
+        return Ok(crate::quality_gate::QualityGateEvaluation {
+            outcome: crate::quality_gate::QualityGateOutcome::Passed,
+            message: "人工核验边界已记录".to_string(),
+        });
     }
-
-    // 校验测试结果存在
     let test_result = subtask
         .test_result
         .as_ref()
         .ok_or("缺少测试结果，无法确认。测试服务可能不可用。".to_string())?;
-
-    let quality = crate::quality_gate::evaluate_with_deferred(
+    Ok(crate::quality_gate::evaluate_with_deferred(
         Some(test_result),
         &subtask.acceptance_ledger,
         subtask.acceptance_criteria.len(),
         false,
         batch_deferred_review_is_complete(proj, subtask),
-    );
-    if !quality.passed() {
-        return Err(quality.message);
-    }
-
-    Ok(())
+    ))
 }
 
 fn batch_deferred_review_is_complete(proj: &project::Project, subtask: &project::Subtask) -> bool {
@@ -2407,6 +2512,37 @@ pub(crate) async fn confirm_subtask_result_with_source(
         );
         let _ = crate::save_project(&proj);
         return Err(message);
+    }
+
+    let completion_task = crate::task_tree::find_task(&proj, &subtask_id)?
+        .ok_or_else(|| "完成裁决目标叶子任务不存在。".to_string())?;
+    let completion_quality = quality_evaluation_for_completion(&proj, completion_task)?;
+    let completion_decision =
+        crate::quality_gate::decide_completion(completion_task, Some(&completion_quality), true);
+    match completion_decision {
+        crate::quality_gate::CompletionDecision::Completed => {}
+        crate::quality_gate::CompletionDecision::AwaitingConfirmation => {
+            let message = "唯一完成裁决阻断：确认事务未达到完成阶段".to_string();
+            mark_confirmation_blocked_with_source(
+                &mut proj,
+                project::GitConfirmationFailureKind::ProjectFinalizationFailed,
+                message.clone(),
+                operation_source,
+            );
+            crate::save_project(&proj)?;
+            return Err(message);
+        }
+        crate::quality_gate::CompletionDecision::Blocked(reason) => {
+            let message = format!("唯一完成裁决阻断：{}", reason);
+            mark_confirmation_blocked_with_source(
+                &mut proj,
+                project::GitConfirmationFailureKind::ProjectFinalizationFailed,
+                message.clone(),
+                operation_source,
+            );
+            crate::save_project(&proj)?;
+            return Err(message);
+        }
     }
 
     let st = crate::task_tree::find_task_mut(&mut proj, &subtask_id)?
@@ -4762,11 +4898,7 @@ pub fn reconcile_execution_state(
         "executing" | "recovering" => {
             match pipeline_status {
                 // 内存 PipelineState 存在且正在运行 → 真执行中
-                Some(ps)
-                    if ps.status == PipelineStatus::Running
-                        && (session.execution_id.is_empty()
-                            || ps.execution_id == session.execution_id) =>
-                {
+                Some(ps) if pipeline_owner_matches(Some(ps), &session.execution_id) => {
                     ExecutionReconciliation::Executing
                 }
                 // 内存 PipelineState 存在但不在运行 → 进程已死
@@ -4841,6 +4973,12 @@ pub fn apply_execution_reconciliation(
             // 自动驾驶显式标记恢复动作，不得靠错误文本猜测
             if proj.workflow_state.autopilot_active {
                 if let Some(ref mut ap) = proj.workflow_state.autopilot_state {
+                    // The persisted runtime owner belongs to the lost process. Keep
+                    // heartbeat/history for diagnosis, but never let startup treat it as live.
+                    ap.job_owner = project::AutopilotJobOwner::None;
+                    ap.current_action_id.clear();
+                    ap.current_action_kind.clear();
+                    ap.action_started_at.clear();
                     let interrupted_recovery = proj.workflow_state.recovery_state.is_some();
                     ap.run_status = if replan_execution_lost {
                         project::AutopilotRunStatus::ErrorStopped
@@ -4916,6 +5054,91 @@ pub fn apply_execution_reconciliation(
             true
         }
     }
+}
+
+fn infer_startup_resource_facts(proj: &mut project::Project) -> bool {
+    let observation = crate::snapshot::load_snapshot(&proj.name)
+        .ok()
+        .flatten()
+        .and_then(|snapshot| snapshot.startup_process_observation);
+    let Some(session) = proj.execution_session.as_ref() else {
+        return false;
+    };
+    if !matches!(
+        session.parsed_status(),
+        project::ExecutionSessionStatus::SessionLost
+            | project::ExecutionSessionStatus::ExecutionFailed
+    ) {
+        return false;
+    }
+    let (observation, failure_kind, message, intentional_exit) = match observation {
+        Some(observation) => match observation.kind {
+            crate::snapshot::StartupProcessObservationKind::Killed => (
+                project::ResourceObservationSummary {
+                    state: project::ResourceObservationState::KilledSuspected,
+                    source: project::ResourceObservationSource::Unknown,
+                    sampled_at: Some(observation.observed_at.clone()),
+                    ..Default::default()
+                },
+                Some(project::ResourceFailureKind::ResourceKilled),
+                format!(
+                    "启动对账发现执行子进程 PID={} 已被清理；无法据此确认 OOM，资源终止标记为 KilledSuspected。",
+                    observation.pid
+                ),
+                false,
+            ),
+            crate::snapshot::StartupProcessObservationKind::IntentionalExit => (
+                project::ResourceObservationSummary {
+                    sampled_at: Some(observation.observed_at.clone()),
+                    ..Default::default()
+                },
+                None,
+                format!(
+                    "应用已正常退出，执行子进程 PID={} 的退出属于 intentional exit；资源来源保持 Unknown。",
+                    observation.pid
+                ),
+                true,
+            ),
+            crate::snapshot::StartupProcessObservationKind::AlreadyExited => (
+                project::ResourceObservationSummary {
+                    sampled_at: Some(observation.observed_at.clone()),
+                    ..Default::default()
+                },
+                None,
+                format!(
+                    "启动对账发现执行子进程 PID={} 已退出；没有资源终止证据，保持 Unknown。",
+                    observation.pid
+                ),
+                false,
+            ),
+            crate::snapshot::StartupProcessObservationKind::TerminationUnknown
+            | crate::snapshot::StartupProcessObservationKind::IdentityUnverified => (
+                project::ResourceObservationSummary {
+                    sampled_at: Some(observation.observed_at.clone()),
+                    ..Default::default()
+                },
+                None,
+                format!(
+                    "启动对账无法证明执行子进程 PID={} 的归属或终止来源，保持 SessionLost + Unknown；请先核对工作区基线。",
+                    observation.pid
+                ),
+                false,
+            ),
+        },
+        None => (
+            project::ResourceObservationSummary::default(),
+            None,
+            "启动对账无法证明资源终止来源，保持 SessionLost + Unknown；请先核对工作区基线。"
+                .to_string(),
+            false,
+        ),
+    };
+    if intentional_exit {
+        if let Some(session) = proj.execution_session.as_mut() {
+            session.failure_message = message.clone();
+        }
+    }
+    crate::recovery::record_resource_facts(proj, observation, failure_kind, &message)
 }
 
 /// 在调用方已持有流水线互斥权时，对最新项目快照做执行对账并可选写盘。
@@ -5091,6 +5314,9 @@ pub(crate) fn reconcile_loaded_project_under_pipeline_lock(
         }
     }
     modified |= apply_execution_reconciliation(proj, &reconciliation);
+    if reconciliation == ExecutionReconciliation::SessionLost {
+        modified |= infer_startup_resource_facts(proj);
+    }
     let lock_reconciliation = crate::control_action_executor::reconcile_stale_control_action_lock(
         proj,
         crate::project_state_bus::process_start_id(),
@@ -5401,6 +5627,32 @@ mod tests {
     use std::process::Command;
     use std::sync::Arc;
     use tokio::sync::Mutex;
+
+    #[test]
+    fn resource_failure_retains_guard_observation_for_finalizer() {
+        let failure = BackgroundExecutionFailure::resource(
+            project::RecoveryErrorKind::ExecutionError,
+            "resource hard stop".to_string(),
+            None,
+            Some(project::ResourceObservationSummary {
+                state: project::ResourceObservationState::HardStop,
+                peak_rss_bytes: Some(900),
+                headroom_bytes: Some(100),
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(
+            failure.resource_observation.state,
+            project::ResourceObservationState::HardStop
+        );
+        assert_eq!(failure.resource_observation.peak_rss_bytes, Some(900));
+        assert_eq!(failure.resource_observation.headroom_bytes, Some(100));
+        assert_eq!(
+            failure.resource_failure_kind,
+            Some(project::ResourceFailureKind::ResourcePressure)
+        );
+    }
 
     #[test]
     fn adaptive_execution_contract_builtin_interruptions_reach_cost_ledger_with_facts() {
@@ -5796,6 +6048,38 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_owner_requires_exact_non_empty_execution_identity() {
+        let running = pipeline_state("execution-1", PipelineStatus::Running);
+        assert!(pipeline_owner_matches(Some(&running), "execution-1"));
+        assert!(!pipeline_owner_matches(Some(&running), "execution-old"));
+        assert!(!pipeline_owner_matches(Some(&running), ""));
+
+        let failed = pipeline_state("execution-1", PipelineStatus::Failed);
+        assert!(!pipeline_owner_matches(Some(&failed), "execution-1"));
+    }
+
+    #[test]
+    fn intentional_exit_keeps_session_active_and_records_only_once() {
+        let mut project = execution_project(
+            "intentional-exit",
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(execution_session("executing", "execution-1", "HEAD")),
+        );
+        let mut pipeline = pipeline_state("execution-1", PipelineStatus::Running);
+        pipeline.project_name = project.name.clone();
+        pipeline.child_pid = Some(42);
+
+        assert!(record_intentional_exit(&mut project, Some(&pipeline)));
+        assert!(!record_intentional_exit(&mut project, Some(&pipeline)));
+        assert!(project.execution_session.as_ref().unwrap().active);
+        assert_eq!(project.execution_history.len(), 1);
+        assert!(project.execution_history[0]
+            .text
+            .contains("应用正常退出：执行会话保留"));
+    }
+
+    #[test]
     fn validate_quality_gate_requires_session() {
         let proj = crate::project::Project::new("test-qg");
         let result = validate_subtask_quality_gate(&proj);
@@ -5975,6 +6259,12 @@ mod tests {
             last_action_at: String::new(),
             error_message: String::new(),
             recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+            job_id: "lost-runtime-job".to_string(),
+            job_generation: 4,
+            job_owner: project::AutopilotJobOwner::BackendRuntime,
+            current_action_id: "lost-action".to_string(),
+            current_action_kind: "run_error_recovery".to_string(),
+            action_started_at: "2026-08-11T11:59:00Z".to_string(),
             ..Default::default()
         });
         proj.workflow_state.recovery_state = Some(project::RecoveryState {
@@ -6005,6 +6295,11 @@ mod tests {
                 .map(|state| &state.recovery_action),
             Some(&project::AutopilotRecoveryAction::WaitHumanDecision)
         );
+        let autopilot = proj.workflow_state.autopilot_state.as_ref().unwrap();
+        assert_eq!(autopilot.job_owner, project::AutopilotJobOwner::None);
+        assert!(autopilot.current_action_id.is_empty());
+        assert!(autopilot.current_action_kind.is_empty());
+        assert!(autopilot.action_started_at.is_empty());
     }
 
     #[test]
@@ -6991,6 +7286,69 @@ mod tests {
         assert!(!recovery.replan_attempted);
         assert!(recovery.attempt_history.is_empty());
         assert!(recovery.next_validation_retry_at.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_retest_keeps_pending_execution_out_of_task_facts() -> Result<(), String> {
+        let session = execution_session("recovering", "recovery-pending", "abc123");
+        let mut proj = execution_project(
+            "recovery-pending",
+            Path::new(""),
+            project::SubtaskStatus::Executing,
+            Some(session.clone()),
+        );
+        let original_execution = project::ExecutionResult {
+            success: true,
+            output: "original execution".to_string(),
+            ..Default::default()
+        };
+        let pending_execution = project::ExecutionResult {
+            success: true,
+            output: "repair execution pending retest".to_string(),
+            ..Default::default()
+        };
+        let subtask = &mut proj.milestones[0].mid_stages[0].subtasks[0];
+        subtask.execution_result = Some(original_execution.clone());
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            error_kind: project::RecoveryErrorKind::TestFailure,
+            phase: project::RecoveryPhase::Retesting,
+            attempt: 1,
+            max_attempts: 2,
+            subtask_id: "subtask-1".to_string(),
+            execution_id: "recovery-pending".to_string(),
+            pending_execution_result: Some(pending_execution.clone()),
+            ..Default::default()
+        });
+
+        let rolled_back = crate::recovery::finish_retest(
+            &mut proj,
+            &session,
+            "recovery-pending",
+            project::TestResult {
+                automated_test_status: project::AutomatedTestStatus::Failed,
+                issues: vec!["retest failed".to_string()],
+                ..Default::default()
+            },
+        )?;
+        assert!(!rolled_back);
+        let subtask = &proj.milestones[0].mid_stages[0].subtasks[0];
+        assert_eq!(
+            subtask
+                .execution_result
+                .as_ref()
+                .map(|result| &result.output),
+            Some(&original_execution.output)
+        );
+        assert!(subtask.test_result.is_some());
+        let recovery = proj.workflow_state.recovery_state.as_ref().unwrap();
+        assert_eq!(
+            recovery
+                .pending_execution_result
+                .as_ref()
+                .map(|result| &result.output),
+            Some(&pending_execution.output)
+        );
         Ok(())
     }
 

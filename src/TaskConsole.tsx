@@ -34,6 +34,7 @@ import {
   type LogFilterCategory,
 } from "./logFilterPolicy";
 import { getVerificationStageLabel } from "./autopilotPolicy";
+import type { RuntimeOutcomePresentation } from "./runtimeOutcomePresentation";
 
 const LOG_LEVEL_ICON: Record<string, string> = {
   info: "ℹ",
@@ -55,8 +56,8 @@ const RECOVERY_EVENT_LABEL: Record<string, string> = {
   RecoveryWarning: "恢复进展警告",
   RecoveryStalled: "恢复已停滞",
   RecoveryExhausted: "自动恢复已停止",
-  RecoverySucceeded: "自动恢复完成",
-  Recovered: "自动恢复完成",
+  RecoverySucceeded: "恢复动作已收口",
+  Recovered: "恢复动作已收口",
 };
 
 function historyLogIdentity(
@@ -141,6 +142,7 @@ interface TaskConsoleProps {
   validationRetryLimit?: number;
   nextValidationRetryAt?: string;
   recoveryPresentation?: RecoveryPresentation | null;
+  runtimeOutcome?: RuntimeOutcomePresentation;
   selectedTaskId?: string;
   onOpenTask?: (taskId: string) => void;
 }
@@ -157,6 +159,7 @@ export default function TaskConsole({
   validationRetryLimit,
   nextValidationRetryAt,
   recoveryPresentation,
+  runtimeOutcome,
   selectedTaskId,
   onOpenTask,
 }: TaskConsoleProps) {
@@ -290,6 +293,18 @@ export default function TaskConsole({
             <div className="task-console-test-summary" role="status" aria-live="polite">
               {testLogs.length === 0 ? "暂无测试记录" : `测试记录：${testLogs.length} 条`}
             </div>
+            {runtimeOutcome && (
+              <div
+                className={`task-console-runtime-outcome tone-${runtimeOutcome.tone}`}
+                data-runtime-outcome={runtimeOutcome.state}
+                role="status"
+                aria-live="polite"
+              >
+                <strong>{runtimeOutcome.statusLabel}</strong>
+                <span>{runtimeOutcome.summary}</span>
+                {!runtimeOutcome.writeAllowed && <span>{runtimeOutcome.writeBlockedReason}</span>}
+              </div>
+            )}
             {displayedValidationStage && (
               <div className="task-console-validation-strip">
                 <span>验证阶段：{displayedValidationStage}</span>

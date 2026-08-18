@@ -126,6 +126,48 @@ pub struct TokenUsage {
     pub total_tokens: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) enum ResourceObservationState {
+    #[default]
+    Unknown,
+    Warning,
+    HardStop,
+    KilledSuspected,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub(crate) enum ResourceObservationSource {
+    #[default]
+    Unknown,
+    Proc,
+    Cgroup,
+    InProcess,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub(crate) struct ResourceObservationSummary {
+    #[serde(default)]
+    pub state: ResourceObservationState,
+    #[serde(default)]
+    pub source: ResourceObservationSource,
+    #[serde(default)]
+    pub current_rss_bytes: Option<u64>,
+    #[serde(default)]
+    pub peak_rss_bytes: Option<u64>,
+    #[serde(default)]
+    pub cgroup_current_bytes: Option<u64>,
+    #[serde(default)]
+    pub cgroup_limit_bytes: Option<u64>,
+    #[serde(default)]
+    pub sampled_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum ResourceFailureKind {
+    ResourcePressure,
+    ResourceKilled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrokBuildExecutionResult {
     pub output: String,

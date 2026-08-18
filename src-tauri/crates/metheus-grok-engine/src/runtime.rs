@@ -35,8 +35,10 @@ where
         Err(error) if error.kind == GrokBuildRuntimeErrorKind::OutputTruncated => error,
         Err(error) => return Err(error),
     };
+    // A truncation without consumed-turn facts cannot safely receive a fresh
+    // full budget; preserve the terminal error instead of resetting it.
     let remaining_turns = config.max_turns.saturating_sub(first_error.turns);
-    if remaining_turns == 0 {
+    if first_error.turns == 0 || remaining_turns == 0 {
         return Err(first_error);
     }
 
@@ -753,5 +755,33 @@ mod tests {
         assert!(error.token_usage.is_none());
         assert!(error.output_summary.contains("first"));
         assert!(error.output_summary.contains("second"));
+    }
+
+    #[tokio::test]
+    async fn truncation_without_turn_facts_does_not_reset_the_budget() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runner_calls = calls.clone();
+        let error = execute_with(
+            continuation_test_config(),
+            continuation_test_request(std::env::temp_dir()),
+            move |_config, _request| {
+                runner_calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(continuation_error(
+                        GrokBuildRuntimeErrorKind::OutputTruncated,
+                        0,
+                        None,
+                        &[],
+                        "turn facts unavailable",
+                    ))
+                }
+            },
+        )
+        .await
+        .expect_err("unknown consumed turns must remain terminal");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(error.kind, GrokBuildRuntimeErrorKind::OutputTruncated);
+        assert_eq!(error.turns, 0);
     }
 }

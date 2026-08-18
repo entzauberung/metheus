@@ -566,6 +566,7 @@ pub(crate) fn build_review_evidence_with_request(
                     continue;
                 }
                 Err(error) => {
+                    merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Partial);
                     notes.push(format!("{file}: 目标文件读取失败：{error}"));
                     continue;
                 }
@@ -643,7 +644,10 @@ pub(crate) fn build_review_evidence_with_request(
                         }
                     }
                 }
-                Err(error) => notes.push(format!("{file}: {error}")),
+                Err(error) => {
+                    merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Partial);
+                    notes.push(format!("{file}: {error}"));
+                }
             }
         }
     }
@@ -653,7 +657,7 @@ pub(crate) fn build_review_evidence_with_request(
             let Ok(full_path) = authorized_file_path(project_path, file) else {
                 continue;
             };
-            if let Ok(content) = std::fs::read_to_string(full_path) {
+            if let Ok(content) = std::fs::read_to_string(&full_path) {
                 let (preview, partial) = render_file_preview(&content);
                 let _ = push_evidence_block(
                     &mut rendered,
@@ -672,6 +676,9 @@ pub(crate) fn build_review_evidence_with_request(
                         "{file}: 当前文件仅提供头尾预览，省略区不代表代码不存在"
                     ));
                 }
+            } else {
+                merge_evidence_status(&mut status, project::ReviewEvidenceStatus::Partial);
+                notes.push(format!("{file}: 当前文件预览读取失败"));
             }
         }
     } else {
@@ -930,6 +937,30 @@ mod tests {
             },
         );
         assert!(evidence.summary.contains("写入但没有初始化读取"));
+        std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn git_diff_failure_marks_existing_file_evidence_partial() -> Result<(), String> {
+        let path =
+            std::env::temp_dir().join(format!("metheus-evidence-no-git-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+        std::fs::write(
+            path.join("index.html"),
+            "function render() { return true; }\n",
+        )
+        .map_err(|error| error.to_string())?;
+
+        let evidence = build_review_evidence_with_request(
+            &path.to_string_lossy(),
+            &["index.html".into()],
+            &["render exists".into()],
+            &ReviewEvidenceRequest::default(),
+        );
+        assert_eq!(evidence.status, project::ReviewEvidenceStatus::Partial);
+        assert!(evidence.rendered.contains("function render"));
+
         std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
         Ok(())
     }

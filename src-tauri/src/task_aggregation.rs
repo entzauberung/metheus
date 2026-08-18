@@ -27,6 +27,9 @@ pub fn aggregate_ancestors(
         .ok_or_else(|| format!("聚合源任务不存在：{}", completed_task_id))?;
     let completed = crate::task_tree::find_task(project, completed_task_id)?
         .ok_or_else(|| format!("聚合源任务不存在：{}", completed_task_id))?;
+    if !completed.child_tasks.is_empty() {
+        return Err("只有叶子任务才能触发父节点聚合".to_string());
+    }
     if !crate::task_tree::is_terminal(&completed.status) {
         return Err("只有进入终态的叶子任务才能触发父节点聚合".to_string());
     }
@@ -40,6 +43,13 @@ pub fn aggregate_ancestors(
         let parent = crate::task_tree::find_task(project, parent_id)?
             .ok_or_else(|| format!("聚合父任务不存在：{}", parent_id))?
             .clone();
+        for child in parent
+            .child_tasks
+            .iter()
+            .filter(|child| crate::task_tree::is_terminal(&child.status))
+        {
+            validate_aggregation_child(project, child)?;
+        }
         let aggregation = aggregate_parent(
             &parent,
             project.human_review_cadence == crate::project::HumanReviewCadence::MilestoneBatch,
@@ -62,6 +72,9 @@ pub fn aggregate_ancestors(
 
 fn validate_terminal_source(project: &Project, task: &Subtask) -> Result<(), String> {
     match task.status {
+        SubtaskStatus::Passed => {
+            validate_passed_leaf(project, task)?;
+        }
         SubtaskStatus::AcceptedDeviation => {
             crate::human_action_policy::validate_recorded_human_acceptance(project, task)
                 .map_err(|reason| format!("接受偏差任务审计无效，禁止父节点聚合：{}", reason))?;
@@ -83,6 +96,78 @@ fn validate_terminal_source(project: &Project, task: &Subtask) -> Result<(), Str
     Ok(())
 }
 
+fn validate_aggregation_child(project: &Project, task: &Subtask) -> Result<(), String> {
+    if !task.child_tasks.is_empty() {
+        if task.aggregated_at.is_some() {
+            return Ok(());
+        }
+        return Err(format!(
+            "父任务 {} 缺少已完成聚合事实，禁止再次向上聚合",
+            task.id
+        ));
+    }
+    validate_terminal_source(project, task)
+}
+
+fn validate_passed_leaf(project: &Project, task: &Subtask) -> Result<(), String> {
+    // Preserve contradictory/unknown/unsatisfied child evidence for parent
+    // aggregation; it must remain a blocking parent fact, not an early error.
+    if task.acceptance_ledger.iter().any(|item| {
+        matches!(
+            item.status,
+            AcceptanceStatus::Unknown
+                | AcceptanceStatus::Unsatisfied
+                | AcceptanceStatus::Contradictory
+        )
+    }) {
+        return Ok(());
+    }
+    if task.confirmed_by_user != Some(true) {
+        return Err("叶子任务尚未完成用户确认，禁止父节点聚合".to_string());
+    }
+    if task.auto_tag.as_deref().map_or(true, str::is_empty) {
+        return Err("叶子任务缺少 Git 确认标签，禁止父节点聚合".to_string());
+    }
+    let quality = if task
+        .human_verification
+        .as_ref()
+        .is_some_and(|verification| {
+            matches!(
+                verification.resolution,
+                crate::project::HumanResolution::ConfirmActualPass
+                    | crate::project::HumanResolution::AcceptDeviation
+            )
+        }) {
+        crate::human_action_policy::validate_recorded_human_acceptance(project, task)
+            .map_err(|reason| format!("叶子人工确认审计无效，禁止父节点聚合：{}", reason))?;
+        crate::quality_gate::QualityGateEvaluation {
+            outcome: crate::quality_gate::QualityGateOutcome::Passed,
+            message: "人工确认边界已完成".to_string(),
+        }
+    } else {
+        let test = task
+            .test_result
+            .as_ref()
+            .ok_or_else(|| "叶子任务缺少质量结果，禁止父节点聚合".to_string())?;
+        crate::quality_gate::evaluate_with_deferred(
+            Some(test),
+            &task.acceptance_ledger,
+            task.acceptance_criteria.len(),
+            false,
+            project.human_review_cadence == crate::project::HumanReviewCadence::MilestoneBatch,
+        )
+    };
+    match crate::quality_gate::decide_completion(task, Some(&quality), true) {
+        crate::quality_gate::CompletionDecision::Completed => Ok(()),
+        crate::quality_gate::CompletionDecision::AwaitingConfirmation => {
+            Err("叶子任务确认事务尚未完成，禁止父节点聚合".to_string())
+        }
+        crate::quality_gate::CompletionDecision::Blocked(reason) => {
+            Err(format!("叶子任务完成裁决阻断：{}", reason))
+        }
+    }
+}
+
 fn aggregate_parent(parent: &Subtask, allow_deferred: bool) -> ParentAggregation {
     let now = chrono::Utc::now().to_rfc3339();
     let all_children_terminal = !parent.child_tasks.is_empty()
@@ -90,17 +175,12 @@ fn aggregate_parent(parent: &Subtask, allow_deferred: bool) -> ParentAggregation
             .child_tasks
             .iter()
             .all(|child| crate::task_tree::is_terminal(&child.status));
-    let mut ledger = parent
-        .acceptance_criteria
-        .iter()
-        .enumerate()
-        .map(|(index, criterion)| AcceptanceLedgerItem {
-            criterion_index: index as u32 + 1,
-            criterion: criterion.clone(),
-            updated_at: now.clone(),
-            ..Default::default()
-        })
-        .collect::<Vec<_>>();
+    // Reopen and repeated aggregation must retain parent evidence that has no
+    // new child proof in this pass. Hydration appends only genuinely missing
+    // criteria and leaves historical rows in their persisted order.
+    let mut hydrated_parent = parent.clone();
+    crate::plan_contract::hydrate_acceptance_ledger(&mut hydrated_parent);
+    let mut ledger = hydrated_parent.acceptance_ledger;
 
     for item in &mut ledger {
         let proofs = parent
@@ -127,6 +207,7 @@ fn aggregate_parent(parent: &Subtask, allow_deferred: bool) -> ParentAggregation
             .iter()
             .map(|proof| proof.confidence)
             .fold(1.0_f64, f64::min);
+        item.updated_at = now.clone();
     }
 
     let conflict = ledger
@@ -306,6 +387,20 @@ mod tests {
                 confidence: 1.0,
                 ..Default::default()
             }],
+            execution_result: Some(crate::project::ExecutionResult {
+                success: true,
+                ..Default::default()
+            }),
+            test_result: Some(crate::project::TestResult {
+                passed: true,
+                review_passed: true,
+                verification_kind: crate::project::VerificationKind::CodeReviewOnly,
+                review_status: crate::project::ReviewStatus::Completed,
+                review_evidence_status: crate::project::ReviewEvidenceStatus::Partial,
+                ..Default::default()
+            }),
+            confirmed_by_user: Some(true),
+            auto_tag: Some(format!("tag-{id}")),
             parent_criterion_indexes: vec![parent_index],
             ..Default::default()
         }
@@ -362,6 +457,26 @@ mod tests {
     }
 
     #[test]
+    fn unconfirmed_passed_leaf_cannot_aggregate_parent() {
+        let mut child = proven_child("unconfirmed", 1, AcceptanceStatus::Satisfied);
+        child.confirmed_by_user = None;
+        let parent = Subtask {
+            id: "parent".to_string(),
+            title: "parent".to_string(),
+            acceptance_criteria: vec!["criterion 1".to_string()],
+            child_tasks: vec![child],
+            ..Default::default()
+        };
+        let mut project = project_with_parent(parent);
+        let error = aggregate_ancestors(&mut project, "unconfirmed").unwrap_err();
+        assert!(error.contains("确认"));
+        assert_eq!(
+            project.milestones[0].subtasks[0].status,
+            SubtaskStatus::Pending
+        );
+    }
+
+    #[test]
     fn phase1_human_action_safety_illegal_deviation_cannot_complete_parent() {
         let child = proven_child("deviation", 1, AcceptanceStatus::AcceptedDeviation);
         let parent = Subtask {
@@ -398,6 +513,81 @@ mod tests {
         assert_eq!(
             project.milestones[0].subtasks[0].status,
             SubtaskStatus::Pending
+        );
+        assert_eq!(
+            project.milestones[0].subtasks[0].acceptance_ledger[1].status,
+            AcceptanceStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn parent_aggregation_preserves_historical_rows_and_stable_criterion_indexes() {
+        let mut child = proven_child("mapped", 2, AcceptanceStatus::Satisfied);
+        child.acceptance_criteria = vec!["criterion 2".to_string()];
+        let parent = Subtask {
+            id: "parent".to_string(),
+            title: "parent".to_string(),
+            acceptance_criteria: vec!["criterion 1".to_string(), "criterion 2".to_string()],
+            acceptance_ledger: vec![AcceptanceLedgerItem {
+                criterion_index: 1,
+                criterion: "criterion 1".to_string(),
+                status: AcceptanceStatus::Unsatisfied,
+                evidence: "historical failure".to_string(),
+                ..Default::default()
+            }],
+            child_tasks: vec![child],
+            ..Default::default()
+        };
+        let mut project = project_with_parent(parent);
+
+        aggregate_ancestors(&mut project, "mapped").unwrap();
+
+        let parent = &project.milestones[0].subtasks[0];
+        assert_eq!(
+            parent
+                .acceptance_ledger
+                .iter()
+                .map(|item| item.criterion_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            parent.acceptance_ledger[0].status,
+            AcceptanceStatus::Unsatisfied
+        );
+        assert_eq!(parent.acceptance_ledger[0].evidence, "historical failure");
+        assert_eq!(
+            parent.acceptance_ledger[1].status,
+            AcceptanceStatus::Satisfied
+        );
+    }
+
+    #[test]
+    fn unsatisfied_and_contradictory_child_evidence_remain_blocking_parent_facts() {
+        let parent = Subtask {
+            id: "parent".to_string(),
+            title: "parent".to_string(),
+            acceptance_criteria: vec!["criterion 1".to_string(), "criterion 2".to_string()],
+            child_tasks: vec![
+                proven_child("unsatisfied", 1, AcceptanceStatus::Unsatisfied),
+                proven_child("contradictory", 2, AcceptanceStatus::Contradictory),
+            ],
+            ..Default::default()
+        };
+        let mut project = project_with_parent(parent);
+
+        let outcome = aggregate_ancestors(&mut project, "contradictory").unwrap();
+
+        let parent = &project.milestones[0].subtasks[0];
+        assert!(outcome.contract_conflict);
+        assert_eq!(parent.status, SubtaskStatus::Pending);
+        assert_eq!(
+            parent.acceptance_ledger[0].status,
+            AcceptanceStatus::Unsatisfied
+        );
+        assert_eq!(
+            parent.acceptance_ledger[1].status,
+            AcceptanceStatus::Contradictory
         );
     }
 
@@ -547,6 +737,19 @@ mod tests {
 
         first.status = SubtaskStatus::Passed;
         first.auto_tag = Some("task-leaf-one".to_string());
+        first.execution_result = Some(crate::project::ExecutionResult {
+            success: true,
+            ..Default::default()
+        });
+        first.test_result = Some(crate::project::TestResult {
+            passed: true,
+            review_passed: true,
+            verification_kind: crate::project::VerificationKind::CodeReviewOnly,
+            review_status: crate::project::ReviewStatus::Completed,
+            review_evidence_status: crate::project::ReviewEvidenceStatus::Partial,
+            ..Default::default()
+        });
+        first.confirmed_by_user = Some(true);
         first.acceptance_ledger =
             proven_child("leaf-one", 1, AcceptanceStatus::Satisfied).acceptance_ledger;
         *crate::task_tree::find_task_mut(&mut project, "leaf-one")
@@ -564,6 +767,19 @@ mod tests {
 
         second.status = SubtaskStatus::Passed;
         second.auto_tag = Some("task-leaf-two".to_string());
+        second.execution_result = Some(crate::project::ExecutionResult {
+            success: true,
+            ..Default::default()
+        });
+        second.test_result = Some(crate::project::TestResult {
+            passed: true,
+            review_passed: true,
+            verification_kind: crate::project::VerificationKind::CodeReviewOnly,
+            review_status: crate::project::ReviewStatus::Completed,
+            review_evidence_status: crate::project::ReviewEvidenceStatus::Partial,
+            ..Default::default()
+        });
+        second.confirmed_by_user = Some(true);
         second.acceptance_ledger =
             proven_child("leaf-two", 2, AcceptanceStatus::Satisfied).acceptance_ledger;
         *crate::task_tree::find_task_mut(&mut project, "leaf-two")

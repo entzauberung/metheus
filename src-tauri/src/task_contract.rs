@@ -3,9 +3,18 @@ use crate::validator_contract::VerificationMode;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub const TASK_CONTRACT_VERSION: &str = "task-contract-v2";
 const LEGACY_TASK_CONTRACT_VERSION: &str = "task-contract-v1";
+pub(crate) const DEFAULT_MAX_WALL_CLOCK_SECS: u64 = 600;
+const ABSOLUTE_MAX_WALL_CLOCK_SECS: u64 = 20 * 60;
+
+fn default_max_wall_clock_secs() -> u64 {
+    DEFAULT_MAX_WALL_CLOCK_SECS
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum TaskNodeType {
@@ -63,6 +72,146 @@ pub struct TaskBudgetSummary {
     pub max_executor_turns: u32,
     pub max_transport_retries: u32,
     pub max_doom_loop_retries: u32,
+    /// Contract-level budget for the complete execution attempt. This is not
+    /// reset by provider/API retries or continuation attempts.
+    #[serde(default = "default_max_wall_clock_secs")]
+    pub max_wall_clock_secs: u64,
+}
+
+impl TaskBudgetSummary {
+    pub(crate) fn bounded_wall_clock_secs(&self) -> u64 {
+        let requested = if self.max_wall_clock_secs == 0 {
+            DEFAULT_MAX_WALL_CLOCK_SECS
+        } else {
+            self.max_wall_clock_secs
+        };
+        requested.min(ABSOLUTE_MAX_WALL_CLOCK_SECS)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionStopReason {
+    Cancelled,
+    WallClockExceeded,
+    ResourceHardStop,
+}
+
+/// Shared cancellation/deadline state for an entire execution attempt.
+/// Resource sampling may promote the decision while the attempt is running;
+/// callers still own the actual child/future termination.
+#[derive(Clone)]
+pub(crate) struct ExecutionGuard {
+    cancellation: Arc<AtomicBool>,
+    resource_decision: Arc<AtomicU8>,
+    resource_observation: Arc<Mutex<project::ResourceObservationSummary>>,
+    deadline: Instant,
+}
+
+impl ExecutionGuard {
+    pub(crate) fn new(
+        budget: &TaskBudgetSummary,
+        resource_decision: crate::runtime_resource::ResourceDecision,
+    ) -> Self {
+        Self {
+            cancellation: Arc::new(AtomicBool::new(false)),
+            resource_decision: Arc::new(AtomicU8::new(resource_decision_code(resource_decision))),
+            resource_observation: Arc::new(Mutex::new(
+                project::ResourceObservationSummary::default(),
+            )),
+            deadline: Instant::now() + Duration::from_secs(budget.bounded_wall_clock_secs()),
+        }
+    }
+
+    pub(crate) fn cancellation(&self) -> Arc<AtomicBool> {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn request_cancel(&self) {
+        self.cancellation.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn set_resource_decision(
+        &self,
+        decision: crate::runtime_resource::ResourceDecision,
+    ) {
+        let next = resource_decision_code(decision);
+        loop {
+            let current = self.resource_decision.load(Ordering::Acquire);
+            if current
+                == resource_decision_code(crate::runtime_resource::ResourceDecision::HardStop)
+            {
+                break;
+            }
+            if self
+                .resource_decision
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        if decision == crate::runtime_resource::ResourceDecision::HardStop {
+            self.request_cancel();
+        }
+    }
+
+    pub(crate) fn set_resource_observation(
+        &self,
+        observation: project::ResourceObservationSummary,
+    ) {
+        if let Ok(mut current) = self.resource_observation.lock() {
+            if current.state == project::ResourceObservationState::HardStop
+                && observation.state != project::ResourceObservationState::HardStop
+            {
+                return;
+            }
+            *current = observation;
+        }
+    }
+
+    pub(crate) fn resource_observation(&self) -> project::ResourceObservationSummary {
+        self.resource_observation
+            .lock()
+            .map(|observation| observation.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    pub(crate) fn stop_reason(&self) -> Option<ExecutionStopReason> {
+        if resource_decision_from_code(self.resource_decision.load(Ordering::Acquire))
+            == crate::runtime_resource::ResourceDecision::HardStop
+        {
+            return Some(ExecutionStopReason::ResourceHardStop);
+        }
+        if self.remaining().is_zero() {
+            return Some(ExecutionStopReason::WallClockExceeded);
+        }
+        if self.cancellation.load(Ordering::Acquire) {
+            return Some(ExecutionStopReason::Cancelled);
+        }
+        None
+    }
+}
+
+fn resource_decision_code(decision: crate::runtime_resource::ResourceDecision) -> u8 {
+    match decision {
+        crate::runtime_resource::ResourceDecision::Unknown => 0,
+        crate::runtime_resource::ResourceDecision::Continue => 1,
+        crate::runtime_resource::ResourceDecision::Warning => 2,
+        crate::runtime_resource::ResourceDecision::HardStop => 3,
+    }
+}
+
+fn resource_decision_from_code(code: u8) -> crate::runtime_resource::ResourceDecision {
+    match code {
+        1 => crate::runtime_resource::ResourceDecision::Continue,
+        2 => crate::runtime_resource::ResourceDecision::Warning,
+        3 => crate::runtime_resource::ResourceDecision::HardStop,
+        _ => crate::runtime_resource::ResourceDecision::Unknown,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -296,6 +445,92 @@ mod tests {
         let contract = restored.contract_snapshot.unwrap();
         assert_eq!(contract.version, "task-contract-v2");
         assert_eq!(contract.workload_profile_fingerprint, workload.fingerprint);
+    }
+
+    #[test]
+    fn legacy_budget_without_wall_clock_gets_a_bounded_default() {
+        let budget: TaskBudgetSummary = serde_json::from_value(serde_json::json!({
+            "level": "small",
+            "estimated_model_calls": 1,
+            "estimated_input_tokens": 100,
+            "estimated_output_tokens": 100,
+            "max_executor_turns": 4,
+            "max_transport_retries": 0,
+            "max_doom_loop_retries": 0
+        }))
+        .unwrap();
+        assert_eq!(budget.max_wall_clock_secs, DEFAULT_MAX_WALL_CLOCK_SECS);
+        assert_eq!(
+            budget.bounded_wall_clock_secs(),
+            DEFAULT_MAX_WALL_CLOCK_SECS
+        );
+    }
+
+    #[test]
+    fn resource_hard_stop_has_priority_over_generic_cancellation() {
+        let budget = TaskBudgetSummary {
+            max_wall_clock_secs: 600,
+            ..TaskBudgetSummary::default()
+        };
+        let guard =
+            ExecutionGuard::new(&budget, crate::runtime_resource::ResourceDecision::HardStop);
+        assert_eq!(
+            guard.stop_reason(),
+            Some(ExecutionStopReason::ResourceHardStop)
+        );
+        guard.request_cancel();
+        assert_eq!(
+            guard.stop_reason(),
+            Some(ExecutionStopReason::ResourceHardStop)
+        );
+    }
+
+    #[test]
+    fn resource_guard_retains_latest_observation_for_finalization() {
+        let budget = TaskBudgetSummary::default();
+        let guard =
+            ExecutionGuard::new(&budget, crate::runtime_resource::ResourceDecision::Unknown);
+        guard.set_resource_observation(project::ResourceObservationSummary {
+            state: project::ResourceObservationState::Warning,
+            headroom_bytes: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(
+            guard.resource_observation().state,
+            project::ResourceObservationState::Warning
+        );
+        assert_eq!(guard.resource_observation().headroom_bytes, Some(10));
+    }
+
+    #[test]
+    fn resource_hard_stop_cannot_be_downgraded_by_a_later_sample() {
+        let budget = TaskBudgetSummary::default();
+        let guard =
+            ExecutionGuard::new(&budget, crate::runtime_resource::ResourceDecision::Unknown);
+        guard.set_resource_observation(project::ResourceObservationSummary {
+            state: project::ResourceObservationState::HardStop,
+            sampled_at: Some("hard-stop".to_string()),
+            ..Default::default()
+        });
+        guard.set_resource_decision(crate::runtime_resource::ResourceDecision::HardStop);
+        guard.set_resource_observation(project::ResourceObservationSummary {
+            state: project::ResourceObservationState::Warning,
+            sampled_at: Some("later-warning".to_string()),
+            ..Default::default()
+        });
+        guard.set_resource_decision(crate::runtime_resource::ResourceDecision::Warning);
+        assert_eq!(
+            guard.stop_reason(),
+            Some(ExecutionStopReason::ResourceHardStop)
+        );
+        assert_eq!(
+            guard.resource_observation().state,
+            project::ResourceObservationState::HardStop
+        );
+        assert_eq!(
+            guard.resource_observation().sampled_at.as_deref(),
+            Some("hard-stop")
+        );
     }
 
     #[test]

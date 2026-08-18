@@ -235,7 +235,7 @@ describe("TaskConsole task navigation", () => {
         "恢复进展警告",
         "恢复已停滞",
         "自动恢复已停止",
-        "自动恢复完成",
+        "恢复动作已收口",
       ]);
     const exhausted = host.querySelector<HTMLElement>(
       "[data-execution-event='RecoveryExhausted']",
@@ -263,7 +263,7 @@ describe("TaskConsole task navigation", () => {
     ));
 
     expect(host.querySelector("[data-execution-event='RecoverySucceeded']")?.textContent)
-      .toBe("自动恢复完成");
+      .toBe("恢复动作已收口");
   });
 
   it("filters test source independently and restores an empty selection from All", () => {

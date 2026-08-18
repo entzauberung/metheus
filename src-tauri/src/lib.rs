@@ -46,6 +46,9 @@ mod recovery_learning;
 mod recovery_presentation;
 mod review_evidence;
 mod review_protocol;
+#[cfg(test)]
+mod runtime_long_chain_fixture;
+mod runtime_resource;
 mod runtime_snapshot;
 mod settings;
 mod snapshot;
@@ -63,11 +66,15 @@ mod vision_review;
 mod workflow_resolution;
 mod workload_policy;
 use crate::pipeline::PipelineState;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use tauri::Manager;
 use tokio::sync::Mutex;
 
 static PROJECT_WRITE_LOCK: StdMutex<()> = StdMutex::new(());
+static EXIT_FACTS_RECORDED: AtomicBool = AtomicBool::new(false);
+const MAX_EXIT_RECONCILIATION_PROJECTS: usize = 64;
 
 /// 获取项目数据文件的统一存储路径
 ///
@@ -275,7 +282,7 @@ pub struct AppState {
     pub(crate) managed_runtime: Arc<crate::managed_runtime::ManagedRuntime>,
 }
 
-/// WO-004-ST-001 冻结的窗口关闭策略。
+/// WO-007-ST-001 冻结的窗口关闭策略。
 ///
 /// 策略 B：允许窗口/应用退出；不拦截关闭；不在关闭路径上强杀 PID。
 /// 进程内 Tokio task 随应用退出；执行子进程 PID 保留在快照中，由下次启动
@@ -283,13 +290,13 @@ pub struct AppState {
 /// 父终端、Vite、Cargo 与未知进程永远不在关闭路径上被终止。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowClosePolicy {
-    /// 保留后台可重开（当前默认）
-    PreserveBackgroundForReopen,
+    /// 退出应用，并在重开时对账遗留的执行子进程。
+    ExitAndReconcileOnReopen,
 }
 
-/// 当前冻结的窗口关闭策略（WO-004-ST-001 策略 B）。
+/// 当前冻结的窗口关闭策略（策略 B）。
 pub(crate) fn window_close_policy() -> WindowClosePolicy {
-    WindowClosePolicy::PreserveBackgroundForReopen
+    WindowClosePolicy::ExitAndReconcileOnReopen
 }
 
 /// 关闭路径是否应终止给定 PID。
@@ -302,7 +309,7 @@ pub(crate) fn should_terminate_pid_on_window_close(
     _pid_is_dev_supervisor_or_unknown: bool,
 ) -> bool {
     match policy {
-        WindowClosePolicy::PreserveBackgroundForReopen => false,
+        WindowClosePolicy::ExitAndReconcileOnReopen => false,
     }
 }
 
@@ -310,15 +317,15 @@ pub(crate) fn should_terminate_pid_on_window_close(
 /// 策略 B 不拦截，允许默认退出。
 pub(crate) fn should_prevent_window_close(policy: WindowClosePolicy) -> bool {
     match policy {
-        WindowClosePolicy::PreserveBackgroundForReopen => false,
+        WindowClosePolicy::ExitAndReconcileOnReopen => false,
     }
 }
 
 /// 应用退出时的生命周期决策摘要（可测纯函数，供日志与审查引用）。
 pub(crate) fn window_close_lifecycle_decision(policy: WindowClosePolicy) -> &'static str {
     match policy {
-        WindowClosePolicy::PreserveBackgroundForReopen => {
-            "strategy_b_preserve_background: allow_exit; no_pid_kill_on_close; startup_reconcile_owns_orphan_execution_pids; never_kill_parent_terminal_or_dev_supervisors"
+        WindowClosePolicy::ExitAndReconcileOnReopen => {
+            "strategy_b_exit_and_reconcile_on_reopen: allow_exit; in_process_tasks_end_with_app; no_pid_kill_on_close; startup_reconcile_owns_orphan_execution_pids; never_kill_parent_terminal_or_dev_supervisors"
         }
     }
 }
@@ -331,9 +338,111 @@ fn handle_window_close_lifecycle(policy: WindowClosePolicy) {
     let _ = should_terminate_pid_on_window_close(policy, true, false);
 }
 
-fn handle_app_exit_lifecycle(policy: WindowClosePolicy) {
+fn record_exit_facts_for_project(
+    project: &mut project::Project,
+    pipeline: Option<&PipelineState>,
+) -> bool {
+    let mut changed = crate::pipeline::record_intentional_exit(project, pipeline);
+    changed |= crate::autopilot_runtime::record_intentional_exit(project);
+    changed |= crate::managed_runtime::record_intentional_exit(project);
+    changed
+}
+
+fn session_has_in_process_exit_owner(status: &str) -> bool {
+    matches!(
+        status,
+        "executing" | "recovering" | "replanning" | "replan_ready" | "confirming" | "rejecting"
+    )
+}
+
+/// Record durable exit facts without awaiting or joining any in-process task.
+/// The next startup owns reconciliation; this path only preserves evidence.
+fn record_app_exit_facts(app_handle: &tauri::AppHandle) {
+    let pipeline_snapshot = app_handle.try_state::<AppState>().and_then(|state| {
+        state
+            .pipeline_state
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    });
+
+    if let Some(state) = app_handle.try_state::<AppState>() {
+        // Do this before project writes so registered drivers cannot race a
+        // later heartbeat into the exit marker. No await is allowed here.
+        state.autopilot_runtime.shutdown_nowait();
+        state.managed_runtime.shutdown_nowait();
+    }
+
+    let Some(home) = dirs::home_dir() else {
+        eprintln!("[lifecycle] 无法获取家目录，保留现有 session/snapshot 事实");
+        return;
+    };
+    let metheus_dir = home.join(".metheus");
+    let Ok(entries) = fs::read_dir(&metheus_dir) else {
+        eprintln!("[lifecycle] 无法读取项目目录，保留现有 session/snapshot 事实");
+        return;
+    };
+
+    for entry in entries
+        .flatten()
+        .filter(|entry| {
+            let path = entry.path();
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            path.extension().and_then(|extension| extension.to_str()) == Some("json")
+                && !file_name.ends_with("_snapshot.json")
+        })
+        .take(MAX_EXIT_RECONCILIATION_PROJECTS)
+    {
+        let path = entry.path();
+        let Ok(mut project) = load_project_from_path(&path) else {
+            continue;
+        };
+        let pipeline = pipeline_snapshot.as_ref().filter(|state| {
+            state.project_name == project.name
+                && project
+                    .execution_session
+                    .as_ref()
+                    .is_some_and(|session| state.execution_id == session.execution_id)
+        });
+        if let Some(session) = project
+            .execution_session
+            .as_ref()
+            .filter(|session| session.active && session_has_in_process_exit_owner(&session.status))
+        {
+            let child_pid = pipeline.and_then(|state| state.child_pid);
+            if let Err(error) = crate::snapshot::mark_intentional_exit(
+                &project.name,
+                &session.execution_id,
+                child_pid,
+            ) {
+                eprintln!(
+                    "[lifecycle] 项目 {} 退出快照记录失败，保留原 child evidence：{}",
+                    project.name, error
+                );
+            }
+        }
+        if record_exit_facts_for_project(&mut project, pipeline) {
+            if let Err(error) = save_project(&project) {
+                eprintln!(
+                    "[lifecycle] 项目 {} 退出事实落盘失败，保留已有 session/snapshot evidence：{}",
+                    project.name, error
+                );
+            }
+        }
+    }
+}
+
+fn handle_app_exit_lifecycle(app_handle: &tauri::AppHandle, policy: WindowClosePolicy) {
     let decision = window_close_lifecycle_decision(policy);
     eprintln!("[lifecycle] app exit: {decision}");
+    if EXIT_FACTS_RECORDED.swap(true, Ordering::AcqRel) {
+        eprintln!("[lifecycle] app exit facts already recorded; skipping duplicate close event");
+        return;
+    }
+    record_app_exit_facts(app_handle);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -526,9 +635,9 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    // WO-004-ST-002：显式接入窗口/应用生命周期（策略 B）。
+    // WO-007-ST-001：显式接入窗口/应用生命周期（策略 B）。
     // CloseRequested 不拦截；Exit 不杀未知/开发监督器 PID；启动对账仍是孤儿清理兜底。
-    app.run(|_app_handle, event| {
+    app.run(|app_handle, event| {
         let policy = window_close_policy();
         match event {
             tauri::RunEvent::WindowEvent {
@@ -542,11 +651,11 @@ pub fn run() {
                 // 策略 B：不调用 prevent_close，允许窗口关闭并最终退出应用。
             }
             tauri::RunEvent::Exit => {
-                handle_app_exit_lifecycle(policy);
+                handle_app_exit_lifecycle(app_handle, policy);
             }
             tauri::RunEvent::ExitRequested { .. } => {
                 // 策略 B：不 prevent_exit；进程内 task 随退出结束。
-                handle_app_exit_lifecycle(policy);
+                handle_app_exit_lifecycle(app_handle, policy);
             }
             _ => {}
         }
@@ -558,10 +667,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn window_close_policy_is_strategy_b_preserve_background() {
+    fn window_close_policy_exits_and_reconciles_on_reopen() {
         assert_eq!(
             window_close_policy(),
-            WindowClosePolicy::PreserveBackgroundForReopen
+            WindowClosePolicy::ExitAndReconcileOnReopen
         );
         assert!(!should_prevent_window_close(window_close_policy()));
         assert!(!should_terminate_pid_on_window_close(
@@ -574,9 +683,21 @@ mod tests {
             false,
             true
         ));
-        assert!(window_close_lifecycle_decision(window_close_policy()).contains("strategy_b"));
+        assert!(window_close_lifecycle_decision(window_close_policy())
+            .contains("strategy_b_exit_and_reconcile_on_reopen"));
+        assert!(window_close_lifecycle_decision(window_close_policy())
+            .contains("in_process_tasks_end_with_app"));
         assert!(window_close_lifecycle_decision(window_close_policy())
             .contains("never_kill_parent_terminal_or_dev_supervisors"));
+    }
+
+    #[test]
+    fn exit_facts_only_preserve_in_process_execution_owners() {
+        assert!(session_has_in_process_exit_owner("executing"));
+        assert!(session_has_in_process_exit_owner("recovering"));
+        assert!(session_has_in_process_exit_owner("rejecting"));
+        assert!(!session_has_in_process_exit_owner("awaiting_confirmation"));
+        assert!(!session_has_in_process_exit_owner("session_lost"));
     }
 
     #[test]

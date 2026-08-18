@@ -15,6 +15,7 @@ import {
   type ProjectStateSyncController,
   type ProjectStateSyncTransport,
 } from "./useProjectStateSync";
+import { PROJECT_SYNC_FORCE_BACKOFF_MS } from "../projectSyncPolicy";
 
 function recovery(fingerprint = "none"): RecoveryPresentation {
   return {
@@ -380,7 +381,15 @@ describe("useProjectStateSync", () => {
     await flush();
 
     await act(async () => { await controller?.forceSync(); });
+    await act(async () => {
+      vi.advanceTimersByTime(PROJECT_SYNC_FORCE_BACKOFF_MS);
+      await Promise.resolve();
+    });
     await act(async () => { await controller?.forceSync(); });
+    await act(async () => {
+      vi.advanceTimersByTime(PROJECT_SYNC_FORCE_BACKOFF_MS);
+      await Promise.resolve();
+    });
     await act(async () => { await controller?.forceSync(); });
 
     expect(onSnapshot).toHaveBeenCalledTimes(1);
@@ -415,6 +424,29 @@ describe("useProjectStateSync", () => {
     expect((await second)?.event_sequence).toBe(2);
     expect(lastAppliedSnapshot()?.recovery_presentation.state_fingerprint)
       .toBe("latest");
+  });
+
+  it("backs off repeated force sync calls without blocking a later retry", async () => {
+    getSnapshot.mockResolvedValueOnce(snapshot("alpha", 0));
+    render("alpha");
+    await flush();
+
+    getSnapshot.mockResolvedValueOnce(snapshot("alpha", 1));
+    await act(async () => { await controller?.forceSync(); });
+    expect(getSnapshot).toHaveBeenCalledTimes(2);
+
+    let suppressed: RuntimeSnapshot | null | undefined;
+    await act(async () => { suppressed = await controller?.forceSync(); });
+    expect(suppressed).toBeNull();
+    expect(getSnapshot).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      vi.advanceTimersByTime(PROJECT_SYNC_FORCE_BACKOFF_MS);
+      await Promise.resolve();
+    });
+    getSnapshot.mockResolvedValueOnce(snapshot("alpha", 2));
+    await act(async () => { await controller?.forceSync(); });
+    expect(getSnapshot).toHaveBeenCalledTimes(3);
   });
 
   it("keeps snapshot fallback delayed until a failed channel subscription reconnects", async () => {

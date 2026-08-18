@@ -360,6 +360,34 @@ describe("TaskInspector", () => {
     expect(host.querySelector("button[aria-label='跟随当前任务']")).toBeNull();
   });
 
+  it("keeps stop available when the control snapshot is stale", () => {
+    const value = project();
+    const selected = node("selected", [...TASK_CAPABILITIES, "stop"]);
+    act(() => {
+      root.render(
+        <TaskInspector
+          project={value}
+          snapshot={{ ...snapshot("selected"), source_event_sequence: 1 }}
+          selectedNode={selected}
+          selectedTaskId="selected"
+          busy={false}
+          error=""
+          recoveryPresentation={null}
+          expectedEventSequence={4}
+          detailsSyncing={false}
+          onClose={vi.fn()}
+          onRefresh={vi.fn()}
+          onAction={vi.fn()}
+          onChangeMode={vi.fn()}
+        />,
+      );
+    });
+    const stop = [...host.querySelectorAll<HTMLButtonElement>("button")]
+      .find(button => button.textContent?.includes("停止"));
+    expect(stop?.disabled).toBe(false);
+    expect(stop?.title).toContain("仅允许停止或同步");
+  });
+
   it("keeps detailed snapshot failure non-blocking and visibly retrying", () => {
     render("selected", {
       error: "详细快照生成失败",

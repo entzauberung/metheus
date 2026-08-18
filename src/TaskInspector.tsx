@@ -24,6 +24,7 @@ import type {
   TaskTreeNodeView,
   Provability,
 } from "./types";
+import type { RuntimeOutcomePresentation } from "./runtimeOutcomePresentation";
 
 interface Props {
   project: Project;
@@ -33,6 +34,7 @@ interface Props {
   busy: boolean;
   error: string;
   recoveryPresentation: RecoveryPresentation | null;
+  runtimeOutcome?: RuntimeOutcomePresentation;
   expectedEventSequence: number;
   detailsSyncing: boolean;
   onClose: () => void;
@@ -79,6 +81,7 @@ export default function TaskInspector({
   busy,
   error,
   recoveryPresentation,
+  runtimeOutcome,
   expectedEventSequence,
   detailsSyncing,
   onClose,
@@ -99,6 +102,9 @@ export default function TaskInspector({
     [project, selectedTaskId],
   );
   const acceptance = selectedNode?.acceptance ?? [];
+  const acceptanceCriteria = selectedSubtask?.acceptance_criteria?.length
+    ? selectedSubtask.acceptance_criteria
+    : acceptance.map(item => item.criterion);
   const actionableAcceptance = selectedNode?.actionable_acceptance_criteria ?? [];
   const deviationOptions = acceptance.filter(item => (
     actionableAcceptance.includes(item.criterion_index)
@@ -121,7 +127,8 @@ export default function TaskInspector({
   const snapshotStale = !!snapshot
     && expectedEventSequence > 0
     && snapshot.source_event_sequence < expectedEventSequence;
-  const writesDisabled = !snapshot || snapshotStale || detailsSyncing;
+  const writesDisabled = !snapshot || snapshotStale || detailsSyncing
+    || runtimeOutcome?.writeAllowed === false;
   const canAcceptDeviation = !writesDisabled
     && (selectedNode?.capabilities ?? []).includes("accept_deviation");
   const canConfirmHumanReview = !writesDisabled
@@ -168,8 +175,10 @@ export default function TaskInspector({
         onFollowCurrentTask={onFollowCurrentTask}
       />
       {error && <div className="task-control-error" role="alert">{error}</div>}
-      <div className={`task-control-freshness${snapshotStale || detailsSyncing ? " stale" : ""}`} role="status">
-        {detailsSyncing
+      <div className={`task-control-freshness${snapshotStale || detailsSyncing || runtimeOutcome?.writeAllowed === false ? " stale" : ""}`} role="status">
+        {runtimeOutcome
+          ? `${runtimeOutcome.statusLabel}：${runtimeOutcome.summary}${runtimeOutcome.writeAllowed ? "" : `；${runtimeOutcome.writeBlockedReason}`}`
+          : detailsSyncing
           ? error
             ? "控制详情暂不可用；主状态已更新，正在后台重试"
             : "控制详情正在同步"
@@ -202,7 +211,13 @@ export default function TaskInspector({
               </dl>
             </section>
           )}
-          <AcceptanceLedgerPanel items={acceptance} provabilityByIndex={provabilityByIndex} />
+          <AcceptanceLedgerPanel
+            items={acceptance}
+            criteria={acceptanceCriteria}
+            taskStatus={selectedSubtask?.status}
+            runtimeOutcome={runtimeOutcome}
+            provabilityByIndex={provabilityByIndex}
+          />
           {canConfirmHumanReview && humanOptions.length > 0 && (
             <section className="task-control-panel task-control-human-review-form">
               <h3>人工确认边界</h3>
@@ -255,7 +270,11 @@ export default function TaskInspector({
           <section className="task-control-panel">
             <div className="task-control-panel-title"><Activity size={16} /><h3>恢复状态</h3></div>
             {!recovery ? (
-              <p className="task-control-muted">当前任务没有活动恢复流程。</p>
+              <p className="task-control-muted">
+                {runtimeOutcome?.state === "waiting_human"
+                  ? runtimeOutcome.summary
+                  : "当前任务没有活动恢复流程。"}
+              </p>
             ) : (
               <dl className="task-recovery-details">
                 <div data-recovery-progress={recoveryProgress?.status}>

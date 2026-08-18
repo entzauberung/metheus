@@ -9,7 +9,10 @@ readonly CORE_MIN_DISK_KIB=4194304
 readonly CORE_MIN_MEMORY_KIB=2097152
 readonly GROK_MIN_DISK_KIB=8388608
 readonly GROK_MIN_MEMORY_KIB=6291456
+readonly GROK_ADAPTIVE_MIN_MEMORY_KIB=4194304
+readonly GROK_ADAPTIVE_STANDARD_MEMORY_KIB=6291456
 readonly DESKTOP_META_SUFFIX=".build-meta"
+readonly TEST_MODE="${METHEUS_PREFLIGHT_TEST_MODE:-0}"
 
 case "${TRACK}" in
   core|runtime-fault)
@@ -23,10 +26,10 @@ case "${TRACK}" in
   grok)
     readonly MIN_DISK_KIB="${GROK_MIN_DISK_KIB}"
     readonly MIN_MEMORY_KIB="${GROK_MIN_MEMORY_KIB}"
-    if pgrep -x cargo >/dev/null 2>&1; then
-      echo "资源预检失败：检测到其他 Cargo 进程，拒绝启动 Grok 检查。" >&2
-      exit 1
-    fi
+    ;;
+  grok-adaptive)
+    readonly MIN_DISK_KIB="${GROK_MIN_DISK_KIB}"
+    readonly MIN_MEMORY_KIB="${GROK_ADAPTIVE_MIN_MEMORY_KIB}"
     ;;
   *)
     echo "资源预检失败：未知验证轨道 ${TRACK}。" >&2
@@ -34,19 +37,60 @@ case "${TRACK}" in
     ;;
 esac
 
-AVAILABLE_DISK_KIB="$(df -Pk "${REPO_ROOT}" | awk 'NR == 2 { print $4 }')"
-AVAILABLE_MEMORY_KIB="$(awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo 2>/dev/null || true)"
+if [[ "${TEST_MODE}" == "1" ]]; then
+  AVAILABLE_DISK_KIB="${METHEUS_PREFLIGHT_TEST_DISK_KIB-}"
+  AVAILABLE_MEMORY_KIB="${METHEUS_PREFLIGHT_TEST_MEMORY_KIB-}"
+else
+  AVAILABLE_DISK_KIB="$(df -Pk "${REPO_ROOT}" | awk 'NR == 2 { print $4 }')"
+  AVAILABLE_MEMORY_KIB="$(awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo 2>/dev/null || true)"
+fi
+
+if [[ "${TRACK}" == "grok" || "${TRACK}" == "grok-adaptive" ]]; then
+  if [[ "${TEST_MODE}" == "1" ]]; then
+    CARGO_PRESENT="${METHEUS_PREFLIGHT_TEST_CARGO_PRESENT:-0}"
+    if [[ "${CARGO_PRESENT}" == "1" ]]; then
+      echo "R2_RESOURCE_PROFILE=HARD_STOP reason=检测到其他 Cargo 进程" >&2
+      echo "资源预检失败：检测到其他 Cargo 进程，拒绝启动 Grok 检查。" >&2
+      exit 1
+    fi
+  elif pgrep -x cargo >/dev/null 2>&1; then
+    echo "资源预检失败：检测到其他 Cargo 进程，拒绝启动 Grok 检查。" >&2
+    exit 1
+  fi
+fi
 
 if [[ ! "${AVAILABLE_DISK_KIB}" =~ ^[0-9]+$ ]]; then
+  if [[ "${TRACK}" == "grok-adaptive" ]]; then
+    echo "R2_RESOURCE_PROFILE=HARD_STOP reason=无法读取可用磁盘空间" >&2
+  fi
   echo "资源预检失败：无法读取可用磁盘空间。" >&2
   exit 1
 fi
 if (( AVAILABLE_DISK_KIB < MIN_DISK_KIB )); then
+  if [[ "${TRACK}" == "grok-adaptive" ]]; then
+    echo "R2_RESOURCE_PROFILE=HARD_STOP reason=可用磁盘空间不足" >&2
+  fi
   echo "资源预检失败：${TRACK} 轨道至少需要 ${MIN_DISK_KIB} KiB 可用磁盘，当前 ${AVAILABLE_DISK_KIB} KiB。" >&2
   exit 1
 fi
 
-if [[ -n "${AVAILABLE_MEMORY_KIB}" ]]; then
+if [[ "${TRACK}" == "grok-adaptive" ]]; then
+  if [[ ! "${AVAILABLE_MEMORY_KIB}" =~ ^[0-9]+$ ]]; then
+    echo "R2_RESOURCE_PROFILE=HARD_STOP reason=无法读取或解析可用内存" >&2
+    echo "资源预检失败：无法解析自适应 Grok 轨道的可用内存。" >&2
+    exit 1
+  fi
+  if (( AVAILABLE_MEMORY_KIB < MIN_MEMORY_KIB )); then
+    echo "R2_RESOURCE_PROFILE=HARD_STOP reason=可用内存低于 ${MIN_MEMORY_KIB} KiB" >&2
+    echo "资源预检失败：grok-adaptive 轨道至少需要 ${MIN_MEMORY_KIB} KiB 可用内存，当前 ${AVAILABLE_MEMORY_KIB} KiB。" >&2
+    exit 1
+  fi
+  if (( AVAILABLE_MEMORY_KIB >= GROK_ADAPTIVE_STANDARD_MEMORY_KIB )); then
+    R2_RESOURCE_PROFILE="STANDARD"
+  else
+    R2_RESOURCE_PROFILE="CONSTRAINED"
+  fi
+elif [[ -n "${AVAILABLE_MEMORY_KIB}" ]]; then
   if [[ ! "${AVAILABLE_MEMORY_KIB}" =~ ^[0-9]+$ ]]; then
     echo "资源预检失败：无法解析可用内存。" >&2
     exit 1
@@ -57,7 +101,11 @@ if [[ -n "${AVAILABLE_MEMORY_KIB}" ]]; then
   fi
 fi
 
-echo "资源预检通过：track=${TRACK} disk_kib=${AVAILABLE_DISK_KIB} memory_kib=${AVAILABLE_MEMORY_KIB:-unknown}"
+if [[ "${TRACK}" == "grok-adaptive" ]]; then
+  echo "资源预检通过：track=${TRACK} disk_kib=${AVAILABLE_DISK_KIB} memory_kib=${AVAILABLE_MEMORY_KIB} R2_RESOURCE_PROFILE=${R2_RESOURCE_PROFILE}"
+else
+  echo "资源预检通过：track=${TRACK} disk_kib=${AVAILABLE_DISK_KIB} memory_kib=${AVAILABLE_MEMORY_KIB:-unknown}"
+fi
 
 if [[ "${TRACK}" == "runtime-fault" ]]; then
   readonly FAULT_TEMP_PARENT="${TMPDIR:-/tmp}"

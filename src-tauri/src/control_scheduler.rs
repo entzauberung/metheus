@@ -115,25 +115,36 @@ pub fn decide_next_action(
             ControlAction::new(kind, "仅补充尚未证明的验收项"),
             "证据不足，不重跑已满足项".to_string(),
         )
-    } else if subtask.status == SubtaskStatus::AwaitingConfirmation
-        && (acceptance.ai_provisionally_satisfied > 0 || acceptance.deferred_human_review > 0)
-        && cadence == crate::project::HumanReviewCadence::MilestoneBatch
-    {
-        (
-            ControlAction::new(
-                ControlActionKind::GitConfirm,
-                "大阶段集中确认项已登记，任务可进入串行确认",
-            ),
-            "AI 临时结论仅用于阶段内推进，不代表人工确认".to_string(),
-        )
     } else if subtask.status == SubtaskStatus::AwaitingConfirmation {
-        (
-            ControlAction::new(
-                ControlActionKind::GitConfirm,
-                "验收账本已满足，进入串行确认",
+        match crate::quality_gate::confirmation_prerequisites(subtask) {
+            Err(reason) => (
+                ControlAction::new(
+                    ControlActionKind::Human,
+                    format!("确认前置阻断：{}", reason),
+                ),
+                "执行与确认事实未满足，禁止直接创建 Git 确认事务".to_string(),
             ),
-            "质量条件已满足".to_string(),
-        )
+            Ok(())
+                if (acceptance.ai_provisionally_satisfied > 0
+                    || acceptance.deferred_human_review > 0)
+                    && cadence == crate::project::HumanReviewCadence::MilestoneBatch =>
+            {
+                (
+                    ControlAction::new(
+                        ControlActionKind::GitConfirm,
+                        "大阶段集中确认项已登记，任务可进入串行确认",
+                    ),
+                    "AI 临时结论仅用于阶段内推进，不代表人工确认".to_string(),
+                )
+            }
+            Ok(()) => (
+                ControlAction::new(
+                    ControlActionKind::GitConfirm,
+                    "验收账本已满足，进入串行确认",
+                ),
+                "质量条件已满足".to_string(),
+            ),
+        }
     } else if subtask.status == SubtaskStatus::Rejected {
         (
             ControlAction::new(
@@ -367,6 +378,11 @@ mod tests {
             status: AcceptanceStatus::Satisfied,
             ..Default::default()
         }];
+        task.execution_result = Some(crate::project::ExecutionResult {
+            success: true,
+            ..Default::default()
+        });
+        task.test_result = Some(crate::project::TestResult::default());
         let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
         assert_eq!(
             decide_next_action(
@@ -380,5 +396,31 @@ mod tests {
             .kind,
             ControlActionKind::GitConfirm
         );
+    }
+
+    #[test]
+    fn failed_execution_never_schedules_git_confirmation() {
+        let (mut task, _) = compiled_task();
+        task.acceptance_ledger = vec![crate::project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            criterion: task.acceptance_criteria[0].clone(),
+            status: AcceptanceStatus::Satisfied,
+            ..Default::default()
+        }];
+        task.execution_result = Some(crate::project::ExecutionResult {
+            success: false,
+            ..Default::default()
+        });
+        task.test_result = Some(crate::project::TestResult::default());
+        let compiled = crate::task_compiler::compile(&task, None, 0, &workload());
+        let decision = decide_next_action(
+            &task,
+            &compiled,
+            "facts-1",
+            false,
+            crate::project::HumanReviewCadence::PerTask,
+        );
+        assert_eq!(decision.action.kind, ControlActionKind::Human);
+        assert!(decision.reason.contains("执行与确认事实未满足"));
     }
 }

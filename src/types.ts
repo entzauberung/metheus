@@ -105,6 +105,41 @@ export type EngineFailureKind =
   | "RuntimeError"
   | "TaskExecutionError";
 
+export type ResourceObservationState =
+  | "Unknown"
+  | "MeasuredSafe"
+  | "Warning"
+  | "HardStop"
+  | "KilledSuspected";
+export type ResourceObservationSource = "Unknown" | "Proc" | "Cgroup" | "InProcess";
+export type ResourceFailureKind = "ResourcePressure" | "ResourceKilled";
+
+export interface ResourceObservationSummary {
+  state: ResourceObservationState;
+  source: ResourceObservationSource;
+  current_rss_bytes?: number;
+  peak_rss_bytes?: number;
+  cgroup_current_bytes?: number;
+  cgroup_limit_bytes?: number;
+  headroom_bytes?: number;
+  warning_reserve_bytes?: number;
+  hard_stop_reserve_bytes?: number;
+  sampled_at?: string;
+}
+
+export type StartupProcessObservationKind =
+  | "Killed"
+  | "AlreadyExited"
+  | "TerminationUnknown"
+  | "IdentityUnverified"
+  | "IntentionalExit";
+
+export interface StartupProcessObservation {
+  pid: number;
+  kind: StartupProcessObservationKind;
+  observed_at: string;
+}
+
 export type AcceptanceStatus =
   | "Satisfied"
   | "AiProvisionallySatisfied"
@@ -318,6 +353,8 @@ export interface RecoveryState {
   started_at: string;
   updated_at: string;
   engine_failure_kind?: EngineFailureKind;
+  resource_observation?: ResourceObservationSummary;
+  resource_failure_kind?: ResourceFailureKind | null;
   checkpoint_id: string;
   rollback_retest_pending: boolean;
   evidence_rebuild_attempted: boolean;
@@ -781,6 +818,33 @@ export interface PreflightCheckResult {
   expired_at?: string;
 }
 
+export type NativeReadinessStatus = "PENDING" | "READY" | "BLOCKED";
+export type NativeEvidenceSource = "human" | "native_observer" | "vite" | "unknown";
+export type NativeEvidenceKind =
+  | "operator"
+  | "channel"
+  | "screenshot"
+  | "input_probe"
+  | "close_reopen"
+  | "stop_control";
+
+export interface NativeEvidenceReference {
+  kind: NativeEvidenceKind;
+  reference: string;
+  source: NativeEvidenceSource;
+  recorded_at: string;
+}
+
+/** Optional because legacy projects have no native evidence record. */
+export interface NativeReadinessRecord {
+  status?: NativeReadinessStatus;
+  operator?: string;
+  channel?: string;
+  evidence_references?: NativeEvidenceReference[];
+  missing_requirements?: string[];
+  next_action?: string;
+}
+
 // ========== 草稿生命周期状态 ==========
 
 export type DraftStatus = "Pending" | "Approved" | "Rejected" | "Expired" | "Superseded";
@@ -1196,6 +1260,7 @@ export interface Project {
   version_plan: string;
   existing_baseline?: ExistingProjectBaseline;
   preflight_results: PreflightCheckResult[];
+  native_readiness?: NativeReadinessRecord;
   discussion_revision: number;
   plan_draft?: PlanDraft;
   draft_history: PlanDraft[];
@@ -1757,6 +1822,9 @@ export interface RuntimeSnapshot {
   process_start_id: string;
   event_sequence: number;
   recovery_presentation: RecoveryPresentation;
+  startup_process_observation?: StartupProcessObservation | null;
+  resource_observation?: ResourceObservationSummary;
+  resource_failure_kind?: ResourceFailureKind | null;
   task_control_snapshot_version: string;
   task_control_tree_revision: number;
   task_control_event_sequence: number;

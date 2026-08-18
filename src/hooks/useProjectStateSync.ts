@@ -12,6 +12,7 @@ import {
   advanceProjectSyncRevisions,
   mergePendingProjectEvent,
   PROJECT_SYNC_CONNECTED_FALLBACK_MS,
+  shouldStartForcedSync,
   projectSyncFallbackIntervalMs,
   recoveryPresentationIsActive,
   shouldAcceptProjectStateEvent,
@@ -153,6 +154,7 @@ export function useProjectStateSync({
   const channelRef = useRef<ProjectEventChannel | null>(null);
   const subscriptionIdRef = useRef("");
   const subscriptionRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastForcedSyncAtRef = useRef<number | null>(null);
   const onSnapshotRef = useRef(onSnapshot);
   const transportRef = useRef(transport);
   const includeTaskControlSnapshotRef = useRef(includeTaskControlSnapshot);
@@ -367,6 +369,7 @@ export function useProjectStateSync({
     pendingEventRef.current = null;
     requestedSyncRef.current = 0;
     completedSyncRef.current = 0;
+    lastForcedSyncAtRef.current = null;
     subscriptionIdRef.current = "";
     setState(initialState);
     setActiveRecovery(false);
@@ -474,8 +477,22 @@ export function useProjectStateSync({
   }, [enabled, includeTaskControlSnapshot, projectName]);
 
   const forceSync = useCallback(async () => {
+    const scope = scopeRef.current;
+    if (!scope.enabled || !scope.projectName) return null;
+    if (inFlightRef.current && inFlightGenerationRef.current === scope.generation) {
+      const queuedSnapshot = await syncNowRef.current(true);
+      if (inFlightRef.current && inFlightGenerationRef.current === scopeRef.current.generation) {
+        return await inFlightRef.current;
+      }
+      return queuedSnapshot;
+    }
+    const nowMs = Date.now();
+    if (!shouldStartForcedSync(lastForcedSyncAtRef.current, nowMs)) return null;
+    lastForcedSyncAtRef.current = nowMs;
     const snapshot = await syncNowRef.current(true);
-    if (inFlightRef.current) return await inFlightRef.current;
+    if (inFlightRef.current && inFlightGenerationRef.current === scopeRef.current.generation) {
+      return await inFlightRef.current;
+    }
     return snapshot;
   }, []);
 

@@ -11,6 +11,15 @@ export const TASK_CONTROL_MAX_SYNC_FAILURES = 3;
 export const PROJECT_SYNC_CONNECTED_FALLBACK_MS = 60_000;
 export const PROJECT_SYNC_ACTIVE_RECOVERY_FALLBACK_MS = 5_000;
 export const PROJECT_SYNC_DISCONNECTED_FALLBACK_MS = 15_000;
+export const PROJECT_SYNC_FORCE_BACKOFF_MS = 1_000;
+
+export function shouldStartForcedSync(
+  lastForcedSyncAtMs: number | null,
+  nowMs = Date.now(),
+  backoffMs = PROJECT_SYNC_FORCE_BACKOFF_MS,
+): boolean {
+  return lastForcedSyncAtMs === null || nowMs - lastForcedSyncAtMs >= backoffMs;
+}
 
 export function recoveryPresentationIsActive(
   presentation: RecoveryPresentation,
@@ -92,9 +101,10 @@ export function taskControlFallbackDecision({
   if (detailStatus === "unavailable") {
     return { active: true, reason: "detail_unavailable" };
   }
-  if (detailStatus === "ready" && detailUpdatedAt) {
+  if (detailStatus === "ready") {
+    if (!detailUpdatedAt) return { active: true, reason: "detail_stale" };
     const updatedAtMs = Date.parse(detailUpdatedAt);
-    if (Number.isFinite(updatedAtMs) && nowMs - updatedAtMs >= staleAfterMs) {
+    if (!Number.isFinite(updatedAtMs) || nowMs - updatedAtMs >= staleAfterMs) {
       return { active: true, reason: "detail_stale" };
     }
   }
@@ -186,8 +196,30 @@ export function shouldAcceptRuntimeSnapshot(
   snapshot: RuntimeSnapshot,
 ): boolean {
   if (snapshot.project.name !== cursor.projectName) return false;
-  return snapshot.process_start_id !== cursor.processStartId
-    || snapshot.event_sequence >= cursor.eventSequence;
+  if (snapshot.process_start_id !== cursor.processStartId) return true;
+  if (snapshot.event_sequence > cursor.eventSequence) return true;
+  if (snapshot.event_sequence < cursor.eventSequence) return false;
+
+  const snapshotDataRevision = snapshot.project.workflow_state?.data_revision;
+  if (snapshotDataRevision !== undefined && snapshotDataRevision < cursor.dataRevision) {
+    return false;
+  }
+  if (snapshot.task_control_tree_revision < cursor.taskControlTreeRevision) {
+    return false;
+  }
+  if (snapshot.event_sequence === cursor.eventSequence
+    && snapshot.task_control_tree_revision === cursor.taskControlTreeRevision
+    && cursor.taskControlSnapshotVersion
+    && snapshot.task_control_snapshot_version !== cursor.taskControlSnapshotVersion) {
+    return false;
+  }
+  if (snapshot.event_sequence === cursor.eventSequence
+    && snapshot.task_control_tree_revision === cursor.taskControlTreeRevision
+    && cursor.taskControlActionId !== null
+    && snapshot.task_control_action_id !== cursor.taskControlActionId) {
+    return false;
+  }
+  return true;
 }
 
 export function mergePendingProjectEvent(

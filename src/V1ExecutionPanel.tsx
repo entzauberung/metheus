@@ -25,6 +25,7 @@ import {
 import type { ExecutionWorkspaceStatus, PipelineState, Project, RecoveryPresentation } from "./types";
 import { getWorkspaceAction } from "./workspacePolicy";
 import { resolvePlanTarget } from "./planTargetPolicy";
+import type { RuntimeOutcomePresentation } from "./runtimeOutcomePresentation";
 
 // ============================================================
 // V1 执行面板：单小阶段执行 + 人工确认
@@ -32,11 +33,13 @@ import { resolvePlanTarget } from "./planTargetPolicy";
 export default function V1ExecutionPanel({
   project, executionStatus, workspaceStatus, busy: externalBusy,
   recoveryPresentation,
+  runtimeOutcome,
   onPrepareWorkspace, onExecute, onConfirm, onReject,
 }: {
   project: Project; executionStatus: PipelineState | null;
   workspaceStatus: ExecutionWorkspaceStatus | null;
   recoveryPresentation: RecoveryPresentation | null;
+  runtimeOutcome?: RuntimeOutcomePresentation;
   busy: boolean;
   onPrepareWorkspace: () => Promise<void>;
   onExecute: () => Promise<void>; onConfirm: () => Promise<void>;
@@ -45,7 +48,7 @@ export default function V1ExecutionPanel({
   const [rejectReason, setRejectReason] = useState("");
   const [localBusy, setLocalBusy] = useState(false);
   const [showReject, setShowReject] = useState(false);
-  const busy = externalBusy || localBusy;
+  const busy = externalBusy || localBusy || runtimeOutcome?.writeAllowed === false;
 
   const planTarget = resolvePlanTarget(project);
   const planApproved = planTarget?.planApprovedAt != null && planTarget.planRevision > 0;
@@ -63,10 +66,27 @@ export default function V1ExecutionPanel({
   const isAwaiting = executionStatus?.awaiting_confirmation === true || awaitingSubtask != null;
   const isExecuting = executionStatus?.status === "Running";
 
-  const recoveryBlocked = recoveryPresentation != null && recoveryPresentation.kind !== "None";
+  const recoveryBlocked = (recoveryPresentation != null && recoveryPresentation.kind !== "None")
+    || runtimeOutcome?.state === "recovering"
+    || runtimeOutcome?.state === "waiting_human";
+  const activeOwner = (
+    project.workflow_state.autopilot_active === true
+      && project.workflow_state.autopilot_state?.run_status === "Running"
+  ) || (
+    project.workflow_state.managed_flow_state?.active === true
+      && project.workflow_state.managed_flow_state.run_status === "Running"
+  ) || project.execution_session?.active === true;
+  const outcomeBlocksStart = runtimeOutcome
+    && ["executing", "recovering", "validating", "awaiting_confirmation", "waiting_human"]
+      .includes(runtimeOutcome.state);
+  const startBlocked = recoveryBlocked
+    || activeOwner
+    || isExecuting
+    || outcomeBlocksStart
+    || runtimeOutcome?.writeAllowed === false;
 
   const handlePrepareWorkspace = async () => {
-    if (!project || busy) return;
+    if (!project || busy || runtimeOutcome?.writeAllowed === false) return;
     setLocalBusy(true);
     try {
       await onPrepareWorkspace();
@@ -76,13 +96,14 @@ export default function V1ExecutionPanel({
   };
 
   const handleConfirm = async () => {
+    if (busy || runtimeOutcome?.writeAllowed === false) return;
     setLocalBusy(true);
     await onConfirm();
     setLocalBusy(false);
   };
 
   const handleReject = async () => {
-    if (!rejectReason.trim()) return;
+    if (!rejectReason.trim() || busy || runtimeOutcome?.writeAllowed === false) return;
     setLocalBusy(true);
     await onReject(rejectReason.trim());
     setRejectReason("");
@@ -90,12 +111,28 @@ export default function V1ExecutionPanel({
     setLocalBusy(false);
   };
 
+  const handleExecute = async () => {
+    if (busy || startBlocked) return;
+    setLocalBusy(true);
+    try {
+      await onExecute();
+    } finally {
+      setLocalBusy(false);
+    }
+  };
+
   // 质量判定：判断当前待确认任务是否可以确认通过
   const execOk = awaitingSubtask?.execution_result?.success === true;
   const humanOverride = awaitingSubtask?.human_verification?.verification_kind === "HumanOverride"
     && Boolean(awaitingSubtask.human_verification.verification_reason.trim());
   const testOk = awaitingSubtask?.test_result?.passed === true || humanOverride;
-  const canConfirm = execOk && testOk && isAwaiting;
+  const canConfirm = runtimeOutcome
+    ? runtimeOutcome.execution === "passed"
+      && runtimeOutcome.quality === "passed"
+      && (runtimeOutcome.acceptance === "passed" || runtimeOutcome.acceptance === "not_required")
+      && runtimeOutcome.confirmation === "required"
+      && isAwaiting
+    : execOk && testOk && isAwaiting;
   const qualityStatuses = awaitingSubtask
     ? getQualityStatusPresentation(
       awaitingSubtask.test_result,
@@ -103,7 +140,9 @@ export default function V1ExecutionPanel({
     )
     : [];
   const failureReason = !canConfirm && isAwaiting
-    ? (!execOk ? "执行未成功" : !testOk ? "核验未通过" : null)
+    ? runtimeOutcome?.state === "quality_blocked"
+      ? runtimeOutcome.summary
+      : (!execOk ? "执行未成功" : !testOk ? "核验未通过" : null)
     : null;
 
   const workspaceReady = workspaceStatus?.ready_for_new_execution === true;
@@ -114,6 +153,13 @@ export default function V1ExecutionPanel({
   return (
     <div className="v1-execution-panel" style={{ padding: "24px" }}>
       <h2 className="execution-panel-title"><ListTodo size={20} />执行</h2>
+      {runtimeOutcome && (
+        <div className={`task-console-runtime-outcome tone-${runtimeOutcome.tone}`} data-runtime-outcome={runtimeOutcome.state} role="status">
+          <strong>{runtimeOutcome.statusLabel}</strong>
+          <span>{runtimeOutcome.summary}</span>
+          {!runtimeOutcome.writeAllowed && <span>{runtimeOutcome.writeBlockedReason}</span>}
+        </div>
+      )}
 
       {/* Workspace status banner — 失败会话期间隐藏准备环境 */}
       {!recoveryBlocked && planApproved && workspaceStatus && !workspaceReady && (
@@ -217,7 +263,7 @@ export default function V1ExecutionPanel({
       )}
 
       {/* Next pending subtask — only when workspace is ready and no failure session */}
-      {!recoveryBlocked && !isAwaiting && planApproved && workspaceReady && nextSubtask && (
+      {!startBlocked && !isAwaiting && planApproved && workspaceReady && nextSubtask && (
         <div style={{ marginBottom: "20px" }}>
           <div style={subtaskCardStyle}>
             <strong>下一个任务：{nextSubtask.title}</strong>
@@ -233,21 +279,34 @@ export default function V1ExecutionPanel({
             </div>
           </div>
           <ActionButton icon={<Play size={16} />} loading={busy || isExecuting} loadingLabel={isExecuting ? "执行中" : "启动中"}
-            onClick={async () => { setLocalBusy(true); await onExecute(); setLocalBusy(false); }}>执行当前小阶段</ActionButton>
+            onClick={handleExecute}>执行当前小阶段</ActionButton>
           <p style={{ color: "#656d76", fontSize: "12px", marginTop: "8px" }}>
             一次只执行一个已批准小阶段。执行完成后需要人工确认结果。
           </p>
         </div>
       )}
+      {startBlocked && !recoveryBlocked && !isAwaiting && planApproved && workspaceReady && nextSubtask && (
+        <FeedbackBanner
+          type="info"
+          message={runtimeOutcome?.writeAllowed === false
+            ? runtimeOutcome.writeBlockedReason
+            : runtimeOutcome?.summary ?? "后端已有活跃执行 owner，等待当前状态收口后再启动。"}
+        />
+      )}
 
       {/* All done — workflow should have auto-advanced; this is a safety net */}
-      {!recoveryBlocked && !isAwaiting && planApproved && workspaceReady && !nextSubtask && (
+      {!recoveryBlocked && !isAwaiting && planApproved && workspaceReady && !nextSubtask
+        && (!runtimeOutcome || runtimeOutcome.state === "completed") && (
         <div style={{ marginBottom: "20px" }}>
           <FeedbackBanner
             type="success"
-            message={`${planTarget?.kind === "Milestone" ? "当前大阶段" : "当前中阶段"}所有小阶段已执行完成。`}
+            message={runtimeOutcome?.summary ?? `${planTarget?.kind === "Milestone" ? "当前大阶段" : "当前中阶段"}所有小阶段已执行完成。`}
           />
         </div>
+      )}
+      {!recoveryBlocked && !isAwaiting && planApproved && workspaceReady && !nextSubtask
+        && runtimeOutcome && runtimeOutcome.state !== "completed" && (
+        <FeedbackBanner type="warning" message={runtimeOutcome.summary} />
       )}
     </div>
   );

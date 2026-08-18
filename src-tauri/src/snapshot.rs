@@ -33,6 +33,35 @@ pub(crate) struct UISnapshot {
     pub saved_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum StartupProcessObservationKind {
+    Killed,
+    AlreadyExited,
+    TerminationUnknown,
+    IdentityUnverified,
+    IntentionalExit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct StartupProcessObservation {
+    pub pid: u32,
+    pub kind: StartupProcessObservationKind,
+    pub observed_at: String,
+}
+
+/// Identity captured immediately after spawning an execution child.
+/// `execution_id` is the business owner; the other fields protect against PID reuse.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RunningProcessIdentity {
+    pub pid: u32,
+    #[serde(default)]
+    pub execution_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_id: Option<String>,
+}
+
 /// 应用完整快照，持久化到 ~/.metheus/{project_id}_snapshot.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AppSnapshot {
@@ -41,6 +70,12 @@ pub(crate) struct AppSnapshot {
     pub snapshot_version: u32,
     /// 孤儿进程保护：当前正在运行的子进程 PID（无则为 None）
     pub running_pid: Option<u32>,
+    /// Conservative evidence from the next startup; this does not claim OOM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_process_observation: Option<StartupProcessObservation>,
+    /// Optional identity for safe cleanup; old snapshots deserialize without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_process_identity: Option<RunningProcessIdentity>,
     pub saved_at: String,
 }
 
@@ -71,6 +106,37 @@ pub(crate) fn save_snapshot(
     ui: &UISnapshot,
     running_pid: Option<u32>,
 ) -> Result<(), String> {
+    let (prior_observation, running_process_identity) = load_snapshot(project_id)
+        .ok()
+        .flatten()
+        .map(|snapshot| {
+            let identity = running_pid
+                .filter(|pid| {
+                    snapshot
+                        .running_process_identity
+                        .as_ref()
+                        .is_some_and(|value| value.pid == *pid)
+                })
+                .and(snapshot.running_process_identity);
+            (snapshot.startup_process_observation, identity)
+        })
+        .unwrap_or((None, None));
+    save_snapshot_with_observation(
+        project_id,
+        ui,
+        running_pid,
+        running_process_identity,
+        prior_observation,
+    )
+}
+
+fn save_snapshot_with_observation(
+    project_id: &str,
+    ui: &UISnapshot,
+    running_pid: Option<u32>,
+    running_process_identity: Option<RunningProcessIdentity>,
+    startup_process_observation: Option<StartupProcessObservation>,
+) -> Result<(), String> {
     let path = snapshot_data_path(project_id)?;
 
     // 确保 .metheus/ 目录存在
@@ -83,6 +149,8 @@ pub(crate) fn save_snapshot(
         project_id: project_id.to_string(),
         snapshot_version: SNAPSHOT_VERSION,
         running_pid,
+        startup_process_observation,
+        running_process_identity,
         saved_at: chrono_now(),
     };
 
@@ -151,17 +219,141 @@ pub(crate) fn load_snapshot(project_id: &str) -> Result<Option<AppSnapshot>, Str
 /// 无需前端重新传递 UI 状态。
 pub(crate) fn update_snapshot_pid(
     project_id: &str,
+    execution_id: &str,
     running_pid: Option<u32>,
 ) -> Result<(), String> {
-    // 读取现有快照（如果存在）
-    let ui = match load_snapshot(project_id)? {
-        Some(existing) => existing.ui,
+    if running_pid.is_some() && execution_id.is_empty() {
+        return Err("拒绝在缺少 execution_id 时写入子进程 PID".to_string());
+    }
+    // 读取现有快照（如果存在），并先验证当前执行是否仍拥有该 PID 槽位。
+    let (ui, startup_process_observation) = match load_snapshot(project_id)? {
+        Some(existing) => {
+            validate_running_process_update(&existing, execution_id, running_pid)?;
+            (existing.ui, existing.startup_process_observation)
+        }
         None => {
             // 无现有快照 → 不创建新快照（前端未初始化过 UI 状态）
             return Ok(());
         }
     };
-    save_snapshot(project_id, &ui, running_pid)
+    let startup_process_observation = running_pid
+        .is_none()
+        .then_some(startup_process_observation)
+        .flatten();
+    let running_process_identity = running_pid.map(|pid| {
+        let (executable_path, process_start_id) = read_process_identity(pid);
+        RunningProcessIdentity {
+            pid,
+            execution_id: execution_id.to_string(),
+            executable_path,
+            process_start_id,
+        }
+    });
+    save_snapshot_with_observation(
+        project_id,
+        &ui,
+        running_pid,
+        running_process_identity,
+        startup_process_observation,
+    )
+}
+
+fn validate_running_process_update(
+    snapshot: &AppSnapshot,
+    execution_id: &str,
+    running_pid: Option<u32>,
+) -> Result<(), String> {
+    let Some(existing_pid) = snapshot.running_pid else {
+        if snapshot.running_process_identity.is_some() {
+            return Err("快照中的进程身份与 running_pid 不一致".to_string());
+        }
+        return Ok(());
+    };
+    let Some(identity) = snapshot.running_process_identity.as_ref() else {
+        return Err(format!(
+            "拒绝覆盖没有可验证身份的运行中 PID={}，请先人工对账",
+            existing_pid
+        ));
+    };
+    if identity.pid != existing_pid
+        || identity.execution_id.is_empty()
+        || execution_id.is_empty()
+        || identity.execution_id != execution_id
+    {
+        return Err(format!(
+            "拒绝修改不属于当前 execution 的运行中 PID={}，请先人工对账",
+            existing_pid
+        ));
+    }
+    if running_pid.is_some_and(|pid| pid != existing_pid) {
+        return Err(format!(
+            "拒绝用 PID={:?} 覆盖当前 execution 的 PID={}",
+            running_pid, existing_pid
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn clear_startup_process_observation(project_id: &str) -> Result<(), String> {
+    let Some(mut snapshot) = load_snapshot(project_id)? else {
+        return Ok(());
+    };
+    if snapshot.startup_process_observation.is_none() {
+        return Ok(());
+    }
+    snapshot.startup_process_observation = None;
+    save_snapshot_record(&snapshot)
+}
+
+/// Record a normal application exit without clearing the child evidence.
+/// Reopen reconciliation may still terminate a verified child, but it must
+/// preserve this cause instead of presenting it as a resource kill.
+pub(crate) fn mark_intentional_exit(
+    project_id: &str,
+    execution_id: &str,
+    running_pid: Option<u32>,
+) -> Result<bool, String> {
+    let Some(mut snapshot) = load_snapshot(project_id)? else {
+        return Ok(false);
+    };
+    let pid = running_pid.or(snapshot.running_pid);
+    let Some(pid) = pid else {
+        return Ok(false);
+    };
+    if snapshot.running_pid.is_some_and(|existing| existing != pid) {
+        return Ok(false);
+    }
+    if let Some(identity) = snapshot.running_process_identity.as_ref() {
+        if identity.pid != pid
+            || (!identity.execution_id.is_empty()
+                && !execution_id.is_empty()
+                && identity.execution_id != execution_id)
+        {
+            return Ok(false);
+        }
+    }
+
+    snapshot.running_pid = Some(pid);
+    if snapshot.running_process_identity.is_none() {
+        let (executable_path, process_start_id) = read_process_identity(pid);
+        snapshot.running_process_identity = Some(RunningProcessIdentity {
+            pid,
+            execution_id: execution_id.to_string(),
+            executable_path,
+            process_start_id,
+        });
+    } else if let Some(identity) = snapshot.running_process_identity.as_mut() {
+        if identity.execution_id.is_empty() && !execution_id.is_empty() {
+            identity.execution_id = execution_id.to_string();
+        }
+    }
+    snapshot.startup_process_observation = Some(StartupProcessObservation {
+        pid,
+        kind: StartupProcessObservationKind::IntentionalExit,
+        observed_at: chrono_now(),
+    });
+    save_snapshot_record(&snapshot)?;
+    Ok(true)
 }
 
 // ============================================================
@@ -256,10 +448,98 @@ fn kill_pid(pid: u32) -> bool {
     }
 }
 
-/// 应用启动时调用：扫描所有快照文件，终止孤儿进程
+fn read_process_identity(pid: u32) -> (Option<String>, Option<String>) {
+    #[cfg(target_os = "linux")]
+    {
+        let executable_path = fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+        let process_start_id = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(')')?
+                    .1
+                    .split_whitespace()
+                    .nth(19)
+                    .map(str::to_string)
+            });
+        (executable_path, process_start_id)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        (None, None)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessIdentityCheck {
+    Match,
+    Unverified,
+}
+
+fn process_identity_check(identity: &RunningProcessIdentity) -> ProcessIdentityCheck {
+    if identity.execution_id.is_empty()
+        || identity.executable_path.is_none()
+        || identity.process_start_id.is_none()
+    {
+        return ProcessIdentityCheck::Unverified;
+    }
+    let (executable_path, process_start_id) = read_process_identity(identity.pid);
+    if executable_path == identity.executable_path && process_start_id == identity.process_start_id
+    {
+        ProcessIdentityCheck::Match
+    } else {
+        ProcessIdentityCheck::Unverified
+    }
+}
+
+fn startup_process_cleanup_decision(
+    snapshot: &AppSnapshot,
+    pid_alive: bool,
+) -> (bool, StartupProcessObservationKind) {
+    if !pid_alive {
+        return (true, StartupProcessObservationKind::AlreadyExited);
+    }
+    match snapshot.running_process_identity.as_ref() {
+        Some(identity)
+            if identity.pid == snapshot.running_pid.unwrap_or_default()
+                && process_identity_check(identity) == ProcessIdentityCheck::Match =>
+        {
+            (true, StartupProcessObservationKind::Killed)
+        }
+        _ => (false, StartupProcessObservationKind::IdentityUnverified),
+    }
+}
+
+fn preserve_intentional_exit_observation(
+    snapshot: &AppSnapshot,
+    observed: StartupProcessObservationKind,
+) -> StartupProcessObservationKind {
+    let prior_intentional_exit =
+        snapshot
+            .startup_process_observation
+            .as_ref()
+            .is_some_and(|observation| {
+                observation.kind == StartupProcessObservationKind::IntentionalExit
+            });
+    if prior_intentional_exit
+        && matches!(
+            observed,
+            StartupProcessObservationKind::Killed | StartupProcessObservationKind::AlreadyExited
+        )
+    {
+        StartupProcessObservationKind::IntentionalExit
+    } else {
+        observed
+    }
+}
+
+/// 应用启动时调用：扫描所有快照文件，安全处理遗留执行进程
 ///
 /// 遍历 `~/.metheus/*_snapshot.json`，检测每个快照中的 `running_pid`。
-/// 如果 PID 存活 → 判定为上次异常退出遗留的孤儿进程 → kill -9 终止 → 清除快照中的 PID。
+/// 只有身份可验证且匹配时才终止存活 PID；旧快照或无法验证身份的存活 PID
+/// 保留并记录人工阻断。已退出 PID 可直接清除快照残留。
 pub(crate) fn cleanup_orphan_processes_at_startup() {
     let home = match dirs::home_dir() {
         Some(h) => h,
@@ -297,39 +577,189 @@ pub(crate) fn cleanup_orphan_processes_at_startup() {
             Err(_) => continue,
         };
 
-        let snapshot: AppSnapshot = match serde_json::from_str(&content) {
+        let mut snapshot: AppSnapshot = match serde_json::from_str(&content) {
             Ok(s) => s,
             Err(_) => continue,
         };
 
         if let Some(pid) = snapshot.running_pid {
-            let should_clear_pid = if is_pid_alive(pid) {
+            let (should_attempt_kill, observation_kind) =
+                startup_process_cleanup_decision(&snapshot, is_pid_alive(pid));
+            let (should_clear_pid, observation_kind) = if should_attempt_kill
+                && observation_kind == StartupProcessObservationKind::Killed
+            {
                 eprintln!(
-                    "[snapshot] 发现孤儿进程 PID={} (项目={})，正在终止...",
+                    "[snapshot] 已验证孤儿进程 PID={} (项目={})，正在终止...",
                     pid, snapshot.project_id
                 );
                 if kill_pid(pid) {
                     eprintln!("[snapshot] 孤儿进程 PID={} 已终止", pid);
-                    true
+                    (
+                        true,
+                        preserve_intentional_exit_observation(
+                            &snapshot,
+                            StartupProcessObservationKind::Killed,
+                        ),
+                    )
                 } else {
                     eprintln!(
                         "[snapshot] 警告: 无法终止孤儿进程 PID={}（权限不足或进程已退出）",
                         pid
                     );
-                    false
+                    (false, StartupProcessObservationKind::TerminationUnknown)
                 }
             } else {
-                // PID 不存活 → 进程已自然结束，清理快照中的残留 PID
-                true
+                if observation_kind == StartupProcessObservationKind::IdentityUnverified {
+                    eprintln!(
+                        "[snapshot] 人工阻断：无法证明 PID={} (项目={}) 仍属于当前 execution，保留 PID 不终止",
+                        pid, snapshot.project_id
+                    );
+                }
+                (
+                    observation_kind == StartupProcessObservationKind::AlreadyExited,
+                    preserve_intentional_exit_observation(&snapshot, observation_kind),
+                )
             };
 
+            snapshot.startup_process_observation = Some(StartupProcessObservation {
+                pid,
+                kind: observation_kind,
+                observed_at: chrono_now(),
+            });
             if should_clear_pid {
-                if let Err(e) = update_snapshot_pid(&snapshot.project_id, None) {
-                    eprintln!("[snapshot] 清除快照 PID 失败，保留阻断证据: {}", e);
-                }
+                snapshot.running_pid = None;
+                snapshot.running_process_identity = None;
+            }
+            if let Err(e) = save_snapshot_record(&snapshot) {
+                eprintln!("[snapshot] 清除快照 PID 失败，保留阻断证据: {}", e);
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot_with_identity(identity: Option<RunningProcessIdentity>) -> AppSnapshot {
+        AppSnapshot {
+            ui: UISnapshot {
+                view_phase: "Console".to_string(),
+                sidebar_width: None,
+                active_tab: None,
+                saved_at: "0".to_string(),
+            },
+            project_id: "identity-test".to_string(),
+            snapshot_version: SNAPSHOT_VERSION,
+            running_pid: Some(42),
+            startup_process_observation: None,
+            running_process_identity: identity,
+            saved_at: "0".to_string(),
+        }
+    }
+
+    #[test]
+    fn old_snapshot_alive_pid_is_human_blocked_without_identity() {
+        let snapshot = snapshot_with_identity(None);
+        assert_eq!(
+            startup_process_cleanup_decision(&snapshot, true),
+            (false, StartupProcessObservationKind::IdentityUnverified)
+        );
+    }
+
+    #[test]
+    fn dead_pid_can_be_cleared_without_identity() {
+        let snapshot = snapshot_with_identity(None);
+        assert_eq!(
+            startup_process_cleanup_decision(&snapshot, false),
+            (true, StartupProcessObservationKind::AlreadyExited)
+        );
+    }
+
+    #[test]
+    fn incomplete_identity_never_authorizes_kill() {
+        let snapshot = snapshot_with_identity(Some(RunningProcessIdentity {
+            pid: 42,
+            execution_id: "execution-1".to_string(),
+            executable_path: None,
+            process_start_id: None,
+        }));
+        assert_eq!(
+            startup_process_cleanup_decision(&snapshot, true),
+            (false, StartupProcessObservationKind::IdentityUnverified)
+        );
+    }
+
+    #[test]
+    fn pid_reuse_identity_mismatch_never_authorizes_kill() {
+        let pid = std::process::id();
+        let mut snapshot = snapshot_with_identity(Some(RunningProcessIdentity {
+            pid,
+            execution_id: "execution-1".to_string(),
+            executable_path: Some("/definitely-not-the-current-executable".to_string()),
+            process_start_id: Some("definitely-not-the-current-start".to_string()),
+        }));
+        snapshot.running_pid = Some(pid);
+        assert_eq!(
+            startup_process_cleanup_decision(&snapshot, true),
+            (false, StartupProcessObservationKind::IdentityUnverified)
+        );
+    }
+
+    #[test]
+    fn intentional_exit_observation_survives_verified_reopen_cleanup() {
+        let mut snapshot = snapshot_with_identity(None);
+        snapshot.startup_process_observation = Some(StartupProcessObservation {
+            pid: 42,
+            kind: StartupProcessObservationKind::IntentionalExit,
+            observed_at: "0".to_string(),
+        });
+        assert_eq!(
+            preserve_intentional_exit_observation(&snapshot, StartupProcessObservationKind::Killed),
+            StartupProcessObservationKind::IntentionalExit
+        );
+        assert_eq!(
+            preserve_intentional_exit_observation(
+                &snapshot,
+                StartupProcessObservationKind::AlreadyExited
+            ),
+            StartupProcessObservationKind::IntentionalExit
+        );
+        assert_eq!(
+            preserve_intentional_exit_observation(
+                &snapshot,
+                StartupProcessObservationKind::IdentityUnverified
+            ),
+            StartupProcessObservationKind::IdentityUnverified
+        );
+    }
+
+    #[test]
+    fn snapshot_pid_updates_require_the_current_execution_identity() {
+        let current = snapshot_with_identity(Some(RunningProcessIdentity {
+            pid: 42,
+            execution_id: "execution-1".to_string(),
+            executable_path: Some("/bin/worker".to_string()),
+            process_start_id: Some("start-1".to_string()),
+        }));
+        assert!(validate_running_process_update(&current, "execution-1", None).is_ok());
+        assert!(validate_running_process_update(&current, "execution-2", None).is_err());
+        assert!(validate_running_process_update(&current, "execution-1", Some(43)).is_err());
+    }
+
+    #[test]
+    fn snapshot_pid_updates_preserve_unknown_pid_as_a_human_boundary() {
+        let unknown = snapshot_with_identity(None);
+        assert!(validate_running_process_update(&unknown, "execution-1", None).is_err());
+        assert!(validate_running_process_update(&unknown, "execution-1", Some(43)).is_err());
+    }
+}
+
+fn save_snapshot_record(snapshot: &AppSnapshot) -> Result<(), String> {
+    let path = snapshot_data_path(&snapshot.project_id)?;
+    let json =
+        serde_json::to_string_pretty(snapshot).map_err(|e| format!("序列化快照失败: {}", e))?;
+    fs::write(&path, json).map_err(|e| format!("写入快照文件失败: {}", e))
 }
 
 // ============================================================

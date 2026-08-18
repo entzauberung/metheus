@@ -297,6 +297,9 @@ mod change_detection_tests {
                 evidence_block_ids: vec!["E001".to_string()],
             }]),
             review_issues: vec![ModelReviewIssue {
+                criterion_index: Some(1),
+                criterion: "按钮可点击".to_string(),
+                file: "index.html".to_string(),
                 actual: "可以改用 let".to_string(),
                 confidence: 0.9,
                 severity: Some(crate::project::ReviewIssueSeverity::Suggestion),
@@ -318,6 +321,66 @@ mod change_detection_tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("总体结论")));
+    }
+
+    #[test]
+    fn review_issues_require_bound_criterion_file_and_evidence() {
+        let reference = crate::project::ReviewEvidenceReference {
+            block_id: "E001".to_string(),
+            source_kind: crate::project::EvidenceSourceKind::CurrentFileSnippet,
+            file: "index.html".to_string(),
+            start_line: Some(1),
+            end_line: Some(3),
+        };
+        let evidence = ReviewEvidence {
+            rendered: String::new(),
+            status: crate::project::ReviewEvidenceStatus::Complete,
+            summary: String::new(),
+            blocks: std::collections::BTreeMap::from([("E001".to_string(), reference)]),
+        };
+        let issue = |file: &str, evidence_block_ids: Vec<String>| ModelReviewIssue {
+            criterion_index: Some(1),
+            criterion: "按钮可点击".to_string(),
+            file: file.to_string(),
+            actual: "无法点击".to_string(),
+            confidence: 0.9,
+            severity: Some(crate::project::ReviewIssueSeverity::Blocking),
+            evidence_block_ids,
+            ..Default::default()
+        };
+        let result = normalize_model_review(
+            ModelReviewResponse {
+                criterion_reviews: Some(vec![ModelCriterionReview {
+                    criterion_index: 1,
+                    conclusion: crate::project::CriterionReviewConclusion::Unsatisfied,
+                    confidence: 0.9,
+                    evidence_block_ids: vec!["E001".to_string()],
+                }]),
+                review_issues: vec![
+                    issue("index.html", vec!["E001".to_string()]),
+                    issue("other.html", vec!["E001".to_string()]),
+                    issue("index.html", vec![]),
+                ],
+                ..Default::default()
+            },
+            &["按钮可点击".to_string()],
+            &["index.html".to_string()],
+            &ReviewEvidenceRequest::default(),
+            &evidence,
+        );
+        assert_eq!(result.review_issues.len(), 1);
+        assert_eq!(result.review_issues[0].criterion_index, Some(1));
+        assert_eq!(result.review_issues[0].criterion, "按钮可点击");
+        assert_eq!(result.review_issues[0].file, "index.html");
+        assert_eq!(result.review_issues[0].evidence_references.len(), 1);
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("文件与证据块不一致")));
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("criterion/file/evidence")));
     }
 
     #[test]
@@ -503,35 +566,79 @@ fn normalize_model_review(
                 issue.actual
             ));
         }
+        let Some(references) = references else {
+            warnings.push(format!(
+                "审查问题缺少可复核的 criterion/file/evidence 绑定，已降为诊断：{}",
+                issue.actual
+            ));
+            continue;
+        };
+        let criterion_index = issue
+            .criterion_index
+            .filter(|index| *index > 0 && (*index as usize) <= criteria.len())
+            .or_else(|| {
+                let criterion = issue.criterion.trim();
+                (!criterion.is_empty())
+                    .then(|| {
+                        criteria
+                            .iter()
+                            .position(|candidate| candidate.trim() == criterion)
+                    })
+                    .flatten()
+                    .map(|index| index as u32 + 1)
+            });
+        let Some(criterion_index) = criterion_index else {
+            warnings.push(format!(
+                "审查问题缺少有效的验收项绑定，已降为诊断：{}",
+                issue.actual
+            ));
+            continue;
+        };
+        let evidence_files = references
+            .iter()
+            .map(|reference| reference.file.as_str())
+            .collect::<BTreeSet<_>>();
+        let file = if issue.file.trim().is_empty() {
+            if evidence_files.len() == 1 {
+                evidence_files
+                    .iter()
+                    .next()
+                    .map(|file| (*file).to_string())
+                    .unwrap_or_default()
+            } else {
+                warnings.push(format!(
+                    "审查问题缺少唯一文件绑定，已降为诊断：{}",
+                    issue.actual
+                ));
+                continue;
+            }
+        } else if evidence_files.contains(issue.file.trim()) {
+            issue.file.trim().to_string()
+        } else {
+            warnings.push(format!(
+                "审查问题的文件与证据块不一致，已降为诊断：{}",
+                issue.actual
+            ));
+            continue;
+        };
         let blocking = issue.severity == Some(project::ReviewIssueSeverity::Blocking);
-        if issue.severity.is_none()
-            || issue.confidence < 0.7
-            || (blocking && references.is_none())
-            || issue
-                .criterion_index
-                .is_some_and(|index| index == 0 || index as usize > criteria.len())
-        {
+        if issue.severity.is_none() || issue.confidence < 0.7 {
             warnings.push(format!(
                 "审查问题未通过结构化校验，已降为诊断：{}",
                 issue.actual
             ));
             continue;
         }
-        let criterion = issue
-            .criterion_index
-            .and_then(|index| criteria.get(index as usize - 1))
-            .cloned()
-            .unwrap_or(issue.criterion);
         review_issues.push(project::ReviewIssue {
-            criterion_index: issue.criterion_index,
-            criterion,
-            file: issue.file,
+            criterion_index: Some(criterion_index),
+            criterion: criteria[criterion_index as usize - 1].clone(),
+            file,
             expected: issue.expected,
             actual: issue.actual,
             suggested_change: issue.suggested_change,
             confidence: issue.confidence,
             severity: issue.severity,
-            evidence_references: references.unwrap_or_default(),
+            evidence_references: references,
         });
     }
 

@@ -5,17 +5,18 @@ use super::contract::{
 };
 use crate::pipeline::{append_runtime_log, PipelineState, PipelineStatus};
 use crate::project::{EngineFailureKind, ExecutionProvider, ExecutionResult, ExecutionRuntime};
+use crate::runtime_resource::ResourceDecision;
 use crate::settings::{
     AppSettings, BuiltInGrokBuildSettings, ConnectionTestResult, GrokBuildApiBackend,
     ModelConnectionErrorKind, ModelConnectionTarget,
 };
+use crate::task_contract::{ExecutionGuard, ExecutionStopReason};
 use metheus_grok_engine::{
     GrokBuildExecutionConfig, GrokBuildExecutionRequest, GrokBuildRuntimeErrorKind,
     GrokBuildRuntimeEvent, RuntimeEventSink, TokenUsage,
 };
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -466,12 +467,35 @@ fn runtime_failure_result(
 fn interrupted_engine_error(
     kind: GrokBuildRuntimeErrorKind,
     result: ExecutionResult,
+    stop_reason: Option<ExecutionStopReason>,
+    resource_observation: crate::project::ResourceObservationSummary,
 ) -> Result<ExecutionResult, EngineError> {
     match kind {
-        GrokBuildRuntimeErrorKind::Cancelled => Err(EngineError::cancelled_with_result(result)),
+        GrokBuildRuntimeErrorKind::Cancelled => match stop_reason {
+            Some(ExecutionStopReason::ResourceHardStop) => {
+                Err(EngineError::resource_hard_stop_with_result_and_observation(
+                    result,
+                    resource_observation,
+                ))
+            }
+            Some(ExecutionStopReason::WallClockExceeded) => {
+                Err(EngineError::timeout_with_result(result))
+            }
+            _ => Err(EngineError::cancelled_with_result(result)),
+        },
         GrokBuildRuntimeErrorKind::Timeout => Err(EngineError::timeout_with_result(result)),
         _ => Ok(result),
     }
+}
+
+fn sample_builtin_resource(
+    guard: &ExecutionGuard,
+    sampler: impl FnOnce(Option<&str>) -> crate::runtime_resource::ResourceObservation,
+) {
+    let sampled_at = chrono::Utc::now().to_rfc3339();
+    let sample = sampler(Some(sampled_at.as_str()));
+    guard.set_resource_observation(sample.summary);
+    guard.set_resource_decision(sample.decision);
 }
 
 pub(super) async fn execute(
@@ -481,12 +505,33 @@ pub(super) async fn execute(
     state: Arc<AsyncMutex<Option<PipelineState>>>,
 ) -> Result<ExecutionResult, EngineError> {
     let before_files = crate::test_runner::get_file_snapshot(&request.project_path);
-    let cancellation = Arc::new(AtomicBool::new(false));
-    let monitor_cancellation = cancellation.clone();
+    let guard = ExecutionGuard::new(&request.task_budget, ResourceDecision::Unknown);
+    sample_builtin_resource(&guard, crate::runtime_resource::observe_current_process);
+    if guard.stop_reason() == Some(ExecutionStopReason::ResourceHardStop) {
+        let result = runtime_failure_result(
+            app_settings,
+            GrokBuildRuntimeErrorKind::Runtime,
+            "内置执行启动前资源已达到硬停止阈值".to_string(),
+            String::new(),
+            None,
+            vec![],
+            vec![],
+        );
+        return Err(EngineError::resource_hard_stop_with_result_and_observation(
+            result,
+            guard.resource_observation(),
+        ));
+    }
+    let cancellation = guard.cancellation();
+    let monitor_guard = guard.clone();
     let monitor_state = state.clone();
     let monitor_execution_id = request.execution_id.clone();
     let monitor = tokio::spawn(async move {
         loop {
+            sample_builtin_resource(
+                &monitor_guard,
+                crate::runtime_resource::observe_current_process,
+            );
             let should_cancel = {
                 let guard = monitor_state.lock().await;
                 guard.as_ref().is_none_or(|pipeline| {
@@ -498,10 +543,19 @@ pub(super) async fn execute(
                 })
             };
             if should_cancel {
-                monitor_cancellation.store(true, Ordering::Relaxed);
+                monitor_guard.request_cancel();
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if matches!(
+                monitor_guard.stop_reason(),
+                Some(
+                    ExecutionStopReason::WallClockExceeded | ExecutionStopReason::ResourceHardStop
+                )
+            ) {
+                monitor_guard.request_cancel();
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     });
     let adapter_request = GrokBuildExecutionRequest {
@@ -512,26 +566,107 @@ pub(super) async fn execute(
         cancellation,
         event_sink: Some(event_sink(state, request.execution_id.clone())),
     };
-    let result = metheus_grok_engine::execute(
-        adapter_config(
-            &app_settings.built_in_grok_build,
-            api_key,
-            app_settings
-                .built_in_grok_build
-                .max_turns
-                .min(request.task_budget.max_executor_turns),
-            request.task_budget.max_transport_retries,
-            request.task_budget.max_doom_loop_retries,
-        ),
-        adapter_request,
-    )
-    .await;
+    let (wall_clock_expired, result) = tokio::select! {
+        result = metheus_grok_engine::execute(
+            adapter_config(
+                &app_settings.built_in_grok_build,
+                api_key,
+                app_settings
+                    .built_in_grok_build
+                    .max_turns
+                    .min(request.task_budget.max_executor_turns),
+                request.task_budget.max_transport_retries,
+                request.task_budget.max_doom_loop_retries,
+            ),
+            adapter_request,
+        ) => (false, Some(result)),
+        _ = tokio::time::sleep(guard.remaining()) => {
+            guard.request_cancel();
+            (true, None)
+        }
+    };
     monitor.abort();
     let after_files = crate::test_runner::get_file_snapshot(&request.project_path);
     let file_changes =
         crate::test_runner::detect_changes(&before_files, &after_files, &request.project_path);
+    if wall_clock_expired {
+        let stop_reason = guard
+            .stop_reason()
+            .unwrap_or(ExecutionStopReason::WallClockExceeded);
+        let result = runtime_failure_result(
+            app_settings,
+            if stop_reason == ExecutionStopReason::ResourceHardStop {
+                GrokBuildRuntimeErrorKind::Runtime
+            } else {
+                GrokBuildRuntimeErrorKind::Timeout
+            },
+            if stop_reason == ExecutionStopReason::ResourceHardStop {
+                "内置执行因资源压力达到硬停止阈值而终止".to_string()
+            } else {
+                format!(
+                    "内置执行达到任务总墙钟上限（{} 秒）",
+                    request.task_budget.bounded_wall_clock_secs()
+                )
+            },
+            String::new(),
+            None,
+            vec![],
+            file_changes,
+        );
+        return if stop_reason == ExecutionStopReason::ResourceHardStop {
+            Err(EngineError::resource_hard_stop_with_result_and_observation(
+                result,
+                guard.resource_observation(),
+            ))
+        } else {
+            Err(EngineError::timeout_with_result(result))
+        };
+    }
+    let result = result.expect("内置执行 future 未在完成或总墙钟分支中返回");
     match result {
         Ok(result) => {
+            if let Some(stop_reason) = guard.stop_reason() {
+                let (kind, message) = match stop_reason {
+                    ExecutionStopReason::ResourceHardStop => (
+                        GrokBuildRuntimeErrorKind::Runtime,
+                        "内置执行因资源压力达到硬停止阈值而终止".to_string(),
+                    ),
+                    ExecutionStopReason::WallClockExceeded => (
+                        GrokBuildRuntimeErrorKind::Timeout,
+                        format!(
+                            "内置执行达到任务总墙钟上限（{} 秒）",
+                            request.task_budget.bounded_wall_clock_secs()
+                        ),
+                    ),
+                    ExecutionStopReason::Cancelled => (
+                        GrokBuildRuntimeErrorKind::Cancelled,
+                        "内置执行已暂停".to_string(),
+                    ),
+                };
+                let failure_result = runtime_failure_result(
+                    app_settings,
+                    kind,
+                    message,
+                    result.output,
+                    result.token_usage,
+                    result.files_written,
+                    file_changes,
+                );
+                return match stop_reason {
+                    ExecutionStopReason::ResourceHardStop => {
+                        Err(EngineError::resource_hard_stop_with_result_and_observation(
+                            failure_result,
+                            guard.resource_observation(),
+                        ))
+                    }
+                    ExecutionStopReason::WallClockExceeded => {
+                        Err(EngineError::timeout_with_result(failure_result))
+                    }
+                    ExecutionStopReason::Cancelled => {
+                        Err(EngineError::cancelled_with_result(failure_result))
+                    }
+                };
+            }
             let output = result.output;
             let token_usage = provider_usage(result.token_usage);
             Ok(ExecutionResult {
@@ -567,7 +702,12 @@ pub(super) async fn execute(
                 error.files_written,
                 file_changes,
             );
-            interrupted_engine_error(kind, result)
+            interrupted_engine_error(
+                kind,
+                result,
+                guard.stop_reason(),
+                guard.resource_observation(),
+            )
         }
     }
 }
@@ -575,6 +715,49 @@ pub(super) async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resource_sample(
+        decision: ResourceDecision,
+        state: crate::project::ResourceObservationState,
+    ) -> crate::runtime_resource::ResourceObservation {
+        crate::runtime_resource::ResourceObservation {
+            summary: crate::project::ResourceObservationSummary {
+                state,
+                ..Default::default()
+            },
+            decision,
+        }
+    }
+
+    #[test]
+    fn builtin_production_sampler_updates_warning_and_hard_stop_guard() {
+        let guard = ExecutionGuard::new(
+            &crate::task_contract::TaskBudgetSummary::default(),
+            ResourceDecision::Unknown,
+        );
+        sample_builtin_resource(&guard, |_| {
+            resource_sample(
+                ResourceDecision::Warning,
+                crate::project::ResourceObservationState::Warning,
+            )
+        });
+        assert_eq!(
+            guard.resource_observation().state,
+            crate::project::ResourceObservationState::Warning
+        );
+        assert_eq!(guard.stop_reason(), None);
+
+        sample_builtin_resource(&guard, |_| {
+            resource_sample(
+                ResourceDecision::HardStop,
+                crate::project::ResourceObservationState::HardStop,
+            )
+        });
+        assert_eq!(
+            guard.stop_reason(),
+            Some(ExecutionStopReason::ResourceHardStop)
+        );
+    }
 
     #[test]
     fn builtin_runtime_reports_missing_secret_without_path_lookup() {
@@ -769,6 +952,41 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_grok_contract_truncation_wrapper_preserves_structured_facts() {
+        let result = runtime_failure_result(
+            &AppSettings::default(),
+            GrokBuildRuntimeErrorKind::OutputTruncated,
+            "max tokens reached".to_string(),
+            "partial output".to_string(),
+            Some(TokenUsage {
+                prompt_tokens: 9,
+                completion_tokens: 6,
+                total_tokens: 15,
+            }),
+            vec!["runtime.txt".to_string()],
+            vec!["detected.txt".to_string(), "runtime.txt".to_string()],
+        );
+
+        assert!(!result.success);
+        assert_eq!(
+            result.engine_failure_kind,
+            Some(EngineFailureKind::OutputTruncated)
+        );
+        assert_eq!(result.engine_runtime, ExecutionRuntime::BuiltIn);
+        assert_eq!(result.output, "partial output");
+        assert_eq!(result.file_changes, vec!["detected.txt", "runtime.txt"]);
+        assert_eq!(
+            result.token_usage,
+            Some(crate::cost_ledger::ProviderUsage {
+                input_tokens: Some(9),
+                output_tokens: Some(6),
+                total_tokens: Some(15),
+                cached_input_tokens: None,
+            })
+        );
+    }
+
+    #[test]
     fn adaptive_grok_contract_interruptions_preserve_usage_files_and_output() {
         for (kind, expected_failure) in [
             (
@@ -793,7 +1011,13 @@ mod tests {
                 vec!["shared.txt".to_string(), "runtime.txt".to_string()],
                 vec!["detected.txt".to_string(), "shared.txt".to_string()],
             );
-            let error = interrupted_engine_error(kind, result).unwrap_err();
+            let error = interrupted_engine_error(
+                kind,
+                result,
+                None,
+                crate::project::ResourceObservationSummary::default(),
+            )
+            .unwrap_err();
             let partial = match error {
                 EngineError::Timeout { execution_result }
                 | EngineError::Cancelled { execution_result } => {

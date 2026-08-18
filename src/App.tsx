@@ -72,6 +72,11 @@ import { resolvePlanTarget } from "./planTargetPolicy";
 import { getConsoleWritePolicy, type ConsoleWritePolicy } from "./consoleWritePolicy";
 import { shouldCollapseConsolePanel } from "./consolePanelPolicy";
 import { getManagedFlowPresentation } from "./managedFlowPolicy";
+import {
+  formatRuntimeMutationFeedback,
+  resolveRuntimeOutcomePresentation,
+  runtimeOutcomeFeedbackType,
+} from "./runtimeOutcomePresentation";
 
 const WORKFLOW_STEPS = new Set<WorkflowStep>([
   "WaitingEntry", "ExistingAnalysis", "BaselineApproval", "Discussion", "ThreeChecks",
@@ -322,6 +327,7 @@ function App() {
   const [feedbackMsg, setFeedbackMsg] = useState<{ type: "error" | "success" | "warning" | "info"; message: string } | null>(null);
   const [executionStatus, setExecutionStatus] = useState<PipelineState | null>(null);
   const [recoveryPresentation, setRecoveryPresentation] = useState<RecoveryPresentation | null>(null);
+  const [runtimeSnapshot, setRuntimeSnapshot] = useState<RuntimeSnapshot | null>(null);
   const [recoveryResult, setRecoveryResult] = useState<RecoveryResultSummary | null>(null);
   const [runtimeTaskControlSnapshot, setRuntimeTaskControlSnapshot] = useState<import("./types").TaskControlSnapshot | null>(null);
   const dismissRecoveryResult = useCallback(() => setRecoveryResult(null), []);
@@ -380,6 +386,7 @@ function App() {
   }, []);
   const applyRuntimeSnapshot = useCallback((snapshot: RuntimeSnapshot) => {
     if (!handleChatComplete(snapshot.project)) return;
+    setRuntimeSnapshot(snapshot);
     setExecutionStatus(snapshot.pipeline_state);
     setIsExecuting(snapshot.pipeline_state?.status === "Running");
     setRecoveryPresentation(snapshot.recovery_presentation);
@@ -412,11 +419,42 @@ function App() {
     includeTaskControlSnapshot: inspectorOpen,
     onSnapshot: applyRuntimeSnapshot,
   });
-  const consoleWritePolicy = getConsoleWritePolicy(
+  const outcomeSnapshot = runtimeSnapshot && project
+    && runtimeSnapshot.project.name === project.name
+    ? {
+      ...runtimeSnapshot,
+      project,
+      pipeline_state: executionStatus,
+      recovery_presentation: recoveryPresentation ?? runtimeSnapshot.recovery_presentation,
+    }
+    : null;
+  const runtimeOutcome = resolveRuntimeOutcomePresentation({
+    snapshot: outcomeSnapshot,
+    syncStatus: projectStateSync.state.status,
+  });
+  const syncWritePolicy = getConsoleWritePolicy(
     project?.workflow_state.top_level_phase === "Console",
     projectStateSync.state,
   );
+  const consoleWritePolicy: ConsoleWritePolicy = runtimeOutcome.writeAllowed && syncWritePolicy.writable
+    ? syncWritePolicy
+    : {
+      writable: false,
+      reason: runtimeOutcome.writeAllowed
+        ? syncWritePolicy.reason
+        : runtimeOutcome.writeBlockedReason,
+    };
   consoleWritePolicyRef.current = consoleWritePolicy;
+  const showRuntimeMutationFeedback = useCallback((result: RuntimeMutationResult) => {
+    const outcome = resolveRuntimeOutcomePresentation({
+      snapshot: result.runtime_snapshot,
+      syncStatus: projectStateSync.state.status,
+    });
+    setFeedbackMsg({
+      type: outcome.tone === "error" ? "error" : runtimeOutcomeFeedbackType(outcome),
+      message: formatRuntimeMutationFeedback(result.action.message, outcome),
+    });
+  }, [projectStateSync.state.status]);
   const forceRuntimeSync = projectStateSync.forceSync;
   const taskControlWorkspace = useTaskControlWorkspace({
     project,
@@ -477,6 +515,7 @@ function App() {
     setPendingRecoveryDecision(null);
     setRecoveryResult(null);
     setRuntimeTaskControlSnapshot(null);
+    setRuntimeSnapshot(null);
     setTerminalSyncPhase("idle");
   }, [project?.name]);
   // V1: 回退后手动触发生成（不再自动触发）
@@ -1147,13 +1186,11 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   const handleResolvePause = async (action: string) => {
     if (!project || !beginConsoleAction(`pause_${action}`)) return;
     try {
-      await invokeRuntimeMutation("resolve_pause_decision_runtime", {
+      const result = await invokeRuntimeMutation("resolve_pause_decision_runtime", {
         projectName: project.name,
         action,
       });
-      if (action === "continue") {
-        setFeedbackMsg({ type: "info", message: "已恢复执行模式，可继续执行下一个小阶段。" });
-      }
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "决策失败：" + String(err) });
       throw err;
@@ -1183,11 +1220,11 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   const handleConfirmRollback = async (checkpointSubtaskId: string) => {
     if (!project || !beginConsoleAction("rollback_confirm")) return;
     try {
-      await invokeRuntimeMutation("confirm_rollback_runtime", {
+      const result = await invokeRuntimeMutation("confirm_rollback_runtime", {
         projectName: project.name,
         checkpointSubtaskId,
       });
-      setFeedbackMsg({ type: "success", message: "回退已完成。请重新生成执行计划。" });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "回退失败：" + String(err) });
     } finally {
@@ -1254,7 +1291,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
       }
       setTerminalSyncPhase("idle");
       startExecutionPolling(project.name);
-      setFeedbackMsg({ type: "info", message: "小阶段已启动，正在后台执行。" });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       console.error("执行失败:", err);
       setFeedbackMsg({ type: "error", message: "执行失败：" + String(err) });
@@ -1271,10 +1308,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
         projectName: project.name,
       });
       setExecutionStatus(null);
-      setFeedbackMsg({
-        type: "success",
-        message: result.action.message || "小阶段已确认通过，Git 标签已创建。",
-      });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       try {
         await forceRuntimeSync();
@@ -1294,10 +1328,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
         projectName: project.name,
       });
       setExecutionStatus(null);
-      setFeedbackMsg({
-        type: "success",
-        message: result.action.message || "Git 确认已完成，代码与质量结果保持不变。",
-      });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       try {
         await forceRuntimeSync();
@@ -1314,12 +1345,12 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   const handleRejectSubtask = async (reason: string) => {
     if (!project || !beginConsoleAction("reject_subtask")) return;
     try {
-      await invokeRuntimeMutation("reject_subtask_result_runtime", {
+      const result = await invokeRuntimeMutation("reject_subtask_result_runtime", {
         projectName: project.name,
         reason,
       });
       setExecutionStatus(null);
-      setFeedbackMsg({ type: "warning", message: "小阶段已驳回：" + reason });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "驳回失败：" + String(err) });
     } finally {
@@ -1331,14 +1362,11 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   const handleToggleAutopilot = async (active: boolean) => {
     if (!project || !beginConsoleAction(active ? "autopilot_start" : "autopilot_stop")) return;
     try {
-      await invokeRuntimeMutation("toggle_autopilot_runtime", {
+      const result = await invokeRuntimeMutation("toggle_autopilot_runtime", {
         projectName: project.name,
         active,
       });
-      setFeedbackMsg({
-        type: active ? "info" : "info",
-        message: active ? "自动驾驶已激活。" : "自动驾驶已关闭。",
-      });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "切换自动驾驶失败：" + String(err) });
     } finally {
@@ -1349,10 +1377,10 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   const handleStopManagedFlow = async () => {
     if (!project || !beginConsoleAction("managed_stop")) return;
     try {
-      await invokeRuntimeMutation("stop_managed_flow_runtime", {
+      const result = await invokeRuntimeMutation("stop_managed_flow_runtime", {
         projectName: project.name,
       });
-      setFeedbackMsg({ type: "info", message: "托管层已停止，当前步骤已交给手动处理。" });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "停止托管失败：" + String(err) });
     } finally {
@@ -1363,10 +1391,10 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   const handlePauseManagedFlow = async () => {
     if (!project || !beginConsoleAction("managed_pause")) return;
     try {
-      await invokeRuntimeMutation("pause_managed_flow_runtime", {
+      const result = await invokeRuntimeMutation("pause_managed_flow_runtime", {
         projectName: project.name,
       });
-      setFeedbackMsg({ type: "info", message: "托管层已暂停。" });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "暂停托管失败：" + String(err) });
     } finally {
@@ -1379,13 +1407,10 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
     const errorStopped = project.workflow_state.managed_flow_state?.run_status === "ErrorStopped";
     const command = errorStopped ? "start_managed_flow_runtime" : "resume_managed_flow_runtime";
     try {
-      await invokeRuntimeMutation(command, {
+      const result = await invokeRuntimeMutation(command, {
         projectName: project.name,
       });
-      setFeedbackMsg({
-        type: "info",
-        message: errorStopped ? "托管层已重新启动。" : "托管层已恢复。",
-      });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "恢复托管失败：" + String(err) });
     } finally {
@@ -1396,10 +1421,10 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   const handleAutopilotPauseNow = async () => {
     if (!project || !beginConsoleAction("autopilot_pause")) return;
     try {
-      await invokeRuntimeMutation("autopilot_pause_runtime", {
+      const result = await invokeRuntimeMutation("autopilot_pause_runtime", {
         projectName: project.name,
       });
-      setFeedbackMsg({ type: "info", message: "自动驾驶已暂停。" });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "暂停失败：" + String(err) });
     } finally {
@@ -1410,10 +1435,10 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   const handleAutopilotPauseAfterCurrent = async () => {
     if (!project || !beginConsoleAction("autopilot_ed_stop")) return;
     try {
-      await invokeRuntimeMutation("request_ed_stop_runtime", {
+      const result = await invokeRuntimeMutation("request_ed_stop_runtime", {
         projectName: project.name,
       });
-      setFeedbackMsg({ type: "info", message: "将在当前任务完成后暂停。" });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "ED Stop 失败：" + String(err) });
     } finally {
@@ -1424,10 +1449,10 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
   const handleAutopilotResume = async () => {
     if (!project || !beginConsoleAction("autopilot_resume")) return;
     try {
-      await invokeRuntimeMutation("autopilot_resume_runtime", {
+      const result = await invokeRuntimeMutation("autopilot_resume_runtime", {
         projectName: project.name,
       });
-      setFeedbackMsg({ type: "info", message: "自动驾驶已恢复。" });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "恢复失败：" + String(err) });
     } finally {
@@ -1441,13 +1466,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
       const result = await invokeRuntimeMutation("run_error_recovery_runtime", {
         projectName: project.name,
       });
-      const recoveryPending = result.runtime_snapshot.recovery_presentation.kind !== "None";
-      setFeedbackMsg({
-        type: recoveryPending ? "warning" : "success",
-        message: result.action.message || (recoveryPending
-          ? "自动恢复已完成本轮处理，但仍需人工处理。"
-          : "自动恢复已完成。"),
-      });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       setFeedbackMsg({ type: "error", message: "自动恢复失败：" + String(err) });
     } finally {
@@ -1492,10 +1511,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
       if (workspace) setWorkspaceStatus(workspace);
       setRecoveryImpact(null);
       setPendingRecoveryDecision(null);
-      setFeedbackMsg({
-        type: "success",
-        message: result.action.message,
-      });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       // 不得先在前端清空失败状态；保持恢复面板并显示后端原始错误
       if (String(err).includes("预览已过期")) {
@@ -1551,7 +1567,6 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
         acceptedCriteria: acceptedCriteria.length > 0 ? acceptedCriteria : undefined,
         expectedStateFingerprint,
       });
-      const updated = result.runtime_snapshot.project;
       const workspace = await invokeWithTimeout<ExecutionWorkspaceStatus>(
         "get_execution_workspace_status",
         { projectName: project.name },
@@ -1559,10 +1574,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
       if (workspace) setWorkspaceStatus(workspace);
       setRecoveryImpact(null);
       setPendingRecoveryDecision(null);
-      setFeedbackMsg({
-        type: updated.workflow_state.recovery_state ? "warning" : "success",
-        message: result.action.message,
-      });
+      showRuntimeMutationFeedback(result);
     } catch (err) {
       if (String(err).includes("预览已过期")) {
         setRecoveryImpact(null);
@@ -2019,6 +2031,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                     project={project}
                     recoveryPresentation={recoveryPresentation}
                     executionStatus={executionStatus}
+                    runtimeOutcome={runtimeOutcome}
                     busy={isConsoleBusy}
                     writeDisabled={!consoleWritePolicy.writable}
                     writeDisabledReason={consoleWritePolicy.reason}
@@ -2078,6 +2091,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                   validationRetryLimit={project.workflow_state.recovery_state?.max_validation_retries}
                   nextValidationRetryAt={project.workflow_state.recovery_state?.next_validation_retry_at}
                   recoveryPresentation={recoveryPresentation}
+                  runtimeOutcome={runtimeOutcome}
                   selectedTaskId={taskControlWorkspace.selectedTaskId}
                   onOpenTask={openTaskInspector}
                 />
@@ -2087,6 +2101,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
             <div className="execution-main">
               <RecoveryResultBanner
                 result={recoveryResult}
+                runtimeOutcome={runtimeOutcome}
                 onDismiss={dismissRecoveryResult}
               />
               <RecoveryImpactDialog
@@ -2142,6 +2157,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
                 <V1ExecutionPanel
                     project={project}
                     recoveryPresentation={recoveryPresentation}
+                    runtimeOutcome={runtimeOutcome}
                     executionStatus={executionStatus}
                     workspaceStatus={workspaceStatus}
                     busy={
@@ -2279,6 +2295,7 @@ ${isDirect ? "所有直挂小阶段" : "所有中阶段"}已执行完成，请�
               busy={isConsoleBusy || taskControlWorkspace.busy}
               error={taskControlWorkspace.error}
               recoveryPresentation={recoveryPresentation}
+              runtimeOutcome={runtimeOutcome}
               expectedEventSequence={projectStateSync.state.taskControlEventSequence}
               detailsSyncing={taskControlWorkspace.detailsSyncing}
               onClose={() => setInspectorOpen(false)}

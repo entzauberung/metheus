@@ -22,6 +22,10 @@ pub(crate) enum EngineError {
     Timeout {
         execution_result: Option<Box<ExecutionResult>>,
     },
+    ResourceHardStop {
+        execution_result: Option<Box<ExecutionResult>>,
+        resource_observation: Option<crate::project::ResourceObservationSummary>,
+    },
     ProcessFailed(String),
     Cancelled {
         execution_result: Option<Box<ExecutionResult>>,
@@ -39,6 +43,7 @@ impl fmt::Display for EngineError {
             | Self::ProcessFailed(message)
             | Self::ProtocolError(message) => formatter.write_str(message),
             Self::Timeout { .. } => formatter.write_str("执行超时"),
+            Self::ResourceHardStop { .. } => formatter.write_str("资源压力达到硬停止阈值"),
             Self::Cancelled { .. } => formatter.write_str("执行已暂停"),
         }
     }
@@ -66,6 +71,30 @@ impl EngineError {
     pub(crate) fn cancelled_with_result(result: ExecutionResult) -> Self {
         Self::Cancelled {
             execution_result: Some(Box::new(result)),
+        }
+    }
+
+    pub(crate) fn resource_hard_stop() -> Self {
+        Self::ResourceHardStop {
+            execution_result: None,
+            resource_observation: None,
+        }
+    }
+
+    pub(crate) fn resource_hard_stop_with_result(result: ExecutionResult) -> Self {
+        Self::ResourceHardStop {
+            execution_result: Some(Box::new(result)),
+            resource_observation: None,
+        }
+    }
+
+    pub(crate) fn resource_hard_stop_with_result_and_observation(
+        result: ExecutionResult,
+        observation: crate::project::ResourceObservationSummary,
+    ) -> Self {
+        Self::ResourceHardStop {
+            execution_result: Some(Box::new(result)),
+            resource_observation: Some(observation),
         }
     }
 }
@@ -230,4 +259,13 @@ pub(super) struct ProcessOutput {
     pub stderr: String,
     pub exit_code: Option<i32>,
     pub success: bool,
+}
+
+/// Resource facts carried at the engine boundary once a runtime guard is active.
+/// The current ST only defines the contract; samplers populate it in later STs.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct EngineResourceFacts {
+    pub observation: crate::project::ResourceObservationSummary,
+    pub failure_kind: Option<crate::project::ResourceFailureKind>,
 }

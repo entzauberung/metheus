@@ -3,6 +3,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { RuntimeOutcomePresentation } from "../runtimeOutcomePresentation";
 import { RecoveryResultBanner, RECOVERY_RESULT_DISPLAY_MS } from "./RecoveryResultBanner";
 
 describe("RecoveryResultBanner", () => {
@@ -52,5 +53,44 @@ describe("RecoveryResultBanner", () => {
     expect(host.textContent).toContain("下一步：后台将重新执行当前任务");
     act(() => vi.advanceTimersByTime(RECOVERY_RESULT_DISPLAY_MS));
     expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps recovery completion separate from a task still awaiting validation", () => {
+    act(() => root.render(
+      <RecoveryResultBanner
+        result={{
+          title: "执行基线已恢复",
+          message: "恢复动作已收口。",
+          baseline: null,
+          baseline_summary: "",
+          discarded_files: [],
+          discarded_files_summary: "",
+          background_job_started: false,
+          background_job_summary: "",
+          next_step: "validate",
+          next_step_summary: "下一步：等待验证结果。",
+        }}
+        runtimeOutcome={{
+          state: "validating",
+          statusLabel: "验证中",
+          summary: "等待质量和验收事实",
+          tone: "active",
+          execution: "passed",
+          quality: "pending",
+          acceptance: "pending",
+          confirmation: "required",
+          recoveryKind: "AutomaticRecovery",
+          syncStatus: "synced",
+          syncFresh: true,
+          writeAllowed: true,
+          writeBlockedReason: "",
+        } satisfies RuntimeOutcomePresentation}
+        onDismiss={vi.fn()}
+      />,
+    ));
+
+    expect(host.textContent).toContain("当前任务：验证中");
+    expect(host.textContent).toContain("等待质量和验收事实");
+    expect(host.textContent).not.toContain("任务已完成");
   });
 });

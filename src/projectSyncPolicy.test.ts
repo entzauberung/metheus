@@ -5,6 +5,7 @@ import {
   mergePendingProjectEvent,
   projectSyncFallbackIntervalMs,
   recoveryPresentationIsActive,
+  shouldStartForcedSync,
   shouldAcceptProjectStateEvent,
   shouldAcceptRuntimeSnapshot,
   shouldRequestRuntimeSnapshot,
@@ -123,6 +124,12 @@ describe("projectSyncPolicy", () => {
     expect(projectSyncFallbackIntervalMs("connected", "disconnected")).toBe(15_000);
   });
 
+  it("backs off repeated forced sync requests", () => {
+    expect(shouldStartForcedSync(null, 1_000)).toBe(true);
+    expect(shouldStartForcedSync(1_000, 1_999)).toBe(false);
+    expect(shouldStartForcedSync(1_000, 2_000)).toBe(true);
+  });
+
   it("bounds active recovery sync without changing normal or disconnected fallback", () => {
     expect(projectSyncFallbackIntervalMs("connected", "synced", 60_000, true)).toBe(5_000);
     expect(projectSyncFallbackIntervalMs("connected", "synced", 60_000, false)).toBe(60_000);
@@ -142,6 +149,24 @@ describe("projectSyncPolicy", () => {
   it("rejects a snapshot older than the latest invalidation event", () => {
     expect(shouldAcceptRuntimeSnapshot(cursor, snapshot(7))).toBe(false);
     expect(shouldAcceptRuntimeSnapshot(cursor, snapshot(8))).toBe(true);
+    expect(shouldAcceptRuntimeSnapshot(cursor, snapshot(8, {
+      project: {
+        name: "alpha",
+        workflow_state: { data_revision: 3 },
+      } as RuntimeSnapshot["project"],
+    }))).toBe(false);
+    expect(shouldAcceptRuntimeSnapshot(cursor, snapshot(8, {
+      task_control_tree_revision: 7,
+    }))).toBe(false);
+    expect(shouldAcceptRuntimeSnapshot(cursor, snapshot(8, {
+      task_control_snapshot_version: "task-control-snapshot-v0",
+    }))).toBe(false);
+    expect(shouldAcceptRuntimeSnapshot({
+      ...cursor,
+      taskControlActionId: "action-1",
+    }, snapshot(8, {
+      task_control_action_id: "action-2",
+    }))).toBe(false);
     expect(shouldAcceptRuntimeSnapshot(cursor, snapshot(9, {
       project: { name: "beta" } as RuntimeSnapshot["project"],
     }))).toBe(false);
@@ -175,6 +200,14 @@ describe("projectSyncPolicy", () => {
     expect(taskControlFallbackDecision({
       ...healthy,
       nowMs: Date.parse("2026-08-01T00:01:00Z"),
+    }).reason).toBe("detail_stale");
+    expect(taskControlFallbackDecision({
+      ...healthy,
+      detailUpdatedAt: null,
+    }).reason).toBe("detail_stale");
+    expect(taskControlFallbackDecision({
+      ...healthy,
+      detailUpdatedAt: "not-a-timestamp",
     }).reason).toBe("detail_stale");
     expect(taskControlFallbackDecision({
       ...healthy,

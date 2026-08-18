@@ -1,8 +1,16 @@
 // src/PreflightPanel.tsx — 三项显式检查面板（后端事实驱动，无本地业务状态）
 import { useMemo } from "react";
 import { invokeWithTimeout } from "./utils/invokeWithTimeout";
-import { ManagedFlowState, PreflightCheckResult, RuntimeMutationResult } from "./types";
-import { CheckCircle, XCircle, Clock, ArrowRight, ArrowLeft } from "lucide-react";
+import {
+  ManagedFlowState,
+  NativeEvidenceKind,
+  NativeEvidenceReference,
+  NativeReadinessRecord,
+  NativeReadinessStatus,
+  PreflightCheckResult,
+  RuntimeMutationResult,
+} from "./types";
+import { CheckCircle, XCircle, Clock, ArrowRight, ArrowLeft, ShieldAlert, ShieldCheck } from "lucide-react";
 import { useState } from "react";
 import { getManagedFlowPresentation } from "./managedFlowPolicy";
 
@@ -31,6 +39,102 @@ interface PreflightPanelProps {
   onResumeManagedFlow?: () => void;
   onPauseManagedFlow?: () => void;
   onStopManagedFlow?: () => void;
+  nativeReadiness?: NativeReadinessRecord;
+}
+
+const NATIVE_REQUIREMENTS: Array<{ kind: NativeEvidenceKind; label: string }> = [
+  { kind: "operator", label: "原生操作员" },
+  { kind: "channel", label: "双向窗口通道" },
+  { kind: "screenshot", label: "原生窗口截图" },
+  { kind: "input_probe", label: "输入探针" },
+  { kind: "close_reopen", label: "关闭/重开对账" },
+  { kind: "stop_control", label: "停止权限" },
+];
+
+export interface NativeReadinessView {
+  status: NativeReadinessStatus;
+  statusLabel: string;
+  summary: string;
+  missingRequirements: string[];
+  nextAction: string;
+}
+
+function validNativeReference(reference: NativeEvidenceReference | undefined): boolean {
+  return Boolean(
+    reference
+      && reference.reference.trim()
+      && reference.recorded_at.trim()
+      && (reference.source === "human" || reference.source === "native_observer"),
+  );
+}
+
+export function resolveNativeReadiness(record?: NativeReadinessRecord): NativeReadinessView {
+  const references = record?.evidence_references ?? [];
+  const missingRequirements = NATIVE_REQUIREMENTS
+    .filter(({ kind }) => !validNativeReference(references.find((reference) => reference.kind === kind)))
+    .map(({ label }) => label);
+  const hasOperator = Boolean(record?.operator?.trim());
+  const hasChannel = Boolean(record?.channel?.trim());
+  if (!hasOperator && !missingRequirements.includes("原生操作员")) missingRequirements.unshift("原生操作员");
+  if (!hasChannel && !missingRequirements.includes("双向窗口通道")) missingRequirements.unshift("双向窗口通道");
+  if (record?.status === "BLOCKED") {
+    return {
+      status: "BLOCKED",
+      statusLabel: "原生运行资格：BLOCKED",
+      summary: "原生能力或证据存在阻断，不能启动真实体验。",
+      missingRequirements,
+      nextAction: record.next_action || "等待人工补齐并核对原生证据。",
+    };
+  }
+  if (missingRequirements.length > 0) {
+    return {
+      status: record?.status === "READY" ? "BLOCKED" : "PENDING",
+      statusLabel: record?.status === "READY" ? "原生运行资格：BLOCKED" : "原生运行资格：PENDING",
+      summary: record?.status === "READY"
+        ? "记录声明 READY，但必需证据不完整，已降级为阻断。"
+        : "原生证据尚未建立；批准、按钮状态或 Vite 页面不构成 Native ready。",
+      missingRequirements,
+      nextAction: record?.next_action || "由操作员补齐缺口后重新核对。",
+    };
+  }
+  return {
+    status: "READY",
+    statusLabel: "原生运行资格：READY",
+    summary: "必需原生证据引用完整，可进入人工批准边界；此状态不代表已启动 provider。",
+    missingRequirements: [],
+    nextAction: record?.next_action || "等待明确人工批准后再进入唯一 R2 入口。",
+  };
+}
+
+export function NativeReadinessPanel({ readiness }: { readiness?: NativeReadinessRecord }) {
+  const view = resolveNativeReadiness(readiness);
+  const blocked = view.status === "BLOCKED";
+  const ready = view.status === "READY";
+  return (
+    <section
+      className={`native-readiness-panel native-readiness-${view.status.toLowerCase()}`}
+      aria-label="Native 运行准备"
+      style={{
+        padding: "12px 14px",
+        marginBottom: "16px",
+        border: `1px solid ${blocked ? "#cf222e" : ready ? "#1a7f37" : "#d4a72c"}`,
+        borderRadius: "6px",
+        background: blocked ? "#fff1f0" : ready ? "#f0fff4" : "#fff8c5",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+        {blocked ? <ShieldAlert size={18} color="#cf222e" /> : ready ? <ShieldCheck size={18} color="#1a7f37" /> : <Clock size={18} color="#9a6700" />}
+        <strong>{view.statusLabel}</strong>
+      </div>
+      <p style={{ margin: "8px 0 4px", fontSize: "13px" }}>{view.summary}</p>
+      {view.missingRequirements.length > 0 && (
+        <p style={{ margin: "4px 0", fontSize: "12px" }}>
+          缺口：{view.missingRequirements.join("、")}
+        </p>
+      )}
+      <p style={{ margin: "4px 0 0", fontSize: "12px" }}>下一步：{view.nextAction}</p>
+    </section>
+  );
 }
 
 const CHECK_ORDER = ["goal_completeness", "reality_consistency", "task_executability"] as const;
@@ -65,6 +169,7 @@ export function PreflightPanel({
   onResumeManagedFlow,
   onPauseManagedFlow,
   onStopManagedFlow,
+  nativeReadiness,
 }: PreflightPanelProps) {
   // 仅保留 UI 状态：当前正在加载的检查类型、错误信息
   const [loadingType, setLoadingType] = useState<string | null>(null);
@@ -165,6 +270,7 @@ export function PreflightPanel({
       </div>
 
       <h2>📋 三项显式检查</h2>
+      <NativeReadinessPanel readiness={nativeReadiness} />
       <p style={{ color: "#656d76", fontSize: "13px", marginBottom: "16px" }}>
         在生成项目方案前，需要依次通过以下三项检查。前一项通过后才能进行下一项。
       </p>

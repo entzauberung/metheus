@@ -1,15 +1,17 @@
-import { CheckCircle2, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Info, X } from "lucide-react";
 import { useEffect } from "react";
+import type { RuntimeOutcomePresentation } from "../runtimeOutcomePresentation";
 import type { RecoveryResultSummary } from "../types";
 
 export const RECOVERY_RESULT_DISPLAY_MS = 12_000;
 
 interface RecoveryResultBannerProps {
   result: RecoveryResultSummary | null;
+  runtimeOutcome?: RuntimeOutcomePresentation;
   onDismiss: () => void;
 }
 
-export function RecoveryResultBanner({ result, onDismiss }: RecoveryResultBannerProps) {
+export function RecoveryResultBanner({ result, runtimeOutcome, onDismiss }: RecoveryResultBannerProps) {
   useEffect(() => {
     if (!result) return;
     const timer = window.setTimeout(onDismiss, RECOVERY_RESULT_DISPLAY_MS);
@@ -17,12 +19,23 @@ export function RecoveryResultBanner({ result, onDismiss }: RecoveryResultBanner
   }, [onDismiss, result]);
 
   if (!result) return null;
+  const OutcomeIcon = runtimeOutcome?.tone === "error"
+    ? AlertTriangle
+    : runtimeOutcome?.state === "completed"
+      ? CheckCircle2
+      : Info;
   return (
     <section className="recovery-result-banner" role="status" aria-live="polite">
-      <CheckCircle2 size={19} aria-hidden="true" />
+      <OutcomeIcon size={19} aria-hidden="true" />
       <div className="recovery-result-content">
-        <strong>{result.title}</strong>
-        <span>{result.message}</span>
+        <strong>恢复动作：{result.title}</strong>
+        <span>动作摘要：{result.message}</span>
+        {runtimeOutcome && (
+          <small>
+            当前任务：{runtimeOutcome.statusLabel}。{runtimeOutcome.summary}
+            {!runtimeOutcome.writeAllowed ? ` ${runtimeOutcome.writeBlockedReason}` : ""}
+          </small>
+        )}
         {result.baseline_summary && <small>{result.baseline_summary}</small>}
         {result.discarded_files.length > 0 && (
           <details className="recovery-result-files">

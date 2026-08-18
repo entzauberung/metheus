@@ -134,7 +134,7 @@ fn record_failed_signature(
     }
     recovery.error_kind = kind;
     recovery.error_signature = signature;
-    recovery.attempt >= recovery.max_attempts || recovery.repeated_signature_count >= 3
+    recovery.attempt >= recovery.max_attempts || recovery.repeated_signature_count >= 2
 }
 
 fn append_failure_history(recovery: &mut project::RecoveryState, failure: &str) {
@@ -413,8 +413,14 @@ fn issue_list_for_prompt(issues: &[project::RecoveryIssue]) -> String {
     issues
         .iter()
         .map(|issue| {
+            let evidence = issue
+                .evidence_references
+                .iter()
+                .map(|reference| reference.block_id.as_str())
+                .collect::<Vec<_>>()
+                .join("、");
             format!(
-                "- [{}] 验收项={} 文件={}；预期={}；实际={}；修复目标={}",
+                "- [{}] 验收项={} 文件={}；预期={}；实际={}；修复目标={}；证据={}",
                 issue.id,
                 issue
                     .criterion_index
@@ -435,6 +441,11 @@ fn issue_list_for_prompt(issues: &[project::RecoveryIssue]) -> String {
                     "见总体建议"
                 } else {
                     &issue.suggested_change
+                },
+                if evidence.is_empty() {
+                    "无"
+                } else {
+                    evidence.as_str()
                 },
             )
         })
@@ -489,6 +500,35 @@ fn test_failure_summary(test: Option<&project::TestResult>, fallback: &str) -> S
     }
     if !test.suggestion.is_empty() {
         parts.push(format!("suggestion={}", test.suggestion));
+    }
+    if !test.review_issues.is_empty() {
+        let issues = test
+            .review_issues
+            .iter()
+            .take(8)
+            .map(|issue| {
+                let evidence = issue
+                    .evidence_references
+                    .iter()
+                    .map(|reference| reference.block_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "criterion={:?},file={},actual={},suggested={},evidence={}",
+                    issue.criterion_index,
+                    issue.file,
+                    issue.actual,
+                    issue.suggested_change,
+                    if evidence.is_empty() {
+                        "none"
+                    } else {
+                        evidence.as_str()
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        parts.push(format!("review_issues={issues}"));
     }
     if !test.test_output_summary.is_empty() {
         parts.push(format!(
@@ -589,6 +629,8 @@ fn create_recovery_state(
         started_at: now.clone(),
         updated_at: now,
         engine_failure_kind: None,
+        resource_observation: project::ResourceObservationSummary::default(),
+        resource_failure_kind: None,
         checkpoint_id: String::new(),
         rollback_retest_pending: false,
         evidence_rebuild_attempted: false,
@@ -677,6 +719,7 @@ pub(crate) fn apply_recovery_dispatch_timeout(
 
     if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
         // Preserve last heartbeat_at for diagnosis; stop further updates by clearing claim.
+        autopilot.job_owner = project::AutopilotJobOwner::None;
         autopilot.current_action_id.clear();
         autopilot.current_action_kind.clear();
         autopilot.action_started_at.clear();
@@ -757,6 +800,21 @@ fn is_active_recovery_phase(phase: &project::RecoveryPhase) -> bool {
     )
 }
 
+fn recovery_action_is_claimed(autopilot: Option<&project::AutopilotState>) -> bool {
+    autopilot.is_some_and(|state| {
+        !state.current_action_id.is_empty() && state.current_action_kind == "run_error_recovery"
+    })
+}
+
+fn has_proven_backend_owner(autopilot: Option<&project::AutopilotState>) -> bool {
+    autopilot.is_some_and(|state| {
+        state.active
+            && state.run_status == project::AutopilotRunStatus::Running
+            && state.job_owner == project::AutopilotJobOwner::BackendRuntime
+            && !state.job_id.is_empty()
+    })
+}
+
 /// Bounded reconciliation for persistent Replanning/Repairing without a live worker.
 pub(crate) fn reconcile_stalled_recovery(
     input: StalledRecoveryInput<'_>,
@@ -822,6 +880,29 @@ pub(crate) fn apply_stalled_recovery_reconciliation(
     if !is_active_recovery_phase(&recovery.phase) {
         return StalledRecoveryDisposition::Wait;
     }
+    let autopilot = proj.workflow_state.autopilot_state.as_ref();
+    if recovery_action_is_claimed(autopilot) && !has_proven_backend_owner(autopilot) {
+        let message = "恢复 worker 的 owner 无法证明，已停止自动重派发并等待人工处理";
+        mark_waiting_human(proj, project::RecoveryErrorKind::HumanRequired, message);
+        if let Some(state) = proj.workflow_state.autopilot_state.as_mut() {
+            state.job_owner = project::AutopilotJobOwner::None;
+            state.current_action_id.clear();
+            state.current_action_kind.clear();
+            state.action_started_at.clear();
+            state.next_retry_at = None;
+        }
+        write_recovery_history(
+            proj,
+            "error",
+            project::ExecutionEventType::RecoveryExhausted,
+            message.to_string(),
+            None,
+            None,
+            Some(recovery.subtask_id.as_str()),
+        );
+        touch(proj);
+        return StalledRecoveryDisposition::EnterHumanBoundary;
+    }
     let action_id = proj
         .workflow_state
         .autopilot_state
@@ -866,6 +947,7 @@ pub(crate) fn apply_stalled_recovery_reconciliation(
                 state.next_validation_retry_at = None;
             }
             if let Some(ap) = proj.workflow_state.autopilot_state.as_mut() {
+                ap.job_owner = project::AutopilotJobOwner::None;
                 ap.current_action_id.clear();
                 ap.current_action_kind.clear();
                 ap.action_started_at.clear();
@@ -906,6 +988,12 @@ pub(crate) fn apply_stalled_recovery_reconciliation(
                     project::RecoveryErrorKind::HumanRequired,
                     "重规划后的任务执行已失联或曾启动，禁止自动重复启动",
                 );
+                if let Some(state) = proj.workflow_state.autopilot_state.as_mut() {
+                    state.job_owner = project::AutopilotJobOwner::None;
+                    state.current_action_id.clear();
+                    state.current_action_kind.clear();
+                    state.action_started_at.clear();
+                }
                 write_recovery_history(
                     proj,
                     "error",
@@ -946,6 +1034,9 @@ pub(crate) fn recovery_allows_automatic_claim(
         return false;
     }
     let autopilot = proj.workflow_state.autopilot_state.as_ref();
+    if recovery_action_is_claimed(autopilot) {
+        return false;
+    }
     matches!(
         reconcile_stalled_recovery(StalledRecoveryInput {
             phase: &recovery.phase,
@@ -1072,6 +1163,93 @@ pub(crate) fn begin_execution_recovery(
     );
     set_autopilot_recovering(proj, "正在诊断执行错误");
     touch(proj);
+}
+
+fn resource_observation_rank(state: project::ResourceObservationState) -> u8 {
+    match state {
+        project::ResourceObservationState::Unknown => 0,
+        project::ResourceObservationState::MeasuredSafe => 1,
+        project::ResourceObservationState::Warning => 2,
+        project::ResourceObservationState::KilledSuspected => 3,
+        project::ResourceObservationState::HardStop => 4,
+    }
+}
+
+/// Persist resource evidence without inferring an OOM cause from free-form text.
+/// HardStop evidence is monotonic; a later startup observation cannot downgrade it.
+pub(crate) fn record_resource_facts(
+    proj: &mut project::Project,
+    observation: project::ResourceObservationSummary,
+    failure_kind: Option<project::ResourceFailureKind>,
+    message: &str,
+) -> bool {
+    let Some(session) = proj.execution_session.as_ref() else {
+        return false;
+    };
+    let session_id = session.execution_id.clone();
+    let subtask_id = session.subtask_id.clone();
+    let baseline_commit = session.base_commit.clone();
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut created = false;
+    let mut changed = false;
+    if proj.workflow_state.recovery_state.is_none() {
+        let mut recovery = create_recovery_state(
+            project::RecoveryErrorKind::ExecutionError,
+            subtask_id,
+            session_id,
+            baseline_commit,
+            message.to_string(),
+        );
+        recovery.phase = project::RecoveryPhase::WaitingHuman;
+        recovery.resource_observation = observation.clone();
+        recovery.resource_failure_kind = failure_kind;
+        proj.workflow_state.recovery_state = Some(recovery);
+        created = true;
+        changed = true;
+    } else if let Some(recovery) = proj.workflow_state.recovery_state.as_mut() {
+        if resource_observation_rank(observation.state)
+            > resource_observation_rank(recovery.resource_observation.state)
+        {
+            recovery.resource_observation = observation.clone();
+            changed = true;
+        } else if recovery.resource_observation.state == project::ResourceObservationState::Unknown
+        {
+            recovery.resource_observation = observation.clone();
+            changed = true;
+        }
+        if failure_kind.is_some()
+            && (recovery.resource_failure_kind.is_none()
+                || recovery.resource_failure_kind
+                    == Some(project::ResourceFailureKind::ResourceKilled))
+            && recovery.resource_failure_kind != failure_kind
+        {
+            recovery.resource_failure_kind = failure_kind;
+            changed = true;
+        }
+        if failure_kind == Some(project::ResourceFailureKind::ResourcePressure)
+            && recovery.phase != project::RecoveryPhase::WaitingHuman
+        {
+            recovery.phase = project::RecoveryPhase::WaitingHuman;
+            changed = true;
+        }
+        if changed && !message.trim().is_empty() {
+            recovery.last_repair_summary = truncate_chars(message, 4_000);
+        }
+        if changed {
+            recovery.updated_at = now.clone();
+        }
+    }
+    if changed {
+        if let Some(autopilot) = proj.workflow_state.autopilot_state.as_mut() {
+            autopilot.run_status = project::AutopilotRunStatus::ErrorStopped;
+            autopilot.last_action = truncate_chars(message, 2_048);
+            autopilot.last_action_at = now;
+            autopilot.error_message = truncate_chars(message, 2_048);
+            autopilot.recovery_action = project::AutopilotRecoveryAction::WaitHumanDecision;
+        }
+        touch(proj);
+    }
+    created || changed
 }
 
 pub(crate) fn ensure_quality_recovery(
@@ -1581,8 +1759,8 @@ async fn replan_current_subtask(
     subtask: &project::Subtask,
     authorized_paths: &[String],
 ) -> Result<(), String> {
-    if recovery.replan_attempted {
-        return Err("当前小阶段已经执行过受限重规划。".to_string());
+    if recovery.replan_attempted || recovery.replan_execution_attempted {
+        return Err("当前小阶段已经执行过受限重规划或其重规划执行，进入人工边界。".to_string());
     }
     if subtask.acceptance_criteria.is_empty() {
         return Err("当前小阶段没有可供重规划核对的验收标准。".to_string());
@@ -2647,6 +2825,32 @@ pub(crate) async fn run_error_recovery_with_pipeline(
             crate::save_project(&proj)?;
             return crate::load_project(&project_name);
         }
+        Err(crate::engine::EngineError::ResourceHardStop {
+            execution_result,
+            resource_observation,
+        }) => {
+            let message = "自动修复因资源压力达到硬停止阈值而终止";
+            handle_repair_engine_block(
+                &mut proj,
+                &session,
+                &recovery_execution_id,
+                message,
+                project::EngineFailureKind::ProcessCrash,
+                execution_result.map(|result| *result),
+                &mut pipeline_guard,
+            )?;
+            record_resource_facts(
+                &mut proj,
+                resource_observation.unwrap_or_else(|| project::ResourceObservationSummary {
+                    state: project::ResourceObservationState::HardStop,
+                    ..Default::default()
+                }),
+                Some(project::ResourceFailureKind::ResourcePressure),
+                message,
+            );
+            crate::save_project(&proj)?;
+            return crate::load_project(&project_name);
+        }
         Err(error) => {
             let message = error.to_string();
             let kind = crate::engine::classify_process_failure(None, &message, "");
@@ -2955,21 +3159,55 @@ fn handle_repair_execution_failure(
     Ok(())
 }
 
+fn restore_pre_retest_task_state(
+    item: &mut project::Subtask,
+    previous_ledger: &[project::AcceptanceLedgerItem],
+) {
+    item.test_report.clear();
+    item.test_result = None;
+    item.acceptance_ledger = previous_ledger.to_vec();
+    item.human_verification = None;
+    item.status = project::SubtaskStatus::Executing;
+}
+
+fn failed_retest_session_status(phase: &project::RecoveryPhase) -> &'static str {
+    match phase {
+        project::RecoveryPhase::WaitingHuman => "quality_blocked",
+        project::RecoveryPhase::Replanning => "replanning",
+        project::RecoveryPhase::Diagnosing
+        | project::RecoveryPhase::Repairing
+        | project::RecoveryPhase::Retesting => "recovering",
+        _ => "quality_blocked",
+    }
+}
+
+fn store_failed_retest(item: &mut project::Subtask, test: project::TestResult) {
+    item.status = project::SubtaskStatus::Executing;
+    item.acceptance_ledger = test.acceptance_results.clone();
+    item.test_result = Some(test);
+}
+
 pub(crate) fn finish_retest(
     proj: &mut project::Project,
     session: &project::ExecutionSession,
     execution_id: &str,
     mut test: project::TestResult,
 ) -> Result<bool, String> {
+    if session.execution_id != execution_id {
+        return Err("复测结果的执行身份与会话不一致，已忽略。".to_string());
+    }
     let recovery_is_current = proj
         .workflow_state
         .recovery_state
         .as_ref()
-        .is_some_and(|current| current.execution_id == execution_id)
+        .is_some_and(|current| {
+            current.execution_id == execution_id && current.subtask_id == session.subtask_id
+        })
         && proj.execution_session.as_ref().is_some_and(|current| {
             current.active
                 && current.status.eq_ignore_ascii_case("recovering")
                 && current.execution_id == execution_id
+                && current.subtask_id == session.subtask_id
         });
     if !recovery_is_current {
         return Err("复测结果属于已失效的恢复会话，已忽略。".to_string());
@@ -2978,6 +3216,9 @@ pub(crate) fn finish_retest(
     let subtask = crate::task_tree::find_task(proj, &session.subtask_id)?
         .ok_or_else(|| "复测完成后无法定位小阶段。".to_string())?
         .clone();
+    // Keep the pre-retest ledger available for regression rollback. The new
+    // test result is allowed to replace evidence only after this snapshot.
+    let previous_ledger = subtask.acceptance_ledger.clone();
     let authorized_paths = crate::plan_contract::validate_subtask(&subtask, "恢复复测任务")?;
     let evidence_recovery = proj
         .workflow_state
@@ -3011,7 +3252,11 @@ pub(crate) fn finish_retest(
     test.passed = quality_passed;
     let item = crate::task_tree::find_task_mut(proj, &session.subtask_id)?
         .ok_or_else(|| "复测完成后无法定位小阶段。".to_string())?;
-    item.status = project::SubtaskStatus::AwaitingConfirmation;
+    item.status = if quality_passed {
+        project::SubtaskStatus::AwaitingConfirmation
+    } else {
+        project::SubtaskStatus::Executing
+    };
     item.test_result = Some(test.clone());
     item.acceptance_ledger = test.acceptance_results.clone();
 
@@ -3405,11 +3650,7 @@ pub(crate) fn finish_retest(
                 &mut proj.milestones,
                 &session.subtask_id,
             ) {
-                item.test_report.clear();
-                item.test_result = None;
-                item.acceptance_ledger.clear();
-                item.human_verification = None;
-                item.status = project::SubtaskStatus::Executing;
+                restore_pre_retest_task_state(item, &previous_ledger);
             }
             recovery.active_issues = previous_issues;
             recovery.original_test_failure = previous_failure;
@@ -3429,14 +3670,8 @@ pub(crate) fn finish_retest(
         } else if !checkpoint_id.is_empty() {
             crate::recovery_checkpoint::discard(&checkpoint_id)?;
         }
-        let accepted_execution = recovery.pending_execution_result.take();
-        if let Some(item) =
-            crate::task_tree::find_task_in_milestones_mut(&mut proj.milestones, &session.subtask_id)
-        {
-            if accepted_execution.is_some() {
-                item.execution_result = accepted_execution;
-            }
-        }
+        // Keep the repair result pending until a successful retest. A failed
+        // retest may update test/ledger evidence, but it cannot commit code facts.
         let next_signature = normalized_signature(&next_kind, &summary);
         let regular_repair_exhausted =
             record_failed_signature(recovery, next_kind.clone(), next_signature);
@@ -3476,11 +3711,7 @@ pub(crate) fn finish_retest(
     if let Some(current_session) = proj.execution_session.as_mut() {
         current_session.execution_id = execution_id.to_string();
         current_session.active = true;
-        current_session.status = match next_phase {
-            project::RecoveryPhase::WaitingHuman => "quality_blocked".to_string(),
-            project::RecoveryPhase::Replanning => "replanning".to_string(),
-            _ => "awaiting_confirmation".to_string(),
-        };
+        current_session.status = failed_retest_session_status(&next_phase).to_string();
         current_session.failure_message = truncate_chars(&summary, 2_048);
         current_session.state_entered_at = chrono::Utc::now().to_rfc3339();
     }
@@ -4027,9 +4258,7 @@ pub(crate) async fn resolve_human_recovery(
                 if let Ok(Some(item)) =
                     crate::task_tree::find_task_mut(&mut proj, &session.subtask_id)
                 {
-                    item.status = project::SubtaskStatus::AwaitingConfirmation;
-                    item.test_result = Some(test.clone());
-                    item.acceptance_ledger = test.acceptance_results.clone();
+                    store_failed_retest(item, test.clone());
                 }
                 mark_waiting_human(
                     &mut proj,
@@ -4074,6 +4303,94 @@ pub(crate) async fn resolve_human_recovery(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_facts_are_monotonic_and_never_claim_oom_from_kill_evidence() {
+        let mut proj = project::Project::new("resource-facts");
+        proj.execution_session = Some(project::ExecutionSession {
+            execution_id: "execution-resource".to_string(),
+            subtask_id: "subtask-resource".to_string(),
+            ..Default::default()
+        });
+
+        assert!(record_resource_facts(
+            &mut proj,
+            project::ResourceObservationSummary {
+                state: project::ResourceObservationState::HardStop,
+                ..Default::default()
+            },
+            Some(project::ResourceFailureKind::ResourcePressure),
+            "资源压力达到硬停止阈值",
+        ));
+        assert!(record_resource_facts(
+            &mut proj,
+            project::ResourceObservationSummary {
+                state: project::ResourceObservationState::KilledSuspected,
+                ..Default::default()
+            },
+            Some(project::ResourceFailureKind::ResourceKilled),
+            "启动时只确认子进程已退出",
+        ));
+
+        let recovery = proj.workflow_state.recovery_state.as_ref().unwrap();
+        assert_eq!(
+            recovery.resource_observation.state,
+            project::ResourceObservationState::HardStop
+        );
+        assert_eq!(
+            recovery.resource_failure_kind,
+            Some(project::ResourceFailureKind::ResourcePressure)
+        );
+        assert!(!recovery.last_repair_summary.contains("OOM"));
+    }
+
+    #[test]
+    fn measured_safe_fills_unknown_without_downgrading_stronger_facts() {
+        let mut proj = project::Project::new("resource-safe-monotonic");
+        proj.execution_session = Some(project::ExecutionSession {
+            execution_id: "execution-resource-safe".to_string(),
+            subtask_id: "subtask-resource-safe".to_string(),
+            ..Default::default()
+        });
+
+        assert!(record_resource_facts(
+            &mut proj,
+            project::ResourceObservationSummary {
+                state: project::ResourceObservationState::MeasuredSafe,
+                ..Default::default()
+            },
+            None,
+            "资源已测量且安全",
+        ));
+        assert!(record_resource_facts(
+            &mut proj,
+            project::ResourceObservationSummary {
+                state: project::ResourceObservationState::Warning,
+                ..Default::default()
+            },
+            Some(project::ResourceFailureKind::ResourcePressure),
+            "资源进入 warning",
+        ));
+        assert!(!record_resource_facts(
+            &mut proj,
+            project::ResourceObservationSummary {
+                state: project::ResourceObservationState::MeasuredSafe,
+                ..Default::default()
+            },
+            None,
+            "较新的安全样本不能覆盖 warning",
+        ));
+
+        let recovery = proj.workflow_state.recovery_state.as_ref().unwrap();
+        assert_eq!(
+            recovery.resource_observation.state,
+            project::ResourceObservationState::Warning
+        );
+        assert_eq!(
+            recovery.resource_failure_kind,
+            Some(project::ResourceFailureKind::ResourcePressure)
+        );
+    }
 
     fn contract_subtask() -> project::Subtask {
         project::Subtask {
@@ -4695,6 +5012,8 @@ mod tests {
         proj.workflow_state.autopilot_state = Some(project::AutopilotState {
             active: true,
             run_status: project::AutopilotRunStatus::Running,
+            job_id: "stalled-job".to_string(),
+            job_owner: project::AutopilotJobOwner::BackendRuntime,
             recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
             current_action_id: String::new(),
             current_action_kind: String::new(),
@@ -4746,6 +5065,7 @@ mod tests {
         assert!(autopilot.current_action_id.is_empty());
         assert!(autopilot.current_action_kind.is_empty());
         assert!(autopilot.action_started_at.is_empty());
+        assert_eq!(autopilot.job_owner, project::AutopilotJobOwner::None);
         assert!(autopilot.next_retry_at.is_none());
         assert!(proj.execution_history.iter().any(|entry| {
             entry.event_type == project::ExecutionEventType::RecoveryExhausted
@@ -4755,6 +5075,46 @@ mod tests {
             entry.event_type == project::ExecutionEventType::RecoveryStalled
                 && entry.subtask_id.as_deref() == Some("sub-1")
         }));
+    }
+
+    #[test]
+    fn lost_recovery_claim_cannot_be_requeued_without_owner() {
+        let now = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 8, 11, 12, 0, 0)
+            .single()
+            .expect("fixed now");
+        let mut proj = project::Project::new("lost-recovery-claim");
+        proj.workflow_state.autopilot_active = true;
+        proj.workflow_state.autopilot_state = Some(project::AutopilotState {
+            active: true,
+            run_status: project::AutopilotRunStatus::Running,
+            recovery_action: project::AutopilotRecoveryAction::RunAutomaticRecovery,
+            current_action_id: "orphaned-action".to_string(),
+            current_action_kind: "run_error_recovery".to_string(),
+            action_started_at: "2026-08-11T11:59:00Z".to_string(),
+            ..Default::default()
+        });
+        proj.workflow_state.recovery_state = Some(project::RecoveryState {
+            phase: project::RecoveryPhase::Repairing,
+            error_kind: project::RecoveryErrorKind::PlanFailure,
+            subtask_id: "sub-1".to_string(),
+            execution_id: "exec-lost".to_string(),
+            updated_at: "2026-08-11T11:59:30Z".to_string(),
+            ..Default::default()
+        });
+
+        assert!(!recovery_allows_automatic_claim(&proj, now));
+        assert_eq!(
+            apply_stalled_recovery_reconciliation(&mut proj, now),
+            StalledRecoveryDisposition::EnterHumanBoundary
+        );
+        let autopilot = proj.workflow_state.autopilot_state.as_ref().unwrap();
+        assert_eq!(autopilot.job_owner, project::AutopilotJobOwner::None);
+        assert!(autopilot.current_action_id.is_empty());
+        assert!(autopilot.current_action_kind.is_empty());
+        assert_eq!(
+            proj.workflow_state.recovery_state.as_ref().unwrap().phase,
+            project::RecoveryPhase::WaitingHuman
+        );
     }
 
     #[test]
@@ -4774,6 +5134,80 @@ mod tests {
     }
 
     #[test]
+    fn regression_rollback_restores_the_pre_retest_ledger() {
+        let previous_ledger = vec![project::AcceptanceLedgerItem {
+            criterion_index: 1,
+            criterion: "criterion".to_string(),
+            status: project::AcceptanceStatus::Unsatisfied,
+            evidence: "pre-retest failure".to_string(),
+            ..Default::default()
+        }];
+        let mut task = project::Subtask {
+            status: project::SubtaskStatus::AwaitingConfirmation,
+            test_report: "new report".to_string(),
+            test_result: Some(project::TestResult::default()),
+            acceptance_ledger: vec![project::AcceptanceLedgerItem {
+                criterion_index: 1,
+                criterion: "criterion".to_string(),
+                status: project::AcceptanceStatus::Satisfied,
+                evidence: "new evidence".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        restore_pre_retest_task_state(&mut task, &previous_ledger);
+
+        assert_eq!(task.status, project::SubtaskStatus::Executing);
+        assert!(task.test_report.is_empty());
+        assert!(task.test_result.is_none());
+        assert_eq!(task.acceptance_ledger, previous_ledger);
+    }
+
+    #[test]
+    fn failed_retest_states_never_report_awaiting_confirmation() {
+        for phase in [
+            project::RecoveryPhase::Diagnosing,
+            project::RecoveryPhase::Repairing,
+            project::RecoveryPhase::Retesting,
+        ] {
+            assert_eq!(failed_retest_session_status(&phase), "recovering");
+        }
+        assert_eq!(
+            failed_retest_session_status(&project::RecoveryPhase::Replanning),
+            "replanning"
+        );
+        assert_eq!(
+            failed_retest_session_status(&project::RecoveryPhase::WaitingHuman),
+            "quality_blocked"
+        );
+
+        let test = project::TestResult {
+            passed: false,
+            acceptance_results: vec![project::AcceptanceLedgerItem {
+                criterion_index: 1,
+                status: project::AcceptanceStatus::Unsatisfied,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut task = project::Subtask {
+            status: project::SubtaskStatus::AwaitingConfirmation,
+            ..Default::default()
+        };
+        store_failed_retest(&mut task, test.clone());
+        assert_eq!(task.status, project::SubtaskStatus::Executing);
+        assert_eq!(
+            serde_json::to_value(task.test_result.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(&test).unwrap()
+        );
+        assert_eq!(
+            task.acceptance_ledger[0].status,
+            project::AcceptanceStatus::Unsatisfied
+        );
+    }
+
+    #[test]
     fn repeated_signature_stops_before_spending_another_attempt() {
         let mut recovery = project::RecoveryState {
             error_kind: project::RecoveryErrorKind::TestFailure,
@@ -4783,12 +5217,18 @@ mod tests {
             max_attempts: 2,
             ..Default::default()
         };
-        assert!(!record_failed_signature(
+        assert!(record_failed_signature(
             &mut recovery,
             project::RecoveryErrorKind::TestFailure,
             "same".to_string(),
         ));
         assert_eq!(recovery.repeated_signature_count, 2);
+        assert!(!record_failed_signature(
+            &mut recovery,
+            project::RecoveryErrorKind::TestFailure,
+            "changed".to_string(),
+        ));
+        assert_eq!(recovery.repeated_signature_count, 1);
     }
 
     #[test]

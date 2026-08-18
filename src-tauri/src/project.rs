@@ -828,6 +828,11 @@ pub struct RecoveryState {
     /// 执行端阻断的细分类别；旧项目为空。
     #[serde(default)]
     pub engine_failure_kind: Option<EngineFailureKind>,
+    /// 运行中资源事实；旧项目和不可测平台保持 Unknown。
+    #[serde(default)]
+    pub resource_observation: ResourceObservationSummary,
+    #[serde(default)]
+    pub resource_failure_kind: Option<ResourceFailureKind>,
     /// Repair-level file checkpoint used to undo only the latest regressing attempt.
     #[serde(default)]
     pub checkpoint_id: String,
@@ -893,6 +898,8 @@ impl Default for RecoveryState {
             started_at: String::new(),
             updated_at: String::new(),
             engine_failure_kind: None,
+            resource_observation: ResourceObservationSummary::default(),
+            resource_failure_kind: None,
             checkpoint_id: String::new(),
             rollback_retest_pending: false,
             evidence_rebuild_attempted: false,
@@ -1400,6 +1407,59 @@ pub struct ExecutionResult {
     /// 供应方返回的执行 token；未返回 usage 时保持 None。
     #[serde(default)]
     pub token_usage: Option<crate::cost_ledger::ProviderUsage>,
+}
+
+/// 运行中资源观测的保守状态。缺少采样事实时必须保持 Unknown，不能推断为正常。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ResourceObservationState {
+    #[default]
+    Unknown,
+    MeasuredSafe,
+    Warning,
+    HardStop,
+    KilledSuspected,
+}
+
+/// 资源采样来源，明确区分进程 RSS、cgroup 和进程内观测。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ResourceObservationSource {
+    #[default]
+    Unknown,
+    Proc,
+    Cgroup,
+    InProcess,
+}
+
+/// 可持久化的资源观测摘要；字段只增量兼容，采样器在后续 ST 填充。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ResourceObservationSummary {
+    #[serde(default)]
+    pub state: ResourceObservationState,
+    #[serde(default)]
+    pub source: ResourceObservationSource,
+    #[serde(default)]
+    pub current_rss_bytes: Option<u64>,
+    #[serde(default)]
+    pub peak_rss_bytes: Option<u64>,
+    #[serde(default)]
+    pub cgroup_current_bytes: Option<u64>,
+    #[serde(default)]
+    pub cgroup_limit_bytes: Option<u64>,
+    #[serde(default)]
+    pub headroom_bytes: Option<u64>,
+    #[serde(default)]
+    pub warning_reserve_bytes: Option<u64>,
+    #[serde(default)]
+    pub hard_stop_reserve_bytes: Option<u64>,
+    #[serde(default)]
+    pub sampled_at: Option<String>,
+}
+
+/// 资源失败类别与普通引擎错误分离，避免把不可归属的 OS kill 误归因于 provider。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ResourceFailureKind {
+    ResourcePressure,
+    ResourceKilled,
 }
 
 /// 执行引擎错误分类。它描述执行环境事实，不代表项目代码质量。
@@ -3625,6 +3685,29 @@ mod tests {
         assert_eq!(result.engine_runtime, ExecutionRuntime::Plugin);
         assert_eq!(result.engine_settings_revision, 0);
 
+        let resource: ResourceObservationSummary = serde_json::from_str("{}").unwrap();
+        assert_eq!(resource.state, ResourceObservationState::Unknown);
+        assert_eq!(resource.source, ResourceObservationSource::Unknown);
+        assert!(resource.current_rss_bytes.is_none());
+        assert!(resource.peak_rss_bytes.is_none());
+        assert!(resource.cgroup_current_bytes.is_none());
+        assert!(resource.cgroup_limit_bytes.is_none());
+        assert!(resource.headroom_bytes.is_none());
+        assert!(resource.warning_reserve_bytes.is_none());
+        assert!(resource.hard_stop_reserve_bytes.is_none());
+        assert!(resource.sampled_at.is_none());
+
+        let mut recovery_value = serde_json::to_value(RecoveryState::default()).unwrap();
+        let recovery_object = recovery_value.as_object_mut().unwrap();
+        recovery_object.remove("resource_observation");
+        recovery_object.remove("resource_failure_kind");
+        let recovery: RecoveryState = serde_json::from_value(recovery_value).unwrap();
+        assert_eq!(
+            recovery.resource_observation.state,
+            ResourceObservationState::Unknown
+        );
+        assert!(recovery.resource_failure_kind.is_none());
+
         let mut subtask_value =
             serde_json::to_value(Subtask::default()).map_err(|error| error.to_string())?;
         for field in [
@@ -3657,6 +3740,23 @@ mod tests {
         let project: Project =
             serde_json::from_value(project_value).map_err(|error| error.to_string())?;
         assert!(project.recovery_learning.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resource_observation_states_round_trip_without_aliasing() -> Result<(), String> {
+        for state in [
+            ResourceObservationState::Unknown,
+            ResourceObservationState::MeasuredSafe,
+            ResourceObservationState::Warning,
+            ResourceObservationState::HardStop,
+            ResourceObservationState::KilledSuspected,
+        ] {
+            let encoded = serde_json::to_string(&state).map_err(|error| error.to_string())?;
+            let decoded: ResourceObservationState =
+                serde_json::from_str(&encoded).map_err(|error| error.to_string())?;
+            assert_eq!(decoded, state);
+        }
         Ok(())
     }
 

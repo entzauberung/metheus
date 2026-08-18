@@ -1,5 +1,6 @@
 use crate::project::{
-    AutopilotRecoveryAction, GitConfirmationFailureKind, Project, RecoveryErrorKind, RecoveryPhase,
+    AutopilotJobOwner, AutopilotRecoveryAction, GitConfirmationFailureKind, Project,
+    RecoveryErrorKind, RecoveryPhase,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -278,7 +279,7 @@ fn disabled_decision(
 }
 
 fn reason(project: &Project, fallback: &str) -> String {
-    project
+    let base = project
         .execution_session
         .as_ref()
         .map(|session| session.failure_message.trim())
@@ -300,7 +301,67 @@ fn reason(project: &Project, fallback: &str) -> String {
                 .filter(|message| !message.is_empty())
         })
         .unwrap_or(fallback)
-        .to_string()
+        .to_string();
+    let Some(recovery) = project.workflow_state.recovery_state.as_ref() else {
+        return base;
+    };
+    let mut trace = Vec::new();
+    if !recovery.active_issues.is_empty() {
+        let issues = recovery
+            .active_issues
+            .iter()
+            .take(6)
+            .map(|issue| {
+                let evidence = issue
+                    .evidence_references
+                    .iter()
+                    .take(6)
+                    .map(|reference| reference.block_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                format!(
+                    "{} criterion={} file={} actual={} suggestion={} evidence={}",
+                    issue.id,
+                    issue
+                        .criterion_index
+                        .map(|index| index.to_string())
+                        .unwrap_or_else(|| "unbound".to_string()),
+                    if issue.file.is_empty() {
+                        "unbound"
+                    } else {
+                        issue.file.as_str()
+                    },
+                    issue.actual.chars().take(180).collect::<String>(),
+                    if issue.suggested_change.is_empty() {
+                        "unavailable"
+                    } else {
+                        issue.suggested_change.as_str()
+                    },
+                    if evidence.is_empty() {
+                        "none"
+                    } else {
+                        evidence.as_str()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        trace.push(format!("剩余问题：{}", issues.join("；")));
+    }
+    if !recovery.pending_evidence_criteria.is_empty() {
+        trace.push(format!(
+            "待补证验收项：{:?}",
+            recovery.pending_evidence_criteria
+        ));
+    }
+    if let Some(attempt) = recovery.attempt_history.last() {
+        if !attempt.summary.trim().is_empty() {
+            trace.push(format!("最近复测：{}", attempt.summary));
+        }
+    }
+    if trace.is_empty() {
+        return base;
+    }
+    format!("{}；{}", base, trace.join("；"))
 }
 
 fn retryable_git_confirmation(failure: Option<&GitConfirmationFailureKind>) -> bool {
@@ -385,6 +446,17 @@ fn recovery_timestamp(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|timestamp| timestamp.with_timezone(&chrono::Utc))
 }
 
+fn has_proven_backend_owner(state: &crate::project::AutopilotState) -> bool {
+    state.active
+        && state.run_status == crate::project::AutopilotRunStatus::Running
+        && state.job_owner == AutopilotJobOwner::BackendRuntime
+        && !state.job_id.is_empty()
+}
+
+fn has_recovery_action_claim(state: &crate::project::AutopilotState) -> bool {
+    !state.current_action_id.is_empty() && state.current_action_kind == "run_error_recovery"
+}
+
 fn recovery_progress_at(
     project: &Project,
     now: chrono::DateTime<chrono::Utc>,
@@ -392,6 +464,8 @@ fn recovery_progress_at(
 ) -> RecoveryProgressPresentation {
     let recovery = project.workflow_state.recovery_state.as_ref();
     let autopilot = project.workflow_state.autopilot_state.as_ref();
+    let owner_lost = autopilot
+        .is_some_and(|state| has_recovery_action_claim(state) && !has_proven_backend_owner(state));
     let waiting_human = recovery
         .map(|state| state.phase == RecoveryPhase::WaitingHuman)
         .unwrap_or(false)
@@ -400,11 +474,10 @@ fn recovery_progress_at(
                 state.run_status == crate::project::AutopilotRunStatus::ErrorStopped
                     || state.recovery_action == AutopilotRecoveryAction::WaitHumanDecision
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
+        || owner_lost;
     let claimed = autopilot.filter(|state| {
-        !waiting_human
-            && !state.current_action_id.is_empty()
-            && state.current_action_kind == "run_error_recovery"
+        has_proven_backend_owner(state) && !waiting_human && has_recovery_action_claim(state)
     });
     let action_started_at = claimed
         .map(|state| state.action_started_at.clone())
@@ -698,13 +771,19 @@ fn heartbeat_status_at(project: &Project, now: chrono::DateTime<chrono::Utc>) ->
         .map(|state| state.phase == RecoveryPhase::WaitingHuman)
         .unwrap_or(false)
         || autopilot.run_status == crate::project::AutopilotRunStatus::ErrorStopped
-        || autopilot.recovery_action == AutopilotRecoveryAction::WaitHumanDecision;
+        || autopilot.recovery_action == AutopilotRecoveryAction::WaitHumanDecision
+        || (has_recovery_action_claim(autopilot) && !has_proven_backend_owner(autopilot));
     if waiting_human {
         return if autopilot.heartbeat_at.is_empty() {
             "已停止".to_string()
         } else {
             format!("已停止，最后更新 {}", autopilot.heartbeat_at)
         };
+    }
+    if autopilot.run_status == crate::project::AutopilotRunStatus::Running
+        && !has_proven_backend_owner(autopilot)
+    {
+        return "等待后台 worker 领取".to_string();
     }
     if autopilot.heartbeat_at.is_empty() {
         return "未记录".to_string();
@@ -1186,6 +1265,8 @@ pub(crate) fn present_recovery(project: &Project) -> RecoveryPresentation {
     let recovery_action = autopilot
         .map(|state| &state.recovery_action)
         .unwrap_or(&AutopilotRecoveryAction::None);
+    let orphaned_recovery_claim = autopilot
+        .is_some_and(|state| has_recovery_action_claim(state) && !has_proven_backend_owner(state));
     let automatic_infrastructure_retry = autopilot
         .map(|state| state.transient_retry_count > 0 && state.next_retry_at.is_some())
         .unwrap_or(false);
@@ -1249,6 +1330,28 @@ pub(crate) fn present_recovery(project: &Project) -> RecoveryPresentation {
     }
 
     if let Some(recovery) = recovery {
+        if orphaned_recovery_claim {
+            return finish(
+                project,
+                RecoveryPresentationKind::HumanDecision,
+                "等待人工决策",
+                reason(
+                    project,
+                    "恢复 worker owner 无法证明，已停止自动恢复，请人工处理。",
+                ),
+                RecoverySeverity::Error,
+                Some(action(
+                    RecoveryCapability::ResolveHumanRecovery,
+                    "选择处理方式",
+                )),
+                Vec::new(),
+                true,
+                false,
+                false,
+                false,
+                human_decision_options(project),
+            );
+        }
         if validation_recovery(&recovery.error_kind) {
             let automatic_retry = recovery.phase == RecoveryPhase::Retesting
                 && recovery.validation_retry_count < recovery.max_validation_retries;
@@ -1586,6 +1689,42 @@ mod tests {
     }
 
     #[test]
+    fn failed_retest_presentation_keeps_issue_trace_in_human_boundary() {
+        let mut project = Project::new("failed-retest-trace");
+        project.workflow_state.recovery_state = Some(RecoveryState {
+            error_kind: RecoveryErrorKind::HumanRequired,
+            phase: RecoveryPhase::WaitingHuman,
+            active_issues: vec![crate::project::RecoveryIssue {
+                id: "criterion:1:file:index.html".to_string(),
+                criterion_index: Some(1),
+                file: "index.html".to_string(),
+                actual: "按钮仍不可点击".to_string(),
+                suggested_change: "补充点击处理".to_string(),
+                evidence_references: vec![crate::project::ReviewEvidenceReference {
+                    block_id: "E001".to_string(),
+                    file: "index.html".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            attempt_history: vec![crate::project::RecoveryAttemptRecord {
+                summary: "第 2 次复测：解决 0 项，剩余 1 项，新增 0 项".to_string(),
+                ..Default::default()
+            }],
+            ..RecoveryState::default()
+        });
+
+        let presentation = present_recovery(&project);
+        assert_eq!(presentation.kind, RecoveryPresentationKind::HumanDecision);
+        assert!(presentation.reason.contains("criterion=1"));
+        assert!(presentation.reason.contains("file=index.html"));
+        assert!(presentation.reason.contains("suggestion=补充点击处理"));
+        assert!(presentation.reason.contains("evidence=E001"));
+        assert_eq!(presentation.phase_label, "等待人工决策");
+        assert!(!presentation.reason.contains("恢复已完成"));
+    }
+
+    #[test]
     fn engine_and_human_blocks_are_distinct() {
         let mut engine = Project::new("engine-blocked");
         engine.workflow_state.recovery_state = Some(RecoveryState {
@@ -1747,6 +1886,29 @@ mod tests {
         );
         assert!(!present_recovery(&queued).background_retry_active);
 
+        let mut lost_claim = queued.clone();
+        lost_claim.name = "progress-lost-claim".to_string();
+        let lost_autopilot = lost_claim
+            .workflow_state
+            .autopilot_state
+            .as_mut()
+            .expect("autopilot");
+        lost_autopilot.current_action_id = "lost-claim".to_string();
+        lost_autopilot.current_action_kind = "run_error_recovery".to_string();
+        lost_autopilot.heartbeat_at = now.to_rfc3339();
+        assert_eq!(
+            recovery_progress_at(&lost_claim, now, true).status,
+            RecoveryProgressStatus::WaitingHuman
+        );
+        let lost_view = present_recovery(&lost_claim);
+        assert_eq!(lost_view.kind, RecoveryPresentationKind::HumanDecision);
+        assert!(!lost_view.background_retry_active);
+        assert_eq!(
+            lost_view.progress_status,
+            RecoveryProgressStatus::WaitingHuman
+        );
+        assert!(heartbeat_status_at(&lost_claim, now).starts_with("已停止"));
+
         let mut scheduled = queued.clone();
         scheduled.name = "progress-scheduled".to_string();
         scheduled
@@ -1767,6 +1929,8 @@ mod tests {
                 (now - chrono::Duration::seconds(progress_age)).to_rfc3339(),
             ));
             project.workflow_state.autopilot_state = Some(AutopilotState {
+                job_id: format!("{name}-job"),
+                job_owner: crate::project::AutopilotJobOwner::BackendRuntime,
                 current_action_id: format!("{name}-claim"),
                 current_action_kind: "run_error_recovery".to_string(),
                 action_started_at: (now - chrono::Duration::seconds(action_age)).to_rfc3339(),

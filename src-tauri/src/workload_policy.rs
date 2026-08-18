@@ -5,6 +5,17 @@ use sha2::{Digest, Sha256};
 
 const LARGE_BASELINE_FILE_COUNT: usize = 200;
 
+/// Total wall-clock caps are workload policy, not provider/API timeouts. A
+/// single attempt is always bounded below the historical 22-minute runaway.
+pub(crate) fn wall_clock_budget_secs(scale: WorkloadScale) -> u64 {
+    match scale {
+        WorkloadScale::Micro => 5 * 60,
+        WorkloadScale::Small => 10 * 60,
+        WorkloadScale::Standard => 15 * 60,
+        WorkloadScale::System => 20 * 60,
+    }
+}
+
 /// Pure workload classification. The caller supplies all facts; this module performs no I/O.
 pub fn classify(
     signals: WorkloadSignals,
@@ -99,7 +110,7 @@ pub fn render_planning_constraints(profile: &WorkloadProfile) -> String {
     };
     format!(
         "工作负载={:?}; 拓扑={topology}; 数量上限=Milestone {}, MidStage {}, Subtask {}; \
-split深度上限={}; 检查深度={:?}; 执行预算=turns {}, transport retries {}, doom-loop retries {}",
+split深度上限={}; 检查深度={:?}; 执行预算=turns {}, transport retries {}, doom-loop retries {}, wall-clock {} 秒",
         profile.scale,
         profile.max_milestones,
         profile.max_mid_stages,
@@ -109,6 +120,7 @@ split深度上限={}; 检查深度={:?}; 执行预算=turns {}, transport retrie
         profile.max_executor_turns,
         profile.max_transport_retries,
         profile.max_doom_loop_retries,
+        wall_clock_budget_secs(profile.scale),
     )
 }
 
@@ -385,5 +397,14 @@ mod tests {
         assert!(rendered.contains("Milestone -> Subtask"));
         assert!(rendered.contains("Subtask 3"));
         assert!(rendered.contains("turns 8"));
+        assert!(rendered.contains("wall-clock 600 秒"));
+    }
+
+    #[test]
+    fn wall_clock_policy_is_bounded_and_scale_sensitive() {
+        assert_eq!(wall_clock_budget_secs(WorkloadScale::Micro), 300);
+        assert_eq!(wall_clock_budget_secs(WorkloadScale::Small), 600);
+        assert_eq!(wall_clock_budget_secs(WorkloadScale::Standard), 900);
+        assert_eq!(wall_clock_budget_secs(WorkloadScale::System), 1_200);
     }
 }

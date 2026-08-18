@@ -96,18 +96,7 @@ pub(crate) fn hydrate_subtask_contract(
     subtask.required_identifiers = acceptance_identifiers(&subtask.acceptance_criteria)
         .into_iter()
         .collect();
-    if subtask.acceptance_ledger.is_empty() {
-        subtask.acceptance_ledger = subtask
-            .acceptance_criteria
-            .iter()
-            .enumerate()
-            .map(|(index, criterion)| project::AcceptanceLedgerItem {
-                criterion_index: index as u32 + 1,
-                criterion: criterion.clone(),
-                ..Default::default()
-            })
-            .collect();
-    }
+    hydrate_acceptance_ledger(subtask);
     if subtask.contract_snapshot.is_none()
         && !matches!(
             subtask.status,
@@ -119,6 +108,28 @@ pub(crate) fn hydrate_subtask_contract(
         subtask.contract_snapshot = Some(crate::task_contract::compile_subtask(
             subtask, None, 0, workload,
         ));
+    }
+}
+
+/// Ensure every contract criterion has one durable, initially-Unknown ledger row.
+/// Existing rows, including historical evidence, are never replaced or reclassified.
+pub(crate) fn hydrate_acceptance_ledger(subtask: &mut project::Subtask) {
+    for (index, criterion) in subtask.acceptance_criteria.iter().enumerate() {
+        let criterion_index = index as u32 + 1;
+        let already_hydrated = subtask
+            .acceptance_ledger
+            .iter()
+            .any(|item| item.criterion_index == criterion_index && item.criterion == *criterion);
+        if !already_hydrated {
+            subtask
+                .acceptance_ledger
+                .push(project::AcceptanceLedgerItem {
+                    criterion_index,
+                    criterion: criterion.clone(),
+                    // New and migrated criteria remain Unknown until independently verified.
+                    ..Default::default()
+                });
+        }
     }
 }
 
@@ -400,6 +411,54 @@ mod tests {
         for identifier in ["getEngines", "setDefault", "isDefault", "Date.now"] {
             assert!(compiled.contains(identifier));
         }
+    }
+
+    #[test]
+    fn ledger_hydration_is_idempotent_and_preserves_existing_evidence() {
+        let workload = crate::workload_policy::test_profile(project::WorkloadScale::Standard);
+        let mut task = subtask(&["src/main.ts"], &[]);
+        task.acceptance_criteria = vec![
+            "first criterion".to_string(),
+            "second criterion".to_string(),
+            "third criterion".to_string(),
+        ];
+        task.acceptance_ledger = vec![
+            project::AcceptanceLedgerItem {
+                criterion_index: 1,
+                criterion: "first criterion".to_string(),
+                status: project::AcceptanceStatus::Satisfied,
+                evidence: "existing evidence".to_string(),
+                ..Default::default()
+            },
+            project::AcceptanceLedgerItem {
+                criterion_index: 2,
+                criterion: "second criterion".to_string(),
+                status: project::AcceptanceStatus::Unsatisfied,
+                evidence: "historical failure".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        hydrate_subtask_contract(&mut task, &workload);
+        assert_eq!(task.acceptance_ledger.len(), 3);
+        assert_eq!(
+            task.acceptance_ledger[0].status,
+            project::AcceptanceStatus::Satisfied
+        );
+        assert_eq!(task.acceptance_ledger[0].evidence, "existing evidence");
+        assert_eq!(
+            task.acceptance_ledger[1].status,
+            project::AcceptanceStatus::Unsatisfied
+        );
+        assert_eq!(task.acceptance_ledger[1].evidence, "historical failure");
+        assert_eq!(
+            task.acceptance_ledger[2].status,
+            project::AcceptanceStatus::Unknown
+        );
+
+        let snapshot = task.acceptance_ledger.clone();
+        hydrate_subtask_contract(&mut task, &workload);
+        assert_eq!(task.acceptance_ledger, snapshot);
     }
 
     #[test]

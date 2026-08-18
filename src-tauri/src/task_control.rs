@@ -486,6 +486,7 @@ fn hydrate_task_contracts(
         ));
     }
     for task in tasks {
+        crate::plan_contract::hydrate_acceptance_ledger(task);
         if let Some(workload) = workload {
             let candidate = crate::task_contract::compile_subtask(task, parent_id, depth, workload);
             let must_refresh = task.contract_snapshot.as_ref().map_or(true, |current| {
@@ -807,6 +808,11 @@ mod tests {
         let restored = &project.milestones[0].subtasks[0];
         assert_eq!(restored.id, "missing-profile");
         assert!(restored.contract_snapshot.is_none());
+        assert_eq!(restored.acceptance_ledger.len(), 1);
+        assert_eq!(
+            restored.acceptance_ledger[0].status,
+            crate::project::AcceptanceStatus::Unknown
+        );
         assert_eq!(
             project.task_control.takeover_capability_status,
             TakeoverCapabilityStatus::Unavailable

@@ -8,6 +8,7 @@ import { MidStagePlanningStep } from "./console/MidStagePlanningStep";
 import { ExecutionPlanStep } from "./console/ExecutionPlanStep";
 import { getManagedFlowPresentation } from "./managedFlowPolicy";
 import { resolvePlanTarget } from "./planTargetPolicy";
+import { NativeReadinessPanel } from "./PreflightPanel";
 
 interface Props {
   project: Project;
@@ -226,7 +227,7 @@ export function ConsoleWorkflowPanel({
   ) : null;
 
   if (["MilestoneGeneration", "MilestoneCheck", "MilestoneApproval", "MilestoneSelection"].includes(step)) {
-    return <>{managedBanner}<MilestonePlanningStep project={project} busy={planningBusy} feedback={feedback}
+    return <><NativeReadinessPanel readiness={project.native_readiness} />{managedBanner}<MilestonePlanningStep project={project} busy={planningBusy} feedback={feedback}
       regenerationFeedback={regenerationFeedback} setRegenerationFeedback={setRegenerationFeedback}
       regenerationModalOpen={milestoneModalOpen} setRegenerationModalOpen={setMilestoneModalOpen}
       onGenerate={handleGenerateMilestone}
@@ -239,7 +240,7 @@ export function ConsoleWorkflowPanel({
   }
 
   if (["MidStageGeneration", "MidStageCheck", "MidStageApproval", "MidStageSelection"].includes(step)) {
-    return <>{managedBanner}<MidStagePlanningStep project={project} busy={planningBusy} feedback={feedback}
+    return <><NativeReadinessPanel readiness={project.native_readiness} />{managedBanner}<MidStagePlanningStep project={project} busy={planningBusy} feedback={feedback}
       regenerationFeedback={regenerationFeedback} setRegenerationFeedback={setRegenerationFeedback}
       regenerationModalOpen={midStageModalOpen} setRegenerationModalOpen={setMidStageModalOpen}
       onGenerate={() => runProjectCommand("generate_mid_stage_draft", { projectName: project.name }, "中阶段草稿已生成。")}
@@ -252,7 +253,7 @@ export function ConsoleWorkflowPanel({
   }
 
   if (["PlanGeneration", "PlanCheck", "PlanApproving"].includes(step)) {
-    return <>{managedBanner}<ExecutionPlanStep project={project} busy={planningBusy} feedback={feedback}
+    return <><NativeReadinessPanel readiness={project.native_readiness} />{managedBanner}<ExecutionPlanStep project={project} busy={planningBusy} feedback={feedback}
       regenerationFeedback={regenerationFeedback} setRegenerationFeedback={setRegenerationFeedback}
       regenerationModalOpen={planModalOpen} setRegenerationModalOpen={setPlanModalOpen}
       onGenerate={() => runProjectCommand("generate_execution_plan", { projectName: project.name }, "执行计划已生成。")}

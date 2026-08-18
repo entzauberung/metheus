@@ -11,6 +11,7 @@ import type {
   RecoveryPresentation,
   RecoveryPresentationKind,
 } from "../types";
+import type { RuntimeOutcomePresentation } from "../runtimeOutcomePresentation";
 import { AutopilotControlBar } from "./AutopilotControlBar";
 
 function project(): Project {
@@ -26,8 +27,12 @@ function project(): Project {
         active: true,
         target_milestone_id: "milestone-1",
         run_status: "Paused",
+        job_id: "autopilot-job-1",
+        job_generation: 1,
+        job_owner: "BackendRuntime",
         last_action: "等待处理",
         last_action_at: "2026-07-31T00:00:00Z",
+        heartbeat_at: new Date().toISOString(),
         error_message: "",
         recovery_action: "None",
       },
@@ -88,6 +93,7 @@ describe("AutopilotControlBar recovery presentation", () => {
     recovery: RecoveryPresentation | null,
     projectValue = project(),
     executionStatus: PipelineState | null = null,
+    runtimeOutcome?: RuntimeOutcomePresentation,
   ) {
     const handlers = {
       toggle: vi.fn(async () => undefined),
@@ -112,6 +118,7 @@ describe("AutopilotControlBar recovery presentation", () => {
           project={projectValue}
           recoveryPresentation={recovery}
           executionStatus={executionStatus}
+          runtimeOutcome={runtimeOutcome}
           busy={false}
           onToggle={handlers.toggle}
           onPauseManagedFlow={handlers.pauseManaged}
@@ -132,6 +139,24 @@ describe("AutopilotControlBar recovery presentation", () => {
       );
     });
     return handlers;
+  }
+
+  function disconnectedOutcome(): RuntimeOutcomePresentation {
+    return {
+      state: "executing",
+      statusLabel: "执行中",
+      summary: "运行时同步已断开",
+      tone: "active",
+      execution: "pending",
+      quality: "unknown",
+      acceptance: "unknown",
+      confirmation: "not_required",
+      recoveryKind: "None",
+      syncStatus: "disconnected",
+      syncFresh: false,
+      writeAllowed: false,
+      writeBlockedReason: "运行时同步已断开，请先同步项目状态",
+    };
   }
 
   it.each([
@@ -224,6 +249,62 @@ describe("AutopilotControlBar recovery presentation", () => {
     render(presentation("None", null));
     expect(host.querySelector("[data-recovery-kind]")).toBeNull();
     expect(host.textContent).toContain("已暂停");
+  });
+
+  it("forces one sync for a stale heartbeat and leaves only sync/stop while disconnected", async () => {
+    const value = project();
+    value.workflow_state.autopilot_state!.run_status = "Running";
+    value.workflow_state.autopilot_state!.heartbeat_at = "2020-01-01T00:00:00Z";
+    const handlers = render(null, value, {
+      status: "Running",
+      current_subtask_id: "task-1",
+    } as PipelineState, disconnectedOutcome());
+
+    await act(async () => { await Promise.resolve(); });
+
+    expect(handlers.sync).toHaveBeenCalledTimes(1);
+    expect(host.textContent).toContain("同步状态");
+    expect(host.textContent).toContain("关闭自动驾驶");
+    expect(host.textContent).not.toContain("立即暂停");
+    expect([...host.querySelectorAll<HTMLButtonElement>("button")]
+      .find(button => button.textContent?.includes("关闭自动驾驶"))?.disabled).toBe(false);
+  });
+
+  it("routes a running no-owner state to sync and stop only", () => {
+    const value = project();
+    value.workflow_state.autopilot_state!.run_status = "Running";
+    value.workflow_state.autopilot_state!.job_id = "";
+    value.workflow_state.autopilot_state!.job_owner = "None";
+    const outcome = disconnectedOutcome();
+    outcome.syncStatus = "synced";
+    outcome.syncFresh = true;
+    outcome.writeAllowed = true;
+    outcome.writeBlockedReason = "";
+    render(null, value, null, outcome);
+
+    const labels = [...host.querySelectorAll("button")].map(button => button.textContent?.trim());
+    expect(labels).toEqual(["同步状态", "关闭自动驾驶"]);
+  });
+
+  it("keeps a safe close action when recovery is stale and only exposes a dangerous primary", () => {
+    const value = project();
+    value.workflow_state.autopilot_state!.run_status = "Running";
+    value.workflow_state.autopilot_state!.job_id = "";
+    value.workflow_state.autopilot_state!.job_owner = "None";
+    const handlers = render(
+      presentation("BaselineRecovery", action("AcknowledgeExecutionRecovery", "恢复执行基线")),
+      value,
+      null,
+      disconnectedOutcome(),
+    );
+
+    const close = [...host.querySelectorAll<HTMLButtonElement>("button")]
+      .find(button => button.textContent?.includes("关闭自动驾驶"));
+    expect(close).toBeDefined();
+    expect(close?.disabled).toBe(false);
+    expect(host.textContent).not.toContain("立即暂停");
+    act(() => close?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+    expect(handlers.toggle).toHaveBeenCalledWith(false);
   });
 
   it("keeps status, summary, and actions regions in a stable order across states", () => {
@@ -424,7 +505,7 @@ describe("AutopilotControlBar recovery presentation", () => {
       job_generation: 1,
       current_action: "generate_milestone_draft",
       current_action_id: "action-1",
-      heartbeat_at: "2026-07-31T05:00:00Z",
+      heartbeat_at: new Date().toISOString(),
       retry_count: 0,
       last_completed_action: "",
     };
